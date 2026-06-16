@@ -105,3 +105,23 @@ The corpus walk and the transcode share the AST harvest step. Once `ruff_cpp_spo
 ---
 
 _Authored by an external session (`AdaWorldAPI/bardioc` `session_01VysoWJ6vsyg3wEGc5v7T5v`). Posted under `.claude/handovers/` so the session that owns this repo can pick up with grounded context. No code, no PR, no changes to this repo's source — only an architectural record + forward-pointer._
+
+---
+
+## Appendix A — post-#500 corrections (added 2026-06-16)
+
+`AdaWorldAPI/lance-graph` **PR #500** (open at time of this addendum: *"rebaseline #497 OCR plans to #498 + gating probes (5-specialist framing)"*) corrects the critical-path framing for this repo's transcode landing:
+
+1. **Master critical path corrected** to `42 → {50, 51} → 53` (was `42 → 53`). This resolves the open CodeRabbit Major on #497. The C++ transcode lands as a `tesseract-rs-ast-dll-codegen-v1` consumer of the harvester IR, with two parallel deliverables (50, 51) bridging the harvester output and the Rust target.
+
+2. **D-OCR-50 marked PARTIALLY SHIPPED** — `LayoutBlock::to_node_row` landed in #498. The plan re-cast it as *"extend"*, not *"build"*. For the C++ transcode that lands here, the analogous discipline applies: when a building block already exists in the substrate (`OcrProvider`, `ValueTenant`, `EdgeCodecFlavor`, `ReadMode`), extend it; don't rebuild.
+
+3. **"Ride existing presets — no new enum variant" is now an enforced contract test** in lance-graph (`ocr::tests::ocr_schema_fit_rides_existing_preset_no_new_variant`). The C++ transcode that produces this repo's Rust source should not introduce a `ValueSchema::Tesseract` (or `Cpp`) variant. Instead, mint a class (or ride `Full`/`Compressed`) and rely on `classid → ClassView` for value-schema resolution.
+
+4. **`HelixResidue` width is uniformly 6 bytes** (the stored `Signed360` place index), not 48 bytes. Any generated Rust that references the helix tenant width should pin 6 B; the 48 B figure that may appear in pre-#498 documentation is a bits-bytes slip that was retired.
+
+5. **Gating probes specced for OCR** — the C++ transcode should produce analogous probes before its big claims (`int8-exact LSTM`, `bit-reproducible diff against C++ Tesseract output`, `~200k-LOC 1:1 layout`) become FINDING-grade. The probes specced in lance-graph `.claude/plans/ocr-probes-v1.md` (OCR-RT / OCR-DET / OCR-POST / OCR-SCHEMA) are the template.
+
+For the immediate next action in this repo:
+- **Remove any C++ source vendored by the previous attempt.** Even if the runtime path stays parked, the structural rule (`-rs` repos hold Rust, not C++) is now enforced by the substrate-session's "no new variant" discipline applied at the tenant level — the analogous rule at the repo level is "no source-language drift inside a language-targeted repo."
+- **Wait for `ruff_cpp_spo`** to land in `AdaWorldAPI/ruff` before scaffolding any new transcode work here. The harvester output is the input contract this repo's source generation will consume.
