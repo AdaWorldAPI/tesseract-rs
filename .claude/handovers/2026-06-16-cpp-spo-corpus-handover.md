@@ -125,3 +125,44 @@ _Authored by an external session (`AdaWorldAPI/bardioc` `session_01VysoWJ6vsyg3w
 For the immediate next action in this repo:
 - **Remove any C++ source vendored by the previous attempt.** Even if the runtime path stays parked, the structural rule (`-rs` repos hold Rust, not C++) is now enforced by the substrate-session's "no new variant" discipline applied at the tenant level — the analogous rule at the repo level is "no source-language drift inside a language-targeted repo."
 - **Wait for `ruff_cpp_spo`** to land in `AdaWorldAPI/ruff` before scaffolding any new transcode work here. The harvester output is the input contract this repo's source generation will consume.
+
+---
+
+## Appendix B — harvester landed + this repo verified clean of C++ (2026-06-16)
+
+Two of the "immediate next actions" above are now resolved:
+
+1. **`ruff_cpp_spo` has landed** in `AdaWorldAPI/ruff` (branch
+   `claude/happy-hamilton-0azlw4`): the C++ machine-plane SPO frontend,
+   sibling to `ruff_ruby_spo`. It fills the shared `ruff_spo_triplet`
+   `ModelGraph` and expands to 13 net-new C++ predicates (vocab 34 → 47,
+   `predicate_count_locked_at_47`), with `Provenance::CppExtracted = (0.95,
+   0.82)`. The libclang walker (`extract()`) is a documented `todo!()`; the
+   locked-shape test for `Tesseract::Recognizer` already passes. See
+   `AdaWorldAPI/ruff/.claude/handovers/2026-06-16-ruff-cpp-spo-handover.md`
+   Appendix B for the full landing report.
+
+2. **This repo is already clean of C++ source — Iron Rule #1 satisfied, no
+   cleanup needed.** A scan of the current `claude/happy-hamilton-0azlw4`
+   tree found **zero** `.cpp/.cc/.cxx/.hpp/.hh/.h` files. The only Rust here
+   (`src/lib.rs`, `src/page_seg_mode.rs`) is the **original published
+   `tesseract-rs` crate** (the `tesseract-sys`/`tesseract-plumbing` FFI
+   wrapper, v0.15.2), NOT the reverted "previous attempt" that vendored C++.
+   So there is nothing to remove and nothing to carve into `legacy/`.
+
+   **Retiring the existing FFI-wrapper crate is deliberately deferred** — it
+   is premature until the codegen plan (`tesseract-rs-ast-dll-codegen-v1`)
+   actually produces replacement generated Rust to land here. Removing a
+   working published crate before its replacement exists would leave the repo
+   empty for no benefit. That decision is the operator's to make once the
+   first codegen run is ready; do not delete it speculatively.
+
+### What unblocks this repo next (off-repo first, in order)
+
+1. **Tesseract release pin** (operator decision) — needed before the
+   libclang corpus walk; not before.
+2. **libclang walker in `ruff_cpp_spo`** → first ndjson emission from a
+   Tesseract subset → load into the lance-graph SPO store.
+3. **`tesseract-rs-ast-dll-codegen-v1`** consumes that IR and emits the first
+   generated Rust file INTO this repo (with provenance headers). Only then
+   does the FFI-wrapper-vs-generated question become live.
