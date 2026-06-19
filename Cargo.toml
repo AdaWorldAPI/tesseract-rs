@@ -1,32 +1,13 @@
-[package]
-name          = "tesseract"
-version       = "0.15.2"
-authors       = ["Kevin Kwok <antimatter15@gmail.com>", "Chris Couzens <ccouzens@gmail.com>"]
-documentation = "https://docs.rs/tesseract"
-repository    = "https://github.com/antimatter15/tesseract-rs"
-description   = "Higher-level bindings for Tesseract OCR"
-license       = "MIT"
-keywords      = ["tesseract", "OCR", "bindings"]
-categories    = ["api-bindings", "multimedia::images"]
-
-[dependencies]
-tesseract-sys = "~0.6"
-tesseract-plumbing = { version="~0.11.1", default-features = false }
-thiserror = "1.0"
-
-[features]
-default = ["tesseract_5_2"]
-tesseract_5_2 = ["tesseract-plumbing/tesseract_5_2"]
-
-[package.metadata.docs.rs]
-# docs.rs is not compatible with tesseract_5_2
-no-default-features = true
-
-# ── Pure-Rust transcode workspace (operator directive: transcode Tesseract into
-# Rust, do NOT wrap libtesseract). The root `tesseract` package stays the legacy
-# FFI wrapper, untouched; `crates/tesseract-core` is the pure-Rust target that
-# consumes the byte-parity-proven OGAR adapters and grows as the FFI shrinks.
+# tesseract-rs — pure-Rust transcode of Tesseract OCR.
+#
+# The original antimatter15 FFI wrapper (`tesseract-sys` / `tesseract-plumbing`
+# bindings to the C++ libtesseract) was DELETED 2026-06-18 per the operator
+# directive: transcode Tesseract into Rust, do NOT wrap libtesseract.
+#
+# This is a virtual workspace. The OCR is rebuilt leaf-by-leaf in pure Rust
+# under `crates/`, each leaf byte-parity-proven against the C++ original
+# (source: AdaWorldAPI/Tesseract) before it lands. The transcoded primitives
+# ride the OGAR Core (`lance-graph-contract`) per the Core-First doctrine.
 [workspace]
 members = ["crates/tesseract-core"]
 resolver = "2"
-

@@ -11,16 +11,27 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
-    - name: Install tesseract
-      run: sudo apt-get install libleptonica-dev libtesseract-dev clang tesseract-ocr-eng
-    - uses: actions/checkout@v2
+    # Pure-Rust transcode: no libtesseract / leptonica / clang. The OCR core
+    # depends on lance-graph-contract via a sibling path dep, so check both repos
+    # out side by side (the path is ../../../lance-graph/crates/lance-graph-contract).
+    - uses: actions/checkout@v4
+      with:
+        path: tesseract-rs
+    - uses: actions/checkout@v4
+      with:
+        repository: AdaWorldAPI/lance-graph
+        path: lance-graph
     - name: Build
-      run: cargo build --verbose --no-default-features
-    - name: Run tests
-      run: cargo test --verbose --no-default-features
+      working-directory: tesseract-rs
+      run: cargo build --verbose
+    - name: Test
+      working-directory: tesseract-rs
+      run: cargo test --verbose
+    - name: Clippy
+      working-directory: tesseract-rs
+      run: cargo clippy --all-targets -- -D warnings
     - name: Check formatting
-      run: cargo fmt -- --check
+      working-directory: tesseract-rs
+      run: cargo fmt --all -- --check
