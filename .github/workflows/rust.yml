@@ -25,13 +25,15 @@ jobs:
         path: lance-graph
     - name: Build
       working-directory: tesseract-rs
-      run: cargo build --verbose
+      run: cargo build -p tesseract-core --verbose
     - name: Test
       working-directory: tesseract-rs
-      run: cargo test --verbose
+      run: cargo test -p tesseract-core --verbose
     - name: Clippy
       working-directory: tesseract-rs
-      run: cargo clippy --all-targets -- -D warnings
+      run: cargo clippy -p tesseract-core --all-targets -- -D warnings
     - name: Check formatting
+      # SCOPED to -p (NOT --all): tesseract-core path-deps lance-graph-contract,
+      # and `cargo fmt --all` would walk into the lance-graph workspace.
       working-directory: tesseract-rs
-      run: cargo fmt --all -- --check
+      run: cargo fmt -p tesseract-core -- --check
