@@ -1,0 +1,12 @@
+[package]
+name = "tesseract-core"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "Pure-Rust Tesseract transcode — the OCR core, consuming the OGAR/lance-graph-contract proven adapters instead of the C library."
+
+[dependencies]
+# AdaWorldAPI fork, sibling checkout (P0: fork-only, path dep — mirrors the
+# smb-office-rs / tesseract-rs contract-dep precedent). lance-graph-contract is
+# zero-dep, so this pulls no arrow/lance/protoc into the OCR core.
+lance-graph-contract = { path = "../../../lance-graph/crates/lance-graph-contract" }

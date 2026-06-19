@@ -22,3 +22,11 @@ tesseract_5_2 = ["tesseract-plumbing/tesseract_5_2"]
 # docs.rs is not compatible with tesseract_5_2
 no-default-features = true
 
+# ── Pure-Rust transcode workspace (operator directive: transcode Tesseract into
+# Rust, do NOT wrap libtesseract). The root `tesseract` package stays the legacy
+# FFI wrapper, untouched; `crates/tesseract-core` is the pure-Rust target that
+# consumes the byte-parity-proven OGAR adapters and grows as the FFI shrinks.
+[workspace]
+members = ["crates/tesseract-core"]
+resolver = "2"
+
