@@ -15,6 +15,10 @@
 //!
 //! - [`UniCharSet`] — `ccutil/unicharset.cpp`, the id↔unichar bijection,
 //!   **112/112 byte-identical** on a real `eng` unicharset.
+//! - [`UniCharSet::get_isalpha`] + the `get_is{lower,upper,digit,punctuation}`
+//!   family — `ccutil/unicharset.cpp` property decode (`properties & MASK`),
+//!   **112/112 byte-identical** on a real `eng` unicharset against tesseract's
+//!   own `get_is*` accessors.
 //! - [`unichar`] — `ccutil/unichar.cpp`, the UTF-8 codec (`utf8_step` +
 //!   `utf8_to_utf32`), **268/268 byte-identical** (256 exhaustive lead-byte
 //!   values + 12 decode rows).
@@ -79,6 +83,25 @@ mod tests {
         // Unknown ids are dropped (INVALID_UNICHAR_ID semantics), not panicked.
         assert_eq!(ids_to_text(&cs, &[1, 999, 2]), "ab");
         assert_eq!(ids_to_text(&cs, &[]), "");
+    }
+
+    #[test]
+    fn charset_exposes_proven_properties() {
+        // Through the OCR core's `CharSet` surface, the property accessors the
+        // Core proved byte-identical (112/112 vs tesseract's `get_is*`) are
+        // reachable. Second column is the hex property mask: 0x3=alpha+lower,
+        // 0x5=alpha+upper, 0x8=digit, 0x10=punct.
+        let cs: CharSet = UniCharSet::load_from_str(
+            "4\na 3 0 a Left a a\nA 5 0 A Left A A\n7 8 0 7 Left 7 7\n. 10 0 . Left . .\n",
+        )
+        .expect("valid unicharset");
+        assert!(cs.get_isalpha(0) && cs.get_islower(0) && !cs.get_isupper(0));
+        assert!(cs.get_isalpha(1) && cs.get_isupper(1) && !cs.get_islower(1));
+        assert!(cs.get_isdigit(2) && !cs.get_isalpha(2));
+        assert!(cs.get_ispunctuation(3) && !cs.get_isdigit(3));
+        // INVALID_UNICHAR_ID semantics: out-of-range never panics, returns false.
+        assert!(!cs.get_isalpha(99));
+        assert!(!cs.get_isngram(0)); // plain-table load never sets ngram
     }
 
     #[test]
