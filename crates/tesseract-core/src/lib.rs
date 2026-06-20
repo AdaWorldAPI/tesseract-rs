@@ -19,6 +19,10 @@
 //!   family — `ccutil/unicharset.cpp` property decode (`properties & MASK`),
 //!   **112/112 byte-identical** on a real `eng` unicharset against tesseract's
 //!   own `get_is*` accessors.
+//! - [`UniCharSet::get_script`] + [`UniCharSet::script_of`] — the interned
+//!   per-id script table (`ccutil/unicharset.cpp` `add_script`),
+//!   **112/112 byte-identical** on a real `eng` unicharset against tesseract's
+//!   own `get_script`.
 //! - [`unichar`] — `ccutil/unichar.cpp`, the UTF-8 codec (`utf8_step` +
 //!   `utf8_to_utf32`), **268/268 byte-identical** (256 exhaustive lead-byte
 //!   values + 12 decode rows).
@@ -102,6 +106,25 @@ mod tests {
         // INVALID_UNICHAR_ID semantics: out-of-range never panics, returns false.
         assert!(!cs.get_isalpha(99));
         assert!(!cs.get_isngram(0)); // plain-table load never sets ngram
+    }
+
+    #[test]
+    fn charset_exposes_script() {
+        // The interned per-id script table (proven 112/112 vs tesseract's
+        // get_script) is reachable through CharSet. null_script is seeded at sid
+        // 0; real scripts follow in id order (here: Common=1, Latin=2). Mixed
+        // tiers: id 0 has no bbox CSV, ids 1-2 do.
+        let cs: CharSet = UniCharSet::load_from_str(
+            "3\nNULL 0 Common 0\nA 5 0,255,0,255,0,0,0,0,0,0 Latin 1 0 1 A\n. 10 0,255,0,255,0,0,0,0,0,0 Common 2 0 2 .\n",
+        )
+        .expect("valid unicharset");
+        assert_eq!(cs.get_script_table_size(), 3);
+        assert_eq!(cs.script_of(0), Some("Common")); // the space char's script
+        assert_eq!(cs.script_of(1), Some("Latin"));
+        assert_eq!(cs.script_of(2), Some("Common"));
+        // null_sid_ / INVALID_UNICHAR_ID: out-of-range resolves the null script.
+        assert_eq!(cs.get_script(99), 0);
+        assert_eq!(cs.script_of(99), Some("NULL"));
     }
 
     #[test]
