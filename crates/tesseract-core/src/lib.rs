@@ -23,6 +23,9 @@
 //!   per-id script table (`ccutil/unicharset.cpp` `add_script`),
 //!   **112/112 byte-identical** on a real `eng` unicharset against tesseract's
 //!   own `get_script`.
+//! - [`UniCharSet::get_other_case`] — the case-pair id per entry (the
+//!   `ccutil/unicharset.cpp` size-clamp), **112/112 byte-identical** on a real
+//!   `eng` unicharset against tesseract's own `get_other_case`.
 //! - [`unichar`] — `ccutil/unichar.cpp`, the UTF-8 codec (`utf8_step` +
 //!   `utf8_to_utf32`), **268/268 byte-identical** (256 exhaustive lead-byte
 //!   values + 12 decode rows).
@@ -125,6 +128,19 @@ mod tests {
         // null_sid_ / INVALID_UNICHAR_ID: out-of-range resolves the null script.
         assert_eq!(cs.get_script(99), 0);
         assert_eq!(cs.script_of(99), Some("NULL"));
+    }
+
+    #[test]
+    fn charset_exposes_other_case() {
+        // The case-pair table (proven 112/112 vs tesseract's get_other_case) is
+        // reachable through CharSet: C<->c, and the INVALID_UNICHAR_ID guard.
+        let cs: CharSet = UniCharSet::load_from_str(
+            "2\nC 5 0,255,0,255,0,0,0,0,0,0 Latin 1 0 0 C\nc 3 0,255,0,255,0,0,0,0,0,0 Latin 0 0 1 c\n",
+        )
+        .expect("valid unicharset");
+        assert_eq!(cs.get_other_case(0), 1); // C -> c
+        assert_eq!(cs.get_other_case(1), 0); // c -> C
+        assert_eq!(cs.get_other_case(99), -1); // INVALID_UNICHAR_ID
     }
 
     #[test]
