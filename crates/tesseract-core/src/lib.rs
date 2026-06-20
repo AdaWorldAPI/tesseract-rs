@@ -26,6 +26,10 @@
 //! - [`UniCharSet::get_other_case`] — the case-pair id per entry (the
 //!   `ccutil/unicharset.cpp` size-clamp), **112/112 byte-identical** on a real
 //!   `eng` unicharset against tesseract's own `get_other_case`.
+//! - [`UniCharSet::get_direction`] + [`UniCharSet::get_mirror`] — the bidi
+//!   direction code + mirror id per entry (the columns past the bbox CSV),
+//!   **112/112 byte-identical** on a real `eng` unicharset against tesseract's
+//!   own `get_direction` / `get_mirror`.
 //! - [`unichar`] — `ccutil/unichar.cpp`, the UTF-8 codec (`utf8_step` +
 //!   `utf8_to_utf32`), **268/268 byte-identical** (256 exhaustive lead-byte
 //!   values + 12 decode rows).
@@ -141,6 +145,22 @@ mod tests {
         assert_eq!(cs.get_other_case(0), 1); // C -> c
         assert_eq!(cs.get_other_case(1), 0); // c -> C
         assert_eq!(cs.get_other_case(99), -1); // INVALID_UNICHAR_ID
+    }
+
+    #[test]
+    fn charset_exposes_direction_and_mirror() {
+        // The bidi direction + mirror columns (proven 112/112 vs tesseract's
+        // get_direction/get_mirror) are reachable through CharSet: a paren pair
+        // mirrors, both U_OTHER_NEUTRAL (10), plus the out-of-range guards.
+        let cs: CharSet = UniCharSet::load_from_str(
+            "2\n( 10 0,255,0,255,0,0,0,0,0,0 Common 0 10 1 (\n) 10 0,255,0,255,0,0,0,0,0,0 Common 0 10 0 )\n",
+        )
+        .expect("valid unicharset");
+        assert_eq!(cs.get_direction(0), 10); // U_OTHER_NEUTRAL
+        assert_eq!(cs.get_mirror(0), 1); // ( -> )
+        assert_eq!(cs.get_mirror(1), 0); // ) -> (
+        assert_eq!(cs.get_direction(99), 10); // out-of-range -> U_OTHER_NEUTRAL
+        assert_eq!(cs.get_mirror(99), -1); // out-of-range -> INVALID_UNICHAR_ID
     }
 
     #[test]
