@@ -30,9 +30,10 @@ Full doctrine: `../lance-graph/.claude/knowledge/core-first-transcode-doctrine.m
 | properties | E-CPP-PARITY-3 | 112/112 | `CharSet::get_is{alpha,lower,upper,digit,punctuation,ngram}` |
 | script table (interned) | E-CPP-PARITY-4 | 112/112 | `CharSet::{get_script,script_of,get_script_table_size,...}` |
 | other_case (case pair) | E-CPP-PARITY-5 | 112/112 | `CharSet::get_other_case` |
+| direction + mirror | E-CPP-PARITY-6 | 112/112 | `CharSet::{get_direction,get_mirror}` |
 
 `ids_to_text` (the recognizer's id→text walk) is the first OCR-facing step in
-`tesseract-core`. Cross-ref the Core's `EPIPHANIES.md` E-CPP-PARITY-1..5 +
+`tesseract-core`. Cross-ref the Core's `EPIPHANIES.md` E-CPP-PARITY-1..6 +
 E-CPP-KEYSTONE-1 (classid→ClassView→adapter dispatch).
 
 ## The proven method — self-validating oracle
@@ -70,11 +71,27 @@ Each leaf is proven this way (the `/tmp` artifacts are ephemeral — rebuild the
 
 ## Next leaf
 
-`other_case` was the **last `UNICHARSET` field reachable by simple token-offset.**
-The remaining columns — `direction`, `mirror`, the bounding box, the float stats —
-sit behind Tesseract's 5-tier `istringstream` fallback (`unicharset.cpp:833-868`),
-so the next leaf is the **multi-tier column parser**. After `UNICHARSET`: the
-recoder (`unicharcompress.{h,cpp}`), then the recognizer.
+**The UNICHARSET *varied-field* surface is COMPLETE** — every field that carries
+varied, falsifiable information on the real `eng.lstm-unicharset` is transcoded +
+byte-parity-proven 112/112: bijection, properties, script, other_case, direction,
+mirror. `direction`/`mirror` were read by continuing the token walk past the
+optional bbox+stats CSV (one whitespace token → fixed offsets, no bespoke 5-tier
+detector needed), and their green parity **proves the CSV-skip is correct.**
+
+**Deferred (weak falsifier on this data, NOT a gap):** the bbox ints
+(`get_top_bottom`), the 6 float stats, and `normed` sit *inside* that CSV. On the
+LSTM unicharset they are **uniform** — 111/111 CSV lines are identically
+`0,255,0,255,0,0,0,0,0,0` and `normed` ≈ the unichar — so a byte-parity diff would
+be all-uniform and prove nothing the CSV-skip hasn't already shown. Transcribing
+them is mechanical but should be gated on a **legacy (non-LSTM) `eng.unicharset`
+with real bbox/stats** so the diff can actually falsify. (Note `get_top_bottom`'s
+out-of-range default is `0,256,0,256` — 256, not 255 — and `set_top_bottom` clips
+to `[0,255]`; `unicharset.h:586-606`.)
+
+**The real next module: the recoder** (`unicharcompress.{h,cpp}`) — then the
+recognizer. That is a new Core type (not another UNICHARSET accessor), so it
+starts with a read of `unicharcompress.h` + a Core-shape design pass, not a quick
+leaf.
 
 ## Branch / PR / merge order
 
