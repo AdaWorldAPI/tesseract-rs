@@ -90,8 +90,17 @@ to `[0,255]`; `unicharset.h:586-606`.)
 
 **The real next module: the recoder** (`unicharcompress.{h,cpp}`) — then the
 recognizer. That is a new Core type (not another UNICHARSET accessor), so it
-starts with a read of `unicharcompress.h` + a Core-shape design pass, not a quick
-leaf.
+starts with a design pass, not a quick leaf. **The plan exists:**
+`.claude/plans/recoder-core-shape-v1.md` — scope (load-side only:
+DeSerialize + Encode/Decode/code_range; ComputeEncoding is training-side),
+the routing verdict vs OGAR's new transpile lane (content-store tier in
+lance-graph-contract, NOT ogar-from-ruff emit_rust — with the OGAR-as-IR §3
+test rationale + drafted SURREAL-AST-TRAP-PREFLIGHT answers to re-run live),
+the first-binary-leaf warning (serialis/TFile), and the falsifier
+(`/tmp/eng.lstm-recoder`, 1012 B real eng data; oracle must re-verify the
+ABI skew for the NEW object layout). Post-OGAR #85–#145 notes live there
+too: `0x08` OCR domain named but not yet minted; EdgeBlock-superseded flag
+is cross-repo-owned, not ours.
 
 ## Branch / PR / merge order
 
