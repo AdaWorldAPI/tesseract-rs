@@ -102,13 +102,19 @@ unicharset parser made, but byte-level. Budget most of the session here.
 
 ## 6. Deferred / cross-repo notes (do not act in the leaf session)
 
-- **`0x08` OCR domain**: named in OGAR's APP‖class layout core codebook,
+- **`0x08` OCR domain**: named in OGAR's APP‖class core codebook,
   **not yet minted** in `ogar-vocab` (mints so far: 0x07 OSINT, 0x09
   Health, 0x0B Auth, 0x0C Automation, commerce extensions). When the
   unicharset/recoder keystone graduates from test-registry classids to
   canonical ones, the mint happens in OGAR (`ogar-vocab` + PortSpec if a
   port is warranted) — a separate cross-repo PR, per the consumer
   best-practices doc (classid is pure address; pull, never re-declare).
+  **Classid half-order FLIPPED (2026-07-02)** — canon HIGH / APP-render
+  prefix LOW, read `domain:appid:classview` (V3 marker currently 1000):
+  lance-graph #628 (`CanonHigh` + compat reader) + OGAR #147
+  (`ogar_vocab::app` lockstep). The #95 layout doc's original order
+  description is superseded — when minting, take the order from
+  `ogar_vocab::app` / contract `CanonHigh`, never from prose.
 - **EdgeBlock-superseded flag**: OGAR ADR work states canon =
   `key(16)+value(496)`, EdgeBlock superseded (F-5) — divergent from
   lance-graph CANON `key(16)|edges(16)|value(480)`. Cross-repo
