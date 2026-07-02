@@ -6,6 +6,6 @@ The original `antimatter15` FFI wrapper (`tesseract-sys` / `tesseract-plumbing`)
 
 ## Layout
 
-- **`crates/tesseract-core`** — the pure-Rust OCR core. First landed leaf: the **character set** (`UNICHARSET` / `UNICHAR`), consumed from the OGAR Core where it is byte-parity-proven against a libtesseract oracle (`UniCharSet` 112/112, the `unichar` UTF-8 codec 268/268).
+- **`crates/tesseract-core`** — the pure-Rust OCR core. It consumes the `UNICHARSET` / `UNICHAR` primitives from the OGAR Core (`lance-graph-contract`), where each is byte-parity-proven against a libtesseract oracle. Landed so far: the id↔unichar bijection (112/112) and the `unichar` UTF-8 codec (268/268), plus the per-id `properties`, `script`, and `other_case` accessors (112/112 each), and `ids_to_text`.
 
-See `.claude/plans/` for the transcode plan (`tesseract-rs-ast-dll-codegen-v1`, `tesseract-rs-receive-contract-v1`).
+Start with **`CLAUDE.md`** (the session contract: Core-First doctrine, the proven self-validating-oracle method, iron rules, and the next leaf). See `.claude/plans/` for the transcode plan (`tesseract-rs-ast-dll-codegen-v1`, `tesseract-rs-receive-contract-v1`).
