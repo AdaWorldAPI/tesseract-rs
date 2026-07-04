@@ -21,6 +21,9 @@
 
 use ndarray::{Array2, ArrayView2};
 
+pub mod weight_matrix;
+pub use weight_matrix::WeightMatrix;
+
 /// `INT8_MAX` (127) — the value the recognizer's imaginary bias input `1.0`
 /// quantizes to (tesseract `intsimdmatrix.cpp:101`: the input is int8-quantized
 /// where `1.0` maps to `INT8_MAX`, **not** `1`).
@@ -34,6 +37,11 @@ pub enum RecognizerError {
     /// The underlying ndarray int8 GEMM rejected the shapes (should not occur
     /// once [`matrix_dot_vector`]'s own dimension checks have passed).
     Gemm(String),
+    /// A serialized buffer ended mid-field.
+    UnexpectedEof,
+    /// A serialized `WeightMatrix` used a format this loader does not handle
+    /// (old float format, or float mode — this crate loads int mode only).
+    UnsupportedFormat(&'static str),
 }
 
 impl std::fmt::Display for RecognizerError {
@@ -41,6 +49,8 @@ impl std::fmt::Display for RecognizerError {
         match self {
             Self::DimMismatch(what) => write!(f, "recognizer dimension mismatch: {what}"),
             Self::Gemm(msg) => write!(f, "int8 gemm rejected the shapes: {msg}"),
+            Self::UnexpectedEof => write!(f, "weight buffer ended mid-field"),
+            Self::UnsupportedFormat(what) => write!(f, "unsupported weight format: {what}"),
         }
     }
 }
@@ -71,6 +81,32 @@ pub fn matrix_dot_vector(
     scales: &[f64],
     u: &[i8],
 ) -> Result<Vec<f64>, RecognizerError> {
+    let combined = matrix_dot_vector_i32(w, u)?;
+    if scales.len() != combined.len() {
+        return Err(RecognizerError::DimMismatch("scales length != num_out"));
+    }
+    Ok(combined
+        .iter()
+        .zip(scales)
+        .map(|(&c, &s)| f64::from(c) * s)
+        .collect())
+}
+
+/// The exact **integer** combined value per output —
+/// `Σ_j w(i,j)·u[j] + w(i,num_in)·INT8_MAX` — the `TFloat`-agnostic core of
+/// [`matrix_dot_vector`]. The caller applies the per-output scale in whatever
+/// precision matches its target: f64 in [`matrix_dot_vector`], **f32** in
+/// [`WeightMatrix::forward`] to match Tesseract's FAST_FLOAT (`TFloat = float`).
+/// It is this value the recognizer's int8 accumulate is byte-parity-proven on
+/// (identical across every SIMD tier — see the Core board `E-OCR-MATDOTVEC-1`).
+///
+/// `w` is `num_out × (num_in + 1)` int8 (last column = bias); `u` is `num_in`.
+///
+/// # Errors
+///
+/// [`RecognizerError::DimMismatch`] if `w` has no columns or `u.len() != num_in`;
+/// [`RecognizerError::Gemm`] if the shaped int8 GEMM is rejected.
+pub fn matrix_dot_vector_i32(w: ArrayView2<'_, i8>, u: &[i8]) -> Result<Vec<i32>, RecognizerError> {
     let num_out = w.nrows();
     let num_in = w
         .ncols()
@@ -79,11 +115,8 @@ pub fn matrix_dot_vector(
     if u.len() != num_in {
         return Err(RecognizerError::DimMismatch("u length != num_in"));
     }
-    if scales.len() != num_out {
-        return Err(RecognizerError::DimMismatch("scales length != num_out"));
-    }
     // Pad the input with a trailing INT8_MAX so the bias column w[:, num_in] is
-    // picked up by the same matmul (the imaginary 1.0 bias input → 127).
+    // picked up by the same matmul (the imaginary 1.0 bias input -> 127).
     let mut u_padded = Vec::with_capacity(num_in + 1);
     u_padded.extend_from_slice(u);
     u_padded.push(INT8_MAX_I8);
@@ -92,9 +125,7 @@ pub fn matrix_dot_vector(
     let mut out = Array2::<i32>::zeros((num_out, 1));
     ndarray::simd_runtime::matmul_i8_to_i32(w, u_col, out.view_mut())
         .map_err(|e| RecognizerError::Gemm(format!("{e:?}")))?;
-    Ok((0..num_out)
-        .map(|i| f64::from(out[[i, 0]]) * scales[i])
-        .collect())
+    Ok((0..num_out).map(|i| out[[i, 0]]).collect())
 }
 
 #[cfg(test)]

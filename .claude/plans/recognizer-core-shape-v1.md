@@ -1,9 +1,10 @@
 # Recognizer Core-shape design pass — v1 (plan, not the design)
 
-> **Status:** IN PROGRESS — **Leaf 1 EXECUTED 2026-07-04**
-> (`tesseract-recognizer::matrix_dot_vector`, byte-parity green vs libtesseract,
-> `E-OCR-MATDOTVEC-1`; new crate `crates/tesseract-recognizer`). Drafted
-> 2026-07-04 after the recoder landed as
+> **Status:** IN PROGRESS — **Leaves 1-2 EXECUTED 2026-07-04** (both byte-parity
+> green vs libtesseract): Leaf 1 `matrix_dot_vector` (`E-OCR-MATDOTVEC-1`) +
+> Leaf 2 `WeightMatrix::from_le_bytes` / `forward` (`E-OCR-WEIGHTMATRIX-1`), in
+> the new crate `crates/tesseract-recognizer`. Next = the network graph (Leaf 3).
+> Drafted 2026-07-04 after the recoder landed as
 > E-CPP-PARITY-7. The next module after the recoder — and the first
 > **compute** leaf, where the operator's sanity check bites: *OCR without
 > hardware acceleration isn't smart.* The LSTM recognizer IS the arithmetic;

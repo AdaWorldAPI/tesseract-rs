@@ -104,7 +104,7 @@ SURREAL-AST-TRAP-PREFLIGHT + OGAR-AS-IR §3. `0x08` OCR is now MINTED (OGAR #148
 (`invoke_recoder`, the E-CPP-KEYSTONE-1 analog) is unblocked but deferred — the
 `classid→ClassView→content` dispatch is already proven generically.
 
-**The recognizer is UNDERWAY — Leaf 1 shipped** (`tesseract-recognizer`, the
+**The recognizer is UNDERWAY — Leaves 1-2 shipped** (`tesseract-recognizer`, the
 COMPUTE tier — a NEW crate, deps `ndarray`). `matrix_dot_vector` transcodes the
 base int8 `IntSimdMatrix::MatrixDotVector` by consuming
 `ndarray::simd_runtime::matmul_i8_to_i32` (the hardware acceleration — the
@@ -114,8 +114,9 @@ int8, two shapes (`E-OCR-MATDOTVEC-1`, integer-combined diff so it is
 `TFloat`-agnostic; the in-env lib is FAST_FLOAT). The **two-foundations** split
 is now real: `tesseract-recognizer` (deps ndarray) = compute, `tesseract-core`
 (deps lance-graph-contract) = content. **Toolchain: always bump to 1.95** (ndarray
-manifest gate); CI sibling-checks-out ndarray now. **Next Leaf 2+:**
-`WeightMatrix::DeSerialize` (load int8 weights + scales, `TFile`), then the
+manifest gate); CI sibling-checks-out ndarray now. **Leaf 2 shipped:**
+`WeightMatrix::DeSerialize` (int-mode load + f32 `forward`, byte-parity green on
+f32 bit-patterns vs libtesseract, `E-OCR-WEIGHTMATRIX-1`). **Next Leaf 3:** the
 network graph (`Series`/`LSTM`/`FullyConnected`/`Convolve`) forward pass, then
 `recodebeam` (CTC decode → the code lattice `recoded_to_text` eats). Plan:
 `.claude/plans/recognizer-core-shape-v1.md`. (Still deferred, unchanged: the
