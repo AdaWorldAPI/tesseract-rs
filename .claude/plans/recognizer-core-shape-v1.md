@@ -1,7 +1,10 @@
 # Recognizer Core-shape design pass — v1 (plan, not the design)
 
-> **Status:** PLAN (drafted 2026-07-04, after the recoder landed as
-> E-CPP-PARITY-7). The next module after the recoder — and the first
+> **Status:** IN PROGRESS — **Leaf 1 EXECUTED 2026-07-04**
+> (`tesseract-recognizer::matrix_dot_vector`, byte-parity green vs libtesseract,
+> `E-OCR-MATDOTVEC-1`; new crate `crates/tesseract-recognizer`). Drafted
+> 2026-07-04 after the recoder landed as
+> E-CPP-PARITY-7. The next module after the recoder — and the first
 > **compute** leaf, where the operator's sanity check bites: *OCR without
 > hardware acceleration isn't smart.* The LSTM recognizer IS the arithmetic;
 > this plan fixes the two-foundations architecture, the clean int8 seam onto
