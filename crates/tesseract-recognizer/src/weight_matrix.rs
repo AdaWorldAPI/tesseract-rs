@@ -70,6 +70,18 @@ impl WeightMatrix {
     /// buffer; [`RecognizerError::DimMismatch`] if the weight dims overflow or
     /// the scale count is below `num_out`.
     pub fn from_le_bytes(bytes: &[u8]) -> Result<Self, RecognizerError> {
+        Self::from_le_bytes_prefix(bytes).map(|(wm, _)| wm)
+    }
+
+    /// Like [`from_le_bytes`](Self::from_le_bytes) but also returns the number of
+    /// bytes consumed — the offset at which the NEXT serialized item begins. Used
+    /// to chain the 4 gate matrices of an `LSTM` payload (`crate::lstm`), where
+    /// `WeightMatrix`es are serialized back-to-back with no length prefix.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`from_le_bytes`](Self::from_le_bytes).
+    pub fn from_le_bytes_prefix(bytes: &[u8]) -> Result<(Self, usize), RecognizerError> {
         let mut r = ByteReader::new(bytes);
         let mode = r.read_u8()?;
         if (mode & K_DOUBLE_FLAG) == 0 {
@@ -108,11 +120,14 @@ impl WeightMatrix {
             return Err(RecognizerError::DimMismatch("fewer scales than outputs"));
         }
         scales.truncate(dim1);
-        Ok(Self {
-            wi,
-            scales,
-            use_adam,
-        })
+        Ok((
+            Self {
+                wi,
+                scales,
+                use_adam,
+            },
+            r.pos,
+        ))
     }
 
     /// The number of outputs (rows of `wi_`).
