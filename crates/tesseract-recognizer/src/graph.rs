@@ -102,7 +102,10 @@ impl Layer {
             }
             Layer::Series(stack) => {
                 let Some((first, rest)) = stack.split_first() else {
-                    return Ok(Vec::new());
+                    // A real network spec never yields an empty Series; erroring
+                    // (rather than silently returning zero timesteps) surfaces a
+                    // malformed graph instead of feeding the decoder no logits.
+                    return Err(RecognizerError::DimMismatch("empty Series layer"));
                 };
                 let mut result = first.forward(input)?;
                 for layer in rest {
@@ -117,6 +120,9 @@ impl Layer {
                 Ok(result)
             }
             Layer::Parallel(stack) => {
+                if stack.is_empty() {
+                    return Err(RecognizerError::DimMismatch("empty Parallel layer"));
+                }
                 let parts: Vec<Vec<Vec<f32>>> = stack
                     .iter()
                     .map(|l| l.forward(input))

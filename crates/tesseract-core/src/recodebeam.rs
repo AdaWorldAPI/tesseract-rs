@@ -680,6 +680,14 @@ impl<'a> RecodeBeamSearch<'a> {
         if use_dawgs {
             return; // dict-only.
         }
+        if length >= K_NUM_LENGTHS {
+            // No beam exists past `kMaxCodeLen`. Unreachable with a Core-validated
+            // recoder — codes are capped at `kMaxCodeLen = 9`, so `get_next_codes`
+            // is empty for a prefix of length >= 8 and the `length + 1` from the
+            // next-codes path never reaches 10. This guards the theoretical index
+            // over libtesseract's unchecked `kBeamWidths[length]`.
+            return;
+        }
         let index = beam_index(false, cont, length);
         let cert = cert * self.dict_ratio;
         if cert >= K_MIN_CERTAINTY || code == self.null_char {
@@ -846,8 +854,19 @@ impl<'a> RecodeBeamSearch<'a> {
 
     /// `ExtractBestPathAsLabels` (`recodebeam.cpp:201`): the best path run through
     /// CTC — drop nulls, fold adjacent equal codes — as `(labels, xcoords)`. The
-    /// labels are recoded codes; feed them (via [`RecodedCharId::from_codes`]) to
-    /// [`recoded_to_text`](crate::recoded_to_text) for the string.
+    /// labels are individual recoded **codes** (faithful to the C++, which likewise
+    /// returns per-position codes here).
+    ///
+    /// For a **single-code recoder** (the eng.lstm pass-through, every code is a
+    /// complete char), each label is a full `RecodedCharId::from_codes(&[label])`,
+    /// so `labels → recoded_to_text` yields the string directly. For a
+    /// **multi-code recoder** (Han/Hangul, code length > 1) the completing code's
+    /// `unichar_id` must be recovered by grouping consecutive codes back into
+    /// complete `RecodedCharId`s and calling `decode` on each group — the job of
+    /// the C++ `ExtractBestPathAsUnicharIds` (deferred, alongside the multi-code
+    /// `next_codes_` trie). Do NOT feed multi-code labels one-at-a-time to
+    /// `recoded_to_text`: a partial one-code id decodes to `INVALID` and drops the
+    /// char.
     #[must_use]
     pub fn extract_best_path_as_labels(&self) -> (Vec<i32>, Vec<i32>) {
         let best_nodes = self.extract_path(self.extract_best_node());
