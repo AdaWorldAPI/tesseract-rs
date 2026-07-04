@@ -1,8 +1,24 @@
 # Plan — recognizer Leaf 7 (recodebeam) + the 2-D front-end → end-to-end OCR
 
-**Status:** Leaves 1-6 EXECUTED + byte-parity green (the full 1-D network forward,
-features → softmax logits). This plan scopes the REMAINING leaves to close
-image → text. **Branch:** `claude/happy-hamilton-0azlw4` (tesseract-rs PR #5).
+**Status:** Leaves 1-6 + **Leaf 7 (7a maps + 7b CTC beam) EXECUTED** + byte-parity
+green — the recognizer now spans **logits → text** (`Decode` → labels →
+`recoded_to_text`). This plan's REMAINING scope is the **2-D front-end** (image →
+features) + the dict/LM beam. **Branch:** `claude/happy-hamilton-0azlw4`
+(tesseract-rs PR #5).
+
+## ✅ Leaf 7 EXECUTED (2026-07-04)
+
+- **7a** — recoder `SetupDecoder` beam maps (`is_valid_start_`/`final_codes_`/
+  `next_codes_`) in the Core `UnicharCompress`, byte-parity green on real
+  `eng.lstm-recoder` (114-line `dump_beam` diff). `E-OCR-RECODER-BEAM-1`,
+  lance-graph PR #647.
+- **7b** — `RecodeBeamSearch::Decode` (non-dict CTC beam) in `tesseract-core`,
+  byte-parity green across 4 configs (`null_char ∈ {110,0,42}` × fold/simple)
+  via the public `Decode`→`ExtractBestPathAsLabels` oracle. `E-OCR-RECODEBEAM-1`,
+  tesseract-rs PR #5. + `RecodedCharId::from_codes` in the Core.
+
+The rest of this doc is the ORIGINAL scoping (retained); the "Recommended order"
+steps 1-2 are now done, steps 3-5 (2-D front-end, image `Input`, dict beam) remain.
 
 ## Where we are (proven)
 
