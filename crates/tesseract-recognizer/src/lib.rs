@@ -21,6 +21,7 @@
 
 use ndarray::{Array2, ArrayView2};
 
+pub mod activation;
 pub mod weight_matrix;
 pub use weight_matrix::WeightMatrix;
 

@@ -1,9 +1,12 @@
 # Recognizer Core-shape design pass — v1 (plan, not the design)
 
-> **Status:** IN PROGRESS — **Leaves 1-2 EXECUTED 2026-07-04** (both byte-parity
-> green vs libtesseract): Leaf 1 `matrix_dot_vector` (`E-OCR-MATDOTVEC-1`) +
-> Leaf 2 `WeightMatrix::from_le_bytes` / `forward` (`E-OCR-WEIGHTMATRIX-1`), in
-> the new crate `crates/tesseract-recognizer`. Next = the network graph (Leaf 3).
+> **Status:** IN PROGRESS — **Leaves 1-3 EXECUTED 2026-07-04** (all byte-parity
+> green vs libtesseract): Leaf 1 `matrix_dot_vector` (`E-OCR-MATDOTVEC-1`),
+> Leaf 2 `WeightMatrix::from_le_bytes` / `forward` (`E-OCR-WEIGHTMATRIX-1`), and
+> Leaf 3 `activation::{tanh,logistic,relu,clip_f,clip_g,softmax_in_place}`
+> (`E-OCR-ACTIVATION-1`) — in the new crate `crates/tesseract-recognizer`. Next =
+> Leaf 4 `FullyConnected::Forward` (`activation(WeightMatrix·input)`), the first
+> complete layer, then the LSTM/Series/Convolve graph.
 > Drafted 2026-07-04 after the recoder landed as
 > E-CPP-PARITY-7. The next module after the recoder — and the first
 > **compute** leaf, where the operator's sanity check bites: *OCR without
