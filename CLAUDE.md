@@ -104,7 +104,7 @@ SURREAL-AST-TRAP-PREFLIGHT + OGAR-AS-IR §3. `0x08` OCR is now MINTED (OGAR #148
 (`invoke_recoder`, the E-CPP-KEYSTONE-1 analog) is unblocked but deferred — the
 `classid→ClassView→content` dispatch is already proven generically.
 
-**The recognizer is UNDERWAY — Leaves 1-3 shipped** (`tesseract-recognizer`, the
+**The recognizer is UNDERWAY — Leaves 1-4 shipped** (`tesseract-recognizer`, the
 COMPUTE tier — a NEW crate, deps `ndarray`). `matrix_dot_vector` transcodes the
 base int8 `IntSimdMatrix::MatrixDotVector` by consuming
 `ndarray::simd_runtime::matmul_i8_to_i32` (the hardware acceleration — the
@@ -118,13 +118,19 @@ manifest gate); CI sibling-checks-out ndarray now. **Leaf 2 shipped:**
 `WeightMatrix::DeSerialize` (int-mode load + f32 `forward`, byte-parity green on
 f32 bit-patterns vs libtesseract, `E-OCR-WEIGHTMATRIX-1`). **Leaf 3:** activations
 (LUT `tanh`/`logistic` + `relu`/`clip`/`softmax`, byte-parity on a 4096-pt sweep,
-`E-OCR-ACTIVATION-1`). **Next Leaf 4:** `FullyConnected::Forward`
-(`activation(WeightMatrix·input)`) — the first complete layer, then the
-`Series`/`LSTM`/`Convolve` graph, then `recodebeam` (CTC decode → the code
-lattice `recoded_to_text` eats). Plan:
-`.claude/plans/recognizer-core-shape-v1.md`. (Still deferred, unchanged: the
-bbox/stats sub-leaf, gated on a legacy non-LSTM `eng.unicharset`; and image
-input, leptonica-heavy, gated on reaching Leaf 3.)
+`E-OCR-ACTIVATION-1`). **Leaf 4:** `FullyConnected::Forward` (int8 path) =
+`activation(WeightMatrix·input)` — the first COMPLETE layer, composing the two
+proven halves; byte-parity green across all 7 activations + 2 shapes vs a
+libtesseract oracle running the REAL `MatrixDotVector`+`FuncInplace`
+(`E-OCR-FULLYCONNECTED-1`; `fully_connected_forward` + `FcActivation`, the
+compute-side activation vocab, mapped from the Core `NetworkType` ordinal — no
+Core dep). **Next Leaf 5:** `LSTM::Forward` (gates CI/GI/GF1/GO + cell
+`c=clip(f·c+i·g,±100)` + `h=o·tanh(c)` recurrent state, reusing
+`FullyConnected::Forward` per gate), then the `Series`/`Parallel`/`Convolve`
+graph walk → `recodebeam` (CTC decode → the code lattice `recoded_to_text`
+eats). Plan: `.claude/plans/recognizer-core-shape-v1.md` (Leaf 4 EXECUTED).
+(Still deferred, unchanged: the bbox/stats sub-leaf, gated on a legacy non-LSTM
+`eng.unicharset`; and image input, leptonica-heavy.)
 
 ## Network structure — ruff→OGAR sink onto V3 SoA (Core-side, byte-parity proven)
 
