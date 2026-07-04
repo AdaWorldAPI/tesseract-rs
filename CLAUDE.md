@@ -31,9 +31,11 @@ Full doctrine: `../lance-graph/.claude/knowledge/core-first-transcode-doctrine.m
 | script table (interned) | E-CPP-PARITY-4 | 112/112 | `CharSet::{get_script,script_of,get_script_table_size,...}` |
 | other_case (case pair) | E-CPP-PARITY-5 | 112/112 | `CharSet::get_other_case` |
 | direction + mirror | E-CPP-PARITY-6 | 112/112 | `CharSet::{get_direction,get_mirror}` |
+| recoder (`UNICHARCOMPRESS` load side) | E-CPP-PARITY-7 | 112 enc + 112 dec | `Recoder`, `recoded_to_text` (codes→ids→text) |
 
 `ids_to_text` (the recognizer's id→text walk) is the first OCR-facing step in
-`tesseract-core`. Cross-ref the Core's `EPIPHANIES.md` E-CPP-PARITY-1..6 +
+`tesseract-core`; `recoded_to_text` is the recoder-fed variant (codes→decode→ids→text).
+Cross-ref the Core's `EPIPHANIES.md` E-CPP-PARITY-1..7 +
 E-CPP-KEYSTONE-1 (classid→ClassView→adapter dispatch).
 
 ## The proven method — self-validating oracle
@@ -88,19 +90,75 @@ with real bbox/stats** so the diff can actually falsify. (Note `get_top_bottom`'
 out-of-range default is `0,256,0,256` — 256, not 255 — and `set_top_bottom` clips
 to `[0,255]`; `unicharset.h:586-606`.)
 
-**The real next module: the recoder** (`unicharcompress.{h,cpp}`) — then the
-recognizer. That is a new Core type (not another UNICHARSET accessor), so it
-starts with a design pass, not a quick leaf. **The plan exists:**
-`.claude/plans/recoder-core-shape-v1.md` — scope (load-side only:
-DeSerialize + Encode/Decode/code_range; ComputeEncoding is training-side),
-the routing verdict vs OGAR's new transpile lane (content-store tier in
-lance-graph-contract, NOT ogar-from-ruff emit_rust — with the OGAR-as-IR §3
-test rationale + drafted SURREAL-AST-TRAP-PREFLIGHT answers to re-run live),
-the first-binary-leaf warning (serialis/TFile), and the falsifier
-(`/tmp/eng.lstm-recoder`, 1012 B real eng data; oracle must re-verify the
-ABI skew for the NEW object layout). Post-OGAR #85–#145 notes live there
-too: `0x08` OCR domain named but not yet minted; EdgeBlock-superseded flag
-is cross-repo-owned, not ours.
+**The recoder is DONE** (`unicharcompress.{h,cpp}`, load side) — byte-parity
+green on real `eng.lstm-recoder` (E-CPP-PARITY-7): `UnicharCompress`
+(`DeSerialize` → `from_le_bytes`; `EncodeUnichar`/`DecodeUnichar`/`code_range`)
+in `lance-graph-contract`, surfaced here as `Recoder` + `recoded_to_text`
+(codes→decode→ids→`ids_to_text`). It was the first BINARY leaf (`TFile` LE; the
+1012 B = `4 + 112·9` on-disk size was a first-principles pre-registration of a
+correct parse), and `kMaxCodeLen = 9` (the plan summary's "3" was wrong —
+Hangul/Han USE length-3, the array is sized 9). The routing verdict held
+(content-store tier, NOT `emit_rust`) — re-verified LIVE against OGAR's
+SURREAL-AST-TRAP-PREFLIGHT + OGAR-AS-IR §3. `0x08` OCR is now MINTED (OGAR #148:
+`recoder`=0x0802, mirrored in `ogar_codebook`), so the recoder keystone
+(`invoke_recoder`, the E-CPP-KEYSTONE-1 analog) is unblocked but deferred — the
+`classid→ClassView→content` dispatch is already proven generically.
+
+**The recognizer is UNDERWAY — Leaves 1-4 shipped** (`tesseract-recognizer`, the
+COMPUTE tier — a NEW crate, deps `ndarray`). `matrix_dot_vector` transcodes the
+base int8 `IntSimdMatrix::MatrixDotVector` by consuming
+`ndarray::simd_runtime::matmul_i8_to_i32` (the hardware acceleration — the
+recognizer NEVER re-implements SIMD, per the `simd-savant` "all SIMD from
+`ndarray::simd`" invariant); byte-parity green vs libtesseract on synthetic
+int8, two shapes (`E-OCR-MATDOTVEC-1`, integer-combined diff so it is
+`TFloat`-agnostic; the in-env lib is FAST_FLOAT). The **two-foundations** split
+is now real: `tesseract-recognizer` (deps ndarray) = compute, `tesseract-core`
+(deps lance-graph-contract) = content. **Toolchain: always bump to 1.95** (ndarray
+manifest gate); CI sibling-checks-out ndarray now. **Leaf 2 shipped:**
+`WeightMatrix::DeSerialize` (int-mode load + f32 `forward`, byte-parity green on
+f32 bit-patterns vs libtesseract, `E-OCR-WEIGHTMATRIX-1`). **Leaf 3:** activations
+(LUT `tanh`/`logistic` + `relu`/`clip`/`softmax`, byte-parity on a 4096-pt sweep,
+`E-OCR-ACTIVATION-1`). **Leaf 4:** `FullyConnected::Forward` (int8 path) =
+`activation(WeightMatrix·input)` — the first COMPLETE layer, composing the two
+proven halves; byte-parity green across all 7 activations + 2 shapes vs a
+libtesseract oracle running the REAL `MatrixDotVector`+`FuncInplace`
+(`E-OCR-FULLYCONNECTED-1`; `fully_connected_forward` + `FcActivation`, the
+compute-side activation vocab, mapped from the Core `NetworkType` ordinal — no
+Core dep). **Next Leaf 5:** `LSTM::Forward` (gates CI/GI/GF1/GO + cell
+`c=clip(f·c+i·g,±100)` + `h=o·tanh(c)` recurrent state, reusing
+`FullyConnected::Forward` per gate), then the `Series`/`Parallel`/`Convolve`
+graph walk → `recodebeam` (CTC decode → the code lattice `recoded_to_text`
+eats). Plan: `.claude/plans/recognizer-core-shape-v1.md` (Leaf 4 EXECUTED).
+(Still deferred, unchanged: the bbox/stats sub-leaf, gated on a legacy non-LSTM
+`eng.unicharset`; and image input, leptonica-heavy.)
+
+## Network structure — ruff→OGAR sink onto V3 SoA (Core-side, byte-parity proven)
+
+The recognizer's polymorphic `Network` subclass tree is sunk onto the Core the
+**right** way — NOT a hand-rolled `enum NetworkKind` (that draft was rejected as
+the parallel-object-model anti-pattern). Operator directive: *"6x8:8, 16 B tenant
+= classid + 12 B, ruff>OGAR transpiler sink-in."* Executed:
+
+1. **Harvest** — `ruff/crates/ruff_cpp_spo/examples/harvest_network.rs` (committed)
+   walks the 11 network headers via libclang → the `has_function`/
+   `virtually_overrides` SPO manifest (62 classes, 5060 triples). The `Forward`
+   override set = the compute-leaf list; the `DeSerialize` set = the binary-leaf
+   list. This IS the `classid → ClassView` method-resolution table.
+2. **Base-header leaf** — `lance_graph_contract::network` (`NetworkType` 27 types +
+   `NetworkHeader::from_le_bytes` = the shared prefix `Network::CreateFromFile`
+   reads, `network.cpp:214-248`) sinks each node onto `facet::FacetCascade` (16 B
+   = classid + 6×8:8, `CascadeShape::G6D2`). `facet_classid =
+   compose_classid(network_layer=0x0804, ntype)`. **Byte-parity GREEN** on real
+   `/tmp/eng.lstm`: `Series ni=36 no=111 num_weights=385807` == libtesseract
+   `Network::CreateFromFile`; oracle `spec()` == the model spec string.
+   Oracle `/tmp/network_spec_oracle.cpp` (built `-DFAST_FLOAT`); example
+   `network_dump.rs`. Board: EPIPHANIES `E-OCR-NETWORK-SINK-1`.
+
+Deferred: per-subclass payload + tree recursion (Plumbing children → `EdgeBlock`,
+weights → out-of-line Lance column); the `invoke_network` keystone; the recognizer
+COMPUTE leaves below. Plan: `.claude/plans/network-ruff-ogar-sink-v1.md`. The
+recognizer-side binary reader (`crates/tesseract-recognizer/src/io.rs`) is written,
+awaiting Leaf 4's Network loader (uncommitted until wired).
 
 ## Branch / PR / merge order
 

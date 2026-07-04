@@ -33,9 +33,14 @@
 //! - [`unichar`] — `ccutil/unichar.cpp`, the UTF-8 codec (`utf8_step` +
 //!   `utf8_to_utf32`), **268/268 byte-identical** (256 exhaustive lead-byte
 //!   values + 12 decode rows).
+//! - [`UnicharCompress`] — `ccutil/unicharcompress.cpp`, the LSTM recoder's load
+//!   side (`DeSerialize` + `EncodeUnichar` / `DecodeUnichar` / `code_range`),
+//!   **byte-identical** on the real `eng.lstm-recoder` (112 encode + 112 decode
+//!   rows, plus `code_range`).
 //!
 //! This module re-exports those as the OCR's character-set substrate and adds
-//! the first OCR-facing transcoded step on top of them: [`ids_to_text`].
+//! the OCR-facing transcoded output steps on top of them: [`ids_to_text`] (the
+//! id→text walk) and [`recoded_to_text`] (the recoder-fed codes→ids→text path).
 //!
 //! ## First landed layer: the character set
 //!
@@ -44,6 +49,7 @@
 //! transcode of that output step.
 
 pub use lance_graph_contract::unichar;
+pub use lance_graph_contract::unicharcompress::{RecodedCharId, RecoderError, UnicharCompress};
 pub use lance_graph_contract::unicharset::{UniCharSet, UniCharSetError};
 
 /// The OCR character set — Tesseract's `UNICHARSET`, transcoded and proven in
@@ -63,6 +69,28 @@ pub fn ids_to_text(charset: &UniCharSet, ids: &[u32]) -> String {
     ids.iter()
         .filter_map(|&id| charset.id_to_unichar(id))
         .collect()
+}
+
+/// The OCR recoder — Tesseract's `UnicharCompress`, transcoded and proven in the
+/// OGAR Core. The LSTM recognizer's lattice speaks recoded codes; the recoder
+/// maps each back to a `UNICHAR_ID`. This alias mirrors [`CharSet`].
+pub type Recoder = UnicharCompress;
+
+/// Decode a recognizer's recoded-code sequence into text — the real OCR output
+/// path: each [`RecodedCharId`] → [`UnicharCompress::decode`] → `UNICHAR_ID` →
+/// [`ids_to_text`]. A code the recoder cannot decode yields `INVALID_UNICHAR_ID`
+/// and contributes nothing, mirroring libtesseract's drop of an unknown code.
+#[must_use]
+pub fn recoded_to_text(
+    recoder: &UnicharCompress,
+    charset: &UniCharSet,
+    codes: &[RecodedCharId],
+) -> String {
+    let ids: Vec<u32> = codes
+        .iter()
+        .filter_map(|code| u32::try_from(recoder.decode(code)).ok())
+        .collect();
+    ids_to_text(charset, &ids)
 }
 
 #[cfg(test)]
@@ -171,5 +199,38 @@ mod tests {
             unichar::utf8_to_utf32(&[0xE4, 0xB8, 0xAD]),
             Some(vec![0x4E2D])
         );
+    }
+
+    /// A tiny pass-through recoder (id 0→code[0], 1→[1], 2→[2]) in the exact
+    /// little-endian wire form `UnicharCompress::Serialize` writes.
+    fn sample_recoder() -> Recoder {
+        let mut bytes = 3_u32.to_le_bytes().to_vec();
+        for code in [0_i32, 1, 2] {
+            bytes.push(1); // self_normalized
+            bytes.extend_from_slice(&1_i32.to_le_bytes()); // length
+            bytes.extend_from_slice(&code.to_le_bytes());
+        }
+        UnicharCompress::from_le_bytes(&bytes).expect("valid recoder")
+    }
+
+    #[test]
+    fn recoder_decodes_a_lattice_to_text() {
+        // The recoder (proven byte-identical on eng.lstm-recoder) composes with
+        // the charset: recognizer codes → decode → UNICHAR_IDs → id_to_unichar.
+        let charset = sample(); // id 0 = space, 1 = a, 2 = b
+        let recoder = sample_recoder();
+        // A recognition lattice for ids 1, 0, 2 — round-tripped through `encode`
+        // to get valid RecodedCharIds the way the recognizer would assemble them.
+        let codes: Vec<RecodedCharId> = [1_u32, 0, 2]
+            .iter()
+            .map(|&id| recoder.encode(id).expect("in range").clone())
+            .collect();
+        assert_eq!(recoded_to_text(&recoder, &charset, &codes), "a b");
+        // An unknown/ill-formed code decodes to INVALID_UNICHAR_ID and is dropped.
+        assert_eq!(
+            recoded_to_text(&recoder, &charset, &[RecodedCharId::default()]),
+            ""
+        );
+        assert_eq!(recoded_to_text(&recoder, &charset, &[]), "");
     }
 }

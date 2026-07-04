@@ -1,10 +1,16 @@
 # Recoder Core-shape design pass — v1 (plan, not the design)
 
-> **Status:** PLAN (drafted 2026-07-01, post-OGAR #85–#145 survey). The next
-> transcode module after the UNICHARSET varied-field surface completed
-> (E-CPP-PARITY-1..6). This is a *design-pass* plan: it fixes scope, gates,
-> falsifier, and the one nuanced routing decision — it does NOT pre-draw the
-> Rust types.
+> **Status:** EXECUTED (2026-07-04) — landed as E-CPP-PARITY-7. The load-side
+> recoder (`UnicharCompress` in `lance-graph-contract` + `Recoder` /
+> `recoded_to_text` in `tesseract-core`) is byte-parity green on real
+> `eng.lstm-recoder` (encode 112/112 + decode 112/112 + code_range=111).
+> **Correction to §1 below:** `kMaxCodeLen = 9` (not 3 — Hangul/Han USE
+> length-3, but the array is sized 9). The routing verdict (content-store tier,
+> NOT `emit_rust`) was re-verified LIVE against OGAR
+> (SURREAL-AST-TRAP-PREFLIGHT + OGAR-AS-IR §3) — held. `0x08` OCR is now minted
+> (OGAR #148: `recoder`=0x0802), so the recoder keystone is unblocked but
+> deferred (dispatch already proven generically). The original plan (drafted
+> 2026-07-01, post-OGAR #85–#145 survey) is preserved below.
 
 ## 1. What the recoder is, and why it is next
 

@@ -1,0 +1,15 @@
+[package]
+name = "tesseract-recognizer"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "Pure-Rust Tesseract LSTM recognizer — the compute tier, consuming ndarray's int8 SIMD GEMM (the hardware acceleration) instead of re-transcoding SIMD."
+
+[dependencies]
+# AdaWorldAPI fork, sibling checkout (P0: fork-only, path dep — mirrors the
+# tesseract-core precedent). `runtime-dispatch` exposes
+# `ndarray::simd_runtime::matmul_i8_to_i32` (AMX TDPBUSD → VPDPBUSD-zmm → -ymm →
+# scalar); it implies `std`, which brings the hpc int8 tile GEMM. This is the
+# COMPUTE foundation — the recognizer never re-implements SIMD (the `simd-savant`
+# invariant: all SIMD comes from `ndarray::simd`).
+ndarray = { path = "../../../ndarray", features = ["runtime-dispatch"] }
