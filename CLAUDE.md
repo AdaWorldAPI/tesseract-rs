@@ -126,6 +126,34 @@ lattice `recoded_to_text` eats). Plan:
 bbox/stats sub-leaf, gated on a legacy non-LSTM `eng.unicharset`; and image
 input, leptonica-heavy, gated on reaching Leaf 3.)
 
+## Network structure — ruff→OGAR sink onto V3 SoA (Core-side, byte-parity proven)
+
+The recognizer's polymorphic `Network` subclass tree is sunk onto the Core the
+**right** way — NOT a hand-rolled `enum NetworkKind` (that draft was rejected as
+the parallel-object-model anti-pattern). Operator directive: *"6x8:8, 16 B tenant
+= classid + 12 B, ruff>OGAR transpiler sink-in."* Executed:
+
+1. **Harvest** — `ruff/crates/ruff_cpp_spo/examples/harvest_network.rs` (committed)
+   walks the 11 network headers via libclang → the `has_function`/
+   `virtually_overrides` SPO manifest (62 classes, 5060 triples). The `Forward`
+   override set = the compute-leaf list; the `DeSerialize` set = the binary-leaf
+   list. This IS the `classid → ClassView` method-resolution table.
+2. **Base-header leaf** — `lance_graph_contract::network` (`NetworkType` 27 types +
+   `NetworkHeader::from_le_bytes` = the shared prefix `Network::CreateFromFile`
+   reads, `network.cpp:214-248`) sinks each node onto `facet::FacetCascade` (16 B
+   = classid + 6×8:8, `CascadeShape::G6D2`). `facet_classid =
+   compose_classid(network_layer=0x0804, ntype)`. **Byte-parity GREEN** on real
+   `/tmp/eng.lstm`: `Series ni=36 no=111 num_weights=385807` == libtesseract
+   `Network::CreateFromFile`; oracle `spec()` == the model spec string.
+   Oracle `/tmp/network_spec_oracle.cpp` (built `-DFAST_FLOAT`); example
+   `network_dump.rs`. Board: EPIPHANIES `E-OCR-NETWORK-SINK-1`.
+
+Deferred: per-subclass payload + tree recursion (Plumbing children → `EdgeBlock`,
+weights → out-of-line Lance column); the `invoke_network` keystone; the recognizer
+COMPUTE leaves below. Plan: `.claude/plans/network-ruff-ogar-sink-v1.md`. The
+recognizer-side binary reader (`crates/tesseract-recognizer/src/io.rs`) is written,
+awaiting Leaf 4's Network loader (uncommitted until wired).
+
 ## Branch / PR / merge order
 
 This arc's dev branch: `claude/happy-hamilton-0azlw4` → base `master`. **PR #3** =
