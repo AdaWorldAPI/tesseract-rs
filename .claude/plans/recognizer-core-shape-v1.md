@@ -168,10 +168,17 @@ unavoidable at the *oracle* boundary; the Rust path stays image-lib-agnostic
   is the int8-quantized previous output; confirm where that quantization + its
   scale live (`networkio.cpp`) — Leaf 1 takes int8 `u` as given; Leaf 3 wires
   the inter-layer quantization.
-- **Crate wiring.** `crates/tesseract-recognizer` needs `ndarray = { path =
-  "../../../ndarray", default-features = false, features = [...] }` — pick the
-  minimal feature set for int8 GEMM (avoid dragging the full HPC tree). Confirm
-  the fork path + that the int8 matmul is reachable without heavy features.
+- **Crate wiring (resolved 2026-07-04).** `crates/tesseract-recognizer` deps
+  `ndarray = { path = "../../../ndarray", features = ["runtime-dispatch"] }`
+  (v0.17.2) + `tesseract-core`. The signed int8 GEMM is
+  `ndarray::simd_runtime::matmul_i8_to_i32` (`ArrayView2<i8> × ArrayView2<i8> →
+  ArrayViewMut2<i32>`), gated under the `runtime-dispatch` feature (lib.rs:469;
+  NOT nightly — `nightly-simd` is the mutually-exclusive alternate). `std`
+  (default) brings `simd_amx` quantize/dequantize + `backend::gemm_i8`. Add the
+  crate to the workspace `members` AND the CI sibling-checkout list (ndarray,
+  next to lance-graph). **Toolchain watch:** ndarray declares `rust-version =
+  1.95` while the ndarray project docs say "1.94 stable only" — confirm the env
+  rustc satisfies the manifest before the (cold, large) first ndarray compile.
 - **`0x08` OCR mint.** The recognizer container kind (if it warrants a classid)
   would mint in OGAR alongside `unicharset`/`recoder`/`charset` (0x0801–0x0803);
   defer until a keystone actually needs it (same posture as the recoder).
