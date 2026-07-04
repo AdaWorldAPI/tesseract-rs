@@ -48,9 +48,12 @@
 //! text is a `UNICHARSET::id_to_unichar` walk. [`ids_to_text`] is the pure-Rust
 //! transcode of that output step.
 
+pub mod recodebeam;
+
 pub use lance_graph_contract::unichar;
 pub use lance_graph_contract::unicharcompress::{RecodedCharId, RecoderError, UnicharCompress};
 pub use lance_graph_contract::unicharset::{UniCharSet, UniCharSetError};
+pub use recodebeam::RecodeBeamSearch;
 
 /// The OCR character set — Tesseract's `UNICHARSET`, transcoded and proven in
 /// the OGAR Core. This alias is the OCR core's pure-Rust char-set surface; the
