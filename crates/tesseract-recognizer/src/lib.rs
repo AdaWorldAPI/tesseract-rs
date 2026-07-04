@@ -23,9 +23,11 @@ use ndarray::{Array2, ArrayView2};
 
 pub mod activation;
 pub mod fully_connected;
+pub mod graph;
 pub mod lstm;
 pub mod weight_matrix;
 pub use fully_connected::{fully_connected_forward, FcActivation};
+pub use graph::Layer;
 pub use lstm::Lstm;
 pub use weight_matrix::WeightMatrix;
 

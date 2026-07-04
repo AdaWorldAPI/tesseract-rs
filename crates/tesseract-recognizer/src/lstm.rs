@@ -187,7 +187,7 @@ impl Lstm {
 /// `IntCastRounded` rounds **half away from zero** (`helpers.h:189`), and the
 /// clip is `[-INT8_MAX, INT8_MAX]` — never `-128`.
 #[inline]
-fn quantize_i8(x: f32) -> i8 {
+pub(crate) fn quantize_i8(x: f32) -> i8 {
     const INT8_MAX: f32 = 127.0;
     let scaled = x * INT8_MAX;
     // (int)(x + 0.5) truncates toward zero == round half away from zero here.
