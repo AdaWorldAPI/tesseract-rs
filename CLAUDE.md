@@ -142,13 +142,26 @@ intermediate NetworkIO is int_mode → `quantize_i8`); `Reversed` (XREVERSED) =
 reverse→inner→reverse. Byte-parity green: `Series[LSTM,FC]` across 4 shapes incl.
 ns=96/ni=192/no=111 (eng.lstm's LSTM192→Fc111 tail) vs a libtesseract oracle
 chaining the REAL per-layer bodies + the REAL `WriteTimeStep` requant
-(`E-OCR-GRAPHWALK-1`). **Next Leaf 7:** `recodebeam` (CTC beam decode → the code
-lattice `recoded_to_text` eats) = the text output. Plan:
-`.claude/plans/recognizer-core-shape-v1.md` (Leaf 6 EXECUTED). (Still deferred,
-unchanged: the 2-D front-end `Convolve`/`Maxpool`/`XYTranspose` — needs the
-`NetworkIO`/`StrideMap` grid + leptonica image `Input`; the bbox/stats sub-leaf,
-gated on a legacy non-LSTM `eng.unicharset`; and the 2-D LSTM / softmax-LSTM paths — eng.lstm is
-1-D non-softmax.)
+(`E-OCR-GRAPHWALK-1`). **Leaf 7 DONE** — the recognizer now spans **logits →
+text**: `7a` = the recoder `SetupDecoder` beam maps (`is_valid_start_`/
+`final_codes_`/`next_codes_`) in the Core, byte-parity green (`E-OCR-RECODER-BEAM-1`,
+lance-graph PR #647); `7b` = `RecodeBeamSearch::Decode` (the non-dict CTC beam,
+`recodebeam.cpp` 1382 lines) in `tesseract-core`, byte-parity green across 4
+configs (`E-OCR-RECODEBEAM-1`, tesseract-rs PR #7). So the chain int8 features →
+graph forward → softmax logits → beam decode → labels → `recoded_to_text` → string
+is complete.
+
+**Next: image → text — the 2-D front-end.** The canonical continuation plan (a
+self-contained handover: proven state + the byte-parity method + every remaining
+leaf with C++ ref / oracle / crate / order) is
+**`.claude/plans/recognizer-image-to-text-v2.md`** — START THERE. In brief:
+`NetworkIO`/`StrideMap` grid (A1, foundational) → `Convolve`/`Maxpool`/`Reconfig`/
+`XYTranspose` (A2-A5, provable on synthetic grids) → network-tree build (B1, wire
+the Core `E-OCR-NETWORK-SINK-1` sink to `graph::Layer`) → leptonica `Input` + load
++ `RecognizeLine` (A6/B2/B3, closes image→text; A6 is the leptonica decision
+point) → dict beam + `ExtractBestPathAsUnicharIds` + CJK trie (C1-C3, accuracy).
+(Still deferred, unchanged: the bbox/stats sub-leaf, gated on a legacy non-LSTM
+`eng.unicharset`; the 2-D LSTM / softmax-LSTM paths — eng.lstm is 1-D non-softmax.)
 
 ## Network structure — ruff→OGAR sink onto V3 SoA (Core-side, byte-parity proven)
 
