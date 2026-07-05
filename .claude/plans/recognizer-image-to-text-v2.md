@@ -198,11 +198,18 @@ The eng.lstm front-end: `Input → [C3,3Ft16] (Convolve+Reconfig) → Mp3,3 (Max
 
 - **B3 — `RecognizeLine` end-to-end** (`lstmrecognizer.cpp` `RecognizeLine`).
   image `Pix` → `Input::Forward` (A6) → `network_->Forward` (B1 tree) →
-  `RecodeBeamSearch::Decode` (7b) → `ExtractBestPathAsUnicharIds` (C2) → words.
-  **The "OCR works" milestone.** Oracle: run libtesseract on a real line image,
-  diff the recognized string + per-char certs. This composes every leaf.
+  `RecodeBeamSearch::Decode` (7b) → the best-path extract → text. **Two
+  milestones, in order:** (i) a **labels-only string** via the already-shipped
+  `extract_best_path_as_labels` → `recoded_to_text` (valid for the eng
+  single-code recoder, needs NO C2) — the first "reads a line" checkpoint; then
+  (ii) the **full `RecognizeLine`** producing words with unichar-ids + certs,
+  which calls `ExtractBestPathAsUnicharIds` — so **C2 lands before this second
+  milestone** (scheduled in step 4 of the order, NOT with the C1/C3 accuracy
+  layer). Oracle: run libtesseract on a real line image, diff the recognized
+  string (milestone i) then the per-char certs (milestone ii). This composes
+  every leaf.
 
-### Phase C — accuracy + completeness (deferred, own waves)
+### Phase C — completeness (C2 is a B3 prereq; C1/C3 are the deferred accuracy waves)
 
 - **C1 — dict / language-model beam.** The dawg machinery skipped in 7b:
   `ContinueDawg`, `PushInitialDawgIfBetter`, `DawgPositionVector`, the
@@ -210,12 +217,15 @@ The eng.lstm front-end: `Input → [C3,3Ft16] (Convolve+Reconfig) → Mp3,3 (Max
   1164`). Needs the `Dict` + dawg load (`src/dict/`). Turns the non-dict CTC core
   into dictionary-corrected output. Biggest remaining subsystem after the
   front-end.
-- **C2 — `ExtractBestPathAsUnicharIds`** (`recodebeam.cpp:224-329`). Groups the
-  best-path codes into complete `RecodedCharId`s → `DecodeUnichar` → unichar-ids
-  + certs + ratings + xcoords. Required for multi-code (Han/Hangul) text and for
-  per-char confidence (B3 needs it). The current `extract_best_path_as_labels`
-  (codes only) is the single-code path; C2 is the general one. (The `certainty`
-  field was dropped from the beam `RecodeNode` — re-add it when C2 lands.)
+- **C2 — `ExtractBestPathAsUnicharIds`** (`recodebeam.cpp:224-329`).
+  **SCHEDULED BEFORE B3 (order step 4), not deferred** — B3's full words-with-certs
+  output calls it. Groups the best-path codes into complete `RecodedCharId`s →
+  `DecodeUnichar` → unichar-ids + certs + ratings + xcoords. Required for
+  multi-code (Han/Hangul) text and for per-char confidence. The already-shipped
+  `extract_best_path_as_labels` (codes only) is the single-code labels path that
+  the B3 milestone (i) uses; C2 is the general one B3 milestone (ii) needs. (The
+  `certainty` field was dropped from the beam `RecodeNode` — re-add it when C2
+  lands.)
 - **C3 — multi-code (CJK) recoder trie exercise.** The `next_codes_` trie (built
   + proven structurally in 7a, but `next_codes_` is empty for eng pass-through)
   needs a non-eng traineddata (e.g. `chi_sim.lstm-recoder`, code length 3) to
@@ -234,10 +244,19 @@ The eng.lstm front-end: `Input → [C3,3Ft16] (Convolve+Reconfig) → Mp3,3 (Max
    NetworkIO, no image needed. Ship the front-end compute.
 3. **B1 (network tree build)** — wire the Core sink to the recognizer graph;
    now the full network runs on a synthetic NetworkIO.
-4. **A6 (Input, leptonica) + B2 (recognizer load) + B3 (RecognizeLine)** — closes
-   image → text. A6 is the external-dep decision point — raise leptonica-rs vs
-   vendored-decoder to the operator before starting it.
-5. **C1-C3** — accuracy layer, each its own wave.
+4. **A6 (Input, leptonica) + B2 (recognizer load) + C2 (`ExtractBestPathAsUnicharIds`)
+   + B3 (RecognizeLine)** — closes image → text. **C2 is scheduled here, before
+   B3, not with the accuracy layer:** B3's full output (words with unichar-ids +
+   certs) calls C2, so C2 is a B3 prerequisite, not a deferral. (A minimal
+   labels-only RecognizeLine — a plain string via the already-shipped
+   `extract_best_path_as_labels` → `recoded_to_text`, valid for the eng
+   single-code recoder — is a legitimate intermediate milestone that does NOT
+   need C2; the full words-with-certs milestone does.) A6 is the external-dep
+   decision point — raise leptonica-rs vs vendored-decoder to the operator
+   before starting it.
+5. **C1 + C3** — the true accuracy layer, each its own wave: C1 (dict / LM beam)
+   and C3 (CJK multi-code trie). Both are optional over a working non-dict,
+   single-code RecognizeLine.
 
 Each leaf: read C++ full → oracle `-DFAST_FLOAT` → byte-parity diff → `-p` gates
 (`cargo fmt`, `cargo clippy -- -D warnings`, `cargo test`) → commit → EPIPHANIES
