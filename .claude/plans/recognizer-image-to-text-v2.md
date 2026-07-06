@@ -282,3 +282,55 @@ entry in lance-graph → push. One leaf per commit; board hygiene in the same PR
 - `tesseract-rs/CLAUDE.md` — the shipped-leaf table, the proven method, iron rules, "Next leaf" (bbox/stats deferral).
 - lance-graph `.claude/board/EPIPHANIES.md` — `E-OCR-*` + `E-CPP-PARITY-*` findings (each leaf's proof record).
 - `../lance-graph/.claude/knowledge/core-first-transcode-doctrine.md` — the Core-First doctrine.
+
+---
+
+## B1 WIRE-FORMAT FACTS (read 2026-07-05 from /tmp/tesseract source — verbatim, for the loader)
+
+**Per-node header** (`Network::CreateFromFile`, `network.cpp:214-248`; the Core's
+proven `NetworkHeader::from_le_bytes` already parses this):
+`i8 type` (if == NT_NONE(0): u32-len string type-name looked up in kTypeNames) ·
+`i8 training` · `i8 needs_to_backprop` · `i32 network_flags` · `i32 ni` ·
+`i32 no` · `i32 num_weights` · `string name` (u32 len + bytes) → then the
+subclass `DeSerialize`:
+
+- **Plumbing (Series/Parallel/Reversed — none override it):** `u32 count` +
+  `count ×` recursive `CreateFromFile`; THEN `learning_rates_` (f32 vec) ONLY if
+  `network_flags & NF_LAYER_SPECIFIC_LR`. A `Reversed` is a Plumbing with 1
+  child; its Forward wraps the child with `CopyWithXReversal` (XREVERSED),
+  `CopyWithYReversal` (YREVERSED) or `CopyWithXYTranspose` (XYTRANSPOSE) —
+  all three NetworkIo ops are A1-proven.
+- **Input:** `StaticShape` = 5×i32 `batch,height,width,depth,loss_type`
+  (`static_shape.h` DeSerialize).
+- **FullyConnected:** one `WeightMatrix` (Leaf-2 proven,
+  `WeightMatrix::from_le_bytes_prefix`). Activation = the node's NetworkType
+  (NT_TANH/RELU/SOFTMAX/... → FcActivation mapping proven in Leaf 4).
+- **Convolve:** `i32 half_x, i32 half_y` (`convolve.cpp:42-51`);
+  `no = ni·(2hx+1)·(2hy+1)` recomputed.
+- **Reconfig / Maxpool:** `i32 x_scale, i32 y_scale`; Maxpool sets `no = ni`.
+- **LSTM** (`lstm.cpp::DeSerialize`): `i32 na_`; `nf_ = no` (LSTM_SOFTMAX) /
+  `ceil_log2(no)` (SOFTMAX_ENCODED) / `0` (plain — eng); gates loop `w in
+  0..WT_COUNT` SKIPPING `GFS` when `!Is2D()`; after CI: `ns_ = CI.num_outputs`,
+  `is_2d_ = (na_ - nf_ == ni_ + 2·ns_)`; if SOFTMAX*: one recursive
+  `CreateFromFile` softmax child. eng.lstm is plain 1-D NT_LSTM (+ possibly
+  NT_LSTM_SUMMARY nodes — `Lfys48`); Leaf-5 `Lstm::from_le_bytes` matches the
+  plain-1-D payload exactly (na + 4 gates CI,GI,GF1,GO).
+
+**B1 design decision (per Core-First + two-foundations + the sweep findings):**
+the loader + runnable tree live in a NEW assembly crate `crates/tesseract-ocr`
+(deps: `tesseract-recognizer` compute + `tesseract-core` content) — the place
+B2 (`LSTMRecognizer` load: network ‖ charset ‖ recoder ‖ null_char) and B3
+(`RecognizeLine`) also live, since only the assembly tier sees both foundations.
+Node headers parse via the Core's proven `NetworkHeader` (re-export through
+tesseract-core like unicharset); payloads via the recognizer's proven parsers.
+Tree type: a local `Node` enum (Input/Series/Parallel/Reversed{X,Y,Txy}/
+Convolve/Maxpool/Reconfig/Lstm{summary?}/Fc) with
+`forward_io(&NetworkIo, &mut TRand) -> NetworkIo` — NOT a contortion of the
+1-D `graph::Layer` (which stays the proven 1-D core). STILL TO READ before
+coding the walk: `lstm.cpp::Forward`'s NetworkIO framing (src/dest index walks,
+the NT_LSTM_SUMMARY final-step-only output via `ResizeXTo1`), `series.cpp::
+Forward` (scratch chaining + int-mode inheritance — the Leaf-6 semantic over
+NetworkIo), `parallel.cpp::Forward` (CopyPacking), `reversed.cpp::Forward`.
+Oracle: per-node spec/num_weights on real `/tmp/eng.lstm` (extend the Core's
+proven `network_dump`), then a full-tree `Forward` diff on a synthetic
+NetworkIo, then RecognizeLine (B3) on a real line image.
