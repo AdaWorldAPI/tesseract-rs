@@ -29,6 +29,10 @@ jobs:
       with:
         repository: AdaWorldAPI/ndarray
         path: ndarray
+    - uses: actions/checkout@v4
+      with:
+        repository: AdaWorldAPI/OGAR
+        path: OGAR
     # ndarray declares rust-version = 1.95; bump the toolchain to satisfy it.
     - name: Rust 1.95 toolchain
       run: rustup toolchain install 1.95 --profile minimal --component clippy --component rustfmt && rustup default 1.95
