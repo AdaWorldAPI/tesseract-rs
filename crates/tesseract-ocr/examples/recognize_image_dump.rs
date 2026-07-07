@@ -20,7 +20,6 @@
 use std::path::Path;
 
 use tesseract_ocr::LstmRecognizer;
-use tesseract_recognizer::TRand;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -36,10 +35,8 @@ fn main() {
     let rec = std::fs::read(rec_path).expect("read recoder");
     let r = LstmRecognizer::from_components(&lstm, &uni, &rec).expect("assemble recognizer");
 
-    let mut rng = TRand::default();
-    rng.set_seed(1);
     let (uids, text) = r
-        .recognize_image_file(Path::new(img_path), &mut rng)
+        .recognize_image_file(Path::new(img_path))
         .expect("recognize image");
 
     print!("uids");

@@ -157,10 +157,28 @@ impl LstmRecognizer {
         Ok((uids, text))
     }
 
+    /// `LSTMRecognizer::SetRandomSeed` (`lstmrecognizer.h:287-291`): the exact
+    /// randomizer seeding `RecognizeLine` uses before the forward pass —
+    /// `seed = (i64)sample_iteration · 0x10000001`, `minstd` seed, one warm-up
+    /// draw. Reproducing it makes [`recognize_image_file`] bit-match real
+    /// libtesseract (not just "correct for an arbitrary seed"): the `Convolve`
+    /// out-of-image noise depends on this seed.
+    ///
+    /// [`recognize_image_file`]: LstmRecognizer::recognize_image_file
+    #[must_use]
+    fn seeded_randomizer(&self) -> TRand {
+        let seed = i64::from(self.sample_iteration).wrapping_mul(0x1000_0001) as u64;
+        let mut rng = TRand::default();
+        rng.set_seed(seed);
+        rng.int_rand(); // the warm-up draw
+        rng
+    }
+
     /// **A6b — image FILE on disk → text.** The full pure-Rust
-    /// `RecognizeLine`-equivalent: read a P5 PGM → pre-scale to the network input
-    /// height (A6b) → `from_grey_pix` (A6a) → `recognize_grid` (B3-core).
-    /// Returns `(unichar_ids, text)`.
+    /// `RecognizeLine`-equivalent (`lstmrecognizer.cpp:321-360`): read a P5 PGM →
+    /// pre-scale to the network input height (A6b) → `from_grey_pix` (A6a) →
+    /// `recognize_grid` (B3-core), seeding the randomizer exactly as
+    /// `RecognizeLine` does ([`seeded_randomizer`]). Returns `(unichar_ids, text)`.
     ///
     /// **Byte-parity vs libtesseract holds when the image is at the model input
     /// height** (leptonica `pixScale` at factor 1.0 is a copy, so the scale is
@@ -169,19 +187,13 @@ impl LstmRecognizer {
     /// [`prescale_grey_to_height`](crate::image_input::prescale_grey_to_height)
     /// (functional, NOT leptonica-`pixScale`-exact).
     ///
-    /// `rng` feeds `Convolve`'s out-of-image noise (seed it as the recognizer
-    /// does, e.g. `1`); the pre-scale + `from_grey_pix` make no draws for a
-    /// full-width image, so it enters the forward pass at its seeded state.
-    ///
     /// # Errors
     ///
     /// [`RecognizerError::Io`] / [`RecognizerError::Pgm`] on a bad image;
     /// [`RecognizerError::Network`] on a forward failure.
-    pub fn recognize_image_file(
-        &self,
-        path: &Path,
-        rng: &mut TRand,
-    ) -> Result<(Vec<i32>, String), RecognizerError> {
+    ///
+    /// [`seeded_randomizer`]: LstmRecognizer::seeded_randomizer
+    pub fn recognize_image_file(&self, path: &Path) -> Result<(Vec<i32>, String), RecognizerError> {
         let bytes = std::fs::read(path).map_err(RecognizerError::Io)?;
         let (grey, w, h) = parse_pgm(&bytes).map_err(RecognizerError::Pgm)?;
         let target_h = self
@@ -189,8 +201,12 @@ impl LstmRecognizer {
             .input_shape
             .map_or(36, |s| s.height.max(1) as usize);
         let (scaled, sw) = prescale_grey_to_height(&grey, w, h, target_h);
-        let grid = from_grey_pix(&scaled, sw, target_h, target_h as i32, 0, rng);
-        self.recognize_grid(&grid, rng)
+        // Seed exactly as RecognizeLine (SetRandomSeed) — the Convolve noise
+        // depends on it. from_grey_pix makes no draws for a full-width image, so
+        // the randomizer enters the forward pass at the post-warm-up state.
+        let mut rng = self.seeded_randomizer();
+        let grid = from_grey_pix(&scaled, sw, target_h, target_h as i32, 0, &mut rng);
+        self.recognize_grid(&grid, &mut rng)
     }
 
     /// Assemble from the three split `.traineddata` components (the
