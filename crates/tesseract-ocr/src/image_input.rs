@@ -9,16 +9,18 @@
 //! to identical pixels (a lossless raw format, so decode is byte-exact by
 //! construction).
 //!
-//! ## The scale boundary (honest)
-//! `ImageData::PreScale` calls leptonica's general `pixScale(src, f, f)` with
-//! `f = target_height / input_height`. **At `f == 1.0` (an image already at the
-//! model height) `pixScale` is a plain copy**, so [`prescale_grey_to_height`] is
-//! identity and the whole `image → text` path is byte-parity-proven (A6a + B1 +
-//! beam + B3-core). For other heights, leptonica's `pixScale` is a specific
-//! depth/factor-dependent resampler (linear-interp ≥0.7, area-map <0.7) whose
-//! byte-exact transcode is a deferred sub-leaf; this module's non-identity path
-//! is a **marked bilinear approximation** — functional, but NOT byte-identical
-//! to leptonica. Supply a height-`target` image for byte-parity.
+//! ## The scale — byte-exact for `f ≥ 0.02` (ruff-driven pixScale transcode)
+//! `ImageData::PreScale` calls leptonica's `pixScale(src, f, f)` with
+//! `f = target_height / input_height`. [`prescale_grey_to_height`] is now a
+//! **byte-exact** transcode of it for every practical line-image height
+//! (`f ≥ 0.02`) via [`pix_scale_grey`] — the full `pixScale` dispatch (LI
+//! `f ≥ 0.7`, general area-map, exact 2⁻ⁿ, + the default `pixUnsharpMasking`),
+//! each leaf ruff-harvest-driven (`ruff_cpp_spo::walk_free_functions` on
+//! leptonica `scale1.c`/`enhance.c`) and byte-parity-proven vs the real
+//! `pixScale`. So the whole `image → text` path is byte-parity at any height, not
+//! just `f == 1.0`. Only `f < 0.02` (a source > 50× the target — never a real
+//! text line, `pixScaleSmooth` unported) falls back to a marked bilinear
+//! approximation.
 //!
 //! [`from_grey_pix`]: tesseract_recognizer::from_grey_pix
 //! [`recognize_grid`]: crate::LstmRecognizer::recognize_grid
@@ -106,13 +108,15 @@ pub fn parse_pgm(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), PgmError> {
     Ok((data.to_vec(), width, height))
 }
 
-/// Pre-scale a grey image to `target_height` (the network input height, e.g. 36).
+/// Pre-scale a grey image to `target_height` (the network input height, e.g. 36)
+/// — the pure-Rust transcode of `ImageData::PreScale` → `pixScale(src, f, f)`,
+/// `f = target_height / height`. Returns `(scaled_grey, scaled_width)`.
 ///
-/// **Identity — byte-exact — when `height == target_height`** (leptonica's
-/// `pixScale` at factor 1.0 is a copy): the canonical line-recognition case, for
-/// which the full `image → text` path is byte-parity-proven. For other heights
-/// this is a **marked bilinear approximation** (NOT byte-identical to leptonica's
-/// `pixScale`; see the module docs). Returns `(scaled_grey, scaled_width)`.
+/// **Byte-exact vs leptonica for `f ≥ 0.02`** (every practical line-image height)
+/// via [`pix_scale_grey`] — the full `pixScale` dispatch (LI / area-map / exact
+/// 2⁻ⁿ + the default unsharp), ruff-harvest-driven and byte-parity-proven. Only
+/// `f < 0.02` (a source > 50× the target height — never a real text line) falls
+/// back to the marked bilinear approximation (`pixScaleSmooth` is unported).
 #[must_use]
 pub fn prescale_grey_to_height(
     grey: &[u8],
@@ -121,14 +125,17 @@ pub fn prescale_grey_to_height(
     target_height: usize,
 ) -> (Vec<u8>, usize) {
     if height == target_height || height == 0 || width == 0 {
-        return (grey.to_vec(), width);
+        return (grey.to_vec(), width); // pixScale at f == 1.0 is a copy
     }
-    // APPROXIMATION (marked): bilinear resample. leptonica's pixScale uses
-    // linear-interp/area-map with its own fixed-point arithmetic; this is NOT
-    // byte-identical to it — supply a height-`target_height` image for parity.
     let im_factor = target_height as f32 / height as f32;
-    let target_width = ((im_factor * width as f32) + 0.5) as usize; // IntCastRounded
-    let target_width = target_width.max(1);
+    if im_factor >= 0.02 {
+        // Byte-exact: the full pixScale grey dispatch.
+        let (scaled, wd, _hd) = pix_scale_grey(grey, width, height, im_factor);
+        return (scaled, wd);
+    }
+
+    // f < 0.02 only (pixScaleSmooth, unported): marked bilinear approximation.
+    let target_width = (((im_factor * width as f32) + 0.5) as usize).max(1);
     let mut out = vec![0u8; target_width * target_height];
     for oy in 0..target_height {
         let sy = ((oy as f32 + 0.5) / im_factor - 0.5).clamp(0.0, (height - 1) as f32);
@@ -283,6 +290,29 @@ pub fn scale_gray_area_map(src: &[u8], ws: usize, hs: usize, wd: usize, hd: usiz
     dst
 }
 
+/// `scaleAreaMapLow2` (leptonica 1.82.0 `scale1.c:3628`, d==8) — the exact 2×
+/// area-map reduction `pixScaleAreaMap2` uses for the `f ∈ {0.5, 0.25, …}`
+/// cases: each dest pixel is the 2×2 block average `(4 src bytes) >> 2`. Output
+/// dims are `ws/2 × hs/2` (**floor**, NOT `round(0.5·ws)` — the distinguishing
+/// detail of this path). Returns `(dst, wd, hd)`.
+#[must_use]
+pub fn scale_gray_area_map2(src: &[u8], ws: usize, hs: usize) -> (Vec<u8>, usize, usize) {
+    let wd = ws / 2;
+    let hd = hs / 2;
+    let get = |y: usize, x: usize| i32::from(src[y * ws + x]);
+    let mut dst = vec![0u8; wd * hd];
+    for i in 0..hd {
+        for j in 0..wd {
+            let val = get(2 * i, 2 * j)
+                + get(2 * i, 2 * j + 1)
+                + get(2 * i + 1, 2 * j)
+                + get(2 * i + 1, 2 * j + 1);
+            dst[i * wd + j] = (val >> 2) as u8;
+        }
+    }
+    (dst, wd, hd)
+}
+
 /// `pixUnsharpMaskingGray2D` (leptonica 1.82.0 `enhance.c`) — the 2-D unsharp
 /// mask `pixScale` applies on top of the resample. The ruff harvest of
 /// `enhance.c` showed the dispatch `pixUnsharpMasking → pixUnsharpMaskingGray →
@@ -399,20 +429,44 @@ pub fn pix_scale_grey(grey: &[u8], w: usize, h: usize, f: f32) -> (Vec<u8>, usiz
         f >= 0.02,
         "f < 0.02 routes to pixScaleSmooth (a separate leaf)"
     );
-    assert!(
-        !(f == 0.5 || f == 0.25 || f == 0.125 || f == 0.0625),
-        "exact 2⁻ⁿ reduction routes to pixScaleAreaMap2 (a separate leaf)"
-    );
-    let scaled = scale_gray_area_map(grey, w, h, wd, hd);
+    // Exact 2⁻ⁿ reductions use pixScaleAreaMap2 (2×2 block average, chained,
+    // FLOOR dims); all other f<0.7 use the general area-map (round dims).
+    let (scaled, sw, sh) = if let Some(n) = exact_halvings(f) {
+        let (mut cur, mut cw, mut ch) = (grey.to_vec(), w, h);
+        for _ in 0..n {
+            let (d, dw, dh) = scale_gray_area_map2(&cur, cw, ch);
+            (cur, cw, ch) = (d, dw, dh);
+        }
+        (cur, cw, ch)
+    } else {
+        (scale_gray_area_map(grey, w, h, wd, hd), wd, hd)
+    };
     if f > 0.2 {
         // pixScaleGeneral: maxscale > 0.2 → default sharpen (1, 0.2).
         (
-            unsharp_mask_gray_2d(&scaled, wd, hd, 1, 0.2_f64 as f32),
-            wd,
-            hd,
+            unsharp_mask_gray_2d(&scaled, sw, sh, 1, 0.2_f64 as f32),
+            sw,
+            sh,
         )
     } else {
-        (scaled, wd, hd) // maxscale ≤ 0.2: no sharpen
+        (scaled, sw, sh) // maxscale ≤ 0.2: no sharpen
+    }
+}
+
+/// The number of `pixScaleAreaMap2` halvings for an exact `2⁻ⁿ` reduction
+/// (`f ∈ {0.5, 0.25, 0.125, 0.0625}` — all exactly representable in `f32`), else
+/// `None`. Mirrors `pixScaleAreaMap`'s special-case dispatch (`scale1.c`).
+fn exact_halvings(f: f32) -> Option<usize> {
+    if f == 0.5 {
+        Some(1)
+    } else if f == 0.25 {
+        Some(2)
+    } else if f == 0.125 {
+        Some(3)
+    } else if f == 0.0625 {
+        Some(4)
+    } else {
+        None
     }
 }
 
