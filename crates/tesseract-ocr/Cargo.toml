@@ -1,0 +1,13 @@
+[package]
+name = "tesseract-ocr"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "Pure-Rust Tesseract OCR assembly tier — loads the .lstm network into a runnable tree and composes the recognizer compute (tesseract-recognizer) with the content/decode surfaces (tesseract-core) into RecognizeLine."
+
+[dependencies]
+# The two foundations (path deps, fork-only policy):
+# compute — NetworkIo/StrideMap/TRand grid + layer forwards + WeightMatrix/Lstm parsers.
+tesseract-recognizer = { path = "../tesseract-recognizer" }
+# content — charset + recoder + CTC beam (re-exports the lance-graph-contract Core surfaces).
+tesseract-core = { path = "../tesseract-core" }
