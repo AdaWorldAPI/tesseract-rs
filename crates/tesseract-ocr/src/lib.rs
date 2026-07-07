@@ -13,11 +13,13 @@
 //! `ruff_cpp_spo` C++ SPO harvest); the compute **payloads** come from the
 //! recognizer's proven leaves. See `.claude/plans/recognizer-image-to-text-v2.md`.
 
+pub mod conncomp;
 pub mod image_input;
 #[cfg(feature = "seg-approx")]
 pub mod line_segment;
 pub mod lstm_recognizer;
 pub mod network;
+pub mod renderer;
 pub mod threshold;
 
 pub use image_input::{parse_pgm, prescale_grey_to_height, PgmError};
