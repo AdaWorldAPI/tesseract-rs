@@ -1,14 +1,16 @@
-//! `tesseract-ocr-pdf` — D5.3-skeleton orchestrator binary.
+//! `tesseract-ocr-pdf` — D5.3 orchestrator binary.
 //!
 //! Per page: does it have an extractable text layer (D5.1)? Print it, no
-//! OCR. Otherwise (image-only page): D5.2 (rasterization via `pdfium-render`
-//! or equivalent) is not yet wired, so this binary reports a documented
-//! `NotImplemented` to stderr and moves on — the OCR arm itself already
-//! works end-to-end for raw grey images, demonstrated by the `.pgm` input
-//! mode below.
+//! OCR. Otherwise (image-only page): extract the largest image XObject
+//! (D5.2, pragmatic image-XObject variant — see
+//! [`tesseract_ocr_pdf::extract_page_image`]) and OCR it. A page with
+//! neither a text layer nor a supported image XObject (e.g. vector-only
+//! content, which needs a full page rasterizer — out of scope, see
+//! `.claude/plans/pdf-to-text-ocr-v1.md` Phase 5, D5.2-full) reports the
+//! specific reason to stderr and is skipped.
 //!
 //! ```sh
-//! # PDF mode (text-layer fast path; raster fallback stubbed):
+//! # PDF mode (text-layer fast path, then image-XObject OCR fallback):
 //! tesseract-ocr-pdf document.pdf --data-dir /tmp
 //!
 //! # Direct-image mode (bypasses PDF entirely, demos the OCR arm E2E):
@@ -26,7 +28,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use tesseract_ocr_pdf::{extract_text_layer, OcrPipeline};
+use tesseract_ocr_pdf::{extract_page_image, extract_text_layer, OcrPipeline};
 
 fn parse_args() -> (PathBuf, PathBuf) {
     let mut input = None;
@@ -104,9 +106,12 @@ fn run_pgm(path: &Path, data_dir: &Path) -> ExitCode {
     }
 }
 
-/// PDF input: D5.1 text-layer fast path per page; image-only pages hit the
-/// D5.2-pending raster stub.
-fn run_pdf(path: &Path, _data_dir: &Path) -> ExitCode {
+/// PDF input: D5.1 text-layer fast path per page; image-only pages fall back
+/// to D5.2's image-XObject extraction + OCR. A page that is neither (no
+/// text layer AND no supported image XObject — e.g. genuinely vector-only
+/// content, or an image encoding D5.2 doesn't cover) reports the specific
+/// reason to stderr and is skipped.
+fn run_pdf(path: &Path, data_dir: &Path) -> ExitCode {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -121,28 +126,65 @@ fn run_pdf(path: &Path, _data_dir: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut any_text = false;
+    // The OCR pipeline is only needed (and only loaded) if at least one page
+    // lacks a text layer.
+    let mut pipeline: Option<Result<OcrPipeline, Box<dyn std::error::Error>>> = None;
+
+    let mut any_output = false;
     for (i, page) in pages.iter().enumerate() {
+        let page_number = u32::try_from(i + 1).expect("page index fits u32");
         match page {
             Some(text) => {
-                any_text = true;
-                println!("--- page {} (text layer) ---", i + 1);
+                any_output = true;
+                println!("--- page {page_number} (text layer) ---");
                 println!("{text}");
             }
-            None => {
-                eprintln!(
-                    "page {}: image-only (no text layer) — raster fallback NOT IMPLEMENTED \
-                     (D5.2/pdfium pending); see .claude/plans/pdf-to-text-ocr-v1.md Phase 5",
-                    i + 1
-                );
-            }
+            None => match extract_page_image(&bytes, page_number) {
+                Ok(Some(image)) => {
+                    let pipeline = pipeline.get_or_insert_with(|| load_pipeline(data_dir));
+                    match pipeline {
+                        Ok(pipeline) => match pipeline.ocr_grey_page(&image.data, image.w, image.h)
+                        {
+                            Ok(text) => {
+                                any_output = true;
+                                println!("--- page {page_number} (OCR) ---");
+                                println!("{text}");
+                            }
+                            Err(e) => {
+                                eprintln!("page {page_number}: OCR failed: {e}");
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!(
+                                "page {page_number}: image-only, but loading OCR data from {} \
+                                 failed: {e}",
+                                data_dir.display()
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "page {page_number}: image-only (no text layer) — no supported image \
+                         XObject on this page either (likely vector-only content); a full \
+                         page rasterizer is NOT IMPLEMENTED (D5.2-full pending); see \
+                         .claude/plans/pdf-to-text-ocr-v1.md Phase 5"
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "page {page_number}: image-only (no text layer) — found an image \
+                         XObject but could not decode it: {e}"
+                    );
+                }
+            },
         }
     }
-    if any_text {
+    if any_output {
         ExitCode::SUCCESS
     } else {
         eprintln!(
-            "warning: no page in {} yielded a text layer",
+            "warning: no page in {} yielded text or a recognized image",
             path.display()
         );
         ExitCode::SUCCESS

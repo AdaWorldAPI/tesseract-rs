@@ -29,13 +29,20 @@
 //! no text operators, or only whitespace). This is the policy gate: a page
 //! that returns `Some` never needs OCR.
 //!
-//! ## D5.3-skeleton — orchestrator
+//! ## D5.2 — scanned-page image extraction (pragmatic variant)
+//!
+//! [`extract_page_image`] finds the largest image XObject on a page and
+//! decodes it to 8-bit grey — see [`image_extract`] for the full rationale
+//! and filter/colour-space coverage matrix. This is the "pragmatic" D5.2:
+//! it covers the common case (one full-page scanned image per page) without
+//! a full content-stream-interpreting page rasterizer.
+//!
+//! ## D5.3 — orchestrator
 //!
 //! [`OcrPipeline`] wraps the proven recognizer + optional dictionary and
 //! exposes [`OcrPipeline::ocr_grey_page`] for a pre-rasterized grey page
-//! buffer (the D5.2 raster step is stubbed in the `tesseract-ocr-pdf` binary,
-//! not in this library — the OCR arm itself is fully wired for raw image
-//! input already).
+//! buffer. The `tesseract-ocr-pdf` binary wires [`extract_page_image`]'s
+//! output straight into it for image-only pages.
 
 use std::path::Path;
 
@@ -44,7 +51,11 @@ use tesseract_core::dawg::DawgError;
 use tesseract_core::DictLite;
 use tesseract_ocr::{LstmRecognizer, RecognizerError};
 
-/// Failures from the PDF text-layer fast path ([`extract_text_layer`]).
+mod image_extract;
+pub use image_extract::{extract_page_image, GreyImage};
+
+/// Failures from the PDF text-layer fast path ([`extract_text_layer`]) and
+/// the scanned-page image extraction path ([`extract_page_image`]).
 #[derive(Debug)]
 pub enum PdfError {
     /// `lopdf` failed to parse the PDF container.
@@ -53,6 +64,52 @@ pub enum PdfError {
     /// lookup failure, malformed content stream, ...). Carries the 1-based
     /// page number lopdf reports.
     Extract(lopdf::Error),
+    /// `lopdf` failed to read the page's XObject dictionary or the chosen
+    /// image stream (malformed dictionary, missing required key, dangling
+    /// reference, ...).
+    ImageObject(lopdf::Error),
+    /// An image XObject's `Width`/`Height` couldn't be represented as
+    /// `usize` on this platform (e.g. negative, which is spec-illegal).
+    InvalidDimensions,
+    /// An image XObject had no `/BitsPerComponent` entry.
+    MissingBitsPerComponent,
+    /// The image's `/Filter` is recognized but not implemented in this
+    /// (D5.2 pragmatic-variant) module. Carries a human-readable filter
+    /// name and, where useful, a pointer to the future leaf that would
+    /// implement it.
+    UnsupportedFilter(String),
+    /// The image's colour space (or its combination with
+    /// `/BitsPerComponent`) is recognized but not implemented in this
+    /// module (e.g. `Indexed`, `ICCBased`, or an unsupported bit depth).
+    UnsupportedColorSpace(String),
+    /// The image uses a PDF feature this module deliberately does not
+    /// implement in v1 (currently: `/SMask` soft-mask compositing).
+    UnsupportedFeature(String),
+    /// The image's `/Decode` array differs from the PDF default for its
+    /// colour space/bit depth (PDF 32000-1:2008 §8.9.5.2, Table 90). Carries
+    /// the array that was found.
+    UnsupportedDecodeArray(String),
+    /// The (decompressed, or raw) image sample buffer is shorter than
+    /// `Width * Height * <components>` requires.
+    TruncatedImageData {
+        /// Expected minimum byte length.
+        expected: usize,
+        /// Actual byte length found.
+        got: usize,
+    },
+    /// A `DCTDecode` (JPEG) stream failed to decode.
+    Jpeg(zune_jpeg::errors::DecodeErrors),
+    /// A decoded JPEG's dimensions disagree with the PDF image dictionary's
+    /// `/Width`/`/Height`.
+    JpegDimensionMismatch {
+        /// `(width, height)` from the PDF image dictionary.
+        pdf: (usize, usize),
+        /// `(width, height)` reported by the JPEG decoder.
+        jpeg: (usize, usize),
+    },
+    /// A decoded JPEG's output colour space is neither `Luma` nor `RGB`
+    /// (e.g. `CMYK`/`YCCK`), which this module does not convert to grey.
+    UnsupportedJpegColorspace(String),
 }
 
 impl std::fmt::Display for PdfError {
@@ -60,6 +117,28 @@ impl std::fmt::Display for PdfError {
         match self {
             Self::Load(e) => write!(f, "PDF load: {e}"),
             Self::Extract(e) => write!(f, "PDF text extraction: {e}"),
+            Self::ImageObject(e) => write!(f, "PDF image XObject: {e}"),
+            Self::InvalidDimensions => write!(f, "image XObject has invalid (negative) dimensions"),
+            Self::MissingBitsPerComponent => write!(f, "image XObject has no /BitsPerComponent"),
+            Self::UnsupportedFilter(name) => write!(f, "unsupported image filter: {name}"),
+            Self::UnsupportedColorSpace(cs) => write!(f, "unsupported image colour space: {cs}"),
+            Self::UnsupportedFeature(feature) => write!(f, "unsupported PDF feature: {feature}"),
+            Self::UnsupportedDecodeArray(arr) => {
+                write!(f, "unsupported (non-default) /Decode array: {arr}")
+            }
+            Self::TruncatedImageData { expected, got } => write!(
+                f,
+                "image sample data too short: expected at least {expected} bytes, got {got}"
+            ),
+            Self::Jpeg(e) => write!(f, "JPEG (DCTDecode) decode: {e}"),
+            Self::JpegDimensionMismatch { pdf, jpeg } => write!(
+                f,
+                "JPEG dimensions {}x{} disagree with PDF image dictionary {}x{}",
+                jpeg.0, jpeg.1, pdf.0, pdf.1
+            ),
+            Self::UnsupportedJpegColorspace(cs) => {
+                write!(f, "unsupported JPEG output colour space: {cs}")
+            }
         }
     }
 }
@@ -67,7 +146,17 @@ impl std::fmt::Display for PdfError {
 impl std::error::Error for PdfError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Load(e) | Self::Extract(e) => Some(e),
+            Self::Load(e) | Self::Extract(e) | Self::ImageObject(e) => Some(e),
+            Self::Jpeg(e) => Some(e),
+            Self::InvalidDimensions
+            | Self::MissingBitsPerComponent
+            | Self::UnsupportedFilter(_)
+            | Self::UnsupportedColorSpace(_)
+            | Self::UnsupportedFeature(_)
+            | Self::UnsupportedDecodeArray(_)
+            | Self::TruncatedImageData { .. }
+            | Self::JpegDimensionMismatch { .. }
+            | Self::UnsupportedJpegColorspace(_) => None,
         }
     }
 }
