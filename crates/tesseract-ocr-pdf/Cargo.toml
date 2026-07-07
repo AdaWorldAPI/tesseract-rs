@@ -1,0 +1,44 @@
+[package]
+name = "tesseract-ocr-pdf"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "PDF front-end for the pure-Rust Tesseract transcode: digital-PDF text-layer fast path (D5.1) + scanned-page image extraction (D5.2, pragmatic image-XObject variant) + orchestrator binary (D5.3)."
+
+[dependencies]
+# Pure-Rust PDF parser/text-extractor (INPUT tooling, not the OCR runtime — see
+# the crate-level doc comment for the boundary this preserves). D5.1 picked
+# lopdf over pdf-extract: lopdf exposes `Document::extract_text(&[page_num])`
+# per-page (needed to classify a page as "has a text layer" vs "image-only"),
+# whereas pdf-extract's `extract_text_from_mem` only returns whole-document
+# text with no per-page seam. Fewer, more targeted deps for the same job.
+# It also exposes `Document::get_page_images` (walks Resources/XObject for us),
+# which D5.2 builds on directly instead of re-walking the XObject dict by hand.
+lopdf = "0.36"
+# Pure-Rust JPEG (DCTDecode) decoder for D5.2. Chosen over `jpeg-decoder`:
+# zune-jpeg is the actively-maintained continuation (jpeg-decoder's last
+# release predates it and its README points readers at zune-jpeg/zune-image),
+# it builds clean on stable 1.95 with no C toolchain, and it re-exports its
+# `zune_core` byte-reader dependency (`zune_jpeg::zune_core::bytestream::
+# ZCursor`) so no extra crate is needed to feed it an in-memory `&[u8]`.
+zune-jpeg = "0.5.15"
+# The two OCR foundations (path deps, fork-only policy) — depended on for
+# their PUBLIC API only; this crate never touches tesseract-ocr's src/ or
+# reaches into private internals.
+tesseract-ocr = { path = "../tesseract-ocr", features = ["seg-approx"] }
+tesseract-core = { path = "../tesseract-core" }
+# D4.5 (searchable_pdf): zlib-compress the embedded page image, same shape
+# examples/make_scanned_pdf.rs already used as a dev-only fixture builder;
+# promoted to a runtime dependency now that render_searchable_pdf (src/, not
+# a test/example) embeds images the same way. Version pinned to match the
+# copy lopdf already pulls transitively (see Cargo.lock), so this adds no
+# new dependency *version*.
+flate2 = "1.1"
+
+[[bin]]
+name = "tesseract-ocr-pdf"
+path = "src/main.rs"
+
+[[example]]
+name = "make_scanned_pdf"
+path = "examples/make_scanned_pdf.rs"

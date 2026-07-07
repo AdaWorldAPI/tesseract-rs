@@ -23,7 +23,8 @@
 use std::path::Path;
 
 use tesseract_core::{
-    ids_to_text, RecodeBeamSearch, RecoderError, UniCharSet, UniCharSetError, UnicharCompress,
+    ids_to_text, DictLite, RecodeBeamSearch, RecoderError, UniCharSet, UniCharSetError,
+    UnicharCompress, WordResult,
 };
 use tesseract_recognizer::{from_grey_pix, NetworkIo, TRand};
 
@@ -33,6 +34,19 @@ use crate::network::{NetError, Network};
 /// `TF_COMPRESS_UNICHARSET` (`lstmrecognizer.h` `TrainingFlags`): the recoder is
 /// present (recoding on) rather than a pass-through identity codec.
 const TF_COMPRESS_UNICHARSET: i32 = 64;
+
+/// `kDictRatio` (`lstmrecognizer.cpp:46`) — the production certainty scale for
+/// dict-path continuations, passed to `RecodeBeamSearch::Decode`.
+const K_DICT_RATIO: f32 = 2.25;
+/// `kCertOffset` (`lstmrecognizer.cpp:47`) — the production certainty offset.
+const K_CERT_OFFSET: f32 = -0.085;
+/// `kWorstDictCertainty / kCertaintyScale` (`ccmain/linerec.cpp:33,35,253-254`) —
+/// the dawg-continuation certainty floor `Tesseract::LSTMRecognizeWord` passes to
+/// `RecognizeLine`. The division happens in the CALLER, not in
+/// `lstmrecognizer.cpp` — kept as a division here (not a pre-rounded decimal
+/// literal) so the float result is bit-for-bit the expression libtesseract
+/// evaluates.
+const K_WORST_DICT_CERT: f32 = -25.0_f32 / 7.0_f32;
 
 /// A failure assembling the recognizer from its components, or recognizing.
 #[derive(Debug)]
@@ -157,6 +171,146 @@ impl LstmRecognizer {
         Ok((uids, text))
     }
 
+    /// **B3-core, dict-enabled (D1.3)** — the dict-path counterpart of
+    /// [`Self::recognize_grid`]: same `network.forward` → softmax logits walk,
+    /// but decodes via [`RecodeBeamSearch::new_with_dict`] +
+    /// [`RecodeBeamSearch::decode_with_dict`] with the production
+    /// `kDictRatio`/`kCertOffset`/`worst_dict_cert` constants
+    /// (`Tesseract::LSTMRecognizeWord`, `linerec.cpp:253-254`). `dict` is
+    /// consumed (matches `RecodeBeamSearch` borrowing it for exactly one decode);
+    /// `self.charset` is cloned into the beam (the beam needs an owned copy for
+    /// `IsSpaceDelimited` lookups; `self.charset` is also needed afterward for
+    /// `ids_to_text`).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::recognize_grid`].
+    pub fn recognize_grid_with_dict(
+        &self,
+        input: &NetworkIo,
+        rng: &mut TRand,
+        dict: DictLite,
+    ) -> Result<(Vec<i32>, String), RecognizerError> {
+        let outputs = self.network.forward(input, rng)?;
+        if outputs.int_mode() {
+            return Err(RecognizerError::Network(NetError::Forward(
+                "recognize_grid_with_dict expects softmax float logits (int-mode output)",
+            )));
+        }
+        let simple = !outputs.int_mode();
+        let rows: Vec<&[f32]> = (0..outputs.width()).map(|t| outputs.f(t)).collect();
+        let mut beam = RecodeBeamSearch::new_with_dict(
+            &self.recoder,
+            self.null_char,
+            simple,
+            dict,
+            self.charset.clone(),
+        );
+        beam.decode_with_dict(&rows, K_DICT_RATIO, K_CERT_OFFSET, K_WORST_DICT_CERT);
+        let (uids, _certs, _ratings, _xcoords) = beam.extract_best_path_as_unichar_ids();
+        let ids: Vec<u32> = uids.iter().map(|&i| i as u32).collect();
+        let text = ids_to_text(&self.charset, &ids);
+        Ok((uids, text))
+    }
+
+    /// Shared plumbing behind every `recognize_image_file*`/`recognize_grey_line`
+    /// entry point: pre-scale a raw grey buffer to the network's input height
+    /// (A6b) and build the int8 feature grid (A6a), seeding the randomizer
+    /// exactly as `RecognizeLine` does ([`seeded_randomizer`]). Returns the
+    /// prepared grid plus the randomizer at the post-warm-up, post-`from_grey_pix`
+    /// state the forward pass expects.
+    ///
+    /// Pure extraction of the steps every `recognize_image_file*` method already
+    /// performed inline — no behavior change.
+    ///
+    /// [`seeded_randomizer`]: LstmRecognizer::seeded_randomizer
+    fn prepare_grid(&self, grey: &[u8], w: usize, h: usize) -> (NetworkIo, TRand) {
+        let target_h = self
+            .network
+            .input_shape
+            .map_or(36, |s| s.height.max(1) as usize);
+        let (scaled, sw) = prescale_grey_to_height(grey, w, h, target_h);
+        // Seed exactly as RecognizeLine (SetRandomSeed) — the Convolve noise
+        // depends on it. from_grey_pix makes no draws for a full-width image, so
+        // the randomizer enters the forward pass at the post-warm-up state.
+        let mut rng = self.seeded_randomizer();
+        let grid = from_grey_pix(&scaled, sw, target_h, target_h as i32, 0, &mut rng);
+        (grid, rng)
+    }
+
+    /// **D3.0 plumbing** — recognize a single already-cropped grey line strip
+    /// (in memory, not a file on disk) → text, optionally through the dict
+    /// beam. This is the [`prepare_grid`] + [`recognize_grid`]/
+    /// [`recognize_grid_with_dict`] composition factored out of
+    /// `recognize_image_file`/`recognize_image_file_with_dict` so a caller that
+    /// already has a grey buffer (e.g. a cropped page band from
+    /// [`find_text_lines`](crate::line_segment::find_text_lines), `seg-approx`
+    /// feature) doesn't need to round-trip through a temporary PGM file.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::recognize_grid`] / [`Self::recognize_grid_with_dict`].
+    pub fn recognize_grey_line(
+        &self,
+        grey: &[u8],
+        w: usize,
+        h: usize,
+        dict: Option<DictLite>,
+    ) -> Result<(Vec<i32>, String), RecognizerError> {
+        let (grid, mut rng) = self.prepare_grid(grey, w, h);
+        match dict {
+            Some(dict) => self.recognize_grid_with_dict(&grid, &mut rng, dict),
+            None => self.recognize_grid(&grid, &mut rng),
+        }
+    }
+
+    /// **D3.0 — page-level recognition composition (Batch 3-alt).**
+    ///
+    /// **APPROXIMATION — not a Tesseract transcode; replaced by the textord
+    /// batches (plan §P3).** Segments a full GREY page into candidate text-line
+    /// bands via [`find_text_lines`](crate::line_segment::find_text_lines) (the
+    /// D3.0 projection-profile line finder — itself an approximation of the
+    /// real textord layout pipeline), crops each band (full page width, the
+    /// band's row range), and recognizes each crop via [`recognize_grey_line`]
+    /// (the SAME proven line-recognition path `recognize_image_file` uses).
+    /// Non-empty line texts are joined with `'\n'`; empty results (e.g. a band
+    /// that decodes to nothing) are dropped rather than emitting a blank line.
+    ///
+    /// `dict`, if given, is cloned per line (each line gets an independent
+    /// dict-beam decode) — the whole-page equivalent of choosing between
+    /// [`Self::recognize_grey_line`]'s `None`/`Some(DictLite)` branches per
+    /// line.
+    ///
+    /// # Errors
+    ///
+    /// The first [`RecognizerError`] hit while recognizing any band (from
+    /// [`Self::recognize_grey_line`]); recognition stops at that band.
+    ///
+    /// [`recognize_grey_line`]: LstmRecognizer::recognize_grey_line
+    #[cfg(feature = "seg-approx")]
+    pub fn recognize_page(
+        &self,
+        grey: &[u8],
+        w: usize,
+        h: usize,
+        dict: Option<&DictLite>,
+    ) -> Result<String, RecognizerError> {
+        let bands = crate::line_segment::find_text_lines(grey, w, h);
+        let mut lines: Vec<String> = Vec::with_capacity(bands.len());
+        for band in bands {
+            let band_h = band.height();
+            if band_h == 0 {
+                continue;
+            }
+            let crop = &grey[band.top * w..band.bottom * w];
+            let (_ids, text) = self.recognize_grey_line(crop, w, band_h, dict.cloned())?;
+            if !text.is_empty() {
+                lines.push(text);
+            }
+        }
+        Ok(lines.join("\n"))
+    }
+
     /// `LSTMRecognizer::SetRandomSeed` (`lstmrecognizer.h:287-291`): the exact
     /// randomizer seeding `RecognizeLine` uses before the forward pass —
     /// `seed = (i64)sample_iteration · 0x10000001`, `minstd` seed, one warm-up
@@ -196,17 +350,81 @@ impl LstmRecognizer {
     pub fn recognize_image_file(&self, path: &Path) -> Result<(Vec<i32>, String), RecognizerError> {
         let bytes = std::fs::read(path).map_err(RecognizerError::Io)?;
         let (grey, w, h) = parse_pgm(&bytes).map_err(RecognizerError::Pgm)?;
-        let target_h = self
-            .network
-            .input_shape
-            .map_or(36, |s| s.height.max(1) as usize);
-        let (scaled, sw) = prescale_grey_to_height(&grey, w, h, target_h);
-        // Seed exactly as RecognizeLine (SetRandomSeed) — the Convolve noise
-        // depends on it. from_grey_pix makes no draws for a full-width image, so
-        // the randomizer enters the forward pass at the post-warm-up state.
-        let mut rng = self.seeded_randomizer();
-        let grid = from_grey_pix(&scaled, sw, target_h, target_h as i32, 0, &mut rng);
-        self.recognize_grid(&grid, &mut rng)
+        self.recognize_grey_line(&grey, w, h, None)
+    }
+
+    /// The dict-enabled counterpart of [`Self::recognize_image_file`] (D1.3):
+    /// same P5-PGM read → pre-scale → `from_grey_pix` pipeline, but decodes via
+    /// [`Self::recognize_grid_with_dict`]. See that method for the dict-path
+    /// constants; see [`Self::recognize_image_file`] for the byte-parity scope
+    /// (model-input-height images only — other heights use the marked
+    /// approximation in [`prescale_grey_to_height`](crate::image_input::prescale_grey_to_height)).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::recognize_image_file`].
+    pub fn recognize_image_file_with_dict(
+        &self,
+        path: &Path,
+        dict: DictLite,
+    ) -> Result<(Vec<i32>, String), RecognizerError> {
+        let bytes = std::fs::read(path).map_err(RecognizerError::Io)?;
+        let (grey, w, h) = parse_pgm(&bytes).map_err(RecognizerError::Pgm)?;
+        self.recognize_grey_line(&grey, w, h, Some(dict))
+    }
+
+    /// **The word/box output surface** — the counterpart of
+    /// [`Self::recognize_image_file`] / [`Self::recognize_image_file_with_dict`]
+    /// that returns [`WordResult`]s (`RecodeBeamSearch::extract_best_path_as_words`,
+    /// `recodebeam.cpp:239-322`) instead of a flat unichar-id run. Same P5-PGM
+    /// read → pre-scale → `from_grey_pix` → `network.forward` pipeline as the
+    /// other `recognize_image_file*` methods; `dict` selects the beam variant
+    /// exactly as [`Self::recognize_grid`]/[`Self::recognize_grid_with_dict`]
+    /// do (`None` → the plain `TOP_CHOICE_PERM`-only beam; `Some` → the
+    /// production `kDictRatio`/`kCertOffset`/`worst_dict_cert` dict beam).
+    ///
+    /// `line_box` is `(left, bottom, right, top)` — `TBOX`'s constructor
+    /// argument order. `scale_factor` un-does any `pixScale` pre-processing so
+    /// boxes land in the ORIGINAL image's pixel space (`1.0` for a model-height
+    /// image, matching [`Self::recognize_image_file`]'s byte-parity scope).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::recognize_image_file`].
+    pub fn recognize_image_file_words(
+        &self,
+        path: &Path,
+        dict: Option<DictLite>,
+        line_box: (i32, i32, i32, i32),
+        scale_factor: f32,
+    ) -> Result<Vec<WordResult>, RecognizerError> {
+        let bytes = std::fs::read(path).map_err(RecognizerError::Io)?;
+        let (grey, w, h) = parse_pgm(&bytes).map_err(RecognizerError::Pgm)?;
+        let (grid, mut rng) = self.prepare_grid(&grey, w, h);
+        let outputs = self.network.forward(&grid, &mut rng)?;
+        if outputs.int_mode() {
+            return Err(RecognizerError::Network(NetError::Forward(
+                "recognize_image_file_words expects softmax float logits (int-mode output)",
+            )));
+        }
+        let simple = !outputs.int_mode();
+        let rows: Vec<&[f32]> = (0..outputs.width()).map(|t| outputs.f(t)).collect();
+        let words = if let Some(dict) = dict {
+            let mut beam = RecodeBeamSearch::new_with_dict(
+                &self.recoder,
+                self.null_char,
+                simple,
+                dict,
+                self.charset.clone(),
+            );
+            beam.decode_with_dict(&rows, K_DICT_RATIO, K_CERT_OFFSET, K_WORST_DICT_CERT);
+            beam.extract_best_path_as_words(line_box, scale_factor, &self.charset)
+        } else {
+            let mut beam = RecodeBeamSearch::new(&self.recoder, self.null_char, simple);
+            beam.decode(&rows, 1.0, 0.0);
+            beam.extract_best_path_as_words(line_box, scale_factor, &self.charset)
+        };
+        Ok(words)
     }
 
     /// Assemble from the three split `.traineddata` components (the

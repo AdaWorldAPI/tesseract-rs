@@ -1,0 +1,31 @@
+# Run:
+#   curl -sS -o /tmp/leptonica-src/sel1.c \
+#     https://raw.githubusercontent.com/DanBloomberg/leptonica/master/src/sel1.c
+#   LIBCLANG_PATH=/usr/lib/llvm-18/lib SCALE_SRC=/tmp/leptonica-src/sel1.c \
+#     cargo run -p ruff_cpp_spo --features libclang --example harvest_leptonica_scale
+#
+# Harvested for Batch 3C (morph.rs) to resolve the non-TU callee selCreateBrick
+# (used by pixDilateBrick/pixErodeBrick/pixOpenBrick/pixCloseBrick) and
+# selFindMaxTranslations (used by pixErode's ASYMMETRIC_MORPH_BC boundary clear).
+#
+# intra-TU dispatch manifest (ruff_cpp_spo::walk_free_functions on /tmp/leptonica-src/sel1.c)
+# <function>	dispatches_to	<in-TU callees>   ([] = LEAF kernel)
+selCreateBrick	dispatches_to	["selCreate", "selSetOrigin"]	(+1 non-TU callees)
+selFindMaxTranslations	dispatches_to	["selGetParameters"]	(+1 non-TU callees)
+
+# VERDICT: both are PLUMBING, not algorithm-bearing beyond what's already
+# quoted in morph.c's call sites:
+#   - selCreateBrick(h, w, cy, cx, type): allocates an h x w int grid, sets
+#     origin (cy, cx), fills every cell with `type` (SEL_HIT = 1 for bricks).
+#     No further transcode needed — a brick sel IS "every cell hit"; the Rust
+#     port never materializes a grid, it just uses (sy=h, sx=w, cy, cx)
+#     directly as the loop bounds/offsets.
+#   - selFindMaxTranslations(sel, &xp, &yp, &xn, &yn) (sel1.c:1143-1177):
+#         for i in 0..sy, j in 0..sx where sel->data[i][j] == 1 (hit):
+#           xp = max(xp, cx - j);  yp = max(yp, cy - i)
+#           xn = max(xn, j - cx);  yn = max(yn, i - cy)
+#     For an ALL-HIT rectangle (every brick cell is a hit), the max over
+#     j in [0, sx) of (cx - j) is attained at j = 0  => xp = cx.
+#     The max over j of (j - cx) is attained at j = sx - 1 => xn = sx - 1 - cx.
+#     Symmetrically yp = cy, yn = sy - 1 - cy. This closed form (no need to
+#     loop) is what morph.rs's `erode_rect` boundary-clear uses directly.

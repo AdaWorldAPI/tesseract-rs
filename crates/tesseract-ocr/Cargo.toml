@@ -11,3 +11,14 @@ description = "Pure-Rust Tesseract OCR assembly tier — loads the .lstm network
 tesseract-recognizer = { path = "../tesseract-recognizer" }
 # content — charset + recoder + CTC beam (re-exports the lance-graph-contract Core surfaces).
 tesseract-core = { path = "../tesseract-core" }
+
+[features]
+# D3.0 (Batch 3-alt): the projection-profile line segmenter + page-level
+# recognition composition. MARKED APPROXIMATION — not a Tesseract transcode;
+# replaced by the textord parity batches (plan §P3). Gated so it can never be
+# mistaken for a proven leaf on the crate's default surface.
+seg-approx = []
+
+[[example]]
+name = "recognize_page_dump"
+required-features = ["seg-approx"]

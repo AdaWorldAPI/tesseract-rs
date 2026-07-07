@@ -1,0 +1,48 @@
+# Run:
+#   curl -sS -o /tmp/leptonica-src/rop.c \
+#     https://raw.githubusercontent.com/DanBloomberg/leptonica/master/src/rop.c
+#   LIBCLANG_PATH=/usr/lib/llvm-18/lib SCALE_SRC=/tmp/leptonica-src/rop.c \
+#     cargo run -p ruff_cpp_spo --features libclang --example harvest_leptonica_scale
+#
+# Harvested for Batch 3C (morph.rs) to resolve the non-TU callee pixRasterop
+# (every pixDilate/pixErode inner-loop op in morph.c is a pixRasterop call).
+#
+# intra-TU dispatch manifest (ruff_cpp_spo::walk_free_functions on /tmp/leptonica-src/rop.c)
+# <function>	dispatches_to	<in-TU callees>   ([] = LEAF kernel)
+pixRasterop	dispatches_to	[]	(+6 non-TU callees)
+pixRasteropVip	dispatches_to	["pixRasterop"]	(+10 non-TU callees)
+pixRasteropHip	dispatches_to	["pixRasterop"]	(+10 non-TU callees)
+pixTranslate	dispatches_to	["pixRasteropIP"]	(+2 non-TU callees)
+pixRasteropIP	dispatches_to	["pixRasteropHip", "pixRasteropVip"]	(+2 non-TU callees)
+pixRasteropFullImage	dispatches_to	["pixRasterop"]	(+3 non-TU callees)
+checkRasteropCrop	dispatches_to	[]	(+1 non-TU callees)
+#
+# pixRasterop itself (rop.c:204-254) is a LEAF here (its two-image body,
+# `op` a boolean-combine op-code, delegates to non-TU `rasteropLow` in
+# roplow.c). Fetched roplow.c and read rasteropLow (roplow.c:485-560+)
+# directly for the clip semantics used by morph.rs's `dilate_rect`/
+# `erode_rect`:
+#
+#   /* Clip to max rectangle within both src and dest */
+#   if (dx < 0) { sx -= dx; dw += dx; dx = 0; }
+#   if (sx < 0) { dx -= sx; dw += sx; sx = 0; }
+#   dhangw = dx + dw - dpixw; if (dhangw > 0) dw -= dhangw;
+#   shangw = sx + dw - spixw; if (shangw > 0) dw -= shangw;
+#   ... (vertical: same pattern for dy/sy/dh) ...
+#   if ((dw <= 0) || (dh <= 0)) return 0;  /* fully clipped: no-op */
+#
+# VERDICT: the destination rectangle is clipped to the INTERSECTION of
+# (a) pixd's own bounds, (b) the requested dw x dh window, and (c) the
+# region whose shifted source coordinate falls inside pixs's bounds.
+# Outside that intersection, the op is simply never applied to that pixel
+# — pixd retains whatever value it had before the call (0 after
+# pixClearAll for dilate; 1 after pixSetAll for erode, prior to the
+# explicit ASYMMETRIC_MORPH_BC border-clear that follows in morph.c).
+# This is EXACTLY the "in-bounds contributes, out-of-bounds is a no-op"
+# rule morph.rs's `get_or_default` (dilate: default false/no contribution)
+# and the skip-if-out-of-range accumulation (erode: default true/no
+# constraint, corrected by the closed-form boundary clear from
+# selFindMaxTranslations) implement — a faithful per-pixel transcode of
+# the *behavior* of the word-level bit machinery, not a literal port of
+# rasteropLow's 32-bit-word shifting arithmetic (same "behavior not
+# bit-trick" standard as conncomp.rs's next_on_pixel_in_raster).

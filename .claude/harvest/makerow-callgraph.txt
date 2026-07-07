@@ -1,0 +1,245 @@
+# makerow.cpp call-graph manifest (Batch 3E — textline formation, the
+# seg-approx replacement: TO_BLOCK+BLOBNBOX → TO_ROW baselines)
+#
+# Run (LANG_MODE=c++ switches walk_free_functions into namespaced-C++ mode;
+# EXTRA_INC mirrors harvest_textord.rs's include sweep since this harvester
+# doesn't hardcode tesseract's directory layout):
+#   cd /home/user/ruff
+#   LIBCLANG_PATH=/usr/lib/llvm-18/lib LANG_MODE=c++ \
+#   SCALE_SRC=/tmp/tesseract/src/textord/makerow.cpp \
+#   LEPT_INCLUDE=/usr/include/leptonica \
+#   EXTRA_INC="/tmp/tesseract/src/textord:/tmp/tesseract/src/ccstruct:/tmp/tesseract/src/ccutil:\
+# /tmp/tesseract/src/arch:/tmp/tesseract/src/ccmain:/tmp/tesseract/src/api:/tmp/tesseract/src/dict:\
+# /tmp/tesseract/src/classify:/tmp/tesseract/src/wordrec:/tmp/tesseract/src/lstm:/tmp/tesseract/include" \
+#   cargo run -p ruff_cpp_spo --features libclang --example harvest_leptonica_scale
+#
+# Result: 90 free-function definitions in makerow.cpp (0 parse failures).
+# NOTE: walk_free_functions only recurses FunctionDecl + Namespace cursors
+# (see ruff_cpp_spo/src/clang_walker.rs collect_functions) — it does NOT
+# descend into CXXMethod, so 3 out-of-line class methods defined in this TU
+# are INVISIBLE to this harvest and must be tracked by hand (see below):
+#   Textord::compute_block_xheight   (line 1278)
+#   Textord::compute_row_xheight     (line 1384)
+#   Textord::make_spline_rows        (line 1998)
+# These are real dispatchers (compute_block_xheight is the actual external
+# entry point for the xheight sub-pipeline, called from textord.cpp, NOT from
+# anywhere inside this TU) — see the "Class-method dispatchers" section below.
+#
+# Full stderr harvest output follows (raw, unfiltered — includes PTIs*/PSM*
+# param-check inline helpers, TBOX/FCOORD operator overloads (x2 sets — TBOX's
+# and FCOORD's operators both land in this TU's callee-name index since
+# walk_free_functions groups by bare name, not by class), and ccutil helpers
+# pulled in transitively (copy_string/split/chomp_string/RoundUp/Modulo/
+# DivRounded/IntCastRounded/ReverseN/Reverse32/DirOtherWay/DominatesInMerge —
+# these are call-graph noise from headers, not makerow.cpp's own dispatch
+# tree; they show 0 in-TU dispatch and are the C++-mode analog of the
+# "operator" noise in the leptonica scale harvest).
+# ============================================================
+[harvest] 90 free-function definitions in /tmp/tesseract/src/textord/makerow.cpp
+# intra-TU dispatch manifest (ruff_cpp_spo::walk_free_functions on /tmp/tesseract/src/textord/makerow.cpp)
+# <function>	dispatches_to	<in-TU callees>   ([] = LEAF kernel)
+PTIsLineType	dispatches_to	[]	(+0 non-TU callees)
+PTIsImageType	dispatches_to	[]	(+0 non-TU callees)
+PTIsTextType	dispatches_to	[]	(+0 non-TU callees)
+PTIsPulloutType	dispatches_to	[]	(+0 non-TU callees)
+PSM_OSD_ENABLED	dispatches_to	[]	(+0 non-TU callees)
+PSM_ORIENTATION_ENABLED	dispatches_to	[]	(+0 non-TU callees)
+PSM_COL_FIND_ENABLED	dispatches_to	[]	(+0 non-TU callees)
+PSM_SPARSE	dispatches_to	[]	(+0 non-TU callees)
+PSM_BLOCK_FIND_ENABLED	dispatches_to	[]	(+0 non-TU callees)
+PSM_LINE_FIND_ENABLED	dispatches_to	[]	(+0 non-TU callees)
+PSM_WORD_FIND_ENABLED	dispatches_to	[]	(+0 non-TU callees)
+operator!	dispatches_to	[]	(+1 non-TU callees)
+operator-	dispatches_to	[]	(+1 non-TU callees)
+operator+	dispatches_to	[]	(+1 non-TU callees)
+operator+=	dispatches_to	[]	(+0 non-TU callees)
+operator-	dispatches_to	[]	(+1 non-TU callees)
+operator-=	dispatches_to	[]	(+0 non-TU callees)
+operator%	dispatches_to	[]	(+0 non-TU callees)
+operator*	dispatches_to	[]	(+0 non-TU callees)
+operator*	dispatches_to	[]	(+0 non-TU callees)
+operator*	dispatches_to	[]	(+0 non-TU callees)
+operator*=	dispatches_to	[]	(+0 non-TU callees)
+operator/	dispatches_to	[]	(+1 non-TU callees)
+operator/=	dispatches_to	[]	(+0 non-TU callees)
+operator!	dispatches_to	[]	(+1 non-TU callees)
+operator-	dispatches_to	[]	(+1 non-TU callees)
+operator+	dispatches_to	[]	(+1 non-TU callees)
+operator+=	dispatches_to	[]	(+0 non-TU callees)
+operator-	dispatches_to	[]	(+1 non-TU callees)
+operator-=	dispatches_to	[]	(+0 non-TU callees)
+operator%	dispatches_to	[]	(+0 non-TU callees)
+operator*	dispatches_to	[]	(+0 non-TU callees)
+operator*	dispatches_to	[]	(+0 non-TU callees)
+operator*	dispatches_to	[]	(+0 non-TU callees)
+operator*=	dispatches_to	[]	(+0 non-TU callees)
+operator/	dispatches_to	[]	(+1 non-TU callees)
+operator/=	dispatches_to	[]	(+0 non-TU callees)
+DirOtherWay	dispatches_to	[]	(+0 non-TU callees)
+DominatesInMerge	dispatches_to	[]	(+0 non-TU callees)
+get_min_max_xheight	dispatches_to	[]	(+4 non-TU callees)
+get_row_category	dispatches_to	[]	(+0 non-TU callees)
+within_error_margin	dispatches_to	[]	(+0 non-TU callees)
+copy_string	dispatches_to	[]	(+1 non-TU callees)
+split	dispatches_to	[]	(+2 non-TU callees)
+chomp_string	dispatches_to	[]	(+1 non-TU callees)
+RoundUp	dispatches_to	[]	(+0 non-TU callees)
+Modulo	dispatches_to	[]	(+0 non-TU callees)
+DivRounded	dispatches_to	["DivRounded"]	(+0 non-TU callees)
+IntCastRounded	dispatches_to	[]	(+2 non-TU callees)
+IntCastRounded	dispatches_to	[]	(+2 non-TU callees)
+ReverseN	dispatches_to	[]	(+1 non-TU callees)
+Reverse32	dispatches_to	["ReverseN"]	(+0 non-TU callees)
+row_y_order	dispatches_to	[]	(+1 non-TU callees)
+row_spacing_order	dispatches_to	[]	(+0 non-TU callees)
+MakeRowFromBlobs	dispatches_to	[]	(+5 non-TU callees)
+MakeRowFromSubBlobs	dispatches_to	["MakeRowFromBlobs"]	(+4 non-TU callees)
+make_single_row	dispatches_to	["MakeRowFromBlobs", "compute_page_skew"]	(+3 non-TU callees)
+make_rows	dispatches_to	["compute_page_skew"]	(+3 non-TU callees)
+make_initial_textrows	dispatches_to	["assign_blobs_to_rows"]	(+4 non-TU callees)
+fit_lms_line	dispatches_to	[]	(+9 non-TU callees)
+compute_page_skew	dispatches_to	[]	(+8 non-TU callees)
+dot_of_i	dispatches_to	["operator+="]	(+17 non-TU callees)
+vigorous_noise_removal	dispatches_to	["dot_of_i"]	(+8 non-TU callees)
+cleanup_rows_making	dispatches_to	["assign_blobs_to_rows", "delete_non_dropout_rows", "expand_rows", "fit_parallel_rows"]	(+5 non-TU callees)
+delete_non_dropout_rows	dispatches_to	["deskew_block_coords", "find_best_dropout_row"]	(+8 non-TU callees)
+find_best_dropout_row	dispatches_to	[]	(+5 non-TU callees)
+deskew_block_coords	dispatches_to	["operator+="]	(+9 non-TU callees)
+compute_line_occupation	dispatches_to	[]	(+14 non-TU callees)
+compute_occupation_threshold	dispatches_to	[]	(+2 non-TU callees)
+compute_dropout_distances	dispatches_to	[]	(+0 non-TU callees)
+expand_rows	dispatches_to	["adjust_row_limits", "assign_blobs_to_rows", "compute_row_stats", "fit_parallel_rows"]	(+13 non-TU callees)
+adjust_row_limits	dispatches_to	[]	(+7 non-TU callees)
+compute_row_stats	dispatches_to	[]	(+9 non-TU callees)
+fill_heights	dispatches_to	[]	(+17 non-TU callees)
+compute_xheight_from_modes	dispatches_to	["compute_height_modes"]	(+8 non-TU callees)
+compute_row_descdrop	dispatches_to	[]	(+18 non-TU callees)
+compute_height_modes	dispatches_to	[]	(+1 non-TU callees)
+correct_row_xheight	dispatches_to	["get_row_category", "within_error_margin"]	(+3 non-TU callees)
+CountOverlaps	dispatches_to	[]	(+3 non-TU callees)
+separate_underlines	dispatches_to	["CountOverlaps"]	(+22 non-TU callees)
+pre_associate_blobs	dispatches_to	[]	(+21 non-TU callees)
+fit_parallel_rows	dispatches_to	[]	(+1 non-TU callees)
+fit_parallel_lms	dispatches_to	[]	(+13 non-TU callees)
+make_baseline_spline	dispatches_to	[]	(+5 non-TU callees)
+segment_baseline	dispatches_to	[]	(+18 non-TU callees)
+linear_spline_baseline	dispatches_to	[]	(+16 non-TU callees)
+assign_blobs_to_rows	dispatches_to	["most_overlapping_row"]	(+21 non-TU callees)
+most_overlapping_row	dispatches_to	[]	(+10 non-TU callees)
+blob_x_order	dispatches_to	[]	(+2 non-TU callees)
+mark_repeated_chars	dispatches_to	[]	(+7 non-TU callees)
+
+# ============================================================
+# Class-method dispatchers NOT visible to walk_free_functions
+# (out-of-line `Textord::` methods defined in this TU; READ from source,
+# makerow.cpp:1278-1410, 1998-2044)
+# ============================================================
+Textord::compute_block_xheight	dispatches_to	["get_min_max_xheight", "compute_row_xheight", "get_row_category", "fill_heights", "compute_xheight_from_modes", "correct_row_xheight"]	(external entry point — called from textord.cpp, not from within makerow.cpp)
+Textord::compute_row_xheight	dispatches_to	["mark_repeated_chars", "get_min_max_xheight", "fill_heights", "compute_xheight_from_modes", "compute_row_descdrop"]
+Textord::make_spline_rows	dispatches_to	["make_baseline_spline", "make_old_baselines" (oldbasel.cpp, not in this TU)]
+
+# ============================================================
+# textord_* param inventory (READ from _VAR() macro declarations at file top,
+# makerow.cpp:46-96, cross-checked against every textord_* identifier used
+# in the file body)
+# ============================================================
+# Declared IN makerow.cpp (36 total):
+#   textord_heavy_nr (bool, false) — UNUSED in this TU's body (read by a caller
+#     of vigorous_noise_removal, e.g. textord.cpp, to decide whether to call it)
+#   textord_show_initial_rows / _parallel_rows / _expanded_rows / _final_rows /
+#     _final_blobs (bool, false) — GRAPHICS_DISABLED-gated debug-draw toggles,
+#     inert for a headless oracle (no ScrollView)
+#   textord_test_landscape (bool, false) — flips make_rows' fixed
+#     FCOORD(1,0) rotation; a single-column oracle can pin false
+#   textord_parallel_baselines (bool, true), textord_straight_baselines
+#     (bool, false), textord_old_baselines (bool, true), textord_old_xheight
+#     (bool, false) — baseline-shape policy switches read in
+#     make_baseline_spline/make_spline_rows/fit_parallel_lms
+#   textord_fix_xheight_bug (bool, true) — fill_heights: baseline.y(xcentre)
+#     vs raw gradient*xcentre+parallel_c
+#   textord_fix_makerow_bug (bool, true) — most_overlapping_row REJECT gate
+#   textord_debug_xheights / textord_debug_blob (bool, false) — tprintf-only
+#   textord_biased_skewcalc (bool, true, static) — compute_page_skew sample
+#     weighting (blob_count /= row_err twice — note the doubled divide at
+#     makerow.cpp:366-367, READ verbatim, looks like a duplicate-division but
+#     is the actual C++ behaviour: line 366 `blob_count /= row_err;` then line
+#     367's for-init `blob_count /= row_err;` again — an oracle MUST replicate
+#     this double-divide bit-for-bit, not "fix" it)
+#   textord_interpolating_skew (bool, true, static) — assign_blobs_to_rows
+#     skew interpolation between blobs
+#   textord_skewsmooth_offset / _offset2 (int, 4 / 1, static) — smooth_factor
+#     denominator in assign_blobs_to_rows (two call sites: make_new_rows with
+#     vs without existing rows use offset vs offset2 respectively)
+#   textord_test_x / _test_y (int, -INT32_MAX) — single test-point debug hook
+#   textord_min_blobs_in_row (int, 4) — compute_page_skew non-biased sample gate
+#   textord_spline_minblobs (int, 8), textord_spline_medianwin (int, 6) —
+#     segment_baseline / linear_spline_baseline windowing
+#   textord_max_blob_overlaps (int, 4, static) — separate_underlines large-blob
+#     reclassification threshold
+#   textord_min_xheight (int, 10) — global xheight floor (compute_row_stats,
+#     Textord::compute_block_xheight)
+#   textord_spline_shift_fraction (double, 0.02) — segment_baseline curve
+#     needed-detection threshold
+#   textord_skew_ile (double, 0.5) — compute_page_skew nth_element fractile
+#   textord_skew_lag (double, 0.02) — assign_blobs_to_rows smooth_factor
+#   textord_linespace_iqrlimit (double, 0.2) — compute_row_stats IQR/median gate
+#   textord_width_limit (double, 8) — DECLARED, UNUSED in this TU's body
+#     (grep shows 0 non-declaration references in makerow.cpp; consumed
+#     elsewhere, e.g. topitch.cpp — confirm before treating as dead for the
+#     oracle)
+#   textord_chop_width (double, 1.5) — pre_associate_blobs chop threshold
+#   textord_expansion_factor (double, 1.0, static) — expand_rows y_bottom/y_top
+#   textord_overlap_x (double, 0.375, static) — assign_blobs_to_rows +
+#     most_overlapping_row overlap-acceptance fraction
+#   textord_minxh (double, 0.25) — get_min_max_xheight min_height floor
+#   textord_min_linesize (double, 1.25) — DECLARED, UNUSED in this TU's body
+#     (same caveat as textord_width_limit — likely consumed by the caller
+#     that sets block->line_size before make_rows runs)
+#   textord_excess_blobsize (double, 1.3) — compute_row_stats max_blob_size
+#   textord_occupancy_threshold (double, 0.4) — compute_occupation_threshold
+#     divisor
+#   textord_underline_width (double, 2.0) — separate_underlines width gate
+#   textord_min_blob_height_fraction (double, 0.75) — fill_heights +
+#     separate_underlines "floating blob" / min-height gate
+#   textord_xheight_mode_fraction / _ascheight_mode_fraction (double, 0.4 /
+#     0.08) — compute_xheight_from_modes mode-acceptance fractions
+#   textord_descheight_mode_fraction (double, 0.08, static) —
+#     compute_row_descdrop descender-mode-acceptance fraction
+#   textord_ascx_ratio_min / _max (double, 1.25 / 1.8) — ascender/xheight
+#     ratio window (compute_xheight_from_modes + compute_row_descdrop)
+#   textord_descx_ratio_min / _max (double, 0.25 / 0.6) — descender/xheight
+#     ratio window (compute_row_descdrop)
+#   textord_xheight_error_margin (double, 0.1) — correct_row_xheight tolerance
+#   textord_lms_line_trials (int, 12) — fit_parallel_lms re-fit blob-count gate
+#   textord_new_initial_xheight (bool, true) — expand_rows/compute_row_stats
+#     ordering + Textord::compute_block_xheight branch selector
+#
+# Referenced but declared ELSEWHERE (extern, 2 total — an oracle pinning
+# makerow.cpp in isolation must also pin these):
+#   textord_oldbl_debug — segment_baseline/linear_spline_baseline tprintf gate
+#     (declared in oldbasel.h per grep; NOT in makerow.h)
+#   textord_single_height_mode — Textord::compute_block_xheight /
+#     Textord::compute_row_xheight cap_only selector (declared elsewhere,
+#     consumed only via the two Textord:: methods, i.e. only relevant once
+#     the class-method dispatchers are ported)
+#
+# Declared in makerow.h but with 0 references found in makerow.cpp's body —
+# read makerow.h:106-249 for the full declaration list including
+# median_block_xheight (declared, never defined/called in this TU — dead
+# declaration, likely vestigial).
+
+# ============================================================
+# STATS overlap note (see also statistc-manifest.txt)
+# ============================================================
+# tesseract-recognizer/src/input.rs already carries a private `Stats` struct
+# (fixed [0,255] histogram, only add()/ile() implemented) for the A6a
+# ComputeBlackWhite leaf. makerow.cpp's STATS usage is materially bigger:
+# arbitrary [min_bucket_value,max_bucket_value] ranges (not fixed 0..255),
+# and needs mode(), median(), pile_count(), get_total(), min_bucket(),
+# max_bucket() at minimum (smooth()/cluster()/top_n_modes()/local_min() are
+# used by callers OUTSIDE makerow.cpp, e.g. wordrec — not required for the
+# minimal single-column leaf chain below). A general STATS port (arbitrary
+# range, full accessor surface) is a NEW primitive, not a reuse of the
+# existing narrow Stats — the existing type should probably be renamed/scoped
+# to make clear it is the ComputeBlackWhite-specific [0,255] specialisation,
+# once the general STATS lands.

@@ -263,3 +263,110 @@ P2 ≈ 2 · P3-alt ≈ 1 · P3 ≈ 8-15 (the marathon) · P4 ≈ 3-4 · P5 ≈ 2
 Plan index: lance-graph `INTEGRATION_PLANS.md` (prepended). Per-batch findings:
 `EPIPHANIES.md` `E-OCR-*`. Status: this file's tables (⬜→✅ in the landing
 commit). Oracles: banked in the consuming plan section, always.
+
+### D1.2 seed decision (finding from oracle draft, 2026-07-07)
+`RecodeBeamSearch::ContinueDawg` (recodebeam.cpp:1108) uses **`default_dawgs()`** for
+word-start, NOT `init_active_dawgs()` (which is `LanguageModel`'s legacy-recognizer
+seed — out of scope for the LSTM beam transcode). D1.2b's Rust walker MUST seed
+via the `default_dawgs` equivalent to match production `recognize_line` behavior.
+Oracle at `/tmp/def_letter_oracle.cpp`; example: "the" (ids 91 97 92) → perm=8
+SystemDawgPerm, `valid_end=1` after "th" (word-end reached).
+
+---
+
+## P1 execution addendum (planned on Fable, 2026-07-07) — ready-to-fire briefs
+
+### D1.2b — the Dict-lite walker (fire AFTER D1.2a lands with ruff-verified shapes)
+
+**Placement:** `tesseract-core/src/dict_walker.rs` (NOT the Core — the walker is
+beam-coupled compute-free logic like `recodebeam`; the Core carries only the
+dawg TABLE). Consumes `lance_graph_contract::dawg::{SquishedDawg, DawgType,
+PermuterType, NodeRef, NO_EDGE}` re-exported through tesseract-core.
+
+**Shapes (ruff-manifest-sourced, per directive):** `DawgPosition { dawg_ref:
+NodeRef, punc_ref: NodeRef, dawg_index: i8, punc_index: i8, back_to_punc: bool }`
+(+ `PartialEq` for `add_unique`), `DawgArgs`-equivalent as fn params/return
+(`active: &[DawgPosition], out updated: Vec<DawgPosition>, permuter, valid_end`).
+
+**API:**
+```rust
+pub struct DictLite { dawgs: Vec<SquishedDawg>, /* indices: word/punc/number */ }
+impl DictLite {
+    pub fn from_components(word: &[u8], punc: &[u8], number: &[u8]) -> Result<...>;
+    pub fn default_dawgs(&self, suppress_patterns: bool) -> Vec<DawgPosition>;   // dict.cpp:625-647
+    pub fn def_letter_is_okay(&self, active: &[DawgPosition], charset: &UniCharSet,
+        unichar_id: u32, word_end: bool, permuter_in: PermuterType)
+        -> (Vec<DawgPosition>, PermuterType, bool /*valid_end*/);               // dict.cpp:407-571
+}
+```
+**Transcode notes (from the full Opus read, banked):**
+- `GetStartingNode`: `NO_EDGE → 0`; `next_node(edge)==0 → NO_EDGE` (dict.h:397-406).
+- `char_for_dawg`: Number-dawg maps `get_isdigit(ch) → kPatternUnicharID(0)` (dict.h:411-421).
+- Successor sets: `kDawgSuccessors[punc][ty]` — punc→{word,number}; word/number→{punc} (dawg.h:87-92).
+- eng has NO pattern dawg → `ProcessPatternEdges` arm is dead for eng; implement the
+  DAWG_TYPE_PATTERN branch as a documented `unreachable-for-eng` returning no-op (do NOT
+  silently skip — keep the branch structure, note the falsifier gap).
+- Permuter update rule at fn end (dict.cpp:559-566): overwrite unless COMPOUND_PERM kept.
+- `add_unique` = linear dedup on the 5-tuple.
+- Successor lists in Dict are built per-dawg at load (dict.cpp:367ff `SuccessorList`);
+  for 3 dawgs this is: punc→[word_idx, number_idx], word→[punc_idx], number→[punc_idx].
+
+**Byte-parity:** example `dict_walk_dump` — args = space-separated unichar-ids;
+output format EXACTLY the oracle's (`step\t…` + sorted `p\t…` lines).
+Oracle: `/tmp/def_letter_oracle` (built, works; TessBaseAPI+getDict public path;
+needs `/tmp/eng.traineddata` — present, 4.1 MB). Sweep: ≥6 words — "the", "cat",
+negative "qjx", punctuation-wrapped («"the"», ids for quote chars), a number
+("42"), a mixed token — full-step dumps byte-identical.
+
+### D1.3 — beam dict arms (fire AFTER D1.2b green)
+
+**Change surface:** `tesseract-core/src/recodebeam.rs` ONLY:
+1. `RecodeBeamSearch::new_with_dict(recoder, null_char, simple, DictLite)` (keep
+   the existing `new` — non-dict path stays untouched, its 7b parity is regression).
+2. Port `ContinueDawg` + the dict arms of `PushDupOrNoDawgIfBetter` +
+   `PushInitialDawgIfBetter` (recodebeam.cpp:1057-1160) — the currently-dormant
+   branches; `dawgs: Vec<DawgPosition>` rides on `RecodeNode` (arena-friendly:
+   store as `Option<Box<[DawgPosition]>>`).
+3. Live constants: `kDictRatio=2.25`, `kCertOffset=-0.085` enter `Decode` args
+   from `recognize_line` when dict present.
+**Oracle:** extend `/tmp/image_text_oracle.cpp` → `image_text_dict_oracle.cpp`
+with `api.Init + RecodeBeamSearch(recoder, null, simple, dict)` … OR simpler:
+libtesseract full `RecognizeLine` with dict via TessBaseAPI on line images.
+Gate: with-dict uids+text == oracle on ≥5 images AND the without-dict sweep
+(`E-OCR-RECOGNIZE-GRID-1`, 5/5) stays green (regression).
+
+### Sequencing + model split
+1. ruff enum-harvest lands (in flight) → verify D1.2a shapes vs manifest → land D1.2a [Opus verify]
+2. Fire D1.2b brief [Sonnet grind; Opus lands]
+3. Fire D1.3 brief [Sonnet grind on the beam edits is HIGHER RISK (touches proven
+   code) → Sonnet drafts, Opus reviews diff hunk-by-hunk before gates]
+4. B3-full (ExtractBestPathAsWords) — after D1.3, same recodebeam.rs wave.
+5. ruff PR: walk_enums + harvest_tesseract_dict via runbook recipe → ruff main.
+
+## P2 EXECUTED (2026-07-07) — input layer: pixconv + Otsu, both byte-parity green
+
+Ruff-harvest manifests (banked in `.claude/harvest/leptonica-scale-callgraph.txt`):
+`pixConvertTo8 → pixConvertRGBToLuminance → pixConvertRGBToGray` (LEAF, weights
+0.3/0.5/0.2) and `OtsuThreshold → {HistogramRect, OtsuStats}` (both LEAF;
+otsuthr.cpp lives in `ccstruct/`, not textord/). Harvested via the extended
+`harvest_leptonica_scale` (LANG_MODE=c++ / EXTRA_INC, ruff session branch `ee030a0`).
+
+- **pixconv** (`image_input::rgb_to_gray`/`rgb_to_luminance`, pixconv.c:741-885):
+  f32 weighted sum, `+0.5` f64 promotion; weights 0,0,0 → the default trio
+  (exactly `pixConvertRGBToLuminance`). Parity 3/3 (24×36, 33×50, 0.5/0.3/0.2
+  explicit weights) vs REAL `pixConvertRGBToGray`.
+- **Otsu** (`threshold.rs`: `histogram_rect_*`, `otsu_stats` (i32 counts, f64
+  mu/variance), `otsu_threshold_gray`/`_channels`, `threshold_rect_to_binary`,
+  otsuthr.cpp:34/88/118 + thresholder.cpp:394-421): parity 3/3 (24×36, 64×36,
+  37×29) vs REAL `tesseract::OtsuThreshold` + replicated per-pixel predicate.
+  Dump convention: white_result → 255 (grey rendering of 1bpp CLEAR bit;
+  the oracle's first draft dumped the raw bit value = inverted).
+
+Oracles banked at `.claude/harvest/oracles/{pixconv,otsu}_oracle.cpp`. Rebuild:
+```sh
+g++ -std=c++17 pixconv_oracle.cpp -I/usr/include/leptonica $(pkg-config --cflags --libs lept) -o /tmp/pixconv_oracle
+INCS=$(find /tmp/tesseract/src -maxdepth 1 -type d | sed 's/^/-I/' | tr '\n' ' ')
+g++ -std=c++17 -DFAST_FLOAT $INCS -I/tmp/tesseract/include otsu_oracle.cpp $(pkg-config --cflags --libs tesseract) $(pkg-config --libs lept) -o /tmp/otsu_oracle
+```
+Shared inputs: the Rust dumps self-generate + write `/tmp/{pixconv,otsu}_input.bin`;
+run the Rust example FIRST, then the oracle on the bin, then diff.

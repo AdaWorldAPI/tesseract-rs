@@ -23,3 +23,23 @@ pixUnsharpMaskingGray	dispatches_to	["pixUnsharpMaskingGrayFast"]	(+13 non-TU ca
 pixUnsharpMaskingGrayFast	dispatches_to	["pixUnsharpMaskingGray1D", "pixUnsharpMaskingGray2D"]	(+5 non-TU callees)
 pixUnsharpMaskingGray1D	dispatches_to	[]	(+8 non-TU callees)
 pixUnsharpMaskingGray2D	dispatches_to	[]	(+13 non-TU callees)
+
+# --- pixconv.c (pixConvertTo8 dispatch, 2026-07-07) ---
+# intra-TU dispatch manifest (ruff_cpp_spo::walk_free_functions on /tmp/leptonica-src/pixconv.c)
+# <function>	dispatches_to	<in-TU callees>   ([] = LEAF kernel)
+pixConvertTo8	dispatches_to	["pixAddGrayColormap8", "pixConvert16To8", "pixConvert1To8", "pixConvert1To8Cmap", "pixConvert24To32", "pixConvert2To8", "pixConvert4To8", "pixConvertRGBToLuminance", "pixRemoveColormap"]	(+5 non-TU callees)
+pixConvertRGBToGrayFast	dispatches_to	[]	(+8 non-TU callees)
+pixConvertRGBToGray	dispatches_to	[]	(+9 non-TU callees)
+pixConvertRGBToLuminance	dispatches_to	["pixConvertRGBToGray"]	(+0 non-TU callees)
+pixConvert1To8	dispatches_to	[]	(+13 non-TU callees)
+pixConvert2To8	dispatches_to	["pixRemoveColormap"]	(+16 non-TU callees)
+pixConvert4To8	dispatches_to	["pixRemoveColormap"]	(+13 non-TU callees)
+pixConvert16To8	dispatches_to	[]	(+8 non-TU callees)
+pixRemoveColormap	dispatches_to	[]	(+24 non-TU callees)
+
+# --- otsuthr.cpp (tesseract ccstruct, C++ mode, 2026-07-07) ---
+# intra-TU dispatch manifest (ruff_cpp_spo::walk_free_functions on /tmp/tesseract/src/ccstruct/otsuthr.cpp)
+# <function>	dispatches_to	<in-TU callees>   ([] = LEAF kernel)
+OtsuThreshold	dispatches_to	["HistogramRect", "OtsuStats"]	(+5 non-TU callees)
+HistogramRect	dispatches_to	[]	(+6 non-TU callees)
+OtsuStats	dispatches_to	[]	(+0 non-TU callees)

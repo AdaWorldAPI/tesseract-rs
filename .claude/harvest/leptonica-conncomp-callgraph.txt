@@ -1,0 +1,23 @@
+# Run:
+#   curl -sS -o /tmp/leptonica-src/conncomp.c \
+#     https://raw.githubusercontent.com/DanBloomberg/leptonica/master/src/conncomp.c
+#   LIBCLANG_PATH=/usr/lib/llvm-18/lib SCALE_SRC=/tmp/leptonica-src/conncomp.c \
+#     cargo run -p ruff_cpp_spo --features libclang --example harvest_leptonica_scale
+#
+# intra-TU dispatch manifest (ruff_cpp_spo::walk_free_functions on /tmp/leptonica-src/conncomp.c)
+# <function>	dispatches_to	<in-TU callees>   ([] = LEAF kernel)
+pixConnComp	dispatches_to	["pixConnCompBB", "pixConnCompPixa"]	(+2 non-TU callees)
+pixConnCompPixa	dispatches_to	["nextOnPixelInRaster", "pixSeedfillBB"]	(+20 non-TU callees)
+pixConnCompBB	dispatches_to	["nextOnPixelInRaster", "pixSeedfillBB"]	(+13 non-TU callees)
+pixCountConnComp	dispatches_to	["nextOnPixelInRaster", "pixSeedfill"]	(+9 non-TU callees)
+nextOnPixelInRaster	dispatches_to	["nextOnPixelInRasterLow"]	(+4 non-TU callees)
+nextOnPixelInRasterLow	dispatches_to	[]	(+0 non-TU callees)
+pixSeedfillBB	dispatches_to	["pixSeedfill4BB", "pixSeedfill8BB"]	(+2 non-TU callees)
+pixSeedfill4BB	dispatches_to	["popFillseg", "pushFillsegBB"]	(+8 non-TU callees)
+pixSeedfill8BB	dispatches_to	["popFillseg", "pushFillsegBB"]	(+8 non-TU callees)
+pixSeedfill	dispatches_to	["pixSeedfill4", "pixSeedfill8"]	(+2 non-TU callees)
+pixSeedfill4	dispatches_to	["popFillseg", "pushFillseg"]	(+7 non-TU callees)
+pixSeedfill8	dispatches_to	["popFillseg", "pushFillseg"]	(+7 non-TU callees)
+pushFillsegBB	dispatches_to	[]	(+5 non-TU callees)
+pushFillseg	dispatches_to	[]	(+5 non-TU callees)
+popFillseg	dispatches_to	[]	(+3 non-TU callees)
