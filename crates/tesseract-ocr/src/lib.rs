@@ -21,6 +21,8 @@ pub mod lstm_recognizer;
 pub mod morph;
 pub mod network;
 pub mod renderer;
+pub mod stats;
+pub mod textline;
 pub mod threshold;
 
 pub use conncomp::{conn_comp_bb, ConnCompBox};
@@ -31,6 +33,11 @@ pub use lstm_recognizer::{LstmRecognizer, RecognizerError};
 pub use morph::{close_brick, dilate_brick, erode_brick, open_brick};
 pub use network::{InputShape, NetError, Network, Node, ReverseKind};
 pub use renderer::{render_hocr, render_text, render_tsv, LineWords};
+pub use stats::Stats;
+pub use textline::{
+    compute_dropout_distances, compute_height_modes, compute_line_occupation,
+    compute_occupation_threshold, fill_heights, fit_lms_line, DetLineFit, FCoord, ICoord,
+};
 pub use threshold::{
     histogram_rect_gray, histogram_rect_multi, histogram_rect_rgb, otsu_stats,
     otsu_threshold_channels, otsu_threshold_gray, threshold_rect_to_binary,
