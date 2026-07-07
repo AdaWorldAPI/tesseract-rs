@@ -19,8 +19,9 @@ use std::fs::File;
 use std::io::Read;
 
 use tesseract_ocr::{
-    assign_blobs_to_rows, compute_page_skew, delete_non_dropout_rows, expand_rows,
-    fit_parallel_rows, make_initial_textrows, ToBlockCtx, ToRow,
+    assign_blobs_to_rows, compute_block_xheight, compute_page_skew, delete_non_dropout_rows,
+    expand_rows, fit_parallel_rows, get_row_category, make_initial_textrows, RowCategory,
+    ToBlockCtx, ToRow,
 };
 
 struct Cursor {
@@ -186,5 +187,27 @@ fn main() {
     );
     for (i, row) in block.rows.iter().enumerate() {
         println!("STAGE6_ROW[{i}] blobs={}", dump_row_blobs(row));
+    }
+
+    // ---- Stage 7: compute_block_xheight (wave 3) ----
+    // rotation_y = classify_rotation().y() = 0.0 on the eng single-column path.
+    compute_block_xheight(&mut block, page_m, 0.0);
+    println!("STAGE7_BLOCK xheight_hex={}", hex32(block.xheight));
+    for (i, row) in block.rows.iter().enumerate() {
+        let category = match get_row_category(row) {
+            RowCategory::AscendersFound => 0,
+            RowCategory::DescendersFound => 1,
+            RowCategory::Unknown => 2,
+            RowCategory::Invalid => 3,
+        };
+        println!(
+            "STAGE7_ROW[{i}] xheight_hex={} ascrise_hex={} descdrop_hex={} evidence={} category={} all_caps={}",
+            hex32(row.xheight),
+            hex32(row.ascrise),
+            hex32(row.descdrop),
+            row.xheight_evidence,
+            category,
+            i32::from(row.all_caps),
+        );
     }
 }

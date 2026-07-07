@@ -948,6 +948,18 @@ pub struct ToRow {
     /// `true` when dead (unused by this wave's chain; carried for field
     /// parity with the real `TO_ROW`).
     pub merged: bool,
+    /// `TO_ROW::xheight` — x-height estimate (wave 3, `blobbox.h`).
+    pub xheight: f32,
+    /// `TO_ROW::ascrise` — ascender rise above the x-height.
+    pub ascrise: f32,
+    /// `TO_ROW::descdrop` — descender drop below the baseline (`<= 0`).
+    pub descdrop: f32,
+    /// `TO_ROW::xheight_evidence` — mode count backing the x-height.
+    pub xheight_evidence: i32,
+    /// `TO_ROW::all_caps` — set by [`correct_row_xheight`].
+    pub all_caps: bool,
+    /// `TO_ROW::rep_chars_marked` — repeated-char run marking done.
+    pub rep_chars_marked: bool,
 }
 
 impl ToRow {
@@ -1103,6 +1115,8 @@ pub struct ToBlockCtx {
     /// `TO_BLOCK::key_row` -- index into `rows`, set by
     /// [`compute_row_stats`].
     pub key_row: Option<usize>,
+    /// `TO_BLOCK::xheight` -- block x-height, set by [`compute_block_xheight`].
+    pub xheight: f32,
 }
 
 /// `ELIST2_ITERATOR::data_relative` circular-index helper: `idx + offset`,
@@ -1930,6 +1944,414 @@ pub fn make_rows(blocks: &mut [ToBlockCtx]) -> f32 {
     page_m
 }
 
+// ─── Wave 3: x-height chain (makerow.cpp:1276-1462 + makerow.h inlines) ──────
+//
+// The x-height stage is NOT inside make_rows -- the real Tesseract calls
+// `Textord::compute_block_xheight` from baselinedetect.cpp after make_rows.
+// Ported here as free fns on the ToBlockCtx/ToRow carriers; the dump example
+// calls compute_block_xheight explicitly after make_rows (STAGE7+).
+
+/// `MAX_HEIGHT_MODES` (`makerow.cpp:98`).
+const MAX_HEIGHT_MODES: i32 = 12;
+/// `textord_minxh` (`makerow.cpp`, default `0.25`).
+const TEXTORD_MINXH: f64 = 0.25;
+/// `textord_xheight_mode_fraction` (default `0.4`).
+const TEXTORD_XHEIGHT_MODE_FRACTION: f32 = 0.4;
+/// `textord_ascheight_mode_fraction` (default `0.08`).
+const TEXTORD_ASCHEIGHT_MODE_FRACTION: f32 = 0.08;
+/// `textord_descheight_mode_fraction` (default `0.08`).
+const TEXTORD_DESCHEIGHT_MODE_FRACTION: f32 = 0.08;
+/// `textord_ascx_ratio_min` (default `1.25`).
+const TEXTORD_ASCX_RATIO_MIN: f32 = 1.25;
+/// `textord_ascx_ratio_max` (default `1.8`).
+const TEXTORD_ASCX_RATIO_MAX: f32 = 1.8;
+/// `textord_descx_ratio_min` (default `0.25`).
+const TEXTORD_DESCX_RATIO_MIN: f32 = 0.25;
+/// `textord_descx_ratio_max` (default `0.6`).
+const TEXTORD_DESCX_RATIO_MAX: f32 = 0.6;
+/// `textord_xheight_error_margin` (default `0.1`).
+const TEXTORD_XHEIGHT_ERROR_MARGIN: f32 = 0.1;
+/// `textord_min_blob_height_fraction` (default `0.75`) -- the `fill_heights`
+/// floating-blob threshold.
+const TEXTORD_MIN_BLOB_HEIGHT_FRACTION: f32 = 0.75;
+/// `textord_single_height_mode` (default `false`, `textord.cpp:40`) -- so
+/// `cap_only` is always false on this path; pinned + documented.
+const TEXTORD_SINGLE_HEIGHT_MODE: bool = false;
+/// `CCStruct::kXHeightCapRatio` = kXHeightFraction / (kXHeightFraction +
+/// kAscenderFraction) (`ccstruct.cpp:28`).
+const K_XHEIGHT_CAP_RATIO: f64 = K_XHEIGHT_FRACTION / (K_XHEIGHT_FRACTION + K_ASCENDER_FRACTION);
+
+/// `ROW_CATEGORY` (`makerow.h:36-41`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowCategory {
+    /// `ROW_ASCENDERS_FOUND`.
+    AscendersFound,
+    /// `ROW_DESCENDERS_FOUND`.
+    DescendersFound,
+    /// `ROW_UNKNOWN`.
+    Unknown,
+    /// `ROW_INVALID`.
+    Invalid,
+}
+
+/// `get_min_max_xheight` (`makerow.h:86-92`). `block_linesize` is `int` in
+/// C++ (the caller narrows `TO_BLOCK::line_size` float→int at the call).
+fn get_min_max_xheight(block_linesize: i32) -> (i32, i32) {
+    let mut min_height = (f64::from(block_linesize) * TEXTORD_MINXH).floor() as i32;
+    if (min_height as f32) < TEXTORD_MIN_XHEIGHT {
+        min_height = TEXTORD_MIN_XHEIGHT as i32;
+    }
+    let max_height = (f64::from(block_linesize) * 3.0).ceil() as i32;
+    (min_height, max_height)
+}
+
+/// `get_row_category` (`makerow.h:94-100`).
+#[must_use]
+pub fn get_row_category(row: &ToRow) -> RowCategory {
+    if row.xheight <= 0.0 {
+        return RowCategory::Invalid;
+    }
+    if row.ascrise > 0.0 {
+        RowCategory::AscendersFound
+    } else if row.descdrop != 0.0 {
+        RowCategory::DescendersFound
+    } else {
+        RowCategory::Unknown
+    }
+}
+
+/// `within_error_margin` (`makerow.h:102-104`).
+fn within_error_margin(test: f32, num: f32, margin: f32) -> bool {
+    test >= num * (1.0 - margin) && test <= num * (1.0 + margin)
+}
+
+/// `fill_heights` accumulating variant (`makerow.cpp:1418-1462`). The wave-1
+/// [`fill_heights`] returns fresh `Stats`; `compute_block_xheight` instead
+/// accumulates cap heights across every `ROW_UNKNOWN` row into block-level
+/// `Stats`, so this adds into the caller's stats. PARITY PIN: the real
+/// `fill_heights` skips `joined_to_prev()` blobs and repeated-char runs; on
+/// this plain-tuple carrier there is no chopping (joined_to_prev always false)
+/// and the synthetic fixtures carry no repeated-char runs, so every row blob
+/// contributes -- documented, not a silent divergence.
+fn fill_heights_into(
+    row: &ToRow,
+    gradient: f32,
+    min_height: i32,
+    max_height: i32,
+    heights: &mut Stats,
+    floating_heights: &mut Stats,
+) {
+    for &(left, bottom, right, top) in &row.blobs {
+        let xcentre = (left + right) as f32 / 2.0;
+        let height = (top - bottom) as f32;
+        let top_adj = top as f32 - (gradient * xcentre + row.parallel_c());
+        if top_adj >= min_height as f32 && top_adj <= max_height as f32 {
+            let bucket = (top_adj + 0.5).floor() as i32;
+            heights.add(bucket, 1);
+            if height / top_adj < TEXTORD_MIN_BLOB_HEIGHT_FRACTION {
+                floating_heights.add(bucket, 1);
+            }
+        }
+    }
+}
+
+/// `compute_xheight_from_modes` (`makerow.cpp:1480-1562`). Returns
+/// `xheight_evidence` (`best_count`) and writes `(xheight, ascrise)` via the
+/// out tuple. `cap_only` is pinned `false` (single_height_mode default).
+fn compute_xheight_from_modes(
+    heights: &mut Stats,
+    floating_heights: &Stats,
+    cap_only: bool,
+    min_height: i32,
+    max_height: i32,
+) -> (i32, f32, f32) {
+    let blob_index = heights.mode();
+    let blob_count = heights.pile_count(blob_index);
+    if blob_count == 0 {
+        return (0, 0.0, 0.0);
+    }
+    let modes = compute_height_modes(heights, min_height, max_height, MAX_HEIGHT_MODES);
+    let mut mode_count = modes.len() as i32;
+    if cap_only && mode_count > 1 {
+        mode_count = 1;
+    }
+    let mut xheight = 0.0f32;
+    let mut ascrise = 0.0f32;
+    let mut in_best_pile = false;
+    let mut prev_size = -i32::MAX;
+    let mut best_count = 0i32;
+    let mut x = 0i32;
+    while x < mode_count - 1 {
+        if modes[x as usize] != prev_size + 1 {
+            in_best_pile = false;
+        }
+        let modes_x_count =
+            heights.pile_count(modes[x as usize]) - floating_heights.pile_count(modes[x as usize]);
+        if (modes_x_count as f32 >= blob_count as f32 * TEXTORD_XHEIGHT_MODE_FRACTION)
+            && (in_best_pile || modes_x_count > best_count)
+        {
+            let mut asc = x + 1;
+            while asc < mode_count {
+                let ratio = modes[asc as usize] as f32 / modes[x as usize] as f32;
+                if TEXTORD_ASCX_RATIO_MIN < ratio
+                    && ratio < TEXTORD_ASCX_RATIO_MAX
+                    && (heights.pile_count(modes[asc as usize]) as f32
+                        >= blob_count as f32 * TEXTORD_ASCHEIGHT_MODE_FRACTION)
+                {
+                    if modes_x_count > best_count {
+                        in_best_pile = true;
+                        best_count = modes_x_count;
+                    }
+                    prev_size = modes[x as usize];
+                    xheight = modes[x as usize] as f32;
+                    ascrise = (modes[asc as usize] - modes[x as usize]) as f32;
+                }
+                asc += 1;
+            }
+        }
+        x += 1;
+    }
+    if xheight == 0.0 {
+        // single mode: subtract floating counts, find mode, restore.
+        if floating_heights.get_total() > 0 {
+            let mut xi = min_height;
+            while xi < max_height {
+                heights.add(xi, -floating_heights.pile_count(xi));
+                xi += 1;
+            }
+            let blob_index2 = heights.mode();
+            let mut xj = min_height;
+            while xj < max_height {
+                heights.add(xj, floating_heights.pile_count(xj));
+                xj += 1;
+            }
+            xheight = blob_index2 as f32;
+            ascrise = 0.0;
+            best_count = heights.pile_count(blob_index2);
+        } else {
+            xheight = blob_index as f32;
+            ascrise = 0.0;
+            best_count = heights.pile_count(blob_index);
+        }
+    }
+    (best_count, xheight, ascrise)
+}
+
+/// `compute_row_descdrop` (`makerow.cpp:1567-1615`). `asc_heights` is the
+/// row's height `Stats`; returns the (non-positive) descdrop.
+fn compute_row_descdrop(
+    row: &ToRow,
+    gradient: f32,
+    xheight_blob_count: i32,
+    asc_heights: &Stats,
+) -> i32 {
+    let mut i_min = asc_heights.min_bucket();
+    if (i_min as f32 / row.xheight) < TEXTORD_ASCX_RATIO_MIN {
+        i_min = (row.xheight * TEXTORD_ASCX_RATIO_MIN + 0.5).floor() as i32;
+    }
+    let mut i_max = asc_heights.max_bucket();
+    if (i_max as f32 / row.xheight) > TEXTORD_ASCX_RATIO_MAX {
+        i_max = (row.xheight * TEXTORD_ASCX_RATIO_MAX).floor() as i32;
+    }
+    let mut num_potential_asc = 0i32;
+    let mut i = i_min;
+    while i <= i_max {
+        num_potential_asc += asc_heights.pile_count(i);
+        i += 1;
+    }
+    let min_height = (row.xheight * TEXTORD_DESCX_RATIO_MIN + 0.5).floor() as i32;
+    let max_height = (row.xheight * TEXTORD_DESCX_RATIO_MAX).floor() as i32;
+    let mut heights = Stats::new(min_height, max_height);
+    for &(left, bottom, right, _top) in &row.blobs {
+        // joined_to_prev always false on this carrier (documented PIN).
+        let xcentre = (left + right) as f32 / 2.0;
+        let height = gradient * xcentre + row.parallel_c() - bottom as f32;
+        if height >= min_height as f32 && height <= max_height as f32 {
+            heights.add((height + 0.5).floor() as i32, 1);
+        }
+    }
+    let blob_index = heights.mode();
+    let mut blob_count = heights.pile_count(blob_index);
+    let total_fraction = TEXTORD_DESCHEIGHT_MODE_FRACTION + TEXTORD_ASCHEIGHT_MODE_FRACTION;
+    if ((blob_count + num_potential_asc) as f32) < xheight_blob_count as f32 * total_fraction {
+        blob_count = 0;
+    }
+    if blob_count > 0 {
+        -blob_index
+    } else {
+        0
+    }
+}
+
+/// `Textord::compute_row_xheight` (`makerow.cpp:1391-1413`).
+pub fn compute_row_xheight(row: &mut ToRow, rotation_y: f32, gradient: f32, block_line_size: i32) {
+    // mark_repeated_chars: on this plain-tuple carrier there are no BTFT_LEADER
+    // flags and the synthetic fixtures carry no repeated-char runs, so it is a
+    // documented no-op that only sets the marked flag (PARITY PIN).
+    if !row.rep_chars_marked {
+        row.rep_chars_marked = true;
+    }
+    let (min_height, max_height) = get_min_max_xheight(block_line_size);
+    let mut heights = Stats::new(min_height, max_height);
+    let mut floating_heights = Stats::new(min_height, max_height);
+    fill_heights_into(
+        row,
+        gradient,
+        min_height,
+        max_height,
+        &mut heights,
+        &mut floating_heights,
+    );
+    row.ascrise = 0.0;
+    row.xheight = 0.0;
+    let cap_only = TEXTORD_SINGLE_HEIGHT_MODE && rotation_y == 0.0;
+    let (evidence, xh, asc) = compute_xheight_from_modes(
+        &mut heights,
+        &floating_heights,
+        cap_only,
+        min_height,
+        max_height,
+    );
+    row.xheight_evidence = evidence;
+    row.xheight = xh;
+    row.ascrise = asc;
+    row.descdrop = 0.0;
+    if row.xheight > 0.0 {
+        row.descdrop = compute_row_descdrop(row, gradient, row.xheight_evidence, &heights) as f32;
+    }
+}
+
+/// `correct_row_xheight` (`makerow.cpp:1621-1690`).
+pub fn correct_row_xheight(row: &mut ToRow, xheight: f32, ascrise: f32, descdrop: f32) {
+    let row_category = get_row_category(row);
+    let normal_xheight = within_error_margin(row.xheight, xheight, TEXTORD_XHEIGHT_ERROR_MARGIN);
+    let cap_xheight =
+        within_error_margin(row.xheight, xheight + ascrise, TEXTORD_XHEIGHT_ERROR_MARGIN);
+    if row_category == RowCategory::AscendersFound {
+        if row.descdrop >= 0.0 {
+            row.descdrop = row.xheight * (descdrop / xheight);
+        }
+    } else if row_category == RowCategory::Invalid
+        || (row_category == RowCategory::DescendersFound && (normal_xheight || cap_xheight))
+        || (row_category == RowCategory::Unknown && normal_xheight)
+    {
+        row.xheight = xheight;
+        row.ascrise = ascrise;
+        row.descdrop = descdrop;
+    } else if row_category == RowCategory::DescendersFound {
+        row.ascrise = row.xheight * (ascrise / xheight);
+    } else if row_category == RowCategory::Unknown {
+        row.all_caps = true;
+        if cap_xheight {
+            row.xheight = xheight;
+            row.ascrise = ascrise;
+            row.descdrop = descdrop;
+        } else {
+            row.ascrise = row.xheight * (ascrise / (xheight + ascrise));
+            row.xheight -= row.ascrise;
+            row.descdrop = row.xheight * (descdrop / xheight);
+        }
+    }
+}
+
+/// `Textord::compute_block_xheight` (`makerow.cpp:1279-1389`). `rotation_y`
+/// is `block->block->classify_rotation().y()` (0.0 on the eng single-column
+/// path). Mutates every row's xheight/ascrise/descdrop and the block xheight.
+pub fn compute_block_xheight(block: &mut ToBlockCtx, gradient: f32, rotation_y: f32) {
+    let asc_frac_xheight = (K_ASCENDER_FRACTION / K_XHEIGHT_FRACTION) as f32;
+    let desc_frac_xheight = (K_DESCENDER_FRACTION / K_XHEIGHT_FRACTION) as f32;
+    if block.rows.is_empty() {
+        return;
+    }
+    let block_linesize = block.line_size as i32;
+    let (min_height, max_height) = get_min_max_xheight(block_linesize);
+    let mut row_asc_xheights = Stats::new(min_height, max_height);
+    let mut row_asc_ascrise = Stats::new(
+        (min_height as f32 * asc_frac_xheight) as i32,
+        (max_height as f32 * asc_frac_xheight) as i32,
+    );
+    let min_desc_height = (min_height as f32 * desc_frac_xheight) as i32;
+    let max_desc_height = (max_height as f32 * desc_frac_xheight) as i32;
+    let mut row_asc_descdrop = Stats::new(min_desc_height, max_desc_height);
+    let mut row_desc_xheights = Stats::new(min_height, max_height);
+    let mut row_desc_descdrop = Stats::new(min_desc_height, max_desc_height);
+    let mut row_cap_xheights = Stats::new(min_height, max_height);
+    let mut row_cap_floating_xheights = Stats::new(min_height, max_height);
+
+    for idx in 0..block.rows.len() {
+        if block.rows[idx].xheight <= 0.0 {
+            compute_row_xheight(&mut block.rows[idx], rotation_y, gradient, block_linesize);
+        }
+        let category = get_row_category(&block.rows[idx]);
+        let row = &block.rows[idx];
+        match category {
+            RowCategory::AscendersFound => {
+                row_asc_xheights.add(row.xheight as i32, row.xheight_evidence);
+                row_asc_ascrise.add(row.ascrise as i32, row.xheight_evidence);
+                row_asc_descdrop.add((-row.descdrop) as i32, row.xheight_evidence);
+            }
+            RowCategory::DescendersFound => {
+                row_desc_xheights.add(row.xheight as i32, row.xheight_evidence);
+                row_desc_descdrop.add((-row.descdrop) as i32, row.xheight_evidence);
+            }
+            RowCategory::Unknown => {
+                fill_heights_into(
+                    row,
+                    gradient,
+                    min_height,
+                    max_height,
+                    &mut row_cap_xheights,
+                    &mut row_cap_floating_xheights,
+                );
+            }
+            RowCategory::Invalid => {}
+        }
+    }
+
+    let mut xheight;
+    let mut ascrise = 0.0f32;
+    let mut descdrop = 0.0f32;
+    if row_asc_xheights.get_total() > 0 {
+        xheight = row_asc_xheights.median() as f32;
+        ascrise = row_asc_ascrise.median() as f32;
+        descdrop = -(row_asc_descdrop.median() as f32);
+    } else if row_desc_xheights.get_total() > 0 {
+        xheight = row_desc_xheights.median() as f32;
+        descdrop = -(row_desc_descdrop.median() as f32);
+    } else if row_cap_xheights.get_total() > 0 {
+        let cap_only = TEXTORD_SINGLE_HEIGHT_MODE && rotation_y == 0.0;
+        let (_evidence, xh, asc) = compute_xheight_from_modes(
+            &mut row_cap_xheights,
+            &row_cap_floating_xheights,
+            cap_only,
+            min_height,
+            max_height,
+        );
+        xheight = xh;
+        ascrise = asc;
+        if ascrise == 0.0 {
+            xheight = row_cap_xheights.median() as f32 * K_XHEIGHT_CAP_RATIO as f32;
+        }
+    } else {
+        xheight = block.line_size * K_XHEIGHT_FRACTION as f32;
+    }
+    let mut corrected_xheight = false;
+    if xheight < TEXTORD_MIN_XHEIGHT {
+        xheight = TEXTORD_MIN_XHEIGHT;
+        corrected_xheight = true;
+    }
+    if corrected_xheight || ascrise <= 0.0 {
+        ascrise = xheight * asc_frac_xheight;
+    }
+    if corrected_xheight || descdrop >= 0.0 {
+        descdrop = -(xheight * desc_frac_xheight);
+    }
+    block.xheight = xheight;
+    for row in &mut block.rows {
+        correct_row_xheight(row, xheight, ascrise, descdrop);
+    }
+}
+
 #[cfg(test)]
 mod wave2_tests {
     use super::*;
@@ -2089,5 +2511,75 @@ mod wave2_tests {
         assert_eq!(block.rows.len(), 2, "rows: {:?}", block.rows);
         let total_assigned: usize = block.rows.iter().map(|r| r.blobs.len()).sum();
         assert_eq!(total_assigned, 7, "every blob should end up in some row");
+    }
+}
+
+#[cfg(test)]
+mod wave3_tests {
+    use super::*;
+
+    /// `get_row_category` covers all four `ROW_CATEGORY` branches.
+    #[test]
+    fn row_category_branches() {
+        let mut r = ToRow::default();
+        assert_eq!(get_row_category(&r), RowCategory::Invalid); // xheight <= 0
+        r.xheight = 12.0;
+        assert_eq!(get_row_category(&r), RowCategory::Unknown); // ascrise 0, descdrop 0
+        r.descdrop = -3.0;
+        assert_eq!(get_row_category(&r), RowCategory::DescendersFound);
+        r.ascrise = 4.0;
+        assert_eq!(get_row_category(&r), RowCategory::AscendersFound);
+    }
+
+    /// `within_error_margin` matches the C++ `[num*(1-m), num*(1+m)]` band.
+    #[test]
+    fn error_margin_band() {
+        assert!(within_error_margin(10.0, 10.0, 0.1));
+        assert!(within_error_margin(10.9, 10.0, 0.1));
+        assert!(!within_error_margin(11.1, 10.0, 0.1));
+        assert!(within_error_margin(9.1, 10.0, 0.1));
+        assert!(!within_error_margin(8.9, 10.0, 0.1));
+    }
+
+    /// `get_min_max_xheight`: floor(linesize*0.25) clamped to >=10, ceil(*3).
+    #[test]
+    fn min_max_xheight_range() {
+        // linesize 20 -> min = floor(5) = 5 -> clamped to 10; max = ceil(60) = 60.
+        assert_eq!(get_min_max_xheight(20), (10, 60));
+        // linesize 100 -> min = floor(25) = 25; max = ceil(300) = 300.
+        assert_eq!(get_min_max_xheight(100), (25, 300));
+    }
+
+    /// A single-mode row (all blobs one height) yields that height as the
+    /// x-height with zero ascrise (the `compute_xheight_from_modes` single-mode
+    /// fallback).
+    #[test]
+    fn single_mode_xheight() {
+        let mut heights = Stats::new(10, 60);
+        for _ in 0..8 {
+            heights.add(20, 1);
+        }
+        let floating = Stats::new(10, 60);
+        let (evidence, xh, asc) =
+            compute_xheight_from_modes(&mut heights, &floating, false, 10, 60);
+        assert_eq!(xh, 20.0);
+        assert_eq!(asc, 0.0);
+        assert_eq!(evidence, 8);
+    }
+
+    /// A bimodal row (x-height mode + an ascender mode at ~1.5x) recovers both.
+    #[test]
+    fn bimodal_xheight_ascrise() {
+        let mut heights = Stats::new(10, 60);
+        for _ in 0..10 {
+            heights.add(20, 1); // x-height pile
+        }
+        for _ in 0..3 {
+            heights.add(30, 1); // ascender pile (30/20 = 1.5, in [1.25,1.8])
+        }
+        let floating = Stats::new(10, 60);
+        let (_ev, xh, asc) = compute_xheight_from_modes(&mut heights, &floating, false, 10, 60);
+        assert_eq!(xh, 20.0);
+        assert_eq!(asc, 10.0); // 30 - 20
     }
 }

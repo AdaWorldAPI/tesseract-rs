@@ -118,6 +118,9 @@ struct OracleRow {
   float y_origin = 0, credibility = 0;
   float spacing = 0;
   bool merged = false;
+  float xheight = 0, ascrise = 0, descdrop = 0;
+  int xheight_evidence = 0;
+  bool all_caps = false, rep_chars_marked = false;
 
   static OracleRow FromBlob(const Box &blob, float top, float bottom, float row_size) {
     OracleRow row;
@@ -191,6 +194,7 @@ struct OracleBlock {
   std::vector<OracleRow> rows;
   int32_t block_left = 0;
   float line_spacing = 0, line_size = 0, max_blob_size = 0, baseline_offset = 0;
+  float xheight = 0;
 };
 
 // ELIST2_ITERATOR::data_relative circular-index helper.
@@ -988,6 +992,12 @@ static void dump_f32_hex(float v) {
   printf("%08x", bits);
 }
 
+static uint32_t f32_bits(float v) {
+  uint32_t bits;
+  memcpy(&bits, &v, 4);
+  return bits;
+}
+
 static std::string dump_row_blobs(const OracleRow &row) {
   std::string s;
   for (size_t i = 0; i < row.blobs.size(); i++) {
@@ -999,6 +1009,318 @@ static std::string dump_row_blobs(const OracleRow &row) {
     s += buf;
   }
   return s;
+}
+
+
+// ============================================================
+// Wave 3: x-height chain (makerow.cpp:1276-1690 + makerow.h inlines),
+// transcribed verbatim against real (compiled) STATS. This mirrors the
+// tesseract-ocr textline.rs wave-3 port; parity = the two transcriptions
+// agree AND this side is a faithful copy of makerow.cpp.
+// ============================================================
+static const int XH_MAX_HEIGHT_MODES = 12;
+static const double TEXTORD_MINXH = 0.25;
+static const float TEXTORD_XHEIGHT_MODE_FRACTION = 0.4f;
+static const float TEXTORD_ASCHEIGHT_MODE_FRACTION = 0.08f;
+static const float TEXTORD_DESCHEIGHT_MODE_FRACTION = 0.08f;
+static const float TEXTORD_ASCX_RATIO_MIN = 1.25f;
+static const float TEXTORD_ASCX_RATIO_MAX = 1.8f;
+static const float TEXTORD_DESCX_RATIO_MIN = 0.25f;
+static const float TEXTORD_DESCX_RATIO_MAX = 0.6f;
+static const float TEXTORD_XHEIGHT_ERROR_MARGIN = 0.1f;
+static const float TEXTORD_MIN_BLOB_HEIGHT_FRACTION = 0.75f;
+static const bool TEXTORD_SINGLE_HEIGHT_MODE = false;
+static const double K_XHEIGHT_CAP_RATIO =
+    K_XHEIGHT_FRACTION / (K_XHEIGHT_FRACTION + K_ASCENDER_FRACTION);
+
+enum XhRowCategory { XH_ASC, XH_DESC, XH_UNKNOWN, XH_INVALID };
+
+static void get_min_max_xheight(int block_linesize, int *min_height, int *max_height) {
+  *min_height = static_cast<int32_t>(std::floor(block_linesize * TEXTORD_MINXH));
+  if (*min_height < static_cast<int>(TEXTORD_MIN_XHEIGHT)) {
+    *min_height = static_cast<int>(TEXTORD_MIN_XHEIGHT);
+  }
+  *max_height = static_cast<int32_t>(std::ceil(block_linesize * 3.0));
+}
+
+static XhRowCategory get_row_category(const OracleRow &row) {
+  if (row.xheight <= 0) {
+    return XH_INVALID;
+  }
+  return (row.ascrise > 0) ? XH_ASC : (row.descdrop != 0) ? XH_DESC : XH_UNKNOWN;
+}
+
+static bool within_error_margin(float test, float num, float margin) {
+  return (test >= num * (1 - margin) && test <= num * (1 + margin));
+}
+
+static void fill_heights_ora(const OracleRow &row, float gradient, int min_height, int max_height,
+                             STATS *heights, STATS *floating_heights) {
+  for (const Box &b : row.blobs) {
+    float xcentre = (b[0] + b[2]) / 2.0f;
+    float height = static_cast<float>(b[3] - b[1]);
+    float top_adj = static_cast<float>(b[3]) - (gradient * xcentre + row.parallel_c());
+    if (top_adj >= min_height && top_adj <= max_height) {
+      int bucket = static_cast<int>(std::floor(top_adj + 0.5f));
+      heights->add(bucket, 1);
+      if (height / top_adj < TEXTORD_MIN_BLOB_HEIGHT_FRACTION) {
+        floating_heights->add(bucket, 1);
+      }
+    }
+  }
+}
+
+static int32_t compute_height_modes(STATS *heights, int32_t min_height, int32_t max_height,
+                                    int32_t *modes, int32_t maxmodes) {
+  int32_t pile_count, src_count, src_index, least_count, least_index, dest_count;
+  src_count = max_height + 1 - min_height;
+  dest_count = 0;
+  least_count = INT32_MAX;
+  least_index = -1;
+  for (src_index = 0; src_index < src_count; src_index++) {
+    pile_count = heights->pile_count(min_height + src_index);
+    if (pile_count > 0) {
+      if (dest_count < maxmodes) {
+        if (pile_count < least_count) {
+          least_count = pile_count;
+          least_index = dest_count;
+        }
+        modes[dest_count++] = min_height + src_index;
+      } else if (pile_count >= least_count) {
+        while (least_index < maxmodes - 1) {
+          modes[least_index] = modes[least_index + 1];
+          least_index++;
+        }
+        modes[maxmodes - 1] = min_height + src_index;
+        if (pile_count == least_count) {
+          least_index = maxmodes - 1;
+        } else {
+          least_count = heights->pile_count(modes[0]);
+          least_index = 0;
+          for (dest_count = 1; dest_count < maxmodes; dest_count++) {
+            pile_count = heights->pile_count(modes[dest_count]);
+            if (pile_count < least_count) {
+              least_count = pile_count;
+              least_index = dest_count;
+            }
+          }
+        }
+      }
+    }
+  }
+  return dest_count;
+}
+
+static int compute_xheight_from_modes(STATS *heights, STATS *floating_heights, bool cap_only,
+                                      int min_height, int max_height, float *xheight,
+                                      float *ascrise) {
+  int blob_index = heights->mode();
+  int blob_count = heights->pile_count(blob_index);
+  if (blob_count == 0) {
+    return 0;
+  }
+  int modes[XH_MAX_HEIGHT_MODES];
+  bool in_best_pile = false;
+  int prev_size = -INT32_MAX;
+  int best_count = 0;
+  int mode_count = compute_height_modes(heights, min_height, max_height, modes, XH_MAX_HEIGHT_MODES);
+  if (cap_only && mode_count > 1) {
+    mode_count = 1;
+  }
+  int x;
+  for (x = 0; x < mode_count - 1; x++) {
+    if (modes[x] != prev_size + 1) {
+      in_best_pile = false;
+    }
+    int modes_x_count = heights->pile_count(modes[x]) - floating_heights->pile_count(modes[x]);
+    if ((modes_x_count >= blob_count * TEXTORD_XHEIGHT_MODE_FRACTION) &&
+        (in_best_pile || modes_x_count > best_count)) {
+      for (int asc = x + 1; asc < mode_count; asc++) {
+        float ratio = static_cast<float>(modes[asc]) / static_cast<float>(modes[x]);
+        if (TEXTORD_ASCX_RATIO_MIN < ratio && ratio < TEXTORD_ASCX_RATIO_MAX &&
+            (heights->pile_count(modes[asc]) >= blob_count * TEXTORD_ASCHEIGHT_MODE_FRACTION)) {
+          if (modes_x_count > best_count) {
+            in_best_pile = true;
+            best_count = modes_x_count;
+          }
+          prev_size = modes[x];
+          *xheight = static_cast<float>(modes[x]);
+          *ascrise = static_cast<float>(modes[asc] - modes[x]);
+        }
+      }
+    }
+  }
+  if (*xheight == 0) {
+    if (floating_heights->get_total() > 0) {
+      for (x = min_height; x < max_height; ++x) {
+        heights->add(x, -(floating_heights->pile_count(x)));
+      }
+      blob_index = heights->mode();
+      for (x = min_height; x < max_height; ++x) {
+        heights->add(x, floating_heights->pile_count(x));
+      }
+    }
+    *xheight = static_cast<float>(blob_index);
+    *ascrise = 0.0f;
+    best_count = heights->pile_count(blob_index);
+  }
+  return best_count;
+}
+
+static int32_t compute_row_descdrop(OracleRow &row, float gradient, int xheight_blob_count,
+                                    STATS *asc_heights) {
+  int i_min = asc_heights->min_bucket();
+  if ((i_min / row.xheight) < TEXTORD_ASCX_RATIO_MIN) {
+    i_min = static_cast<int>(std::floor(row.xheight * TEXTORD_ASCX_RATIO_MIN + 0.5));
+  }
+  int i_max = asc_heights->max_bucket();
+  if ((i_max / row.xheight) > TEXTORD_ASCX_RATIO_MAX) {
+    i_max = static_cast<int>(std::floor(row.xheight * TEXTORD_ASCX_RATIO_MAX));
+  }
+  int num_potential_asc = 0;
+  for (int i = i_min; i <= i_max; ++i) {
+    num_potential_asc += asc_heights->pile_count(i);
+  }
+  int32_t min_height = static_cast<int32_t>(std::floor(row.xheight * TEXTORD_DESCX_RATIO_MIN + 0.5));
+  int32_t max_height = static_cast<int32_t>(std::floor(row.xheight * TEXTORD_DESCX_RATIO_MAX));
+  STATS heights(min_height, max_height);
+  for (const Box &b : row.blobs) {
+    float xcentre = (b[0] + b[2]) / 2.0f;
+    float height = (gradient * xcentre + row.parallel_c() - b[1]);
+    if (height >= min_height && height <= max_height) {
+      heights.add(static_cast<int>(std::floor(height + 0.5)), 1);
+    }
+  }
+  int blob_index = heights.mode();
+  int blob_count = heights.pile_count(blob_index);
+  float total_fraction = (TEXTORD_DESCHEIGHT_MODE_FRACTION + TEXTORD_ASCHEIGHT_MODE_FRACTION);
+  if (static_cast<float>(blob_count + num_potential_asc) < xheight_blob_count * total_fraction) {
+    blob_count = 0;
+  }
+  return blob_count > 0 ? -blob_index : 0;
+}
+
+static void compute_row_xheight(OracleRow &row, float rotation_y, float gradient,
+                                int block_line_size) {
+  if (!row.rep_chars_marked) {
+    row.rep_chars_marked = true;
+  }
+  int min_height, max_height;
+  get_min_max_xheight(block_line_size, &min_height, &max_height);
+  STATS heights(min_height, max_height);
+  STATS floating_heights(min_height, max_height);
+  fill_heights_ora(row, gradient, min_height, max_height, &heights, &floating_heights);
+  row.ascrise = 0.0f;
+  row.xheight = 0.0f;
+  row.xheight_evidence = compute_xheight_from_modes(
+      &heights, &floating_heights, TEXTORD_SINGLE_HEIGHT_MODE && rotation_y == 0.0, min_height,
+      max_height, &(row.xheight), &(row.ascrise));
+  row.descdrop = 0.0f;
+  if (row.xheight > 0) {
+    row.descdrop = static_cast<float>(compute_row_descdrop(row, gradient, row.xheight_evidence, &heights));
+  }
+}
+
+static void correct_row_xheight(OracleRow &row, float xheight, float ascrise, float descdrop) {
+  XhRowCategory row_category = get_row_category(row);
+  bool normal_xheight = within_error_margin(row.xheight, xheight, TEXTORD_XHEIGHT_ERROR_MARGIN);
+  bool cap_xheight =
+      within_error_margin(row.xheight, xheight + ascrise, TEXTORD_XHEIGHT_ERROR_MARGIN);
+  if (row_category == XH_ASC) {
+    if (row.descdrop >= 0) {
+      row.descdrop = row.xheight * (descdrop / xheight);
+    }
+  } else if (row_category == XH_INVALID ||
+             (row_category == XH_DESC && (normal_xheight || cap_xheight)) ||
+             (row_category == XH_UNKNOWN && normal_xheight)) {
+    row.xheight = xheight;
+    row.ascrise = ascrise;
+    row.descdrop = descdrop;
+  } else if (row_category == XH_DESC) {
+    row.ascrise = row.xheight * (ascrise / xheight);
+  } else if (row_category == XH_UNKNOWN) {
+    row.all_caps = true;
+    if (cap_xheight) {
+      row.xheight = xheight;
+      row.ascrise = ascrise;
+      row.descdrop = descdrop;
+    } else {
+      row.ascrise = row.xheight * (ascrise / (xheight + ascrise));
+      row.xheight -= row.ascrise;
+      row.descdrop = row.xheight * (descdrop / xheight);
+    }
+  }
+}
+
+static void compute_block_xheight(OracleBlock &block, float gradient, float rotation_y) {
+  float asc_frac_xheight = K_ASCENDER_FRACTION / K_XHEIGHT_FRACTION;
+  float desc_frac_xheight = K_DESCENDER_FRACTION / K_XHEIGHT_FRACTION;
+  if (block.rows.empty()) {
+    return;
+  }
+  int block_linesize = static_cast<int>(block.line_size);
+  int min_height, max_height;
+  get_min_max_xheight(block_linesize, &min_height, &max_height);
+  STATS row_asc_xheights(min_height, max_height);
+  STATS row_asc_ascrise(static_cast<int>(min_height * asc_frac_xheight),
+                        static_cast<int>(max_height * asc_frac_xheight));
+  int min_desc_height = static_cast<int>(min_height * desc_frac_xheight);
+  int max_desc_height = static_cast<int>(max_height * desc_frac_xheight);
+  STATS row_asc_descdrop(min_desc_height, max_desc_height);
+  STATS row_desc_xheights(min_height, max_height);
+  STATS row_desc_descdrop(min_desc_height, max_desc_height);
+  STATS row_cap_xheights(min_height, max_height);
+  STATS row_cap_floating_xheights(min_height, max_height);
+  for (auto &row : block.rows) {
+    if (row.xheight <= 0) {
+      compute_row_xheight(row, rotation_y, gradient, block_linesize);
+    }
+    XhRowCategory row_category = get_row_category(row);
+    if (row_category == XH_ASC) {
+      row_asc_xheights.add(static_cast<int32_t>(row.xheight), row.xheight_evidence);
+      row_asc_ascrise.add(static_cast<int32_t>(row.ascrise), row.xheight_evidence);
+      row_asc_descdrop.add(static_cast<int32_t>(-row.descdrop), row.xheight_evidence);
+    } else if (row_category == XH_DESC) {
+      row_desc_xheights.add(static_cast<int32_t>(row.xheight), row.xheight_evidence);
+      row_desc_descdrop.add(static_cast<int32_t>(-row.descdrop), row.xheight_evidence);
+    } else if (row_category == XH_UNKNOWN) {
+      fill_heights_ora(row, gradient, min_height, max_height, &row_cap_xheights,
+                       &row_cap_floating_xheights);
+    }
+  }
+  float xheight = 0.0, ascrise = 0.0, descdrop = 0.0;
+  if (row_asc_xheights.get_total() > 0) {
+    xheight = row_asc_xheights.median();
+    ascrise = row_asc_ascrise.median();
+    descdrop = -row_asc_descdrop.median();
+  } else if (row_desc_xheights.get_total() > 0) {
+    xheight = row_desc_xheights.median();
+    descdrop = -row_desc_descdrop.median();
+  } else if (row_cap_xheights.get_total() > 0) {
+    compute_xheight_from_modes(&row_cap_xheights, &row_cap_floating_xheights,
+                               TEXTORD_SINGLE_HEIGHT_MODE && rotation_y == 0.0, min_height,
+                               max_height, &(xheight), &(ascrise));
+    if (ascrise == 0) {
+      xheight = row_cap_xheights.median() * K_XHEIGHT_CAP_RATIO;
+    }
+  } else {
+    xheight = block.line_size * K_XHEIGHT_FRACTION;
+  }
+  bool corrected_xheight = false;
+  if (xheight < TEXTORD_MIN_XHEIGHT) {
+    xheight = static_cast<float>(TEXTORD_MIN_XHEIGHT);
+    corrected_xheight = true;
+  }
+  if (corrected_xheight || ascrise <= 0) {
+    ascrise = xheight * asc_frac_xheight;
+  }
+  if (corrected_xheight || descdrop >= 0) {
+    descdrop = -(xheight * desc_frac_xheight);
+  }
+  block.xheight = xheight;
+  for (auto &row : block.rows) {
+    correct_row_xheight(row, xheight, ascrise, descdrop);
+  }
 }
 
 int main(int argc, char **argv) {
@@ -1120,5 +1442,17 @@ int main(int argc, char **argv) {
     printf("STAGE6_ROW[%zu] blobs=%s\n", i, dump_row_blobs(block.rows[i]).c_str());
   }
 
+
+  // ---- Stage 7: compute_block_xheight (wave 3) ----
+  compute_block_xheight(block, page_m, 0.0f);
+  printf("STAGE7_BLOCK xheight_hex=%08x\n", f32_bits(block.xheight));
+  for (size_t i = 0; i < block.rows.size(); ++i) {
+    const OracleRow &row = block.rows[i];
+    XhRowCategory cat = get_row_category(row);
+    int catn = (cat == XH_ASC) ? 0 : (cat == XH_DESC) ? 1 : (cat == XH_UNKNOWN) ? 2 : 3;
+    printf("STAGE7_ROW[%zu] xheight_hex=%08x ascrise_hex=%08x descdrop_hex=%08x evidence=%d category=%d all_caps=%d\n",
+           i, f32_bits(row.xheight), f32_bits(row.ascrise), f32_bits(row.descdrop),
+           row.xheight_evidence, catn, row.all_caps ? 1 : 0);
+  }
   return 0;
 }
