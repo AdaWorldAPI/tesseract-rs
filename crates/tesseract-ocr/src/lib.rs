@@ -18,6 +18,7 @@ pub mod image_input;
 #[cfg(feature = "seg-approx")]
 pub mod line_segment;
 pub mod lstm_recognizer;
+pub mod morph;
 pub mod network;
 pub mod renderer;
 pub mod threshold;
