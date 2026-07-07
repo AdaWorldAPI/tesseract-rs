@@ -1,0 +1,48 @@
+# D3.1 — textord + ccstruct layout class manifest (ruff-driven, walk_tu)
+#
+# Run:
+#   TESSERACT_SRC=/tmp/tesseract LIBCLANG_PATH=/usr/lib/llvm-18/lib \
+#     cargo run -p ruff_cpp_spo --features libclang --example harvest_textord
+#   (example added at crates/ruff_cpp_spo/examples/harvest_textord.rs,
+#    UNCOMMITTED in this session — generalizes harvest_network.rs over an
+#    env-driven header list: all 39 textord/*.h + ccstruct/{blobbox,ocrblock,
+#    ocrrow,polyblk,rect}.h; rect.h added because TBOX is only
+#    forward-declared in the 4 named headers, defined in rect.h)
+#
+# Result: 239 unique classes across 44 headers, 0 failed, 14259 triples,
+# 1686043 ndjson bytes -> textord-manifest.ndjson (banked alongside this file)
+#
+# Focus-class method-count summary (7 layout primitives per batch spec):
+#   BLOBNBOX      97 methods  bases=[ELIST_LINK]
+#   TO_ROW        26 methods  bases=[ELIST2_LINK]
+#   TO_BLOCK      12 methods  bases=[ELIST_LINK]
+#   ROW           31 methods  bases=[ELIST_LINK]
+#   BLOCK         40 methods  bases=[ELIST_LINK]
+#   TBOX          60 methods  bases=[]  (leaf value type, no inheritance)
+#   POLY_BLOCK    18 methods  bases=[]  (leaf value type, no inheritance)
+#
+# None of the 7 focus classes override any virtual method (overrides=[] for
+# all) — they are data/geometry containers (linked-list elements via
+# ELIST_LINK/ELIST2_LINK), not part of a polymorphic dispatch hierarchy like
+# the LSTM Network subclasses in harvest_network.rs. The "vtable" a
+# classid->ClassView dispatch would resolve here is trivial (no override
+# set); the manifest's value is the METHOD INVENTORY + FIELD/BASE shape for
+# the OGAR SoA/adapter mapping, not a dispatch table.
+#
+# Full stderr harvest output follows:
+# ============================================================
+   Compiling ruff_cpp_spo v0.1.0 (/home/user/ruff/crates/ruff_cpp_spo)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.55s
+     Running `target/debug/examples/harvest_textord`
+[harvest] 239 unique classes across 44 headers (0 failed)
+
+[textord] focus-class method manifest:
+  BLOBNBOX      97 methods  bases=["tesseract::ELIST_LINK"]  overrides=[]
+  TO_ROW        26 methods  bases=["tesseract::ELIST2_LINK"]  overrides=[]
+  TO_BLOCK      12 methods  bases=["tesseract::ELIST_LINK"]  overrides=[]
+  ROW           31 methods  bases=["tesseract::ELIST_LINK"]  overrides=[]
+  BLOCK         40 methods  bases=["tesseract::ELIST_LINK"]  overrides=[]
+  TBOX          60 methods  bases=[]  overrides=[]
+  POLY_BLOCK    18 methods  bases=[]  overrides=[]
+
+[harvest] 239 models -> 14259 triples, 1686043 ndjson bytes -> /tmp/textord_manifest.ndjson

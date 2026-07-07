@@ -213,6 +213,104 @@ impl LstmRecognizer {
         Ok((uids, text))
     }
 
+    /// Shared plumbing behind every `recognize_image_file*`/`recognize_grey_line`
+    /// entry point: pre-scale a raw grey buffer to the network's input height
+    /// (A6b) and build the int8 feature grid (A6a), seeding the randomizer
+    /// exactly as `RecognizeLine` does ([`seeded_randomizer`]). Returns the
+    /// prepared grid plus the randomizer at the post-warm-up, post-`from_grey_pix`
+    /// state the forward pass expects.
+    ///
+    /// Pure extraction of the steps every `recognize_image_file*` method already
+    /// performed inline — no behavior change.
+    ///
+    /// [`seeded_randomizer`]: LstmRecognizer::seeded_randomizer
+    fn prepare_grid(&self, grey: &[u8], w: usize, h: usize) -> (NetworkIo, TRand) {
+        let target_h = self
+            .network
+            .input_shape
+            .map_or(36, |s| s.height.max(1) as usize);
+        let (scaled, sw) = prescale_grey_to_height(grey, w, h, target_h);
+        // Seed exactly as RecognizeLine (SetRandomSeed) — the Convolve noise
+        // depends on it. from_grey_pix makes no draws for a full-width image, so
+        // the randomizer enters the forward pass at the post-warm-up state.
+        let mut rng = self.seeded_randomizer();
+        let grid = from_grey_pix(&scaled, sw, target_h, target_h as i32, 0, &mut rng);
+        (grid, rng)
+    }
+
+    /// **D3.0 plumbing** — recognize a single already-cropped grey line strip
+    /// (in memory, not a file on disk) → text, optionally through the dict
+    /// beam. This is the [`prepare_grid`] + [`recognize_grid`]/
+    /// [`recognize_grid_with_dict`] composition factored out of
+    /// `recognize_image_file`/`recognize_image_file_with_dict` so a caller that
+    /// already has a grey buffer (e.g. a cropped page band from
+    /// [`find_text_lines`](crate::line_segment::find_text_lines), `seg-approx`
+    /// feature) doesn't need to round-trip through a temporary PGM file.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::recognize_grid`] / [`Self::recognize_grid_with_dict`].
+    pub fn recognize_grey_line(
+        &self,
+        grey: &[u8],
+        w: usize,
+        h: usize,
+        dict: Option<DictLite>,
+    ) -> Result<(Vec<i32>, String), RecognizerError> {
+        let (grid, mut rng) = self.prepare_grid(grey, w, h);
+        match dict {
+            Some(dict) => self.recognize_grid_with_dict(&grid, &mut rng, dict),
+            None => self.recognize_grid(&grid, &mut rng),
+        }
+    }
+
+    /// **D3.0 — page-level recognition composition (Batch 3-alt).**
+    ///
+    /// **APPROXIMATION — not a Tesseract transcode; replaced by the textord
+    /// batches (plan §P3).** Segments a full GREY page into candidate text-line
+    /// bands via [`find_text_lines`](crate::line_segment::find_text_lines) (the
+    /// D3.0 projection-profile line finder — itself an approximation of the
+    /// real textord layout pipeline), crops each band (full page width, the
+    /// band's row range), and recognizes each crop via [`recognize_grey_line`]
+    /// (the SAME proven line-recognition path `recognize_image_file` uses).
+    /// Non-empty line texts are joined with `'\n'`; empty results (e.g. a band
+    /// that decodes to nothing) are dropped rather than emitting a blank line.
+    ///
+    /// `dict`, if given, is cloned per line (each line gets an independent
+    /// dict-beam decode) — the whole-page equivalent of choosing between
+    /// [`Self::recognize_grey_line`]'s `None`/`Some(DictLite)` branches per
+    /// line.
+    ///
+    /// # Errors
+    ///
+    /// The first [`RecognizerError`] hit while recognizing any band (from
+    /// [`Self::recognize_grey_line`]); recognition stops at that band.
+    ///
+    /// [`recognize_grey_line`]: LstmRecognizer::recognize_grey_line
+    #[cfg(feature = "seg-approx")]
+    pub fn recognize_page(
+        &self,
+        grey: &[u8],
+        w: usize,
+        h: usize,
+        dict: Option<&DictLite>,
+    ) -> Result<String, RecognizerError> {
+        let bands = crate::line_segment::find_text_lines(grey, w, h);
+        let mut lines: Vec<String> = Vec::with_capacity(bands.len());
+        for band in bands {
+            let band_h = band.height();
+            if band_h == 0 {
+                continue;
+            }
+            let crop = &grey[band.top * w..band.bottom * w];
+            let (_ids, text) = self.recognize_grey_line(crop, w, band_h, dict.cloned())?;
+            if !text.is_empty() {
+                lines.push(text);
+            }
+        }
+        Ok(lines.join("\n"))
+    }
+
     /// `LSTMRecognizer::SetRandomSeed` (`lstmrecognizer.h:287-291`): the exact
     /// randomizer seeding `RecognizeLine` uses before the forward pass —
     /// `seed = (i64)sample_iteration · 0x10000001`, `minstd` seed, one warm-up
@@ -252,17 +350,7 @@ impl LstmRecognizer {
     pub fn recognize_image_file(&self, path: &Path) -> Result<(Vec<i32>, String), RecognizerError> {
         let bytes = std::fs::read(path).map_err(RecognizerError::Io)?;
         let (grey, w, h) = parse_pgm(&bytes).map_err(RecognizerError::Pgm)?;
-        let target_h = self
-            .network
-            .input_shape
-            .map_or(36, |s| s.height.max(1) as usize);
-        let (scaled, sw) = prescale_grey_to_height(&grey, w, h, target_h);
-        // Seed exactly as RecognizeLine (SetRandomSeed) — the Convolve noise
-        // depends on it. from_grey_pix makes no draws for a full-width image, so
-        // the randomizer enters the forward pass at the post-warm-up state.
-        let mut rng = self.seeded_randomizer();
-        let grid = from_grey_pix(&scaled, sw, target_h, target_h as i32, 0, &mut rng);
-        self.recognize_grid(&grid, &mut rng)
+        self.recognize_grey_line(&grey, w, h, None)
     }
 
     /// The dict-enabled counterpart of [`Self::recognize_image_file`] (D1.3):
@@ -282,14 +370,7 @@ impl LstmRecognizer {
     ) -> Result<(Vec<i32>, String), RecognizerError> {
         let bytes = std::fs::read(path).map_err(RecognizerError::Io)?;
         let (grey, w, h) = parse_pgm(&bytes).map_err(RecognizerError::Pgm)?;
-        let target_h = self
-            .network
-            .input_shape
-            .map_or(36, |s| s.height.max(1) as usize);
-        let (scaled, sw) = prescale_grey_to_height(&grey, w, h, target_h);
-        let mut rng = self.seeded_randomizer();
-        let grid = from_grey_pix(&scaled, sw, target_h, target_h as i32, 0, &mut rng);
-        self.recognize_grid_with_dict(&grid, &mut rng, dict)
+        self.recognize_grey_line(&grey, w, h, Some(dict))
     }
 
     /// **The word/box output surface** — the counterpart of
@@ -319,13 +400,7 @@ impl LstmRecognizer {
     ) -> Result<Vec<WordResult>, RecognizerError> {
         let bytes = std::fs::read(path).map_err(RecognizerError::Io)?;
         let (grey, w, h) = parse_pgm(&bytes).map_err(RecognizerError::Pgm)?;
-        let target_h = self
-            .network
-            .input_shape
-            .map_or(36, |s| s.height.max(1) as usize);
-        let (scaled, sw) = prescale_grey_to_height(&grey, w, h, target_h);
-        let mut rng = self.seeded_randomizer();
-        let grid = from_grey_pix(&scaled, sw, target_h, target_h as i32, 0, &mut rng);
+        let (grid, mut rng) = self.prepare_grid(&grey, w, h);
         let outputs = self.network.forward(&grid, &mut rng)?;
         if outputs.int_mode() {
             return Err(RecognizerError::Network(NetError::Forward(

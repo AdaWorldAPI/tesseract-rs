@@ -1,0 +1,32 @@
+# Run:
+#   curl -sS -o /tmp/leptonica-src/morph.c \
+#     https://raw.githubusercontent.com/DanBloomberg/leptonica/master/src/morph.c
+#   LIBCLANG_PATH=/usr/lib/llvm-18/lib SCALE_SRC=/tmp/leptonica-src/morph.c \
+#     cargo run -p ruff_cpp_spo --features libclang --example harvest_leptonica_scale
+#
+# intra-TU dispatch manifest (ruff_cpp_spo::walk_free_functions on /tmp/leptonica-src/morph.c)
+# <function>	dispatches_to	<in-TU callees>   ([] = LEAF kernel)
+pixDilate	dispatches_to	["processMorphArgs1"]	(+6 non-TU callees)
+pixErode	dispatches_to	["processMorphArgs1"]	(+7 non-TU callees)
+pixHMT	dispatches_to	["processMorphArgs1"]	(+8 non-TU callees)
+pixOpen	dispatches_to	["pixDilate", "pixErode", "processMorphArgs2"]	(+2 non-TU callees)
+pixClose	dispatches_to	["pixDilate", "pixErode", "processMorphArgs2"]	(+2 non-TU callees)
+pixCloseSafe	dispatches_to	["pixClose"]	(+7 non-TU callees)
+pixOpenGeneralized	dispatches_to	["pixDilate", "pixHMT", "processMorphArgs2"]	(+2 non-TU callees)
+pixCloseGeneralized	dispatches_to	["pixDilate", "pixHMT", "processMorphArgs2"]	(+2 non-TU callees)
+pixDilateBrick	dispatches_to	["pixDilate"]	(+6 non-TU callees)
+pixErodeBrick	dispatches_to	["pixErode"]	(+6 non-TU callees)
+pixOpenBrick	dispatches_to	["pixDilate", "pixErode", "pixOpen"]	(+6 non-TU callees)
+pixCloseBrick	dispatches_to	["pixClose", "pixDilate", "pixErode"]	(+6 non-TU callees)
+pixCloseSafeBrick	dispatches_to	["pixClose", "pixCloseBrick", "pixDilate", "pixErode"]	(+8 non-TU callees)
+selectComposableSels	dispatches_to	["selectComposableSizes"]	(+3 non-TU callees)
+selectComposableSizes	dispatches_to	[]	(+2 non-TU callees)
+pixDilateCompBrick	dispatches_to	["pixDilate", "selectComposableSels"]	(+7 non-TU callees)
+pixErodeCompBrick	dispatches_to	["pixErode", "selectComposableSels"]	(+5 non-TU callees)
+pixOpenCompBrick	dispatches_to	["pixDilate", "pixErode", "selectComposableSels"]	(+5 non-TU callees)
+pixCloseCompBrick	dispatches_to	["pixDilate", "pixErode", "selectComposableSels"]	(+5 non-TU callees)
+pixCloseSafeCompBrick	dispatches_to	["pixCloseCompBrick", "pixDilate", "pixErode", "selectComposableSels"]	(+7 non-TU callees)
+resetMorphBoundaryCondition	dispatches_to	[]	(+1 non-TU callees)
+getMorphBorderPixelColor	dispatches_to	[]	(+1 non-TU callees)
+processMorphArgs1	dispatches_to	[]	(+7 non-TU callees)
+processMorphArgs2	dispatches_to	[]	(+5 non-TU callees)
