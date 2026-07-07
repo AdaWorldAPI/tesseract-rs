@@ -9,5 +9,5 @@
 # (source: AdaWorldAPI/Tesseract) before it lands. The transcoded primitives
 # ride the OGAR Core (`lance-graph-contract`) per the Core-First doctrine.
 [workspace]
-members = ["crates/tesseract-core", "crates/tesseract-ocr", "crates/tesseract-recognizer", "crates/tesseract-ocr-pdf"]
+members = ["crates/tesseract-core", "crates/tesseract-ocr", "crates/tesseract-recognizer", "crates/tesseract-ocr-pdf", "crates/tesseract-ogar"]
 resolver = "2"

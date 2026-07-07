@@ -1,0 +1,15 @@
+[package]
+name = "tesseract-ogar"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "In-binary executor for the OGAR-authoritative tesseract-rs OCR action table (ogar_vocab::ocr_actions): OGAR declares the eight capabilities, this crate executes them. No serde, no wire format — a typed OcrRequest/OcrResponse dispatch, monomorphized, in the same binary as the declaration it is proven against."
+
+[dependencies]
+# THE authoritative OCR capability table (Phase 1) — sibling checkout, path dep,
+# no pin, per the workspace's local-repos-are-canonical convention.
+ogar-vocab = { path = "../../../OGAR/crates/ogar-vocab" }
+# The two OCR foundations + the PDF front-end (path deps, fork-only policy).
+tesseract-ocr = { path = "../tesseract-ocr", features = ["seg-approx"] }
+tesseract-core = { path = "../tesseract-core" }
+tesseract-ocr-pdf = { path = "../tesseract-ocr-pdf" }
