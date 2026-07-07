@@ -14,3 +14,12 @@ pixUnsharpMasking	(not defined in this TU)
 pixUnsharpMaskingGray	(not defined in this TU)
 pixScaleGray2xLI	dispatches_to	[]	(+11 non-family callees)
 pixScaleGray4xLI	dispatches_to	[]	(+11 non-family callees)
+
+# --- enhance.c (pixUnsharpMasking dispatch, harvested 2026-07-07) ---
+# intra-TU dispatch manifest (ruff_cpp_spo::walk_free_functions on /tmp/leptonica-src/enhance.c)
+# <function>	dispatches_to	<in-TU callees>   ([] = LEAF kernel)
+pixUnsharpMasking	dispatches_to	["pixUnsharpMaskingFast", "pixUnsharpMaskingGray"]	(+10 non-TU callees)
+pixUnsharpMaskingGray	dispatches_to	["pixUnsharpMaskingGrayFast"]	(+13 non-TU callees)
+pixUnsharpMaskingGrayFast	dispatches_to	["pixUnsharpMaskingGray1D", "pixUnsharpMaskingGray2D"]	(+5 non-TU callees)
+pixUnsharpMaskingGray1D	dispatches_to	[]	(+8 non-TU callees)
+pixUnsharpMaskingGray2D	dispatches_to	[]	(+13 non-TU callees)
