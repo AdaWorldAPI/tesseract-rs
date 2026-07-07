@@ -24,11 +24,19 @@ use ndarray::{Array2, ArrayView2};
 pub mod activation;
 pub mod fully_connected;
 pub mod graph;
+pub mod layers2d;
 pub mod lstm;
+pub mod networkio;
+pub mod stridemap;
+pub mod trand;
 pub mod weight_matrix;
 pub use fully_connected::{fully_connected_forward, FcActivation};
 pub use graph::Layer;
+pub use layers2d::{convolve_forward, maxpool_forward, reconfig_forward};
 pub use lstm::Lstm;
+pub use networkio::NetworkIo;
+pub use stridemap::{FlexDim, StrideIndex, StrideMap};
+pub use trand::TRand;
 pub use weight_matrix::WeightMatrix;
 
 /// `INT8_MAX` (127) — the value the recognizer's imaginary bias input `1.0`

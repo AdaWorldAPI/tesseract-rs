@@ -30,9 +30,11 @@ fn main() {
     let recoder = UnicharCompress::load_from_file(Path::new(recoder_path)).expect("load recoder");
     let n = recoder.code_range() as usize; // 111 for eng.lstm (the Fc111 output width)
 
-    // Winner pattern (T=8): a code held across steps (CTC-folds) with nulls
-    // between, to exercise folding + null-dropping.
-    let winners: [i32; 8] = [5, 5, null_char, 7, 7, 7, null_char, 9];
+    // Winner pattern (T=10): a code held across steps (CTC-folds), nulls
+    // between, and a SPACE (code 0 → unichar-id 0 in the eng pass-through
+    // recoder) mid-sequence — exercising folding, null-dropping, and the C2
+    // space-merge (space donates leading-null certainty to the previous char).
+    let winners: [i32; 10] = [5, 5, null_char, 7, 7, null_char, 0, null_char, 9, 9];
 
     // Distinct (tie-free) probabilities: a tiny per-code base breaks ties, the
     // winner gets +0.8, the null +0.1 (unless it is the winner), then normalize.
@@ -78,5 +80,19 @@ fn main() {
     }
     for xcoord in &xcoords {
         println!("xcoord\t{xcoord}");
+    }
+    // C2: the unichar-ids extract (ids + f32-bit certs/ratings + xcoords).
+    let (uids, certs, ratings, uxcoords) = beam.extract_best_path_as_unichar_ids();
+    for uid in &uids {
+        println!("uid\t{uid}");
+    }
+    for c in &certs {
+        println!("uc\t{:08x}", c.to_bits());
+    }
+    for r in &ratings {
+        println!("ur\t{:08x}", r.to_bits());
+    }
+    for x in &uxcoords {
+        println!("ux\t{x}");
     }
 }

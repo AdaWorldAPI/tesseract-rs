@@ -69,10 +69,21 @@ const NC_ONLY_DUP: usize = 1;
 /// only be followed by a non-duplicate.
 const NC_NO_DUP: usize = 2;
 
-/// `PermuterType::TOP_CHOICE_PERM` (`ratngs.h`). The non-dict path never uses any
-/// other permuter, so the concrete value only ever participates in the (always
-/// equal) [`RecodeBeamSearch::update_heap_if_matched`] identity check.
+/// `PermuterType::TOP_CHOICE_PERM` (`ratngs.h:238`). The non-dict path never uses
+/// any other permuter, so the concrete value only ever participates in the
+/// (always equal) [`RecodeBeamSearch::update_heap_if_matched`] identity check and
+/// the `!= NO_PERM` space test in the unichar extract.
 const TOP_CHOICE_PERM: u8 = 2;
+
+/// `PermuterType::NO_PERM` (`ratngs.h:236`) — in the full engine, the marker a
+/// dict-path space carries so the unichar extract "forgets" preceding null
+/// certainty (`recodebeam.cpp:609-613`). Non-dict nodes are never `NO_PERM`.
+const NO_PERM: u8 = 0;
+
+/// `UNICHAR_SPACE` (`unicharset.h:36`) — unichar-id 0 is the space in every
+/// unicharset; the unichar extract folds a space's leading-null certainty into
+/// the PREVIOUS character (`recodebeam.cpp:594-604`).
+const UNICHAR_SPACE: i32 = 0;
 
 /// The top-n classification of a code at the current timestep
 /// (`TopNState`, `recodebeam.h:84`).
@@ -137,9 +148,10 @@ struct RecodeNode {
     start_of_dawg: bool,
     /// True if `code` is a duplicate of `prev.code` (CTC fold-on-the-fly).
     duplicate: bool,
-    /// Total certainty of the path to this position. (The per-position `certainty`
-    /// of `RecodeNode` is dropped — the labels path never reads it; it returns when
-    /// `ExtractBestPathAsUnicharIds` lands.)
+    /// Certainty (log prob) of just this position — read by
+    /// [`RecodeBeamSearch::extract_best_path_as_unichar_ids`] (C2).
+    certainty: f32,
+    /// Total certainty of the path to this position.
     score: f32,
     /// The previous node in the chain, as an arena index.
     prev: Option<u32>,
@@ -746,6 +758,7 @@ impl<'a> RecodeBeamSearch<'a> {
             permuter,
             start_of_dawg,
             duplicate,
+            certainty: cert,
             score,
             prev,
             code_hash,
@@ -890,6 +903,95 @@ impl<'a> RecodeBeamSearch<'a> {
         }
         xcoords.push(width as i32);
         (labels, xcoords)
+    }
+
+    /// `ExtractBestPathAsUnicharIds` (`recodebeam.cpp:224-236` →
+    /// `ExtractPathAsUnicharIds`, `recodebeam.cpp:567-632`) — recognizer **C2**,
+    /// the general text extract: walk the best path skipping duplicates, nulls
+    /// and (multi-code) intermediate parts, returning per-character
+    /// `(unichar_ids, certs, ratings, xcoords)`. This is the words-with-certs
+    /// surface `RecognizeLine` consumes (B3 milestone ii); unlike
+    /// [`extract_best_path_as_labels`](Self::extract_best_path_as_labels) it
+    /// groups multi-code sequences (only the completing code carries a valid
+    /// `unichar_id`; intermediates are `INVALID` and fold into the rating).
+    ///
+    /// Float contract (`recodebeam.cpp:582-624`): the running `certainty`/
+    /// `rating` accumulate in **f64** from the nodes' f32 certainties and are
+    /// narrowed to f32 on push — including the space-merge back-writes
+    /// (`certs.back()`/`ratings.back()`), where the comparison promotes the
+    /// stored f32 to f64, exactly as C++.
+    ///
+    /// Space handling: a `UNICHAR_SPACE` whose node is not `NO_PERM` donates
+    /// its accumulated leading-null certainty/rating to the PREVIOUS character
+    /// (`recodebeam.cpp:594-604`); a `NO_PERM` space (dict-path only — never
+    /// produced by this non-dict beam, kept for fidelity) resets the certainty
+    /// to its own (`recodebeam.cpp:609-613`).
+    #[must_use]
+    pub fn extract_best_path_as_unichar_ids(&self) -> (Vec<i32>, Vec<f32>, Vec<f32>, Vec<i32>) {
+        let best_nodes = self.extract_path(self.extract_best_node());
+        let mut unichar_ids: Vec<i32> = Vec::new();
+        let mut certs: Vec<f32> = Vec::new();
+        let mut ratings: Vec<f32> = Vec::new();
+        let mut xcoords: Vec<i32> = Vec::new();
+        let width = best_nodes.len();
+        let mut t = 0usize;
+        while t < width {
+            let mut certainty = 0.0_f64;
+            let mut rating = 0.0_f64;
+            // Leading nulls / intermediate codes: fold into the accumulators.
+            while t < width && self.arena[best_nodes[t] as usize].unichar_id == INVALID_UNICHAR_ID {
+                let cert = f64::from(self.arena[best_nodes[t] as usize].certainty);
+                t += 1;
+                if cert < certainty {
+                    certainty = cert;
+                }
+                rating -= cert;
+            }
+            if t < width {
+                let unichar_id = self.arena[best_nodes[t] as usize].unichar_id;
+                if unichar_id == UNICHAR_SPACE
+                    && !certs.is_empty()
+                    && self.arena[best_nodes[t] as usize].permuter != NO_PERM
+                {
+                    // The rating/certainty accumulated so far go on the
+                    // PREVIOUS character, not the space itself.
+                    let back = certs.len() - 1;
+                    if certainty < f64::from(certs[back]) {
+                        certs[back] = certainty as f32;
+                    }
+                    ratings[back] = (f64::from(ratings[back]) + rating) as f32;
+                    certainty = 0.0;
+                    rating = 0.0;
+                }
+                unichar_ids.push(unichar_id);
+                xcoords.push(t as i32);
+                loop {
+                    let node = &self.arena[best_nodes[t] as usize];
+                    let cert = f64::from(node.certainty);
+                    let no_perm_space = unichar_id == UNICHAR_SPACE && node.permuter == NO_PERM;
+                    t += 1;
+                    // A NO_PERM space forgets the preceding nulls' certainty.
+                    if cert < certainty || no_perm_space {
+                        certainty = cert;
+                    }
+                    rating -= cert;
+                    if !(t < width && self.arena[best_nodes[t] as usize].duplicate) {
+                        break;
+                    }
+                }
+                certs.push(certainty as f32);
+                ratings.push(rating as f32);
+            } else if !certs.is_empty() {
+                // Trailing nulls: fold into the last character.
+                let back = certs.len() - 1;
+                if certainty < f64::from(certs[back]) {
+                    certs[back] = certainty as f32;
+                }
+                ratings[back] = (f64::from(ratings[back]) + rating) as f32;
+            }
+        }
+        xcoords.push(width as i32);
+        (unichar_ids, certs, ratings, xcoords)
     }
 }
 
