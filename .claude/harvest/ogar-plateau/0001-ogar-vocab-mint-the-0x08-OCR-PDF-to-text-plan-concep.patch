@@ -1,0 +1,224 @@
+From 0888f3504bb02ff70bb20629d7d31f5c7ee499ad Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 7 Jul 2026 09:31:41 +0000
+Subject: [PATCH] ogar-vocab: mint the 0x08 OCR PDF-to-text plan concepts
+ (0x0805..0x0809)
+
+Five container-KIND mints for the tesseract-rs PDF->text integration plan
+(pdf-to-text-ocr-v1.md Phase 0 D0.3) -- the plan is the emit-seam declaration,
+each row names its consumer phase (mint-on-emit guard honored, not pre-minting
+blind):
+
+  textline     0x0805  segmented text line (box+baseline)   plan P1B + P3E
+  blob         0x0806  connected-component container         plan P3B/3D
+  page_layout  0x0807  layout-analysis result container      plan P3F/4A
+  page_image   0x0808  rasterized page (decoded+normalized)  plan P2
+  ocr_renderer 0x0809  output-rendering kind (fmt=custom-low) plan P4B-D
+
+All lockstep regions updated: CODEBOOK tuples, class_ids consts + ALL,
+builder Classes (AR shapes, content stays in content stores per the 0x08
+section note), domain-enumeration pins (OCR 4->9), count fuse ALL.len()
+79->84. The lance-graph contract mirror (ogar_codebook CODEBOOK + the
+lance-graph-ogar COUNT_FUSE) is updated in the paired lance-graph commit,
+per the two-sided drift-fuse contract.
+
+Gates: cargo test -p ogar-vocab green; fmt + clippy -D warnings clean.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016b33swuXE23hKtqxsHu9p1
+---
+ crates/ogar-vocab/src/lib.rs | 127 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 119 insertions(+), 8 deletions(-)
+
+diff --git a/crates/ogar-vocab/src/lib.rs b/crates/ogar-vocab/src/lib.rs
+index 6e0bfa4..65f11d4 100644
+--- a/crates/ogar-vocab/src/lib.rs
++++ b/crates/ogar-vocab/src/lib.rs
+@@ -1203,6 +1203,14 @@ const CODEBOOK: &[(&str, u16)] = &[
+     ("recoder", 0x0802),
+     ("charset", 0x0803),
+     ("network_layer", 0x0804),
++    // PDF→text plan mints (tesseract-rs `pdf-to-text-ocr-v1.md` Phase 0 D0.3;
++    // the plan IS the emit-seam declaration — each row names its consumer
++    // phase, honoring the mint-on-emit guard rather than pre-minting blind).
++    ("textline", 0x0805),
++    ("blob", 0x0806),
++    ("page_layout", 0x0807),
++    ("page_image", 0x0808),
++    ("ocr_renderer", 0x0809),
+     // ── 0x09XX — Health domain (clinical / patient / care) ──
+     // medcare-rs Healthcare-namespace promotion (Northstar T9). The 7
+     // entities the OGIT `NTO/Healthcare/entities/` TTL ships, projected
+@@ -1678,6 +1686,25 @@ pub mod class_ids {
+     /// ruff→OGAR network harvest lands here). Wire-declared first in the
+     /// lance-graph contract mirror; this is the authoritative OGAR counterpart.
+     pub const NETWORK_LAYER: u16 = 0x0804;
++    /// `textline` (`0x0805`) — a segmented text line: box + baseline, the unit
++    /// the LSTM line recognizer consumes and the word/box extract references
++    /// (plan Phases 1B + 3E; the line images `RecognizeLine` reads).
++    pub const TEXTLINE: u16 = 0x0805;
++    /// `blob` (`0x0806`) — a connected-component blob container (Tesseract
++    /// `C_BLOB`/`BLOBNBOX` kind), the page-segmentation substrate (plan
++    /// Phase 3B/3D). Content (outlines/pixels) stays in content stores.
++    pub const BLOB: u16 = 0x0806;
++    /// `page_layout` (`0x0807`) — the layout-analysis result container:
++    /// blocks / columns / reading order over one page (plan Phase 3F/4A).
++    pub const PAGE_LAYOUT: u16 = 0x0807;
++    /// `page_image` (`0x0808`) — a rasterized page container (decoded +
++    /// grey/binary normalized), the OCR input kind (plan Phase 2).
++    pub const PAGE_IMAGE: u16 = 0x0808;
++    /// `ocr_renderer` (`0x0809`) — an output-rendering KIND (txt / tsv /
++    /// hOCR / searchable-PDF), one slot; the concrete format is the
++    /// classid custom-low half, mirroring the `network_layer` pattern
++    /// (plan Phase 4B-D).
++    pub const OCR_RENDERER: u16 = 0x0809;
+ 
+     // ── 0x09XX — health domain (medcare-rs Healthcare namespace) ──
+ 
+@@ -1878,6 +1905,11 @@ pub mod class_ids {
+         ("recoder", RECODER),
+         ("charset", CHARSET),
+         ("network_layer", NETWORK_LAYER),
++        ("textline", TEXTLINE),
++        ("blob", BLOB),
++        ("page_layout", PAGE_LAYOUT),
++        ("page_image", PAGE_IMAGE),
++        ("ocr_renderer", OCR_RENDERER),
+         // 0x09XX — health
+         ("patient", PATIENT),
+         ("diagnosis", DIAGNOSIS),
+@@ -1986,7 +2018,7 @@ pub mod class_ids {
+             // lance-graph mirror is rebuilt against it.
+             assert_eq!(
+                 ALL.len(),
+-                79,
++                84,
+                 "class_ids::ALL count changed — update this pin AND the \
+                  lance-graph mirror COUNT_FUSE (crates/lance-graph-ogar/src/lib.rs) \
+                  in the same PR",
+@@ -2808,11 +2840,16 @@ pub fn all_promoted_classes() -> Vec<Class> {
+         // `osint_system` / `osint_person` mints); no calls follow — OGAR
+         // vocabulary carries no OSINT concept names, see the CODEBOOK
+         // 0x07XX section note.
+-        // 0x08XX — OCR arm (4 container kinds), in class_ids::ALL order.
++        // 0x08XX — OCR arm (9 container kinds), in class_ids::ALL order.
+         unicharset(),
+         recoder(),
+         charset(),
+         network_layer(),
++        textline(),
++        blob(),
++        page_layout(),
++        page_image(),
++        ocr_renderer(),
+         // 0x09XX — health arm (7 OGIT Healthcare concepts), in
+         // class_ids::ALL order.
+         patient(),
+@@ -3828,6 +3865,69 @@ pub fn network_layer() -> Class {
+     c
+ }
+ 
++/// Textline (`0x0805`) — a segmented text line (box + baseline), the unit the
++/// LSTM line recognizer consumes (plan Phases 1B + 3E).
++#[must_use]
++pub fn textline() -> Class {
++    let mut c = Class::new("Textline");
++    c.language = Language::Unknown;
++    c.canonical_concept = Some("textline".to_string());
++    let mut baseline_y = Attribute::new("baseline_y");
++    baseline_y.type_name = Some("i32".to_string());
++    c.attributes = vec![baseline_y];
++    c.associations = vec![family_edge("belongs_to", "PageLayout")];
++    c
++}
++
++/// Blob (`0x0806`) — a connected-component blob container (Tesseract
++/// `C_BLOB`/`BLOBNBOX` kind), the page-segmentation substrate (plan Phase 3B/3D).
++#[must_use]
++pub fn blob() -> Class {
++    let mut c = Class::new("Blob");
++    c.language = Language::Unknown;
++    c.canonical_concept = Some("blob".to_string());
++    c.associations = vec![family_edge("belongs_to", "Textline")];
++    c
++}
++
++/// PageLayout (`0x0807`) — the layout-analysis result container: blocks /
++/// columns / reading order over one page (plan Phase 3F/4A).
++#[must_use]
++pub fn page_layout() -> Class {
++    let mut c = Class::new("PageLayout");
++    c.language = Language::Unknown;
++    c.canonical_concept = Some("page_layout".to_string());
++    c.associations = vec![family_edge("derived_from", "PageImage")];
++    c
++}
++
++/// PageImage (`0x0808`) — a rasterized page container (decoded + grey/binary
++/// normalized), the OCR input kind (plan Phase 2).
++#[must_use]
++pub fn page_image() -> Class {
++    let mut c = Class::new("PageImage");
++    c.language = Language::Unknown;
++    c.canonical_concept = Some("page_image".to_string());
++    let mut depth = Attribute::new("depth");
++    depth.type_name = Some("u8".to_string());
++    c.attributes = vec![depth];
++    c
++}
++
++/// OcrRenderer (`0x0809`) — an output-rendering KIND (txt / tsv / hOCR /
++/// searchable-PDF), one slot; the concrete format is the classid custom-low
++/// half, mirroring the `network_layer` pattern (plan Phase 4B-D).
++#[must_use]
++pub fn ocr_renderer() -> Class {
++    let mut c = Class::new("OcrRenderer");
++    c.language = Language::Unknown;
++    c.canonical_concept = Some("ocr_renderer".to_string());
++    let mut format = Attribute::new("format");
++    format.type_name = Some("u8".to_string());
++    c.attributes = vec![format];
++    c
++}
++
+ // ─────────────────────────────────────────────────────────────────────
+ // 0x09XX — Health domain (OGIT Healthcare). The reusable Active-Record
+ // shape for the clinical concepts. `diagnosis` (0x0902) is the worked
+@@ -5258,17 +5358,28 @@ mod tests {
+         }
+         // Counts line up with the codebook blocks.
+         assert_eq!(concepts_in_domain(ConceptDomain::Health).count(), 7);
+-        // 0x08XX OCR: the four container KINDS (unicharset/recoder/charset/
+-        // network_layer). Content (the 112 unichars, code tables) never becomes
+-        // concepts — see the CODEBOOK 0x08XX section note (Osint zero-rows
+-        // precedent).
+-        assert_eq!(concepts_in_domain(ConceptDomain::Ocr).count(), 4);
++        // 0x08XX OCR: the nine container KINDS (unicharset/recoder/charset/
++        // network_layer + the PDF→text plan mints textline/blob/page_layout/
++        // page_image/ocr_renderer). Content (the 112 unichars, code tables,
++        // blob outlines) never becomes concepts — see the CODEBOOK 0x08XX
++        // section note (Osint zero-rows precedent).
++        assert_eq!(concepts_in_domain(ConceptDomain::Ocr).count(), 9);
+         let ocr: Vec<&str> = concepts_in_domain(ConceptDomain::Ocr)
+             .map(|(name, _)| name)
+             .collect();
+         assert_eq!(
+             ocr,
+-            ["unicharset", "recoder", "charset", "network_layer"],
++            [
++                "unicharset",
++                "recoder",
++                "charset",
++                "network_layer",
++                "textline",
++                "blob",
++                "page_layout",
++                "page_image",
++                "ocr_renderer",
++            ],
+             "OCR domain set drift — re-sync the consumer coverage gate",
+         );
+         assert_eq!(concepts_in_domain(ConceptDomain::HR).count(), 4);
+-- 
+2.43.0
+

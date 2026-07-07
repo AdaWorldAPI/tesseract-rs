@@ -410,6 +410,21 @@ impl NetworkIo {
         }
     }
 
+    /// `SetPixel` (`networkio.cpp:290-297`): store one image pixel into the
+    /// grid, stretching `[black, black + 2·contrast]` to the dynamic range.
+    /// `float_pixel = (pixel − black)/contrast − 1`; int mode quantizes with
+    /// **×(INT8_MAX+1) = ×128** (NOT the ×127 of `write_time_step` — a distinct
+    /// rounding constant), `clip(round(128·float_pixel), ±127)`.
+    pub fn set_pixel(&mut self, t: usize, f: usize, pixel: i32, black: f32, contrast: f32) {
+        let float_pixel = (pixel as f32 - black) / contrast - 1.0;
+        if self.int_mode {
+            self.i.row_mut(t)[f] =
+                int_cast_rounded_f32(float_pixel * (INT8_MAX_F32 + 1.0)).clamp(-127, 127) as i8;
+        } else {
+            self.f.row_mut(t)[f] = float_pixel;
+        }
+    }
+
     /// `CopyWithYReversal` (`networkio.cpp:868-885`): per image, swap row
     /// bands top-to-bottom.
     pub fn copy_with_y_reversal(&mut self, src: &NetworkIo) {

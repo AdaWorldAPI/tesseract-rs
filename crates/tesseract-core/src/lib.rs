@@ -50,6 +50,11 @@
 
 pub mod recodebeam;
 
+/// The Core's proven network-structure surface (`NetworkType`, `NetworkHeader`,
+/// the FacetCascade sink — `E-OCR-NETWORK-SINK-1`): the per-node header parse
+/// the OCR assembly tier's tree loader consumes (Core-First: structure
+/// vocabulary from the Core, compute payloads in the recognizer).
+pub use lance_graph_contract::network;
 pub use lance_graph_contract::unichar;
 pub use lance_graph_contract::unicharcompress::{RecodedCharId, RecoderError, UnicharCompress};
 pub use lance_graph_contract::unicharset::{UniCharSet, UniCharSetError};

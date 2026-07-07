@@ -334,3 +334,1082 @@ NetworkIo), `parallel.cpp::Forward` (CopyPacking), `reversed.cpp::Forward`.
 Oracle: per-node spec/num_weights on real `/tmp/eng.lstm` (extend the Core's
 proven `network_dump`), then a full-tree `Forward` diff on a synthetic
 NetworkIo, then RecognizeLine (B3) on a real line image.
+
+---
+
+## B1 EXECUTED (2026-07-07) — network loader + runnable forward, BYTE-PARITY GREEN
+
+**Shipped** in the NEW assembly crate `crates/tesseract-ocr` (deps both
+foundations, exactly as the design decision above called for):
+
+- `src/network.rs` — `Network::from_le_bytes` (= `Network::CreateFromFile` +
+  `Plumbing::DeSerialize`) → a runnable `Node` tree; `Node::forward_io` composes
+  A1-A5 grid ops + Leaf-4/5/6 compute. `InputShape`, `ReverseKind{X,Y,Txy}`,
+  `NetError`.
+- `examples/network_dump.rs` — loads real `/tmp/eng.lstm`, prints the tree +
+  `nw`/`ni`/`no`, runs a full `forward` over a synthetic grid (width arg), dumps
+  `oshape` + per-timestep softmax f32-bit `o` lines; writes the shared
+  `net_input.bin`.
+- `tesseract-core` re-exports `lance_graph_contract::network` (Core-First
+  header surface).
+
+**Two corrections the execution nailed (bank these):**
+
+1. **The type discriminant is the `kTypeNames` STRING, not a raw ordinal.**
+   `Network::Serialize` writes `i8 tag = NT_NONE(0)` THEN `string type_name`
+   (u32 len + bytes) — the Core's `NetworkHeader::from_le_bytes` parses exactly
+   this. A synthetic-byte test that pushes a single type ordinal will NOT parse.
+   Mirror the Core's `header_bytes(type_name, ni, no, num_weights, name)` helper.
+2. **`NF_LAYER_SPECIFIC_LR` (bit 64) is NOT a reject.** The real eng.lstm outer
+   Series carries it; `Plumbing::DeSerialize` reads a trailing `learning_rates_`
+   (`u32 count` + `count×f32`) AFTER the children. `skip_layer_lr(cur, flags)`
+   reads past it (only after Plumbing + Reversed; leaf nodes never serialize it).
+
+**Byte-parity result:** the full composed forward — Convolve+TRand-noise →
+FcTanh → Maxpool → XYTranspose → LstmSummary → Lstm → XReversed → Lstm → Lstm →
+FcSoftmax — is **bit-identical** to libtesseract's `net->Forward` on **8/8**
+synthetic image widths (6, 8, 11, 17, 24, 31, 40, 63 — odd widths stress the
+ragged Maxpool-3×3 / Convolve-3×3 / Txy chain). `num_weights` self-check
+385807 == libtesseract; softmax f32 output. Board: lance-graph
+`E-OCR-NETWORK-FORWARD-1`.
+
+**Build/run the parity (the `/tmp` artifacts are ephemeral — rebuild):**
+```sh
+# Rust side (writes net_input.bin + the o-lines):
+cargo run -q -p tesseract-ocr --example network_dump -- /tmp/eng.lstm /tmp/net_input.bin 24 > /tmp/rust_net.tsv
+# Oracle (public-API only — dodges the 5.3.4-lib / 5.5.0-header ABI skew):
+g++ -std=c++17 -DFAST_FLOAT /tmp/network_forward_oracle.cpp \
+    -I/tmp/tesseract/src/lstm -I/tmp/tesseract/src/ccutil -I/tmp/tesseract/src/ccstruct \
+    -I/tmp/tesseract/include $(pkg-config --cflags --libs tesseract lept) \
+    -o /tmp/network_forward_oracle
+/tmp/network_forward_oracle /tmp/eng.lstm /tmp/net_input.bin > /tmp/oracle_net.tsv
+diff <(grep '^o' /tmp/oracle_net.tsv) <(grep '^o' /tmp/rust_net.tsv)   # empty => green
+```
+
+### Oracle source (banked — `/tmp/network_forward_oracle.cpp`, public-API only)
+```cpp
+// Byte-parity oracle for the FULL network-tree forward pass vs the Rust
+// transcode's `Network::forward` (tesseract-ocr/examples/network_dump.rs).
+//
+// Loads the real eng.lstm via the REAL public `Network::CreateFromFile`,
+// builds the same synthetic int8 input grid (read from the shared
+// net_input.bin, written in exact StrideMap walk order), seeds the REAL
+// `TRand` identically (seed 1, no warm-up draw), and calls the REAL
+// polymorphic `Network::Forward` — which dispatches through Series/
+// Convolve/Maxpool/Txy(Reversed)/LSTM/FullyConnected exactly as the C++
+// library always has. Dumps the same `oshape` / `o` lines as the Rust side
+// for a byte-identical diff.
+//
+//   ./network_forward_oracle [eng.lstm] [net_input.bin]
+#include "network.h"
+#include "networkio.h"
+#include "networkscratch.h"
+#include "stridemap.h"
+#include "helpers.h"
+#include "serialis.h"
+
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <vector>
+
+using namespace tesseract;
+
+int main(int argc, char **argv) {
+  const char *lstm_path = argc > 1 ? argv[1] : "/tmp/eng.lstm";
+  const char *bin_path = argc > 2 ? argv[2] : "/tmp/net_input.bin";
+
+  // ---- Load the network (the REAL recursive Network::CreateFromFile) ----
+  std::vector<char> data;
+  if (!LoadDataFromFile(lstm_path, &data)) {
+    fprintf(stderr, "load fail: %s\n", lstm_path);
+    return 1;
+  }
+  TFile fp;
+  if (!fp.Open(data.data(), data.size())) {
+    fprintf(stderr, "TFile::Open failed\n");
+    return 1;
+  }
+  Network *net = Network::CreateFromFile(&fp);
+  if (!net) {
+    fprintf(stderr, "CreateFromFile failed\n");
+    return 1;
+  }
+  printf("nw\t%d\n", net->num_weights());
+  printf("ni\t%d\tno\t%d\n", net->NumInputs(), net->NumOutputs());
+
+  // ---- Load the shared input .bin: i32 batch,height,width,depth then the
+  // f32s in the exact StrideMap walk order (written by the Rust side). ----
+  FILE *bf = fopen(bin_path, "rb");
+  if (!bf) {
+    fprintf(stderr, "open %s failed\n", bin_path);
+    return 1;
+  }
+  auto read_i32 = [&](int32_t *v) {
+    if (fread(v, sizeof(int32_t), 1, bf) != 1) {
+      fprintf(stderr, "bin truncated (header)\n");
+      exit(1);
+    }
+  };
+  int32_t batch = 0, height = 0, width = 0, depth = 0;
+  read_i32(&batch);
+  read_i32(&height);
+  read_i32(&width);
+  read_i32(&depth);
+
+  StrideMap map;
+  std::vector<std::pair<int, int>> hw = {{static_cast<int>(height), static_cast<int>(width)}};
+  map.SetStride(hw);
+
+  NetworkIO input;
+  input.ResizeToMap(true, map, depth);
+
+  {
+    StrideMap::Index idx(map);
+    std::vector<float> vals(static_cast<size_t>(depth));
+    do {
+      int t = idx.t();
+      if (depth > 0 &&
+          fread(vals.data(), sizeof(float), static_cast<size_t>(depth), bf) !=
+              static_cast<size_t>(depth)) {
+        fprintf(stderr, "bin truncated at t=%d\n", t);
+        exit(1);
+      }
+      input.WriteTimeStep(t, vals.data());
+    } while (idx.Increment());
+  }
+  fclose(bf);
+
+  // ---- Randomizer: seed 1, NO warm-up draw — matches the Rust side exactly.
+  // Set BEFORE Forward: Convolve pulls out-of-image noise from it. Plumbing
+  // ::SetRandomizer recurses into every child (Series/Reversed/...), so one
+  // call at the root reaches the Convolve node wherever it sits in the tree.
+  TRand trand;
+  trand.set_seed(1);
+  net->SetRandomizer(&trand);
+
+  // ---- Forward: the REAL polymorphic dispatch through the whole tree. ----
+  NetworkScratch scratch;
+  NetworkIO output;
+  net->Forward(false, input, nullptr, &scratch, &output);
+
+  // ---- Dump: byte-identical format to the Rust side's oshape/o lines. ----
+  printf("oshape\t%d\t%d\t%d\t%d\t%d\n", output.stride_map().Size(FD_BATCH),
+         output.stride_map().Size(FD_HEIGHT), output.stride_map().Size(FD_WIDTH),
+         output.Width(), output.NumFeatures());
+  for (int t = 0; t < output.Width(); ++t) {
+    printf("o\t%d", t);
+    if (output.int_mode()) {
+      const int8_t *row = output.i(t);
+      for (int f = 0; f < output.NumFeatures(); ++f) {
+        printf("\t%d", static_cast<int>(row[f]));
+      }
+    } else {
+      const float *row = output.f(t);
+      for (int f = 0; f < output.NumFeatures(); ++f) {
+        uint32_t u;
+        float v = row[f];
+        std::memcpy(&u, &v, 4);
+        printf("\t%08x", u);
+      }
+    }
+    printf("\n");
+  }
+  return 0;
+}
+```
+
+---
+
+## B2 EXECUTED (2026-07-07) — LSTMRecognizer load, trailing-field parity GREEN
+
+**Shipped** in `crates/tesseract-ocr/src/lstm_recognizer.rs` (`LstmRecognizer` +
+`RecognizerError`) + `examples/lstm_recognizer_dump.rs`. `from_components(lstm,
+unicharset_text, recoder)` = `LSTMRecognizer::DeSerialize` for the
+`include_charsets == false` path (how `combine_tessdata -u` split eng.lstm):
+after `Network::from_le_bytes` (B1) the lstm component's 81-byte tail is
+`network_str_` (u32-len string) + **4×i32** (`training_flags_`,
+`training_iteration_`, `sample_iteration_`, `null_char_`) + **3×f32**
+(`adam_beta_`, `learning_rate_`, `momentum_`); the unicharset (TEXT,
+`UniCharSet::load_from_str`, `E-CPP-PARITY-1..6`) + recoder (binary,
+`UnicharCompress::from_le_bytes`, `E-CPP-PARITY-7`) come from their own
+components.
+
+**Byte-parity GREEN** on real `/tmp/eng.lstm`: the 8 trailing-parse lines
+byte-identical vs a public-API oracle (`Network::CreateFromFile` +
+`TFile::DeSerialize` in the exact `lstmrecognizer.cpp:144-166` order — no private
+access, no ABI skew):
+```
+netstr [1,36,0,1Ct3,3,16Mp3,3Lfys48Lfx96Lrx96Lfx192O1c1]
+tflags 65   titer 6352400   siter 6352704   null 110
+abeta 3f7fbe77   lrate 3a83126f   moment 3f000000
+```
+`training_flags=65 = TF_INT_MODE(1) | TF_COMPRESS_UNICHARSET(64)` → `is_int_mode`
++ `is_recoding` both true (eng is an int8 recoded LSTM). Assembly cross-checks
+(not in the parity diff — each already proven): network `num_weights=385807`,
+charset `size=112`, recoder `code_range=111`, `null_char=110` — all consistent
+with B1 + E-CPP-PARITY-1..7. `null_char=110` is exactly the beam null the
+`RecodeBeamSearch` (`E-OCR-RECODEBEAM-1`) expects. Board: lance-graph
+`E-OCR-RECOGNIZER-LOAD-1`.
+
+**Build/run the parity:**
+```sh
+cargo run -q -p tesseract-ocr --example lstm_recognizer_dump -- \
+    /tmp/eng.lstm /tmp/eng.lstm-unicharset /tmp/eng.lstm-recoder > /tmp/rust_lstmrec.tsv
+g++ -std=c++17 -DFAST_FLOAT /tmp/lstm_recognizer_oracle.cpp \
+    -I/tmp/tesseract/src/lstm -I/tmp/tesseract/src/ccstruct -I/tmp/tesseract/src/ccutil \
+    -I/tmp/tesseract/src/arch -I/tmp/tesseract/src/viewer -I/tmp/tesseract/src/dict \
+    -I/tmp/tesseract/src/classify -I/tmp/tesseract/include \
+    $(pkg-config --cflags tesseract) -o /tmp/lstm_recognizer_oracle \
+    $(pkg-config --libs tesseract) $(pkg-config --libs lept)
+/tmp/lstm_recognizer_oracle /tmp/eng.lstm > /tmp/oracle_lstmrec.tsv
+diff <(grep -E '^(netstr|tflags|titer|siter|null|abeta|lrate|moment)' /tmp/oracle_lstmrec.tsv) \
+     <(grep -E '^(netstr|tflags|titer|siter|null|abeta|lrate|moment)' /tmp/rust_lstmrec.tsv)   # empty => green
+```
+
+**Next: A6 + B3 — the leptonica image front-end.** `RecognizeLine`
+(`lstmrecognizer.cpp:236-291`): image `Pix` → `Input::Forward` (**A6** — the
+leptonica decision point, raise to operator: pure-Rust image decode vs a
+leptonica dep) → `network_->Forward` (B1 tree, DONE) → the softmax logits →
+`RecodeBeamSearch::Decode` (`E-OCR-RECODEBEAM-1`, DONE) →
+`ExtractBestPathAsUnicharIds` (C2, DONE) → `recoded_to_text` (`E-CPP-PARITY-7`,
+DONE). So B3 is: the leptonica `Input` (A6) + the `RecognizeLine` glue that
+threads the already-proven pieces. Everything downstream of the image grid is
+proven; A6 is the last unproven leaf and the one architectural fork.
+
+### Oracle source (banked — `/tmp/lstm_recognizer_oracle.cpp`, public-API only)
+```cpp
+// Byte-parity oracle for `LSTMRecognizer::DeSerialize`'s trailing-field read
+// (recognizer leaf B2), vs the Rust transcode.
+//
+// Loads the real eng.lstm via the REAL public `Network::CreateFromFile` (this
+// advances the TFile cursor past the whole network tree, exactly as
+// LSTMRecognizer::DeSerialize does at lstmrecognizer.cpp:135), then reads the
+// 8 trailing fields via the REAL `TFile::DeSerialize` overloads, in the exact
+// order lstmrecognizer.cpp:144-166 reads them (the `include_charsets == false`
+// path — no inline unicharset/recoder, matching how /tmp/eng.lstm was split
+// out of a traineddata):
+//
+//   network_str_ (std::string) -> training_flags_ (i32) ->
+//   training_iteration_ (i32) -> sample_iteration_ (i32) ->
+//   null_char_ (i32) -> adam_beta_ (f32) -> learning_rate_ (f32) ->
+//   momentum_ (f32)
+//
+//   ./lstm_recognizer_oracle [eng.lstm]
+#include "network.h"
+#include "serialis.h"
+
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+
+using namespace tesseract;
+
+int main(int argc, char **argv) {
+  const char *lstm_path = argc > 1 ? argv[1] : "/tmp/eng.lstm";
+
+  // ---- Load the network (the REAL recursive Network::CreateFromFile) ----
+  std::vector<char> data;
+  if (!LoadDataFromFile(lstm_path, &data)) {
+    fprintf(stderr, "load fail: %s\n", lstm_path);
+    return 1;
+  }
+  TFile fp;
+  if (!fp.Open(data.data(), data.size())) {
+    fprintf(stderr, "TFile::Open failed\n");
+    return 1;
+  }
+  Network *net = Network::CreateFromFile(&fp);
+  if (!net) {
+    fprintf(stderr, "CreateFromFile failed\n");
+    return 1;
+  }
+
+  // ---- Read the 8 trailing fields, exact order of
+  // LSTMRecognizer::DeSerialize (lstmrecognizer.cpp:144-166). ----
+  std::string network_str;
+  if (!fp.DeSerialize(network_str)) {
+    fprintf(stderr, "DeSerialize(network_str_) failed\n");
+    return 1;
+  }
+  int32_t training_flags = 0;
+  if (!fp.DeSerialize(&training_flags)) {
+    fprintf(stderr, "DeSerialize(training_flags_) failed\n");
+    return 1;
+  }
+  int32_t training_iteration = 0;
+  if (!fp.DeSerialize(&training_iteration)) {
+    fprintf(stderr, "DeSerialize(training_iteration_) failed\n");
+    return 1;
+  }
+  int32_t sample_iteration = 0;
+  if (!fp.DeSerialize(&sample_iteration)) {
+    fprintf(stderr, "DeSerialize(sample_iteration_) failed\n");
+    return 1;
+  }
+  int32_t null_char = 0;
+  if (!fp.DeSerialize(&null_char)) {
+    fprintf(stderr, "DeSerialize(null_char_) failed\n");
+    return 1;
+  }
+  float adam_beta = 0.0f;
+  if (!fp.DeSerialize(&adam_beta)) {
+    fprintf(stderr, "DeSerialize(adam_beta_) failed\n");
+    return 1;
+  }
+  float learning_rate = 0.0f;
+  if (!fp.DeSerialize(&learning_rate)) {
+    fprintf(stderr, "DeSerialize(learning_rate_) failed\n");
+    return 1;
+  }
+  float momentum = 0.0f;
+  if (!fp.DeSerialize(&momentum)) {
+    fprintf(stderr, "DeSerialize(momentum_) failed\n");
+    return 1;
+  }
+
+  // ---- Dump: tab-separated, f32 as raw LE bit-pattern hex. ----
+  uint32_t abeta_bits, lrate_bits, moment_bits;
+  std::memcpy(&abeta_bits, &adam_beta, 4);
+  std::memcpy(&lrate_bits, &learning_rate, 4);
+  std::memcpy(&moment_bits, &momentum, 4);
+
+  printf("netstr\t%s\n", network_str.c_str());
+  printf("tflags\t%d\n", training_flags);
+  printf("titer\t%d\n", training_iteration);
+  printf("siter\t%d\n", sample_iteration);
+  printf("null\t%d\n", null_char);
+  printf("abeta\t%08x\n", abeta_bits);
+  printf("lrate\t%08x\n", lrate_bits);
+  printf("moment\t%08x\n", moment_bits);
+  return 0;
+}
+```
+
+---
+
+## A6a EXECUTED (2026-07-07) — NetworkIO::FromPix (pixel → int8 grid), byte-parity GREEN
+
+**Shipped** in `crates/tesseract-recognizer/src/input.rs` (`from_grey_pix` +
+private `Stats`/`compute_black_white`) + a `set_pixel` method on `NetworkIo` +
+`examples/from_pix_dump.rs`. Transcodes `NetworkIO::FromPix` →
+`FromPixes`→`Copy2DImage`→`SetPixel` (`networkio.cpp:127-297`) for the 8-bit
+**grey 2-D path** (eng `[1,36,0,1…]`, depth=1, height=36>1):
+- `ComputeBlackWhite` — middle row (y=height/2) local minima/maxima → two
+  `STATS(0,255)` histograms → `black=mins.ile(0.25)`, `white=maxes.ile(0.75)`.
+- `STATS::ile` — bucket walk + linear interp (`statistc.cpp:172-197`), exact.
+- `SetPixel` — `clip(round((INT8_MAX+1)·((pixel−black)/contrast − 1)), ±127)`.
+  **The ×(INT8_MAX+1)=×128 constant is distinct from `write_time_step`'s ×127**
+  — a real gotcha; reusing the Leaf-5 quantizer here would be silently wrong.
+
+**Byte-parity GREEN** on **8/8** synthetic image widths (3, 5, 12, 17, 24, 33,
+48, 64 — width=3 is the min for the `width>=3` extrema branch; odd widths
+included) vs a public-API oracle (`NetworkIO::FromPix` on a leptonica `Pix`
+built from the shared `frompix_input.bin`; `set_int_mode(true)` first, matching
+`RecognizeLine` `lstmrecognizer.cpp:345`). Up to 2304 int8 cells per case,
+all identical.
+
+**t-order note (the structural risk, verified):** `Copy2DImage` walks y-outer /
+x-inner with a plain `t++`; the recognizer `StrideMap` packs **width innermost**
+(`t_increments[WIDTH]=1`, `t(0,y,x)=y·W+x`), so linear `t++` tracks `index.t()`
+exactly — no per-index recompute needed.
+
+**A6b (the leptonica fork) is deliberately OUT of this leaf** and is the one
+architectural decision the founding directive settles toward pure-Rust ("no
+leptonica at runtime; delete the C++ residue"): image file → decode → depth-
+convert (`pixConvertTo8`) → **`pixScale` to target height 36**. `pixScale`
+byte-parity is leptonica's resampling algorithm, NOT a Tesseract algorithm — a
+separate, hard commodity problem. The pragmatic boundary: the consumer supplies
+a pre-decoded 8-bit grey image at height 36 (via `image`-rs for decode; the
+scale is either a documented approximation or a later dedicated leaf), and A6a
+proves the Tesseract-specific normalization exactly. **B3** (`RecognizeLine`
+glue) then threads A6a → `network.forward` (B1) → beam decode
+(`E-OCR-RECODEBEAM-1`) → `ExtractBestPathAsUnicharIds` (C2) → `recoded_to_text`
+(`E-CPP-PARITY-7`). Board: lance-graph `E-OCR-FROMPIX-1`.
+
+**Build/run the parity:**
+```sh
+cargo run -q -p tesseract-recognizer --example from_pix_dump -- /tmp/frompix_input.bin 24 > /tmp/rust_frompix.tsv
+g++ -std=c++17 -DFAST_FLOAT /tmp/frompix_oracle.cpp \
+    -I/tmp/tesseract/src/lstm -I/tmp/tesseract/src/ccstruct -I/tmp/tesseract/src/ccutil \
+    -I/tmp/tesseract/src/arch -I/tmp/tesseract/src/viewer -I/tmp/tesseract/src/dict \
+    -I/tmp/tesseract/src/classify -I/tmp/tesseract/include \
+    $(pkg-config --cflags tesseract) -o /tmp/frompix_oracle \
+    $(pkg-config --libs tesseract) $(pkg-config --libs lept)
+/tmp/frompix_oracle /tmp/frompix_input.bin > /tmp/oracle_frompix.tsv
+diff /tmp/oracle_frompix.tsv /tmp/rust_frompix.tsv   # empty => green
+```
+
+### Oracle source (banked — `/tmp/frompix_oracle.cpp`, public-API only)
+```cpp
+// Byte-parity oracle for the recognizer leaf A6a: `NetworkIO::FromPix` (the
+// image-pixel -> int8 grid step) vs the Rust transcode's FromPix path in
+// tesseract-recognizer.
+//
+// Reads a synthetic 8-bit grey image from a shared .bin (i32 width, i32
+// height, then height*width row-major u8 pixels — row 0 left-to-right, then
+// row 1, ...), builds a REAL leptonica Pix at that size, puts the NetworkIO
+// into int8 mode (matches LSTMRecognizer::RecognizeLine, lstmrecognizer.cpp:345
+// `inputs->set_int_mode(IsIntMode());` called BEFORE
+// Input::PreparePixInput -> NetworkIO::FromPix, input.cpp:142), and calls the
+// REAL public `NetworkIO::FromPix(StaticShape, Image, TRand*)`
+// (networkio.cpp:163) which dispatches to FromPixes -> ComputeBlackWhite ->
+// Copy2DImage -> SetPixel exactly as the C++ library always has. Dumps the
+// resulting int8 grid for a byte-identical diff against the Rust side.
+//
+// The pix is built at the network's target height (36) with shape.width()==0
+// (dynamic), so FromPix does NOT scale and Copy2DImage's fixed-width
+// clip/pad-with-noise branch never fires: this is the pure
+// FromPixes -> Copy2DImage -> SetPixel normalization path, no randomizer
+// draws expected.
+//
+//   ./frompix_oracle [frompix_input.bin]
+#include "networkio.h"
+#include "static_shape.h"
+#include "stridemap.h"
+#include "helpers.h"
+
+#include <allheaders.h>
+
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <vector>
+
+using namespace tesseract;
+
+int main(int argc, char **argv) {
+  const char *bin_path = argc > 1 ? argv[1] : "/tmp/frompix_input.bin";
+
+  // ---- Read the shared input .bin: i32 width, i32 height, then
+  // height*width row-major u8 grey pixels (written by the Rust side). ----
+  FILE *bf = fopen(bin_path, "rb");
+  if (!bf) {
+    fprintf(stderr, "open %s failed\n", bin_path);
+    return 1;
+  }
+  auto read_i32 = [&](int32_t *v) {
+    if (fread(v, sizeof(int32_t), 1, bf) != 1) {
+      fprintf(stderr, "bin truncated (header)\n");
+      exit(1);
+    }
+  };
+  int32_t width = 0, height = 0;
+  read_i32(&width);
+  read_i32(&height);
+  if (width <= 0 || height <= 0) {
+    fprintf(stderr, "bad dims %d x %d\n", width, height);
+    return 1;
+  }
+  std::vector<uint8_t> pixels(static_cast<size_t>(width) * static_cast<size_t>(height));
+  if (fread(pixels.data(), 1, pixels.size(), bf) != pixels.size()) {
+    fprintf(stderr, "bin truncated (pixels)\n");
+    fclose(bf);
+    return 1;
+  }
+  fclose(bf);
+
+  // ---- Build an 8-bit grey Pix from the pixel buffer (row-major, row 0
+  // first). ----
+  Image pix = pixCreate(width, height, 8);
+  if (pix == nullptr) {
+    fprintf(stderr, "pixCreate failed\n");
+    return 1;
+  }
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      pixSetPixel(pix, x, y, pixels[static_cast<size_t>(y) * width + x]);
+    }
+  }
+
+  // ---- Build the input StaticShape: batch=1, height=36 (fixed — the
+  // network's input height; matches the pix height here so FromPix does NOT
+  // scale, since FromPix/FromPixes themselves never scale — only
+  // Input::PreparePixInput does, and we bypass that to test FromPix in
+  // isolation), width=0 (dynamic, so the real pix width drives the
+  // StrideMap and Copy2DImage's noise-pad branch never fires), depth=1
+  // (8-bit grey, single feature). ----
+  StaticShape shape;
+  shape.set_batch(1);
+  shape.set_height(36);
+  shape.set_width(0);
+  shape.set_depth(1);
+
+  // ---- Randomizer: seed 1, no warm-up draw. Only consulted by
+  // Copy2DImage's Randomize() call if the fixed target_width exceeds the
+  // real pix width, which cannot happen here (shape.width()==0). ----
+  TRand rand;
+  rand.set_seed(1);
+
+  // ---- NetworkIO in int8 mode (matches LSTMRecognizer::RecognizeLine's
+  // inputs->set_int_mode(IsIntMode()) called BEFORE FromPix). ----
+  NetworkIO netio;
+  netio.set_int_mode(true);
+  netio.FromPix(shape, pix, &rand);
+  pix.destroy();
+
+  // ---- Dump: shape line then one "i" line per timestep. ----
+  printf("shape\t%d\t%d\t%d\t%d\n", netio.stride_map().Size(FD_HEIGHT),
+         netio.stride_map().Size(FD_WIDTH), netio.NumFeatures(), netio.Width());
+  for (int t = 0; t < netio.Width(); ++t) {
+    printf("i\t%d", t);
+    const int8_t *row = netio.i(t);
+    for (int f = 0; f < netio.NumFeatures(); ++f) {
+      printf("\t%d", static_cast<int>(row[f]));
+    }
+    printf("\n");
+  }
+  return 0;
+}
+```
+
+---
+
+## B3-core EXECUTED (2026-07-07) — grid → text, byte-parity GREEN (the recognizer produces text)
+
+**Shipped** in `crates/tesseract-ocr/src/lstm_recognizer.rs`
+(`LstmRecognizer::recognize_grid`) + `examples/recognize_grid_dump.rs`. The
+A6b-independent core of `RecognizeLine` (`lstmrecognizer.cpp:247-291`): threads
+`network.forward` (B1) → softmax logits → `RecodeBeamSearch::decode`
+(`E-OCR-RECODEBEAM-1`) → `extract_best_path_as_unichar_ids` (C2) → `ids_to_text`
+(`E-CPP-PARITY-1`). Composes ONLY already-byte-parity-proven pieces + the thin
+logits→beam adapter (`outputs.f(t)` rows).
+
+**Byte-parity GREEN** on **5/5** synthetic grid widths (8, 16, 24, 40, 64) — the
+best-path `unichar_ids` + assembled `text` byte-identical vs a public-API oracle
+(a mechanical composition of the proven B1-forward + 7b-beam + charset oracles:
+`Network::CreateFromFile` → `net->Forward` → `RecodeBeamSearch(recoder, 110,
+true, nullptr).Decode(outputs, 1.0, 0.0, 0.0, &charset, 0)` →
+`ExtractBestPathAsUnicharIds` → `id_to_unichar`). Varied outputs (`:`, `eEE.`,
+`aiiiiff`, …) all matched. This proves the **B1-logits → beam seam** — the one
+integration point not covered by the per-leaf oracles.
+
+**Seam decisions (all verified, not guessed):**
+- `null_char = 110` — eng.lstm's real `DeSerialize`'d value (B2, `E-OCR-RECOGNIZER-LOAD-1`).
+- `simple_text = true` — `OutputLossType() == LT_SOFTMAX` (eng ends `…O1c1`);
+  derived Rust-side as `!outputs.int_mode()` (softmax ⟺ float output).
+- `dict = nullptr` (non-dict path); `dict_ratio=1.0`/`cert_offset=0.0`/
+  `worst_dict_cert=0.0` are **inert** here — `recodebeam.cpp` only consults them
+  inside the `ContinueDawg`/`PushDupOrNoDawgIfBetter` dawg paths (reached only
+  when `dict_ != nullptr`), so the best path is invariant to them.
+
+**What this leaves:** ONLY **A6b** (image file → decode → `pixScale`-to-height-36)
+stands between the current state and full **image → text**. Per the founding
+directive it is pure-Rust (image decode via `image`-rs; the `pixScale` byte-parity
+is leptonica's resampler, a hard commodity problem — boundary = pre-scaled 8-bit
+grey input). With A6a (grey image → grid) + B3-core (grid → text) both proven,
+`from_grey_pix` → `recognize_grid` already composes **grey-image → text** for a
+pre-scaled image. Board: lance-graph `E-OCR-RECOGNIZE-GRID-1`.
+
+### Oracle source (banked — `/tmp/recognize_grid_oracle.cpp`, public-API only)
+```cpp
+// Byte-parity oracle for the recognizer leaf B3-core: grid -> text (the
+// A6b-independent core of `LSTMRecognizer::RecognizeLine`), vs the Rust
+// transcode's `recognize_grid`.
+//
+// This is a MECHANICAL COMPOSITION of two already-proven oracle halves,
+// reused verbatim:
+//
+//   1. network_forward_oracle.cpp (E-OCR-NETWORK-FORWARD-1): loads eng.lstm
+//      via the REAL public `Network::CreateFromFile`, builds the synthetic
+//      int8 grid from the shared .bin format (i32 batch,height,width,depth
+//      header then f32s in StrideMap walk order), seeds the REAL `TRand`
+//      (seed 1, no warm-up draw) BEFORE Forward, and calls the REAL
+//      polymorphic `Network::Forward` to get the softmax NetworkIO.
+//
+//   2. recodebeam_oracle.cpp / recoder_oracle.cpp (E-OCR-RECODER-BEAM-1 /
+//      E-OCR-RECODEBEAM-1): loads the REAL `UnicharCompress` recoder
+//      (LoadDataFromFile + TFile::Open + DeSerialize, the same pattern
+//      proven byte-parity on the encode/decode/beam-maps leaves), builds
+//      the REAL `RecodeBeamSearch` (dict=nullptr, the non-dict path) and
+//      calls the REAL public `Decode` + `ExtractBestPathAsUnicharIds`.
+//
+// New glue here: `UNICHARSET::load_from_file` + `id_to_unichar` text
+// assembly -- proving the B1-logits -> beam seam: grid -> net->Forward ->
+// softmax logits -> RecodeBeamSearch::Decode -> ExtractBestPathAsUnicharIds
+// -> charset id->text.
+//
+// null_char=110 is eng.lstm's REAL DeSerialize'd value (confirmed via
+// LSTMRecognizer::DeSerialize's trailing-field read, /tmp/oracle_lstmrec.tsv:
+// "null 110" -- not a guess). simple_text=true because eng.lstm's
+// OutputLossType() == LT_SOFTMAX (the Series net ends `...O1c1`, a 1-code
+// softmax output, per the netstr dumped in the same oracle: "...Lfx192O1c1").
+// dict=nullptr is the non-dict path (LSTMRecognizer::dict_ is nullptr unless
+// LoadDictionary is explicitly called). dict_ratio=1.0/cert_offset=0.0/
+// worst_dict_cert=0.0 match the convention already established in
+// recodebeam_oracle.cpp; all three are inert when dict_==nullptr (grep of
+// recodebeam.cpp shows worst_dict_cert/dict_ratio are only consulted inside
+// the ContinueDawg/PushDupOrNoDawgIfBetter dawg-continuation paths, which are
+// only reached when dict_ != nullptr).
+//
+//   ./recognize_grid_oracle [eng.lstm] [eng.lstm-unicharset] [eng.lstm-recoder] [rg_input.bin]
+#include "network.h"
+#include "networkio.h"
+#include "networkscratch.h"
+#include "stridemap.h"
+#include "helpers.h"
+#include "serialis.h"
+#include "unicharset.h"
+#include "unicharcompress.h"
+#include "recodebeam.h"
+
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+using namespace tesseract;
+
+int main(int argc, char **argv) {
+  const char *lstm_path = argc > 1 ? argv[1] : "/tmp/eng.lstm";
+  const char *uni_path = argc > 2 ? argv[2] : "/tmp/eng.lstm-unicharset";
+  const char *rec_path = argc > 3 ? argv[3] : "/tmp/eng.lstm-recoder";
+  const char *bin_path = argc > 4 ? argv[4] : "/tmp/rg_input.bin";
+
+  // ---- 1. Load the network: VERBATIM from network_forward_oracle.cpp ----
+  std::vector<char> data;
+  if (!LoadDataFromFile(lstm_path, &data)) {
+    fprintf(stderr, "load fail: %s\n", lstm_path);
+    return 1;
+  }
+  TFile fp;
+  if (!fp.Open(data.data(), data.size())) {
+    fprintf(stderr, "TFile::Open failed\n");
+    return 1;
+  }
+  Network *net = Network::CreateFromFile(&fp);
+  if (!net) {
+    fprintf(stderr, "CreateFromFile failed\n");
+    return 1;
+  }
+  fprintf(stderr, "nw=%d ni=%d no=%d\n", net->num_weights(), net->NumInputs(),
+          net->NumOutputs());
+
+  // ---- 2. Load the charset: UNICHARSET::load_from_file (single-arg
+  // overload, defaults skip_fragments=false -- same convention as
+  // recoder_oracle.cpp's `u.load_from_file(argv[1])`). ----
+  UNICHARSET unicharset;
+  if (!unicharset.load_from_file(uni_path)) {
+    fprintf(stderr, "unicharset load failed: %s\n", uni_path);
+    return 1;
+  }
+  fprintf(stderr, "unicharset size=%d\n", static_cast<int>(unicharset.size()));
+
+  // ---- 3. Load the recoder: VERBATIM pattern from recoder_oracle.cpp /
+  // recodebeam_oracle.cpp (LoadDataFromFile + TFile::Open + DeSerialize). ----
+  std::vector<char> rec_data;
+  if (!LoadDataFromFile(rec_path, &rec_data)) {
+    fprintf(stderr, "recoder load failed: %s\n", rec_path);
+    return 1;
+  }
+  TFile rec_fp;
+  if (!rec_fp.Open(rec_data.data(), rec_data.size())) {
+    fprintf(stderr, "recoder TFile::Open failed\n");
+    return 1;
+  }
+  UnicharCompress recoder;
+  if (!recoder.DeSerialize(&rec_fp)) {
+    fprintf(stderr, "recoder DeSerialize failed\n");
+    return 1;
+  }
+  fprintf(stderr, "recoder code_range=%d\n", recoder.code_range());
+
+  // ---- 4. Build the synthetic grid: VERBATIM from
+  // network_forward_oracle.cpp (i32 batch,height,width,depth header then
+  // f32s in StrideMap walk order; ResizeToMap(true, ...) sets int_mode on
+  // the input NetworkIO, matching the real int8 LSTM input). ----
+  FILE *bf = fopen(bin_path, "rb");
+  if (!bf) {
+    fprintf(stderr, "open %s failed\n", bin_path);
+    return 1;
+  }
+  auto read_i32 = [&](int32_t *v) {
+    if (fread(v, sizeof(int32_t), 1, bf) != 1) {
+      fprintf(stderr, "bin truncated (header)\n");
+      exit(1);
+    }
+  };
+  int32_t batch = 0, height = 0, width = 0, depth = 0;
+  read_i32(&batch);
+  read_i32(&height);
+  read_i32(&width);
+  read_i32(&depth);
+
+  StrideMap map;
+  std::vector<std::pair<int, int>> hw = {
+      {static_cast<int>(height), static_cast<int>(width)}};
+  map.SetStride(hw);
+
+  NetworkIO input;
+  input.ResizeToMap(true, map, depth);
+
+  {
+    StrideMap::Index idx(map);
+    std::vector<float> vals(static_cast<size_t>(depth));
+    do {
+      int t = idx.t();
+      if (depth > 0 &&
+          fread(vals.data(), sizeof(float), static_cast<size_t>(depth), bf) !=
+              static_cast<size_t>(depth)) {
+        fprintf(stderr, "bin truncated at t=%d\n", t);
+        exit(1);
+      }
+      input.WriteTimeStep(t, vals.data());
+    } while (idx.Increment());
+  }
+  fclose(bf);
+
+  // ---- 5. Randomizer + Forward: VERBATIM from network_forward_oracle.cpp
+  // (seed 1, no warm-up draw, set BEFORE Forward). ----
+  TRand trand;
+  trand.set_seed(1);
+  net->SetRandomizer(&trand);
+
+  NetworkScratch scratch;
+  NetworkIO outputs;
+  net->Forward(false, input, nullptr, &scratch, &outputs);
+  fprintf(stderr, "oshape width=%d features=%d int_mode=%d\n",
+          outputs.Width(), outputs.NumFeatures(), outputs.int_mode() ? 1 : 0);
+
+  // ---- 6. Beam decode: the REAL non-dict CTC beam
+  // (RecodeBeamSearch::Decode(const NetworkIO&, ...) overload, which reads
+  // via output.f(t) -- requires int_mode()==false, satisfied since the
+  // final FC layer's softmax activation always produces float). ----
+  const int null_char = 110; // eng.lstm's real DeSerialize'd value
+  const bool simple_text = true; // OutputLossType()==LT_SOFTMAX for eng.lstm
+  RecodeBeamSearch beam(recoder, null_char, simple_text, nullptr);
+  beam.Decode(outputs, 1.0, 0.0, 0.0, &unicharset, 0);
+
+  // ---- 7. Extract best path as unichar ids: the REAL public API. ----
+  std::vector<int> unichar_ids, xcoords;
+  std::vector<float> certs, ratings;
+  beam.ExtractBestPathAsUnicharIds(false, &unicharset, &unichar_ids, &certs,
+                                    &ratings, &xcoords);
+
+  // ---- 8. Build text: id_to_unichar concatenation. ----
+  std::string text;
+  for (int uid : unichar_ids) {
+    text += unicharset.id_to_unichar(uid);
+  }
+
+  // ---- Dump: EXACTLY tab-separated. ----
+  printf("uids");
+  for (int uid : unichar_ids) {
+    printf("\t%d", uid);
+  }
+  printf("\n");
+  printf("text\t%s\n", text.c_str());
+  return 0;
+}
+```
+
+---
+
+## A6b EXECUTED (2026-07-07) — IMAGE FILE → TEXT, byte-parity GREEN — THE PIPELINE IS COMPLETE
+
+**Shipped** in `crates/tesseract-ocr/src/image_input.rs` (`parse_pgm` +
+`prescale_grey_to_height` + `PgmError`) + `LstmRecognizer::recognize_image_file`
+(+ `seeded_randomizer`) + `examples/recognize_image_dump.rs`. An **image FILE on
+disk → text**, entirely pure-Rust (zero leptonica at runtime, per the founding
+directive):
+
+```
+PGM file → parse_pgm → prescale_grey_to_height → from_grey_pix (A6a)
+        → network.forward (B1) → RecodeBeamSearch (7b) → extract (C2)
+        → ids_to_text (E-CPP-PARITY-1) → text
+```
+
+**Byte-parity GREEN** on **6/6** image widths (8, 16, 24, 40, 64, 100; P5 PGM,
+all height 36 = the model input height → identity scale) vs a public-API oracle
+(libtesseract `pixRead` → `Input::PreparePixInput` → the REAL `net->Forward` +
+`RecodeBeamSearch::Decode` + `ExtractBestPathAsUnicharIds` + `id_to_unichar`):
+e.g. `img_24.pgm → "qLLiy,,"`, `img_100.pgm → "sLlViiiii…Se…"`, all identical.
+
+**Faithful `RecognizeLine` seeding (the key refinement):** `recognize_image_file`
+seeds the randomizer via `seeded_randomizer()` = `LSTMRecognizer::SetRandomSeed`
+(`lstmrecognizer.h:287-291`): `seed = (i64)sample_iteration · 0x10000001`, `minstd`
+seed, one `IntRand()` warm-up. This is **NOT inert** — `Convolve`'s out-of-image
+noise draws from it and reaches the recognized text (switching from `set_seed(1)`
+to `SetRandomSeed` changed the output `aLLiii, → qLLiy,,`). So `recognize_image_file`
+reproduces the **actual** `RecognizeLine`, not merely "correct for an arbitrary
+seed". (`TRand::set_seed` already replicates `std::minstd_rand::seed`'s `s%m, 0→1`
+for any seed; `uint_fast32_t` is 64-bit on x86-64 glibc, so no truncation.)
+
+**The one documented boundary — the general-height `pixScale`:** `ImageData::PreScale`
+calls leptonica's `pixScale(src, f, f)`, `f = 36/input_height`. At `f == 1.0`
+(model-height line image) `pixScale` is a **copy**, so the scale is identity and
+the WHOLE path is byte-parity-proven. For other heights,
+`prescale_grey_to_height` uses a **MARKED bilinear approximation** — functional,
+but NOT byte-identical to leptonica's depth/factor-dependent resampler
+(linear-interp ≥0.7, area-map <0.7). Leptonica ships **headers-only** here (v1.82,
+no source), so its resampler can't be transcoded from source this session; a
+byte-exact `pixScale` is the single deferred sub-leaf. Board: lance-graph
+`E-OCR-IMAGE-TEXT-1`.
+
+**The Tesseract→Rust recognizer is COMPLETE for model-height line images:** an
+image file on disk → text, byte-identical to libtesseract, pure-Rust, every step
+proven (A6a grid, B1 forward, 7b beam, C2 extract, recoded_to_text, B3-core glue,
+A6b decode+identity-scale+SetRandomSeed). Remaining accuracy layers (dict beam
+C1, CJK trie C3, the word/box `ExtractBestPathAsWords`) and the byte-exact
+`pixScale` are enhancements, not core-pipeline gaps.
+
+### Oracle source (banked — `/tmp/image_text_oracle.cpp`, public-API only)
+```cpp
+// Byte-parity oracle for the recognizer leaf A6b: IMAGE FILE ON DISK -> text
+// (the image-file-input variant of `recognize_grid_oracle.cpp`'s grid -> text
+// core), vs the Rust transcode's `from_grey_pix` + `recognize_grid`.
+//
+// This is a MECHANICAL MODIFICATION of recognize_grid_oracle.cpp (itself a
+// proven composition of network_forward_oracle.cpp +
+// recodebeam_oracle.cpp/recoder_oracle.cpp). Steps 1-3 (load network, load
+// charset, load recoder) and steps 5-8 (randomizer+Forward, beam decode,
+// extract best path, build+dump text) are VERBATIM. The ONLY change is step
+// 4: instead of building a synthetic grid from a shared .bin (an i32
+// batch,height,width,depth header then f32s in StrideMap walk order), we
+// `pixRead` a real image file and run it through the REAL
+// `Input::PreparePixInput` -- exactly the call
+// `LSTMRecognizer::RecognizeLine` makes (lstmrecognizer.cpp:347:
+// `Input::PreparePixInput(network_->InputShape(), pix, &randomizer_,
+// inputs);`), skipping only `Input::PrepareLSTMInputs`'s line-finding/
+// auto-invert heuristics (out of scope for this leaf; the oracle is proving
+// PreparePixInput's depth-convert + scale-to-target-height + FromPix, not
+// line-finding).
+//
+// `Input::PreparePixInput` (input.cpp:107-144): converts the pix to 8-bit
+// grey (already 8-bit here, so a `clone()`, no `pixConvertTo8`), then scales
+// to `shape.height()` if that differs from the pix height. For our
+// height-36 8-bit grey PGM against eng.lstm's Input shape (height=36,
+// confirmed by network_forward_oracle.cpp / network_spec_oracle.cpp:
+// `target_height == height` -> NO `pixScale` call), this is an
+// identity-scale, so the only real work is `FromPix` -- already proven
+// byte-parity green in frompix_oracle.cpp (E-OCR leaf A6a). This oracle
+// proves the seam one level up: image FILE -> PreparePixInput -> Forward ->
+// beam -> text, end to end.
+//
+// null_char=110 / simple_text=true / dict=nullptr: identical convention to
+// recognize_grid_oracle.cpp. The randomizer is seeded via the REAL
+// `LSTMRecognizer::SetRandomSeed()` (`(int64_t)sample_iteration_ * 0x10000001`
+// then one `IntRand()` warm-up; eng.lstm's sample_iteration_ = 6352704 from the
+// B2 DeSerialize dump) -- NOT a bare set_seed(1). This is NOT inert: while
+// `PreparePixInput`'s FromPix makes no draws here (`shape.width()==0`, no
+// width-padding), `Forward`'s `Convolve` DOES draw out-of-image noise from this
+// randomizer, and that noise reaches the recognized text -- switching from
+// set_seed(1) to SetRandomSeed changed the output "aLLiii," -> "qLLiy,,". So
+// this oracle proves the Rust transcode reproduces the ACTUAL RecognizeLine
+// (its real seeding), not merely "correct for an arbitrary seed".
+//
+//   ./image_text_oracle [eng.lstm] [eng.lstm-unicharset] [eng.lstm-recoder] [image.pgm]
+#include "network.h"
+#include "networkio.h"
+#include "networkscratch.h"
+#include "stridemap.h"
+#include "helpers.h"
+#include "serialis.h"
+#include "unicharset.h"
+#include "unicharcompress.h"
+#include "recodebeam.h"
+#include "input.h"
+#include "static_shape.h"
+
+#include <allheaders.h>
+
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+using namespace tesseract;
+
+int main(int argc, char **argv) {
+  const char *lstm_path = argc > 1 ? argv[1] : "/tmp/eng.lstm";
+  const char *uni_path = argc > 2 ? argv[2] : "/tmp/eng.lstm-unicharset";
+  const char *rec_path = argc > 3 ? argv[3] : "/tmp/eng.lstm-recoder";
+  const char *img_path = argc > 4 ? argv[4] : "/tmp/line36.pgm";
+
+  // ---- 1. Load the network: VERBATIM from network_forward_oracle.cpp /
+  // recognize_grid_oracle.cpp. ----
+  std::vector<char> data;
+  if (!LoadDataFromFile(lstm_path, &data)) {
+    fprintf(stderr, "load fail: %s\n", lstm_path);
+    return 1;
+  }
+  TFile fp;
+  if (!fp.Open(data.data(), data.size())) {
+    fprintf(stderr, "TFile::Open failed\n");
+    return 1;
+  }
+  Network *net = Network::CreateFromFile(&fp);
+  if (!net) {
+    fprintf(stderr, "CreateFromFile failed\n");
+    return 1;
+  }
+  fprintf(stderr, "nw=%d ni=%d no=%d\n", net->num_weights(), net->NumInputs(),
+          net->NumOutputs());
+
+  // ---- 2. Load the charset: UNICHARSET::load_from_file (single-arg
+  // overload, defaults skip_fragments=false -- same convention as
+  // recoder_oracle.cpp's `u.load_from_file(argv[1])`). ----
+  UNICHARSET unicharset;
+  if (!unicharset.load_from_file(uni_path)) {
+    fprintf(stderr, "unicharset load failed: %s\n", uni_path);
+    return 1;
+  }
+  fprintf(stderr, "unicharset size=%d\n", static_cast<int>(unicharset.size()));
+
+  // ---- 3. Load the recoder: VERBATIM pattern from recoder_oracle.cpp /
+  // recodebeam_oracle.cpp (LoadDataFromFile + TFile::Open + DeSerialize). ----
+  std::vector<char> rec_data;
+  if (!LoadDataFromFile(rec_path, &rec_data)) {
+    fprintf(stderr, "recoder load failed: %s\n", rec_path);
+    return 1;
+  }
+  TFile rec_fp;
+  if (!rec_fp.Open(rec_data.data(), rec_data.size())) {
+    fprintf(stderr, "recoder TFile::Open failed\n");
+    return 1;
+  }
+  UnicharCompress recoder;
+  if (!recoder.DeSerialize(&rec_fp)) {
+    fprintf(stderr, "recoder DeSerialize failed\n");
+    return 1;
+  }
+  fprintf(stderr, "recoder code_range=%d\n", recoder.code_range());
+
+  // ---- 4. NEW for A6b: read the image file + run it through the REAL
+  // Input::PreparePixInput -- replaces recognize_grid_oracle.cpp's synthetic
+  // .bin grid build. `pixRead` (leptonica, allheaders.h) handles PGM/PNG/
+  // etc. transparently. One `TRand` is declared here (seed 1, no warm-up
+  // draw) and reused for BOTH PreparePixInput's randomizer arg and (below)
+  // net->SetRandomizer before Forward -- matching
+  // LSTMRecognizer::RecognizeLine's single-randomizer-instance shape
+  // (lstmrecognizer.cpp:321-347), even though the concrete seed convention
+  // differs from RecognizeLine's SetRandomSeed() (see file header). ----
+  Image pix = pixRead(img_path);
+  if (pix == nullptr) {
+    fprintf(stderr, "pixRead failed: %s\n", img_path);
+    return 1;
+  }
+  fprintf(stderr, "pix w=%d h=%d d=%d\n", pixGetWidth(pix), pixGetHeight(pix),
+          pixGetDepth(pix));
+
+  // LSTMRecognizer::SetRandomSeed (lstmrecognizer.h:287-291): the exact seeding
+  // RecognizeLine uses -- seed = (int64_t)sample_iteration_ * 0x10000001, then
+  // one IntRand() warm-up. eng.lstm's sample_iteration_ = 6352704 (the B2
+  // DeSerialize trailing-field dump, /tmp/oracle_lstmrec.tsv "siter 6352704").
+  TRand trand;
+  int64_t rseed = static_cast<int64_t>(6352704) * 0x10000001;
+  trand.set_seed(rseed);
+  trand.IntRand();
+
+  // Must set int_mode BEFORE (RecognizeLine does
+  // inputs->set_int_mode(IsIntMode()) -- eng is int mode).
+  NetworkIO input;
+  input.set_int_mode(true);
+  // Build the input grid via the REAL Input::PreparePixInput (depth-convert
+  // + scale-to-target-height + FromPix), using the REAL network's declared
+  // input shape -- exactly network_->InputShape() as RecognizeLine calls it.
+  Input::PreparePixInput(net->InputShape(), pix, &trand, &input);
+  pix.destroy();
+  fprintf(stderr, "input width=%d features=%d int_mode=%d\n", input.Width(),
+          input.NumFeatures(), input.int_mode() ? 1 : 0);
+
+  // ---- 5. Randomizer + Forward: SAME trand object as step 4 (PreparePixInput
+  // may consult it for Copy2DImage's width-padding noise branch, but a
+  // full-width image -- shape.width()==0, dynamic -- makes no draws, so the
+  // randomizer entering Forward is still fresh seed-1, matching the
+  // established network_forward_oracle.cpp / recognize_grid_oracle.cpp
+  // convention). ----
+  net->SetRandomizer(&trand);
+
+  NetworkScratch scratch;
+  NetworkIO outputs;
+  net->Forward(false, input, nullptr, &scratch, &outputs);
+  fprintf(stderr, "oshape width=%d features=%d int_mode=%d\n",
+          outputs.Width(), outputs.NumFeatures(), outputs.int_mode() ? 1 : 0);
+
+  // ---- 6. Beam decode: the REAL non-dict CTC beam
+  // (RecodeBeamSearch::Decode(const NetworkIO&, ...) overload, which reads
+  // via output.f(t) -- requires int_mode()==false, satisfied since the
+  // final FC layer's softmax activation always produces float). ----
+  const int null_char = 110; // eng.lstm's real DeSerialize'd value
+  const bool simple_text = true; // OutputLossType()==LT_SOFTMAX for eng.lstm
+  RecodeBeamSearch beam(recoder, null_char, simple_text, nullptr);
+  beam.Decode(outputs, 1.0, 0.0, 0.0, &unicharset, 0);
+
+  // ---- 7. Extract best path as unichar ids: the REAL public API. ----
+  std::vector<int> unichar_ids, xcoords;
+  std::vector<float> certs, ratings;
+  beam.ExtractBestPathAsUnicharIds(false, &unicharset, &unichar_ids, &certs,
+                                    &ratings, &xcoords);
+
+  // ---- 8. Build text: id_to_unichar concatenation. ----
+  std::string text;
+  for (int uid : unichar_ids) {
+    text += unicharset.id_to_unichar(uid);
+  }
+
+  // ---- Dump: EXACTLY tab-separated. ----
+  printf("uids");
+  for (int uid : unichar_ids) {
+    printf("\t%d", uid);
+  }
+  printf("\n");
+  printf("text\t%s\n", text.c_str());
+  return 0;
+}
+```
+
+---
+
+## pixScale (general-height) — RUFF-DRIVEN, first leaf proven (2026-07-07)
+
+**Correction of an earlier overstatement:** the A6b note called byte-exact
+`pixScale` "blocked — leptonica ships headers-only, can't transcode from source."
+**Wrong** — leptonica is open source (github.com/DanBloomberg/leptonica); the
+1.82.0 source (matching the installed lib) fetches fine. It was never blocked,
+only deferred.
+
+**Method = ruff-driven, NOT hand-rolled** (per the operator directive + Core-First
+doctrine). The transcode is DRIVEN by a `ruff_cpp_spo` harvest, not by eyeballing
+C++:
+
+1. **Extended `ruff_cpp_spo` with `walk_free_functions`** (ruff commit `096689c`,
+   local — ruff is push-locked) — the C-library free-function + **call-graph**
+   harvest arm. `walk_tu` harvests C++ *classes*; a C library (leptonica) is free
+   functions, so the AR/OO member body-arm captures nothing — but the call graph
+   IS the transcode-driving structure. Example: `harvest_leptonica_scale`.
+2. **Harvested `scale1.c`** → the dispatch manifest (banked at
+   `.claude/harvest/leptonica-scale-callgraph.txt`):
+   ```
+   pixScale → pixScaleGeneral → {pixScaleGrayLI, pixScaleAreaMap, pixScaleSmooth,
+                                 pixUnsharpMasking, pixScaleColorLI, pixScaleBinary}
+   pixScaleGrayLI → scaleGrayLILow (+ 2x/4x fast paths)
+   scaleGrayLILow → []      ← LEAF (essential numeric kernel — the 15% hand-port)
+   scaleColorLILow → []     ← LEAF
+   pixScaleAreaMap2 → []    ← LEAF
+   pixUnsharpMasking → (in enhance.c — harvest that TU next)
+   ```
+   The harvest **classifies** the leaf kernels (`calls=[]`) as the hand-port
+   targets and the dispatch functions as structure — the 85/15 split, *minted*
+   not eyeballed.
+3. **First leaf ported + byte-parity proven:** `scale_gray_li`
+   (`image_input.rs`) = the harvest-identified `scaleGrayLILow` LEAF (16×16
+   sub-pixel bilinear, fixed-point). Byte-identical vs leptonica `pixScaleGrayLI`
+   on **6/6** scale factors (`f = 0.72..1.29`, down- and up-scale;
+   `scale_li_dump` example vs `/tmp/scale_li_oracle`).
+
+**Remaining pixScale leaves (same ruff-driven method):** `pixScaleAreaMap` +
+`scaleColorAreaMapLow`/`scaleGrayAreaMapLow` (the `f<0.7` path); `pixUnsharpMasking`
+(harvest `enhance.c`); `pixScaleSmooth` (`f<0.02`, rare); then the `pixScale`
+dispatch composition (`pixScale` → sharpfract/sharpwidth by factor →
+`pixScaleGeneral` → depth/factor branch → scale + unsharp) proven vs the real
+`pixScale`, and wired into `prescale_grey_to_height` (which stays the marked
+bilinear approximation until the full dispatch is assembled — do NOT claim
+byte-parity on prescale before the unsharp + areamap leaves land).
