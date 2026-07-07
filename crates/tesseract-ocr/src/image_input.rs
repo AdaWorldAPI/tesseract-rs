@@ -152,6 +152,71 @@ pub fn prescale_grey_to_height(
     (out, target_width)
 }
 
+/// `pixScaleGrayLI` → `scaleGrayLILow` (leptonica 1.82.0 `scale1.c:2324`): 8-bit
+/// grey scaling by **linear interpolation**, via 16×16 sub-pixel bilinear
+/// weighting. `src` is `hs × ws` row-major grey; the output is `hd × wd` where
+/// the caller sets `wd = round(f·ws)`, `hd = round(f·hs)` (`pixScaleGrayLI`'s own
+/// dimension formula). Valid for `f ≥ 0.7` (leptonica's `pixScaleGeneral` routes
+/// smaller factors to area-map). This is the **un-sharpened** scale — the full
+/// `pixScale` applies `pixUnsharpMasking` on top (a separate sub-leaf).
+///
+/// Byte-exact vs leptonica: the sub-pixel location is `(int)(scx·j)` truncated,
+/// split into `xp = ·>>4` (src pixel) + `xf = ·&0xF` (1/16 fraction); the four
+/// neighbours are weighted by `(16−xf)(16−yf) … xf·yf` and combined as
+/// `(Σ + 128)/256`. Leptonica's `wpl`-packing is internal, so every logical read
+/// is `src[y·ws + x]`.
+#[must_use]
+pub fn scale_gray_li(src: &[u8], ws: usize, hs: usize, wd: usize, hd: usize) -> Vec<u8> {
+    let scx = 16.0 * ws as f32 / wd as f32;
+    let scy = 16.0 * hs as f32 / hd as f32;
+    let wm2 = ws as i32 - 2;
+    let hm2 = hs as i32 - 2;
+    let get = |y: i32, x: i32| i32::from(src[(y as usize) * ws + x as usize]);
+    let mut dst = vec![0u8; wd * hd];
+    for i in 0..hd {
+        let ypm = (scy * i as f32) as i32;
+        let yp = ypm >> 4;
+        let yf = ypm & 0x0f;
+        for j in 0..wd {
+            let xpm = (scx * j as f32) as i32;
+            let xp = xpm >> 4;
+            let xf = xpm & 0x0f;
+            let v00_val = get(yp, xp);
+            let v10_val;
+            let v01_val;
+            let v11_val;
+            if xp > wm2 || yp > hm2 {
+                if yp > hm2 && xp <= wm2 {
+                    // near bottom
+                    v01_val = v00_val;
+                    v10_val = get(yp, xp + 1);
+                    v11_val = v10_val;
+                } else if xp > wm2 && yp <= hm2 {
+                    // near right side
+                    v01_val = get(yp + 1, xp);
+                    v10_val = v00_val;
+                    v11_val = v01_val;
+                } else {
+                    // LR corner
+                    v10_val = v00_val;
+                    v01_val = v00_val;
+                    v11_val = v00_val;
+                }
+            } else {
+                v10_val = get(yp, xp + 1);
+                v01_val = get(yp + 1, xp);
+                v11_val = get(yp + 1, xp + 1);
+            }
+            let v00 = (16 - xf) * (16 - yf) * v00_val;
+            let v10 = xf * (16 - yf) * v10_val;
+            let v01 = (16 - xf) * yf * v01_val;
+            let v11 = xf * yf * v11_val;
+            dst[i * wd + j] = ((v00 + v01 + v10 + v11 + 128) / 256) as u8;
+        }
+    }
+    dst
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +243,16 @@ mod tests {
     fn pgm_errors() {
         assert_eq!(parse_pgm(b"P6\n1 1\n255\n\0"), Err(PgmError::BadMagic));
         assert_eq!(parse_pgm(b"P5\n2 2\n255\n\0"), Err(PgmError::Truncated));
+    }
+
+    #[test]
+    fn scale_gray_li_identity_at_factor_one() {
+        // f == 1.0 (wd==ws, hd==hs): scx=scy=16, so xf=yf=0 and
+        // val = (256·v00 + 128)/256 = v00 — an exact identity. (Real byte-parity
+        // vs leptonica pixScaleGrayLI is the scale_li_dump example, 6/6 factors.)
+        let src: Vec<u8> = (0..12).map(|i| (i * 17) as u8).collect();
+        let out = scale_gray_li(&src, 4, 3, 4, 3);
+        assert_eq!(out, src, "factor-1.0 LI scale is identity");
     }
 
     #[test]

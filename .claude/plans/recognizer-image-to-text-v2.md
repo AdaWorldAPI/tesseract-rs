@@ -1365,3 +1365,51 @@ int main(int argc, char **argv) {
   return 0;
 }
 ```
+
+---
+
+## pixScale (general-height) — RUFF-DRIVEN, first leaf proven (2026-07-07)
+
+**Correction of an earlier overstatement:** the A6b note called byte-exact
+`pixScale` "blocked — leptonica ships headers-only, can't transcode from source."
+**Wrong** — leptonica is open source (github.com/DanBloomberg/leptonica); the
+1.82.0 source (matching the installed lib) fetches fine. It was never blocked,
+only deferred.
+
+**Method = ruff-driven, NOT hand-rolled** (per the operator directive + Core-First
+doctrine). The transcode is DRIVEN by a `ruff_cpp_spo` harvest, not by eyeballing
+C++:
+
+1. **Extended `ruff_cpp_spo` with `walk_free_functions`** (ruff commit `096689c`,
+   local — ruff is push-locked) — the C-library free-function + **call-graph**
+   harvest arm. `walk_tu` harvests C++ *classes*; a C library (leptonica) is free
+   functions, so the AR/OO member body-arm captures nothing — but the call graph
+   IS the transcode-driving structure. Example: `harvest_leptonica_scale`.
+2. **Harvested `scale1.c`** → the dispatch manifest (banked at
+   `.claude/harvest/leptonica-scale-callgraph.txt`):
+   ```
+   pixScale → pixScaleGeneral → {pixScaleGrayLI, pixScaleAreaMap, pixScaleSmooth,
+                                 pixUnsharpMasking, pixScaleColorLI, pixScaleBinary}
+   pixScaleGrayLI → scaleGrayLILow (+ 2x/4x fast paths)
+   scaleGrayLILow → []      ← LEAF (essential numeric kernel — the 15% hand-port)
+   scaleColorLILow → []     ← LEAF
+   pixScaleAreaMap2 → []    ← LEAF
+   pixUnsharpMasking → (in enhance.c — harvest that TU next)
+   ```
+   The harvest **classifies** the leaf kernels (`calls=[]`) as the hand-port
+   targets and the dispatch functions as structure — the 85/15 split, *minted*
+   not eyeballed.
+3. **First leaf ported + byte-parity proven:** `scale_gray_li`
+   (`image_input.rs`) = the harvest-identified `scaleGrayLILow` LEAF (16×16
+   sub-pixel bilinear, fixed-point). Byte-identical vs leptonica `pixScaleGrayLI`
+   on **6/6** scale factors (`f = 0.72..1.29`, down- and up-scale;
+   `scale_li_dump` example vs `/tmp/scale_li_oracle`).
+
+**Remaining pixScale leaves (same ruff-driven method):** `pixScaleAreaMap` +
+`scaleColorAreaMapLow`/`scaleGrayAreaMapLow` (the `f<0.7` path); `pixUnsharpMasking`
+(harvest `enhance.c`); `pixScaleSmooth` (`f<0.02`, rare); then the `pixScale`
+dispatch composition (`pixScale` → sharpfract/sharpwidth by factor →
+`pixScaleGeneral` → depth/factor branch → scale + unsharp) proven vs the real
+`pixScale`, and wired into `prescale_grey_to_height` (which stays the marked
+bilinear approximation until the full dispatch is assembled — do NOT claim
+byte-parity on prescale before the unsharp + areamap leaves land).
