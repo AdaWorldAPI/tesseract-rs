@@ -1,0 +1,24 @@
+[package]
+name = "tesseract-ocr-pdf"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "PDF front-end for the pure-Rust Tesseract transcode: digital-PDF text-layer fast path (D5.1) + orchestrator binary (D5.3, raster fallback stubbed pending D5.2)."
+
+[dependencies]
+# Pure-Rust PDF parser/text-extractor (INPUT tooling, not the OCR runtime — see
+# the crate-level doc comment for the boundary this preserves). D5.1 picked
+# lopdf over pdf-extract: lopdf exposes `Document::extract_text(&[page_num])`
+# per-page (needed to classify a page as "has a text layer" vs "image-only"),
+# whereas pdf-extract's `extract_text_from_mem` only returns whole-document
+# text with no per-page seam. Fewer, more targeted deps for the same job.
+lopdf = "0.36"
+# The two OCR foundations (path deps, fork-only policy) — depended on for
+# their PUBLIC API only; this crate never touches tesseract-ocr's src/ or
+# reaches into private internals.
+tesseract-ocr = { path = "../tesseract-ocr", features = ["seg-approx"] }
+tesseract-core = { path = "../tesseract-core" }
+
+[[bin]]
+name = "tesseract-ocr-pdf"
+path = "src/main.rs"

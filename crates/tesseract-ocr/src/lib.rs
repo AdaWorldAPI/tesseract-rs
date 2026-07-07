@@ -28,8 +28,9 @@ pub use image_input::{parse_pgm, prescale_grey_to_height, PgmError};
 #[cfg(feature = "seg-approx")]
 pub use line_segment::{find_text_lines, LineBand};
 pub use lstm_recognizer::{LstmRecognizer, RecognizerError};
+pub use morph::{close_brick, dilate_brick, erode_brick, open_brick};
 pub use network::{InputShape, NetError, Network, Node, ReverseKind};
-pub use renderer::{render_text, render_tsv, LineWords};
+pub use renderer::{render_hocr, render_text, render_tsv, LineWords};
 pub use threshold::{
     histogram_rect_gray, histogram_rect_multi, histogram_rect_rgb, otsu_stats,
     otsu_threshold_channels, otsu_threshold_gray, threshold_rect_to_binary,
