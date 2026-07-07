@@ -12,13 +12,21 @@ operator directive: *transcode Tesseract into Rust, do NOT wrap libtesseract;
 delete the C++ residue.* Virtual workspace; the OCR is rebuilt leaf-by-leaf, each
 leaf **byte-parity-proven against the C++ original before it lands.**
 
-## Core-First doctrine (non-negotiable)
+## Core-First doctrine (non-negotiable — HOME CORRECTED 2026-07-07)
 
-Transcoded logic lives in the **OGAR Core** = `lance-graph-contract` (sibling repo
-`../lance-graph`). `tesseract-core` **CONSUMES** it; it never re-implements. The
-char set is `CharSet = lance_graph_contract::unicharset::UniCharSet`. A new
-primitive is shaped + proven in the Core, then surfaced here with a
-consumer-boundary test. **Never build a parallel object model here.**
+**The OGAR Core is the `AdaWorldAPI/OGAR` repo** (`ogar-vocab` = THE codebook,
+`ogar-class-view`, `ogar-from-ruff` = the ruff->OGAR facet producer via
+`ruff_spo_address::{Facet, Mint}`). `lance-graph-contract` is the AGNOSTIC Rust
+consumer contract — existing Tesseract content shapes there (unicharset,
+recoder, network, dawg) are merged precedent, but NEW domain substrate goes to
+OGAR (producer side) or tesseract-rs (consumer side), NEVER into the agnostic
+spine (operator ruling, lance-graph board `E-OCR-FACET-HOME-CORRECTION-1`; all
+four repos — lance-graph + tesseract-rs + OGAR + ndarray — compile into one
+binary, so there is no linking excuse). Classid canon: hi u16 = concept
+(minted in `ogar-vocab`), lo u16 = APP render prefix — NEVER a shape ordinal.
+Domain harvests stay HERE in `.claude/harvest/`, never in lance-graph.
+`tesseract-core` consumes; it never re-implements; **never build a parallel
+object model here.**
 Full doctrine: `../lance-graph/.claude/knowledge/core-first-transcode-doctrine.md`.
 
 ## What's shipped (all byte-parity vs libtesseract on real `eng` data)
