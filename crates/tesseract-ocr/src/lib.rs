@@ -13,6 +13,8 @@
 //! `ruff_cpp_spo` C++ SPO harvest); the compute **payloads** come from the
 //! recognizer's proven leaves. See `.claude/plans/recognizer-image-to-text-v2.md`.
 
+pub mod lstm_recognizer;
 pub mod network;
 
+pub use lstm_recognizer::{LstmRecognizer, RecognizerError};
 pub use network::{InputShape, NetError, Network, Node, ReverseKind};

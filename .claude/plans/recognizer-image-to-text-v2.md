@@ -519,3 +519,172 @@ int main(int argc, char **argv) {
   return 0;
 }
 ```
+
+---
+
+## B2 EXECUTED (2026-07-07) — LSTMRecognizer load, trailing-field parity GREEN
+
+**Shipped** in `crates/tesseract-ocr/src/lstm_recognizer.rs` (`LstmRecognizer` +
+`RecognizerError`) + `examples/lstm_recognizer_dump.rs`. `from_components(lstm,
+unicharset_text, recoder)` = `LSTMRecognizer::DeSerialize` for the
+`include_charsets == false` path (how `combine_tessdata -u` split eng.lstm):
+after `Network::from_le_bytes` (B1) the lstm component's 81-byte tail is
+`network_str_` (u32-len string) + **4×i32** (`training_flags_`,
+`training_iteration_`, `sample_iteration_`, `null_char_`) + **3×f32**
+(`adam_beta_`, `learning_rate_`, `momentum_`); the unicharset (TEXT,
+`UniCharSet::load_from_str`, `E-CPP-PARITY-1..6`) + recoder (binary,
+`UnicharCompress::from_le_bytes`, `E-CPP-PARITY-7`) come from their own
+components.
+
+**Byte-parity GREEN** on real `/tmp/eng.lstm`: the 8 trailing-parse lines
+byte-identical vs a public-API oracle (`Network::CreateFromFile` +
+`TFile::DeSerialize` in the exact `lstmrecognizer.cpp:144-166` order — no private
+access, no ABI skew):
+```
+netstr [1,36,0,1Ct3,3,16Mp3,3Lfys48Lfx96Lrx96Lfx192O1c1]
+tflags 65   titer 6352400   siter 6352704   null 110
+abeta 3f7fbe77   lrate 3a83126f   moment 3f000000
+```
+`training_flags=65 = TF_INT_MODE(1) | TF_COMPRESS_UNICHARSET(64)` → `is_int_mode`
++ `is_recoding` both true (eng is an int8 recoded LSTM). Assembly cross-checks
+(not in the parity diff — each already proven): network `num_weights=385807`,
+charset `size=112`, recoder `code_range=111`, `null_char=110` — all consistent
+with B1 + E-CPP-PARITY-1..7. `null_char=110` is exactly the beam null the
+`RecodeBeamSearch` (`E-OCR-RECODEBEAM-1`) expects. Board: lance-graph
+`E-OCR-RECOGNIZER-LOAD-1`.
+
+**Build/run the parity:**
+```sh
+cargo run -q -p tesseract-ocr --example lstm_recognizer_dump -- \
+    /tmp/eng.lstm /tmp/eng.lstm-unicharset /tmp/eng.lstm-recoder > /tmp/rust_lstmrec.tsv
+g++ -std=c++17 -DFAST_FLOAT /tmp/lstm_recognizer_oracle.cpp \
+    -I/tmp/tesseract/src/lstm -I/tmp/tesseract/src/ccstruct -I/tmp/tesseract/src/ccutil \
+    -I/tmp/tesseract/src/arch -I/tmp/tesseract/src/viewer -I/tmp/tesseract/src/dict \
+    -I/tmp/tesseract/src/classify -I/tmp/tesseract/include \
+    $(pkg-config --cflags tesseract) -o /tmp/lstm_recognizer_oracle \
+    $(pkg-config --libs tesseract) $(pkg-config --libs lept)
+/tmp/lstm_recognizer_oracle /tmp/eng.lstm > /tmp/oracle_lstmrec.tsv
+diff <(grep -E '^(netstr|tflags|titer|siter|null|abeta|lrate|moment)' /tmp/oracle_lstmrec.tsv) \
+     <(grep -E '^(netstr|tflags|titer|siter|null|abeta|lrate|moment)' /tmp/rust_lstmrec.tsv)   # empty => green
+```
+
+**Next: A6 + B3 — the leptonica image front-end.** `RecognizeLine`
+(`lstmrecognizer.cpp:236-291`): image `Pix` → `Input::Forward` (**A6** — the
+leptonica decision point, raise to operator: pure-Rust image decode vs a
+leptonica dep) → `network_->Forward` (B1 tree, DONE) → the softmax logits →
+`RecodeBeamSearch::Decode` (`E-OCR-RECODEBEAM-1`, DONE) →
+`ExtractBestPathAsUnicharIds` (C2, DONE) → `recoded_to_text` (`E-CPP-PARITY-7`,
+DONE). So B3 is: the leptonica `Input` (A6) + the `RecognizeLine` glue that
+threads the already-proven pieces. Everything downstream of the image grid is
+proven; A6 is the last unproven leaf and the one architectural fork.
+
+### Oracle source (banked — `/tmp/lstm_recognizer_oracle.cpp`, public-API only)
+```cpp
+// Byte-parity oracle for `LSTMRecognizer::DeSerialize`'s trailing-field read
+// (recognizer leaf B2), vs the Rust transcode.
+//
+// Loads the real eng.lstm via the REAL public `Network::CreateFromFile` (this
+// advances the TFile cursor past the whole network tree, exactly as
+// LSTMRecognizer::DeSerialize does at lstmrecognizer.cpp:135), then reads the
+// 8 trailing fields via the REAL `TFile::DeSerialize` overloads, in the exact
+// order lstmrecognizer.cpp:144-166 reads them (the `include_charsets == false`
+// path — no inline unicharset/recoder, matching how /tmp/eng.lstm was split
+// out of a traineddata):
+//
+//   network_str_ (std::string) -> training_flags_ (i32) ->
+//   training_iteration_ (i32) -> sample_iteration_ (i32) ->
+//   null_char_ (i32) -> adam_beta_ (f32) -> learning_rate_ (f32) ->
+//   momentum_ (f32)
+//
+//   ./lstm_recognizer_oracle [eng.lstm]
+#include "network.h"
+#include "serialis.h"
+
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+
+using namespace tesseract;
+
+int main(int argc, char **argv) {
+  const char *lstm_path = argc > 1 ? argv[1] : "/tmp/eng.lstm";
+
+  // ---- Load the network (the REAL recursive Network::CreateFromFile) ----
+  std::vector<char> data;
+  if (!LoadDataFromFile(lstm_path, &data)) {
+    fprintf(stderr, "load fail: %s\n", lstm_path);
+    return 1;
+  }
+  TFile fp;
+  if (!fp.Open(data.data(), data.size())) {
+    fprintf(stderr, "TFile::Open failed\n");
+    return 1;
+  }
+  Network *net = Network::CreateFromFile(&fp);
+  if (!net) {
+    fprintf(stderr, "CreateFromFile failed\n");
+    return 1;
+  }
+
+  // ---- Read the 8 trailing fields, exact order of
+  // LSTMRecognizer::DeSerialize (lstmrecognizer.cpp:144-166). ----
+  std::string network_str;
+  if (!fp.DeSerialize(network_str)) {
+    fprintf(stderr, "DeSerialize(network_str_) failed\n");
+    return 1;
+  }
+  int32_t training_flags = 0;
+  if (!fp.DeSerialize(&training_flags)) {
+    fprintf(stderr, "DeSerialize(training_flags_) failed\n");
+    return 1;
+  }
+  int32_t training_iteration = 0;
+  if (!fp.DeSerialize(&training_iteration)) {
+    fprintf(stderr, "DeSerialize(training_iteration_) failed\n");
+    return 1;
+  }
+  int32_t sample_iteration = 0;
+  if (!fp.DeSerialize(&sample_iteration)) {
+    fprintf(stderr, "DeSerialize(sample_iteration_) failed\n");
+    return 1;
+  }
+  int32_t null_char = 0;
+  if (!fp.DeSerialize(&null_char)) {
+    fprintf(stderr, "DeSerialize(null_char_) failed\n");
+    return 1;
+  }
+  float adam_beta = 0.0f;
+  if (!fp.DeSerialize(&adam_beta)) {
+    fprintf(stderr, "DeSerialize(adam_beta_) failed\n");
+    return 1;
+  }
+  float learning_rate = 0.0f;
+  if (!fp.DeSerialize(&learning_rate)) {
+    fprintf(stderr, "DeSerialize(learning_rate_) failed\n");
+    return 1;
+  }
+  float momentum = 0.0f;
+  if (!fp.DeSerialize(&momentum)) {
+    fprintf(stderr, "DeSerialize(momentum_) failed\n");
+    return 1;
+  }
+
+  // ---- Dump: tab-separated, f32 as raw LE bit-pattern hex. ----
+  uint32_t abeta_bits, lrate_bits, moment_bits;
+  std::memcpy(&abeta_bits, &adam_beta, 4);
+  std::memcpy(&lrate_bits, &learning_rate, 4);
+  std::memcpy(&moment_bits, &momentum, 4);
+
+  printf("netstr\t%s\n", network_str.c_str());
+  printf("tflags\t%d\n", training_flags);
+  printf("titer\t%d\n", training_iteration);
+  printf("siter\t%d\n", sample_iteration);
+  printf("null\t%d\n", null_char);
+  printf("abeta\t%08x\n", abeta_bits);
+  printf("lrate\t%08x\n", lrate_bits);
+  printf("moment\t%08x\n", moment_bits);
+  return 0;
+}
+```

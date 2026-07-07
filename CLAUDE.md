@@ -172,17 +172,33 @@ an `i8` NT_NONE tag, NOT a raw ordinal). Oracle: `/tmp/network_forward_oracle.cp
 5.3.4/5.5.0 ABI skew; source banked in the v2 plan §B1) vs `cargo run -p
 tesseract-ocr --example network_dump`. Board: lance-graph `E-OCR-NETWORK-FORWARD-1`.
 
-**Next: B2 → B3 — close image→text.** The canonical continuation plan (a
-self-contained handover: proven state + the byte-parity method + every remaining
-leaf with C++ ref / oracle / crate / order) is
-**`.claude/plans/recognizer-image-to-text-v2.md`** — START THERE. In brief:
-**B2** = `LSTMRecognizer` load (the 81 trailing bytes after the network in
-eng.lstm: charset ‖ recoder ‖ null_char — `from_le_bytes` already reports
-`consumed 401555` of 401636) → **A6/B3** = leptonica `Input` + `RecognizeLine`
-(image→text; A6 is the leptonica decision point, raise to operator) → dict beam +
-CJK trie (C1/C3, accuracy). `ExtractBestPathAsUnicharIds` (C2) is already shipped.
-(Still deferred, unchanged: the bbox/stats sub-leaf, gated on a legacy non-LSTM
-`eng.unicharset`; the 2-D LSTM / softmax-LSTM paths — eng.lstm is 1-D non-softmax.)
+**B2 is DONE too — the full recognizer loads from disk, byte-parity green.**
+`tesseract-ocr/src/lstm_recognizer.rs` (`LstmRecognizer::from_components`)
+transcodes `LSTMRecognizer::DeSerialize` for the `include_charsets == false`
+split-traineddata path: after the B1 network, the lstm component's 81-byte tail
+is `network_str_` + 4×i32 (`training_flags`=65, `training_iteration`,
+`sample_iteration`, `null_char`=110) + 3×f32 (`adam_beta`/`learning_rate`/
+`momentum`); the unicharset (TEXT) + recoder (binary) load from their own
+components (both already `E-CPP-PARITY-1..7`). The 8 trailing-parse fields are
+**byte-identical** vs a public-API oracle (`Network::CreateFromFile` +
+`TFile::DeSerialize`); assembly cross-checks (network 385807, charset 112,
+recoder code_range 111, null 110, int-mode+recoding) all consistent. Board:
+lance-graph `E-OCR-RECOGNIZER-LOAD-1`.
+
+**Next: A6 + B3 — the leptonica image front-end (the last unproven leaf).** The
+canonical continuation plan (proven state + the byte-parity method + every
+remaining leaf with C++ ref / oracle / crate / order) is
+**`.claude/plans/recognizer-image-to-text-v2.md`** — START THERE. `RecognizeLine`
+(`lstmrecognizer.cpp:236-291`): image `Pix` → **A6** `Input::Forward` (THE
+leptonica decision point — pure-Rust image decode vs a leptonica dep — raise to
+operator) → `network_->Forward` (B1, DONE) → softmax logits →
+`RecodeBeamSearch::Decode` (`E-OCR-RECODEBEAM-1`, DONE) →
+`ExtractBestPathAsUnicharIds` (C2, DONE) → `recoded_to_text` (`E-CPP-PARITY-7`,
+DONE). Everything downstream of the image grid is proven; **A6 is the only
+unproven leaf and the one architectural fork.** Then dict beam + CJK trie (C1/C3,
+accuracy). (Still deferred, unchanged: the bbox/stats sub-leaf, gated on a legacy
+non-LSTM `eng.unicharset`; the 2-D LSTM / softmax-LSTM paths — eng.lstm is 1-D
+non-softmax.)
 
 ## Network structure — ruff→OGAR sink onto V3 SoA (Core-side, byte-parity proven)
 
