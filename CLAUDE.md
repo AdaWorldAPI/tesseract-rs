@@ -206,21 +206,37 @@ green.** `tesseract-ocr` `LstmRecognizer::recognize_grid` threads
 (grid→text) both proven, `from_grey_pix` → `recognize_grid` already composes
 **pre-scaled grey-image → text**. Board: lance-graph `E-OCR-RECOGNIZE-GRID-1`.
 
-**Next: A6b — the ONLY remaining leaf for full image→text.** The canonical
-continuation plan (proven state + the byte-parity method + every remaining leaf
-with C++ ref / oracle / crate / order) is
-**`.claude/plans/recognizer-image-to-text-v2.md`** — START THERE. **A6b** = image
-file → decode → `pixConvertTo8` → **`pixScale` to height 36** — the
-leptonica-coupled commodity front of the front-end; per the founding directive
-("no leptonica at runtime; delete the C++ residue") it is pure-Rust (image decode
-via `image`-rs; `pixScale` byte-parity is leptonica's resampling algorithm — a
-hard, separate problem — so the pragmatic boundary is a pre-scaled-8-bit-grey
-input, with A6a proving the Tesseract-specific normalization). **Everything else
-in the image→text pipeline is now byte-parity proven** (A6a grid, B1 forward, 7b
-beam, C2 extract, recoded_to_text, B3-core glue). Then dict beam + CJK trie
-(C1/C3, accuracy). (Still deferred, unchanged: the bbox/stats sub-leaf, gated on
-a legacy non-LSTM `eng.unicharset`; the 2-D LSTM / softmax-LSTM paths — eng.lstm
-is 1-D non-softmax.)
+**★ A6b is DONE — IMAGE FILE → TEXT is CLOSED. The recognizer is a complete,
+byte-parity pure-Rust transcode for model-height line images.**
+`tesseract-ocr` `LstmRecognizer::recognize_image_file(path)` reads a P5 PGM
+(`image_input::parse_pgm` — lossless, decodes identically to leptonica `pixRead`)
+→ `prescale_grey_to_height` → `from_grey_pix` (A6a) → `recognize_grid` (B3-core),
+seeding the randomizer via `seeded_randomizer` = `LSTMRecognizer::SetRandomSeed`
+(`(i64)sample_iteration·0x10000001` + warm-up — the Convolve noise depends on it,
+so this bit-matches the ACTUAL `RecognizeLine`, not just an arbitrary seed).
+**Byte-identical vs a libtesseract oracle** (`pixRead` + `PreparePixInput` +
+`Forward` + beam + extract + id→text) on **6/6** image widths (8..100, all height
+36 = the model input height = identity `pixScale`): e.g. `img_24.pgm → "qLLiy,,"`.
+Board: lance-graph `E-OCR-IMAGE-TEXT-1`.
+
+**The whole `image file on disk → text` pipeline is now byte-parity proven,
+pure-Rust, zero leptonica at runtime** (A6b decode+identity-scale+SetRandomSeed →
+A6a grid → B1 forward → 7b beam → C2 extract → recoded_to_text → text).
+
+**The ONE documented boundary — the general-height `pixScale`:** `PreScale` uses
+leptonica's `pixScale(src, f, f)`; at `f == 1.0` (model-height line image) it is a
+copy → identity → the proven path. For other heights `prescale_grey_to_height`
+uses a **MARKED bilinear approximation** (functional, NOT leptonica-byte-exact —
+leptonica's depth/factor-dependent resampler; leptonica ships headers-only here so
+it can't be transcoded from source). A byte-exact `pixScale` is the single
+deferred sub-leaf; it is an ENHANCEMENT, not a core-pipeline gap.
+
+**Remaining are accuracy layers, not pipeline gaps:** dict beam (C1) + CJK trie
+(C3) for language-model accuracy; the word/box `ExtractBestPathAsWords` (B3-full);
+the byte-exact `pixScale`. See `.claude/plans/recognizer-image-to-text-v2.md`
+(all leaves EXECUTED through A6b). (Still deferred, unchanged: the bbox/stats
+sub-leaf, gated on a legacy non-LSTM `eng.unicharset`; the 2-D LSTM / softmax-LSTM
+paths — eng.lstm is 1-D non-softmax.)
 
 ## Network structure — ruff→OGAR sink onto V3 SoA (Core-side, byte-parity proven)
 
