@@ -865,3 +865,245 @@ int main(int argc, char **argv) {
   return 0;
 }
 ```
+
+---
+
+## B3-core EXECUTED (2026-07-07) — grid → text, byte-parity GREEN (the recognizer produces text)
+
+**Shipped** in `crates/tesseract-ocr/src/lstm_recognizer.rs`
+(`LstmRecognizer::recognize_grid`) + `examples/recognize_grid_dump.rs`. The
+A6b-independent core of `RecognizeLine` (`lstmrecognizer.cpp:247-291`): threads
+`network.forward` (B1) → softmax logits → `RecodeBeamSearch::decode`
+(`E-OCR-RECODEBEAM-1`) → `extract_best_path_as_unichar_ids` (C2) → `ids_to_text`
+(`E-CPP-PARITY-1`). Composes ONLY already-byte-parity-proven pieces + the thin
+logits→beam adapter (`outputs.f(t)` rows).
+
+**Byte-parity GREEN** on **5/5** synthetic grid widths (8, 16, 24, 40, 64) — the
+best-path `unichar_ids` + assembled `text` byte-identical vs a public-API oracle
+(a mechanical composition of the proven B1-forward + 7b-beam + charset oracles:
+`Network::CreateFromFile` → `net->Forward` → `RecodeBeamSearch(recoder, 110,
+true, nullptr).Decode(outputs, 1.0, 0.0, 0.0, &charset, 0)` →
+`ExtractBestPathAsUnicharIds` → `id_to_unichar`). Varied outputs (`:`, `eEE.`,
+`aiiiiff`, …) all matched. This proves the **B1-logits → beam seam** — the one
+integration point not covered by the per-leaf oracles.
+
+**Seam decisions (all verified, not guessed):**
+- `null_char = 110` — eng.lstm's real `DeSerialize`'d value (B2, `E-OCR-RECOGNIZER-LOAD-1`).
+- `simple_text = true` — `OutputLossType() == LT_SOFTMAX` (eng ends `…O1c1`);
+  derived Rust-side as `!outputs.int_mode()` (softmax ⟺ float output).
+- `dict = nullptr` (non-dict path); `dict_ratio=1.0`/`cert_offset=0.0`/
+  `worst_dict_cert=0.0` are **inert** here — `recodebeam.cpp` only consults them
+  inside the `ContinueDawg`/`PushDupOrNoDawgIfBetter` dawg paths (reached only
+  when `dict_ != nullptr`), so the best path is invariant to them.
+
+**What this leaves:** ONLY **A6b** (image file → decode → `pixScale`-to-height-36)
+stands between the current state and full **image → text**. Per the founding
+directive it is pure-Rust (image decode via `image`-rs; the `pixScale` byte-parity
+is leptonica's resampler, a hard commodity problem — boundary = pre-scaled 8-bit
+grey input). With A6a (grey image → grid) + B3-core (grid → text) both proven,
+`from_grey_pix` → `recognize_grid` already composes **grey-image → text** for a
+pre-scaled image. Board: lance-graph `E-OCR-RECOGNIZE-GRID-1`.
+
+### Oracle source (banked — `/tmp/recognize_grid_oracle.cpp`, public-API only)
+```cpp
+// Byte-parity oracle for the recognizer leaf B3-core: grid -> text (the
+// A6b-independent core of `LSTMRecognizer::RecognizeLine`), vs the Rust
+// transcode's `recognize_grid`.
+//
+// This is a MECHANICAL COMPOSITION of two already-proven oracle halves,
+// reused verbatim:
+//
+//   1. network_forward_oracle.cpp (E-OCR-NETWORK-FORWARD-1): loads eng.lstm
+//      via the REAL public `Network::CreateFromFile`, builds the synthetic
+//      int8 grid from the shared .bin format (i32 batch,height,width,depth
+//      header then f32s in StrideMap walk order), seeds the REAL `TRand`
+//      (seed 1, no warm-up draw) BEFORE Forward, and calls the REAL
+//      polymorphic `Network::Forward` to get the softmax NetworkIO.
+//
+//   2. recodebeam_oracle.cpp / recoder_oracle.cpp (E-OCR-RECODER-BEAM-1 /
+//      E-OCR-RECODEBEAM-1): loads the REAL `UnicharCompress` recoder
+//      (LoadDataFromFile + TFile::Open + DeSerialize, the same pattern
+//      proven byte-parity on the encode/decode/beam-maps leaves), builds
+//      the REAL `RecodeBeamSearch` (dict=nullptr, the non-dict path) and
+//      calls the REAL public `Decode` + `ExtractBestPathAsUnicharIds`.
+//
+// New glue here: `UNICHARSET::load_from_file` + `id_to_unichar` text
+// assembly -- proving the B1-logits -> beam seam: grid -> net->Forward ->
+// softmax logits -> RecodeBeamSearch::Decode -> ExtractBestPathAsUnicharIds
+// -> charset id->text.
+//
+// null_char=110 is eng.lstm's REAL DeSerialize'd value (confirmed via
+// LSTMRecognizer::DeSerialize's trailing-field read, /tmp/oracle_lstmrec.tsv:
+// "null 110" -- not a guess). simple_text=true because eng.lstm's
+// OutputLossType() == LT_SOFTMAX (the Series net ends `...O1c1`, a 1-code
+// softmax output, per the netstr dumped in the same oracle: "...Lfx192O1c1").
+// dict=nullptr is the non-dict path (LSTMRecognizer::dict_ is nullptr unless
+// LoadDictionary is explicitly called). dict_ratio=1.0/cert_offset=0.0/
+// worst_dict_cert=0.0 match the convention already established in
+// recodebeam_oracle.cpp; all three are inert when dict_==nullptr (grep of
+// recodebeam.cpp shows worst_dict_cert/dict_ratio are only consulted inside
+// the ContinueDawg/PushDupOrNoDawgIfBetter dawg-continuation paths, which are
+// only reached when dict_ != nullptr).
+//
+//   ./recognize_grid_oracle [eng.lstm] [eng.lstm-unicharset] [eng.lstm-recoder] [rg_input.bin]
+#include "network.h"
+#include "networkio.h"
+#include "networkscratch.h"
+#include "stridemap.h"
+#include "helpers.h"
+#include "serialis.h"
+#include "unicharset.h"
+#include "unicharcompress.h"
+#include "recodebeam.h"
+
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+using namespace tesseract;
+
+int main(int argc, char **argv) {
+  const char *lstm_path = argc > 1 ? argv[1] : "/tmp/eng.lstm";
+  const char *uni_path = argc > 2 ? argv[2] : "/tmp/eng.lstm-unicharset";
+  const char *rec_path = argc > 3 ? argv[3] : "/tmp/eng.lstm-recoder";
+  const char *bin_path = argc > 4 ? argv[4] : "/tmp/rg_input.bin";
+
+  // ---- 1. Load the network: VERBATIM from network_forward_oracle.cpp ----
+  std::vector<char> data;
+  if (!LoadDataFromFile(lstm_path, &data)) {
+    fprintf(stderr, "load fail: %s\n", lstm_path);
+    return 1;
+  }
+  TFile fp;
+  if (!fp.Open(data.data(), data.size())) {
+    fprintf(stderr, "TFile::Open failed\n");
+    return 1;
+  }
+  Network *net = Network::CreateFromFile(&fp);
+  if (!net) {
+    fprintf(stderr, "CreateFromFile failed\n");
+    return 1;
+  }
+  fprintf(stderr, "nw=%d ni=%d no=%d\n", net->num_weights(), net->NumInputs(),
+          net->NumOutputs());
+
+  // ---- 2. Load the charset: UNICHARSET::load_from_file (single-arg
+  // overload, defaults skip_fragments=false -- same convention as
+  // recoder_oracle.cpp's `u.load_from_file(argv[1])`). ----
+  UNICHARSET unicharset;
+  if (!unicharset.load_from_file(uni_path)) {
+    fprintf(stderr, "unicharset load failed: %s\n", uni_path);
+    return 1;
+  }
+  fprintf(stderr, "unicharset size=%d\n", static_cast<int>(unicharset.size()));
+
+  // ---- 3. Load the recoder: VERBATIM pattern from recoder_oracle.cpp /
+  // recodebeam_oracle.cpp (LoadDataFromFile + TFile::Open + DeSerialize). ----
+  std::vector<char> rec_data;
+  if (!LoadDataFromFile(rec_path, &rec_data)) {
+    fprintf(stderr, "recoder load failed: %s\n", rec_path);
+    return 1;
+  }
+  TFile rec_fp;
+  if (!rec_fp.Open(rec_data.data(), rec_data.size())) {
+    fprintf(stderr, "recoder TFile::Open failed\n");
+    return 1;
+  }
+  UnicharCompress recoder;
+  if (!recoder.DeSerialize(&rec_fp)) {
+    fprintf(stderr, "recoder DeSerialize failed\n");
+    return 1;
+  }
+  fprintf(stderr, "recoder code_range=%d\n", recoder.code_range());
+
+  // ---- 4. Build the synthetic grid: VERBATIM from
+  // network_forward_oracle.cpp (i32 batch,height,width,depth header then
+  // f32s in StrideMap walk order; ResizeToMap(true, ...) sets int_mode on
+  // the input NetworkIO, matching the real int8 LSTM input). ----
+  FILE *bf = fopen(bin_path, "rb");
+  if (!bf) {
+    fprintf(stderr, "open %s failed\n", bin_path);
+    return 1;
+  }
+  auto read_i32 = [&](int32_t *v) {
+    if (fread(v, sizeof(int32_t), 1, bf) != 1) {
+      fprintf(stderr, "bin truncated (header)\n");
+      exit(1);
+    }
+  };
+  int32_t batch = 0, height = 0, width = 0, depth = 0;
+  read_i32(&batch);
+  read_i32(&height);
+  read_i32(&width);
+  read_i32(&depth);
+
+  StrideMap map;
+  std::vector<std::pair<int, int>> hw = {
+      {static_cast<int>(height), static_cast<int>(width)}};
+  map.SetStride(hw);
+
+  NetworkIO input;
+  input.ResizeToMap(true, map, depth);
+
+  {
+    StrideMap::Index idx(map);
+    std::vector<float> vals(static_cast<size_t>(depth));
+    do {
+      int t = idx.t();
+      if (depth > 0 &&
+          fread(vals.data(), sizeof(float), static_cast<size_t>(depth), bf) !=
+              static_cast<size_t>(depth)) {
+        fprintf(stderr, "bin truncated at t=%d\n", t);
+        exit(1);
+      }
+      input.WriteTimeStep(t, vals.data());
+    } while (idx.Increment());
+  }
+  fclose(bf);
+
+  // ---- 5. Randomizer + Forward: VERBATIM from network_forward_oracle.cpp
+  // (seed 1, no warm-up draw, set BEFORE Forward). ----
+  TRand trand;
+  trand.set_seed(1);
+  net->SetRandomizer(&trand);
+
+  NetworkScratch scratch;
+  NetworkIO outputs;
+  net->Forward(false, input, nullptr, &scratch, &outputs);
+  fprintf(stderr, "oshape width=%d features=%d int_mode=%d\n",
+          outputs.Width(), outputs.NumFeatures(), outputs.int_mode() ? 1 : 0);
+
+  // ---- 6. Beam decode: the REAL non-dict CTC beam
+  // (RecodeBeamSearch::Decode(const NetworkIO&, ...) overload, which reads
+  // via output.f(t) -- requires int_mode()==false, satisfied since the
+  // final FC layer's softmax activation always produces float). ----
+  const int null_char = 110; // eng.lstm's real DeSerialize'd value
+  const bool simple_text = true; // OutputLossType()==LT_SOFTMAX for eng.lstm
+  RecodeBeamSearch beam(recoder, null_char, simple_text, nullptr);
+  beam.Decode(outputs, 1.0, 0.0, 0.0, &unicharset, 0);
+
+  // ---- 7. Extract best path as unichar ids: the REAL public API. ----
+  std::vector<int> unichar_ids, xcoords;
+  std::vector<float> certs, ratings;
+  beam.ExtractBestPathAsUnicharIds(false, &unicharset, &unichar_ids, &certs,
+                                    &ratings, &xcoords);
+
+  // ---- 8. Build text: id_to_unichar concatenation. ----
+  std::string text;
+  for (int uid : unichar_ids) {
+    text += unicharset.id_to_unichar(uid);
+  }
+
+  // ---- Dump: EXACTLY tab-separated. ----
+  printf("uids");
+  for (int uid : unichar_ids) {
+    printf("\t%d", uid);
+  }
+  printf("\n");
+  printf("text\t%s\n", text.c_str());
+  return 0;
+}
+```

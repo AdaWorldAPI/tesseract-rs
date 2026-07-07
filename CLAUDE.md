@@ -195,22 +195,32 @@ the ×127 of write_time_step** — a real gotcha). Byte-identical vs a public-AP
 `FromPix` oracle on **8/8** widths (3..64, incl. odd + the width=3 minimum).
 Board: lance-graph `E-OCR-FROMPIX-1`.
 
-**Next: A6b + B3 — close image→text.** The canonical continuation plan (proven
-state + the byte-parity method + every remaining leaf with C++ ref / oracle /
-crate / order) is **`.claude/plans/recognizer-image-to-text-v2.md`** — START
-THERE. **A6b** = image file → decode → `pixConvertTo8` → **`pixScale` to height
-36** — the leptonica-coupled commodity front of the front-end; per the founding
-directive ("no leptonica at runtime; delete the C++ residue") it is pure-Rust
-(image decode via `image`-rs; `pixScale` byte-parity is leptonica's resampling
-algorithm — a hard, separate problem — so the pragmatic boundary is a
-pre-scaled-8-bit-grey input, with A6a proving the Tesseract-specific
-normalization). **B3** = the `RecognizeLine` glue threading A6(a/b) →
-`network.forward` (B1, DONE) → `RecodeBeamSearch::Decode` (`E-OCR-RECODEBEAM-1`,
-DONE) → `ExtractBestPathAsUnicharIds` (C2, DONE) → `recoded_to_text`
-(`E-CPP-PARITY-7`, DONE). Everything except A6b's image decode+scale is proven.
-Then dict beam + CJK trie (C1/C3, accuracy). (Still deferred, unchanged: the
-bbox/stats sub-leaf, gated on a legacy non-LSTM `eng.unicharset`; the 2-D LSTM /
-softmax-LSTM paths — eng.lstm is 1-D non-softmax.)
+**B3-core is DONE — the recognizer produces text from a grid, byte-parity
+green.** `tesseract-ocr` `LstmRecognizer::recognize_grid` threads
+`network.forward` (B1) → softmax logits → `RecodeBeamSearch::decode`
+(`E-OCR-RECODEBEAM-1`) → `extract_best_path_as_unichar_ids` (C2) → `ids_to_text`
+(`E-CPP-PARITY-1`), byte-identical vs a public-API oracle on **5/5** grid widths
+(the proven B1-forward + 7b-beam + charset oracles composed). Proves the
+**B1-logits → beam seam** (`null_char=110`, `simple_text = !int_mode`, non-dict
+`dict_ratio=1.0`/`cert_offset=0.0` inert). With A6a (grey-image→grid) + B3-core
+(grid→text) both proven, `from_grey_pix` → `recognize_grid` already composes
+**pre-scaled grey-image → text**. Board: lance-graph `E-OCR-RECOGNIZE-GRID-1`.
+
+**Next: A6b — the ONLY remaining leaf for full image→text.** The canonical
+continuation plan (proven state + the byte-parity method + every remaining leaf
+with C++ ref / oracle / crate / order) is
+**`.claude/plans/recognizer-image-to-text-v2.md`** — START THERE. **A6b** = image
+file → decode → `pixConvertTo8` → **`pixScale` to height 36** — the
+leptonica-coupled commodity front of the front-end; per the founding directive
+("no leptonica at runtime; delete the C++ residue") it is pure-Rust (image decode
+via `image`-rs; `pixScale` byte-parity is leptonica's resampling algorithm — a
+hard, separate problem — so the pragmatic boundary is a pre-scaled-8-bit-grey
+input, with A6a proving the Tesseract-specific normalization). **Everything else
+in the image→text pipeline is now byte-parity proven** (A6a grid, B1 forward, 7b
+beam, C2 extract, recoded_to_text, B3-core glue). Then dict beam + CJK trie
+(C1/C3, accuracy). (Still deferred, unchanged: the bbox/stats sub-leaf, gated on
+a legacy non-LSTM `eng.unicharset`; the 2-D LSTM / softmax-LSTM paths — eng.lstm
+is 1-D non-softmax.)
 
 ## Network structure — ruff→OGAR sink onto V3 SoA (Core-side, byte-parity proven)
 
