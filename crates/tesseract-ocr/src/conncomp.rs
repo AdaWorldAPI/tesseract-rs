@@ -45,6 +45,52 @@
 //! the body's leading clear+push block, then is unconditionally cleared —
 //! matching the C source's one-time-only jump (every later iteration of the
 //! `do`/`while` runs the full body).
+//!
+//! ## Batch 3F₂ leaf 1 — per-component ink pixel count ([`ConnComp`])
+//! [`conn_comp_areas`] extends the same seedfill walk to also return each
+//! component's **ink pixel count** — the source of `BLOBNBOX::enclosed_area()`
+//! (`blobbox.h:150`, `area = static_cast<int>(srcblob->area())`, backed by
+//! `C_OUTLINE::area()`, `coutln.cpp:257-282`). The seedfill already visits
+//! every foreground pixel of the component exactly once (each `clear_bit`
+//! call clears a pixel that just tested ON, so it is never double-counted);
+//! [`seedfill4_bb`]/[`seedfill8_bb`] thread a running counter through every
+//! `clear_bit` call site and return it alongside the (unchanged)
+//! [`ConnCompBox`] — see each function's doc for the exact call sites.
+//! [`conn_comp_bb`] is refactored to be a thin `.map(|c| c.bb)` wrapper over
+//! [`conn_comp_areas`], which *by construction* keeps its box output
+//! byte-identical to the pre-leaf-1 implementation (also covered by an
+//! explicit regression test).
+//!
+//! ### `enclosed_area()` provenance and a documented divergence
+//! `C_OUTLINE::area()` computes area via Green's theorem walked around the
+//! *crack boundary* of the component's traced outline, **plus its `children`
+//! outlines' areas** (`coutln.cpp:280-282`, `total += it.data()->area()`).
+//! For a simple blob this nets to exactly the ink pixel count. For a blob
+//! with topology, the winding sign alternates with nesting depth: a hole
+//! (a child outline, opposite winding) *subtracts* its area, and an island
+//! sitting inside that hole (a grandchild outline, back to the outer
+//! winding) *adds* its area back — because in Tesseract's edge tracer, a
+//! hole and any island inside it are still walked as descendants of the
+//! *same* `C_BLOB`/`C_OUTLINE` tree as the outer boundary.
+//!
+//! A flat pixel-count seedfill (this port, and leptonica's own
+//! `pixConnCompPixa` + `pixCountPixels`, which the byte-parity oracle uses)
+//! does **not** reproduce that "island-in-a-hole" fold-back: under 4- or
+//! 8-connected seedfill, an island inside a hole never touches the
+//! surrounding ring's foreground pixels (the hole's background pixels
+//! separate them), so `pixConnComp` reports it as its own **separate**
+//! component with its own separate `pixel_count`/bounding box, rather than
+//! folding its area into the parent ring's count. This is a genuine,
+//! known, and accepted divergence between "outline Green's-theorem area
+//! with nested-children folding" (real Tesseract) and "flat
+//! pixel-count-based area via connected-component seedfill" (this port) —
+//! it manifests *only* on an island-strictly-inside-a-hole topology (an
+//! isolated dot inside a letter's counter, for example), which per the
+//! orchestrator's analysis is rare-to-nonexistent in Latin OCR corpora.
+//! Test fixtures in this module and the byte-parity oracle deliberately
+//! avoid constructing that topology; a simple hole (no island inside it,
+//! e.g. the counters of "o"/"e"/"8") is unaffected and matches exactly,
+//! since it involves only one level of nesting.
 
 /// One connected component's bounding box: leptonica `BOX` `(x, y, w, h)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +103,21 @@ pub struct ConnCompBox {
     pub w: i32,
     /// Height (`box->h`).
     pub h: i32,
+}
+
+/// A connected component's bounding box plus its **ink pixel count** — the
+/// `BLOBNBOX::enclosed_area()` source (see the module doc's "Batch 3F₂ leaf
+/// 1" section for the exact provenance and a documented island-in-a-hole
+/// divergence). Produced by [`conn_comp_areas`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnComp {
+    /// The component's bounding box — byte-identical to what
+    /// [`conn_comp_bb`] would report for the same component.
+    pub bb: ConnCompBox,
+    /// Count of foreground (`byte == 0`) pixels belonging to this
+    /// component — every pixel the seedfill actually erases, counted
+    /// exactly once.
+    pub pixel_count: i32,
 }
 
 /// A pending scanline segment awaiting expansion — leptonica `struct FillSeg`
@@ -150,8 +211,12 @@ fn next_on_pixel_in_raster(
 
 /// `pixSeedfill4BB` (`conncomp.c:619-705`). Erases the 4-connected component
 /// seeded at `(xseed, yseed)` (which must be ON) from `on`, returning its
-/// bounding box. `stack` is drained to empty on return (as in the C: the
-/// `while (lstackGetCount(stack) > 0)` loop only exits when empty).
+/// bounding box plus its ink pixel count (Batch 3F₂ leaf 1 — every
+/// `clear_bit` call below clears a pixel that just tested ON, so counting
+/// those calls is an exact, non-duplicating pixel tally; the box-computing
+/// logic itself is untouched from the pre-leaf-1 version). `stack` is
+/// drained to empty on return (as in the C: the `while
+/// (lstackGetCount(stack) > 0)` loop only exits when empty).
 fn seedfill4_bb(
     on: &mut [u8],
     w: i32,
@@ -159,9 +224,10 @@ fn seedfill4_bb(
     xseed: i32,
     yseed: i32,
     stack: &mut Vec<FillSeg>,
-) -> ConnCompBox {
+) -> (ConnCompBox, i32) {
     let xmax = w - 1;
     let ymax = h - 1;
+    let mut pixel_count: i32 = 0;
 
     let mut minx = 100_000_i32;
     let mut miny = 100_000_i32;
@@ -192,6 +258,7 @@ fn seedfill4_bb(
         let mut x = x1;
         while x >= 0 && get_bit(on, w, x, y) {
             clear_bit(on, w, x, y);
+            pixel_count += 1;
             x -= 1;
         }
 
@@ -222,6 +289,7 @@ fn seedfill4_bb(
                 // for (; x <= xmax && GET_DATA_BIT(line, x); x++) CLEAR_DATA_BIT(line, x);
                 while x <= xmax && get_bit(on, w, x, y) {
                     clear_bit(on, w, x, y);
+                    pixel_count += 1;
                     x += 1;
                 }
                 push_fillseg_bb(
@@ -266,19 +334,23 @@ fn seedfill4_bb(
         }
     }
 
-    ConnCompBox {
-        x: minx,
-        y: miny,
-        w: maxx - minx + 1,
-        h: maxy - miny + 1,
-    }
+    (
+        ConnCompBox {
+            x: minx,
+            y: miny,
+            w: maxx - minx + 1,
+            h: maxy - miny + 1,
+        },
+        pixel_count,
+    )
 }
 
 /// `pixSeedfill8BB` (`conncomp.c:732-818`). Same shape as [`seedfill4_bb`]
 /// with the 8-connectivity boundary offsets (`x1 - 1` / `x1` / `x2` instead
 /// of `x1` / `x1 + 1` / `x2 + 1`) — see `conncomp.c`'s own comment that this
 /// "follows Heckbert's closely, except the leak checks are changed for 8
-/// connectivity."
+/// connectivity." Also returns the ink pixel count (Batch 3F₂ leaf 1) —
+/// see [`seedfill4_bb`]'s doc for why counting `clear_bit` calls is exact.
 fn seedfill8_bb(
     on: &mut [u8],
     w: i32,
@@ -286,9 +358,10 @@ fn seedfill8_bb(
     xseed: i32,
     yseed: i32,
     stack: &mut Vec<FillSeg>,
-) -> ConnCompBox {
+) -> (ConnCompBox, i32) {
     let xmax = w - 1;
     let ymax = h - 1;
+    let mut pixel_count: i32 = 0;
 
     let mut minx = 100_000_i32;
     let mut miny = 100_000_i32;
@@ -319,6 +392,7 @@ fn seedfill8_bb(
         let mut x = x1 - 1;
         while x >= 0 && get_bit(on, w, x, y) {
             clear_bit(on, w, x, y);
+            pixel_count += 1;
             x -= 1;
         }
 
@@ -349,6 +423,7 @@ fn seedfill8_bb(
                 // for (; x <= xmax && GET_DATA_BIT(line, x); x++) CLEAR_DATA_BIT(line, x);
                 while x <= xmax && get_bit(on, w, x, y) {
                     clear_bit(on, w, x, y);
+                    pixel_count += 1;
                     x += 1;
                 }
                 push_fillseg_bb(
@@ -393,12 +468,15 @@ fn seedfill8_bb(
         }
     }
 
-    ConnCompBox {
-        x: minx,
-        y: miny,
-        w: maxx - minx + 1,
-        h: maxy - miny + 1,
-    }
+    (
+        ConnCompBox {
+            x: minx,
+            y: miny,
+            w: maxx - minx + 1,
+            h: maxy - miny + 1,
+        },
+        pixel_count,
+    )
 }
 
 /// `pixConnCompBB` (`conncomp.c:306-371`) — bounding boxes of the 4- or
@@ -407,10 +485,27 @@ fn seedfill8_bb(
 /// `binary` is `w * h` bytes, foreground = `byte == 0` (see module docs).
 /// `connectivity` must be `4` or `8`.
 ///
+/// A thin wrapper over [`conn_comp_areas`] (Batch 3F₂ leaf 1) — the box
+/// computation itself is unchanged, so this is byte-identical to the
+/// pre-leaf-1 implementation *by construction*, not merely by observation
+/// (also covered by an explicit regression test below).
+///
 /// # Panics
 /// Panics if `connectivity` is neither `4` nor `8`, or if `binary.len() !=
 /// w * h`.
 pub fn conn_comp_bb(binary: &[u8], w: usize, h: usize, connectivity: u32) -> Vec<ConnCompBox> {
+    conn_comp_areas(binary, w, h, connectivity)
+        .into_iter()
+        .map(|c| c.bb)
+        .collect()
+}
+
+/// `pixConnCompBB`'s bounding-box walk, extended (Batch 3F₂ leaf 1) to also
+/// report each component's ink pixel count (the `BLOBNBOX::enclosed_area()`
+/// source — see the module doc). Same raster-scan seed order as
+/// [`conn_comp_bb`]; `binary`/`connectivity` have the same conventions and
+/// panics.
+pub fn conn_comp_areas(binary: &[u8], w: usize, h: usize, connectivity: u32) -> Vec<ConnComp> {
     assert!(
         connectivity == 4 || connectivity == 8,
         "connectivity must be 4 or 8"
@@ -435,23 +530,23 @@ pub fn conn_comp_bb(binary: &[u8], w: usize, h: usize, connectivity: u32) -> Vec
         return Vec::new();
     }
 
-    let mut boxes = Vec::new();
+    let mut comps = Vec::new();
     let mut stack: Vec<FillSeg> = Vec::new();
     let mut xstart = 0_i32;
     let mut ystart = 0_i32;
     while let Some((x, y)) = next_on_pixel_in_raster(&on, wi, hi, xstart, ystart) {
-        let bb = if connectivity == 4 {
+        let (bb, pixel_count) = if connectivity == 4 {
             seedfill4_bb(&mut on, wi, hi, x, y, &mut stack)
         } else {
             seedfill8_bb(&mut on, wi, hi, x, y, &mut stack)
         };
-        boxes.push(bb);
+        comps.push(ConnComp { bb, pixel_count });
 
         xstart = x;
         ystart = y;
     }
 
-    boxes
+    comps
 }
 
 #[cfg(test)]
@@ -575,5 +670,137 @@ mod tests {
         let binary = vec![255_u8; w * h];
         assert!(conn_comp_bb(&binary, w, h, 4).is_empty());
         assert!(conn_comp_bb(&binary, w, h, 8).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Batch 3F₂ leaf 1 — conn_comp_areas / pixel_count
+    // ------------------------------------------------------------------
+
+    /// The session-standard synthetic grey image (`conncomp_dump.rs`'s
+    /// `synthetic_grey`): `((x*37 + y*11) ^ (x*y)) % 256`.
+    fn session_standard_synthetic(w: usize, h: usize) -> Vec<u8> {
+        let mut grey = vec![0_u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let v = ((x * 37 + y * 11) ^ (x * y)) % 256;
+                grey[y * w + x] = u8::try_from(v).expect("mod 256 fits u8");
+            }
+        }
+        grey
+    }
+
+    /// Regression pin (mandated by the Batch 3F₂ leaf-1 spec): [`conn_comp_bb`]
+    /// must stay byte-identical to `conn_comp_areas(...).map(bb)` -- true by
+    /// construction here (see [`conn_comp_bb`]'s doc), but pinned as an
+    /// explicit test so a future edit that re-duplicates the box logic
+    /// cannot silently drift the two apart.
+    #[test]
+    fn conn_comp_areas_bb_matches_conn_comp_bb_on_session_synthetic() {
+        let (w, h) = (24, 36);
+        let grey = session_standard_synthetic(w, h);
+        let otsu = crate::threshold::otsu_threshold_gray(&grey, w, 0, 0, w, h);
+        let binary = crate::threshold::threshold_rect_to_binary(&grey, w, 0, 0, w, h, otsu);
+
+        for connectivity in [4, 8] {
+            let areas = conn_comp_areas(&binary, w, h, connectivity);
+            let boxes_via_areas: Vec<ConnCompBox> = areas.iter().map(|c| c.bb).collect();
+            let boxes_direct = conn_comp_bb(&binary, w, h, connectivity);
+            assert_eq!(
+                boxes_via_areas, boxes_direct,
+                "conn_comp_areas(...).map(bb) must equal conn_comp_bb(...) (connectivity={connectivity})"
+            );
+            assert!(
+                !areas.is_empty(),
+                "session-standard synthetic must yield at least one component"
+            );
+            // Every reported pixel_count must be positive and never exceed
+            // the component's own bounding-box area (a hole can only ever
+            // make enclosed ink area <= bbox area for these fixtures, which
+            // contain no island-in-a-hole topology -- see module doc).
+            for c in &areas {
+                assert!(c.pixel_count > 0);
+                assert!(c.pixel_count <= c.bb.w * c.bb.h);
+            }
+        }
+    }
+
+    #[test]
+    fn pixel_count_single_pixel_component() {
+        let w = 5;
+        let h = 5;
+        let binary = to_binary(&[(2, 2)], w, h);
+        let areas = conn_comp_areas(&binary, w, h, 8);
+        assert_eq!(areas.len(), 1);
+        assert_eq!(areas[0].pixel_count, 1);
+        assert_eq!(
+            areas[0].bb,
+            ConnCompBox {
+                x: 2,
+                y: 2,
+                w: 1,
+                h: 1
+            }
+        );
+    }
+
+    #[test]
+    fn pixel_count_l_shape() {
+        // An L-shaped tromino: bbox is 2x2 (area 4) but only 3 pixels are
+        // ink, so pixel_count (3) < bbox area (4) -- enclosed_area is a
+        // strictly tighter measure than the bounding box for a non-filling
+        // shape, exactly as filter_noise_blobs's noise-area-ratio test
+        // (Batch 3F₂ leaf 2) relies on.
+        let w = 4;
+        let h = 4;
+        let binary = to_binary(&[(1, 1), (1, 2), (2, 2)], w, h);
+        let areas = conn_comp_areas(&binary, w, h, 8);
+        assert_eq!(areas.len(), 1);
+        assert_eq!(areas[0].pixel_count, 3);
+        assert_eq!(
+            areas[0].bb,
+            ConnCompBox {
+                x: 1,
+                y: 1,
+                w: 2,
+                h: 2
+            }
+        );
+        assert!(areas[0].pixel_count < areas[0].bb.w * areas[0].bb.h);
+    }
+
+    #[test]
+    fn pixel_count_ring_with_hole_excludes_hole() {
+        // A 3x3 ring (8 ink pixels around one background pixel in the
+        // center) under 8-connectivity: this is the "simple hole, no
+        // island inside it" case the module doc says matches Tesseract's
+        // enclosed_area() exactly (single level of nesting, no fold-back
+        // needed) -- pixel_count must be 8 (the hole's background pixel is
+        // never counted), not 9 (the full bounding-box area).
+        let w = 5;
+        let h = 5;
+        let ring: Vec<(usize, usize)> = vec![
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (1, 2),
+            (3, 2),
+            (1, 3),
+            (2, 3),
+            (3, 3),
+        ];
+        let binary = to_binary(&ring, w, h);
+        let areas = conn_comp_areas(&binary, w, h, 8);
+        assert_eq!(areas.len(), 1);
+        assert_eq!(areas[0].pixel_count, 8);
+        assert_eq!(
+            areas[0].bb,
+            ConnCompBox {
+                x: 1,
+                y: 1,
+                w: 3,
+                h: 3
+            }
+        );
+        assert_eq!(areas[0].bb.w * areas[0].bb.h, 9);
     }
 }
