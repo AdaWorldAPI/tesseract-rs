@@ -64,7 +64,7 @@ pub use lance_graph_contract::network;
 pub use lance_graph_contract::unichar;
 pub use lance_graph_contract::unicharcompress::{RecodedCharId, RecoderError, UnicharCompress};
 pub use lance_graph_contract::unicharset::{UniCharSet, UniCharSetError};
-pub use recodebeam::RecodeBeamSearch;
+pub use recodebeam::{RecodeBeamSearch, WordResult};
 
 /// The OCR character set — Tesseract's `UNICHARSET`, transcoded and proven in
 /// the OGAR Core. This alias is the OCR core's pure-Rust char-set surface; the

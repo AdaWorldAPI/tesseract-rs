@@ -24,7 +24,7 @@ use std::path::Path;
 
 use tesseract_core::{
     ids_to_text, DictLite, RecodeBeamSearch, RecoderError, UniCharSet, UniCharSetError,
-    UnicharCompress,
+    UnicharCompress, WordResult,
 };
 use tesseract_recognizer::{from_grey_pix, NetworkIo, TRand};
 
@@ -290,6 +290,66 @@ impl LstmRecognizer {
         let mut rng = self.seeded_randomizer();
         let grid = from_grey_pix(&scaled, sw, target_h, target_h as i32, 0, &mut rng);
         self.recognize_grid_with_dict(&grid, &mut rng, dict)
+    }
+
+    /// **The word/box output surface** — the counterpart of
+    /// [`Self::recognize_image_file`] / [`Self::recognize_image_file_with_dict`]
+    /// that returns [`WordResult`]s (`RecodeBeamSearch::extract_best_path_as_words`,
+    /// `recodebeam.cpp:239-322`) instead of a flat unichar-id run. Same P5-PGM
+    /// read → pre-scale → `from_grey_pix` → `network.forward` pipeline as the
+    /// other `recognize_image_file*` methods; `dict` selects the beam variant
+    /// exactly as [`Self::recognize_grid`]/[`Self::recognize_grid_with_dict`]
+    /// do (`None` → the plain `TOP_CHOICE_PERM`-only beam; `Some` → the
+    /// production `kDictRatio`/`kCertOffset`/`worst_dict_cert` dict beam).
+    ///
+    /// `line_box` is `(left, bottom, right, top)` — `TBOX`'s constructor
+    /// argument order. `scale_factor` un-does any `pixScale` pre-processing so
+    /// boxes land in the ORIGINAL image's pixel space (`1.0` for a model-height
+    /// image, matching [`Self::recognize_image_file`]'s byte-parity scope).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::recognize_image_file`].
+    pub fn recognize_image_file_words(
+        &self,
+        path: &Path,
+        dict: Option<DictLite>,
+        line_box: (i32, i32, i32, i32),
+        scale_factor: f32,
+    ) -> Result<Vec<WordResult>, RecognizerError> {
+        let bytes = std::fs::read(path).map_err(RecognizerError::Io)?;
+        let (grey, w, h) = parse_pgm(&bytes).map_err(RecognizerError::Pgm)?;
+        let target_h = self
+            .network
+            .input_shape
+            .map_or(36, |s| s.height.max(1) as usize);
+        let (scaled, sw) = prescale_grey_to_height(&grey, w, h, target_h);
+        let mut rng = self.seeded_randomizer();
+        let grid = from_grey_pix(&scaled, sw, target_h, target_h as i32, 0, &mut rng);
+        let outputs = self.network.forward(&grid, &mut rng)?;
+        if outputs.int_mode() {
+            return Err(RecognizerError::Network(NetError::Forward(
+                "recognize_image_file_words expects softmax float logits (int-mode output)",
+            )));
+        }
+        let simple = !outputs.int_mode();
+        let rows: Vec<&[f32]> = (0..outputs.width()).map(|t| outputs.f(t)).collect();
+        let words = if let Some(dict) = dict {
+            let mut beam = RecodeBeamSearch::new_with_dict(
+                &self.recoder,
+                self.null_char,
+                simple,
+                dict,
+                self.charset.clone(),
+            );
+            beam.decode_with_dict(&rows, K_DICT_RATIO, K_CERT_OFFSET, K_WORST_DICT_CERT);
+            beam.extract_best_path_as_words(line_box, scale_factor, &self.charset)
+        } else {
+            let mut beam = RecodeBeamSearch::new(&self.recoder, self.null_char, simple);
+            beam.decode(&rows, 1.0, 0.0);
+            beam.extract_best_path_as_words(line_box, scale_factor, &self.charset)
+        };
+        Ok(words)
     }
 
     /// Assemble from the three split `.traineddata` components (the

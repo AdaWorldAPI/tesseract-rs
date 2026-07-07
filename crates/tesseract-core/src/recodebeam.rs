@@ -62,6 +62,13 @@ const K_MIN_CERTAINTY: f32 = -20.0;
 /// `INVALID_UNICHAR_ID` (`unichar.h`).
 const INVALID_UNICHAR_ID: i32 = -1;
 
+/// Return shape of
+/// [`RecodeBeamSearch::extract_path_as_unichar_ids_with_boundaries`]:
+/// `(unichar_ids, certs, ratings, xcoords, character_boundaries)` — the same
+/// 4-tuple as [`RecodeBeamSearch::extract_best_path_as_unichar_ids`] plus the
+/// character-boundary x-coordinates.
+type UnicharIdsWithBoundaries = (Vec<i32>, Vec<f32>, Vec<f32>, Vec<i32>, Vec<i32>);
+
 /// `NodeContinuation::NC_ANYTHING` (`recodebeam.h:73`): this node used only its
 /// own score, so anything may follow.
 const NC_ANYTHING: usize = 0;
@@ -390,6 +397,73 @@ pub struct RecodeBeamSearch<'a> {
     second_code: i32,
     /// Reused heap for `ComputeTopN`.
     top_heap: MinHeap,
+}
+
+/// One extracted word — the information-content equivalent of Tesseract's
+/// `WERD_RES` (`ExtractBestPathAsWords`, `recodebeam.cpp:239-322`). We do NOT
+/// port `WERD`/`WERD_RES`/`MATRIX`/`BLOB_CHOICE`/`PAGE_RES` — every number
+/// those types would have carried for a single output word is here instead:
+/// per-character unichar ids/certainties/ratings (the `BLOB_CHOICE` diagonal,
+/// `recodebeam.cpp:303-313`), per-character boxes in the caller's `line_box`
+/// pixel space (the fake `C_BLOB`s, `recodebeam.cpp:645-657`), the permuter
+/// that produced the word (`FakeWordFromRatings`'s argument,
+/// `recodebeam.cpp:314-315`), the merged leading/trailing space certainty,
+/// and whether a leading space preceded the word.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WordResult {
+    /// Per-character unichar ids, `unichar_ids[word_start..word_end)`.
+    pub unichar_ids: Vec<i32>,
+    /// Per-character certainties (log-prob), same range.
+    pub certs: Vec<f32>,
+    /// Per-character CTC ratings (negative summed log-prob), same range.
+    pub ratings: Vec<f32>,
+    /// Per-character boxes `(left, bottom, right, top)` in the caller's
+    /// `line_box` coordinate space (`InitializeWord`, `recodebeam.cpp:642-657`).
+    /// May be shorter than `unichar_ids` — `InitializeWord` only emits a box
+    /// for cell `i` when `i + 1 < character_boundaries.len()`
+    /// (`recodebeam.cpp:646`), exactly as the C++ does.
+    pub char_boxes: Vec<(i32, i32, i32, i32)>,
+    /// The permuter of the word's last character
+    /// (`best_nodes[xcoords[word_end - 1]]->permuter`, the `FakeWordFromRatings`
+    /// argument, `recodebeam.cpp:314-315`).
+    pub permuter: PermuterType,
+    /// `min(space_cert, prev_space_cert)` — the certainty of the space that
+    /// terminates the PREVIOUS word, passed to `InitializeWord` as
+    /// `space_certainty` (`recodebeam.cpp:300-301`).
+    pub space_certainty: f32,
+    /// True if a space immediately precedes this word (`recodebeam.cpp:296-297`).
+    pub leading_space: bool,
+}
+
+/// `RecodeBeamSearch::calculateCharBoundaries` (`recodebeam.cpp:187-198`): turn
+/// the per-character `starts`/`ends` xcoord bookkeeping from
+/// [`RecodeBeamSearch::extract_path_as_unichar_ids_with_boundaries`] into
+/// character-boundary x-coordinates — one more entry than there are
+/// characters, so `boundaries[i]`/`boundaries[i + 1]` bracket character `i`'s
+/// extent for box construction.
+#[must_use]
+fn calculate_char_boundaries(starts: &[i32], ends: &[i32], max_width: i32) -> Vec<i32> {
+    let mut char_bounds = Vec::with_capacity(ends.len() + 1);
+    char_bounds.push(0);
+    for (i, &end) in ends.iter().enumerate() {
+        let middle = (starts[i + 1] - end) / 2;
+        char_bounds.push(end + middle);
+    }
+    char_bounds.pop();
+    char_bounds.push(max_width);
+    char_bounds
+}
+
+/// Mirrors `static_cast<int16_t>(float)` used by `InitializeWord`'s box
+/// construction (`recodebeam.cpp:647-654`): a C++ narrowing float→int16_t on
+/// an out-of-range value is undefined behaviour; Rust's `as i16` on a float
+/// saturates instead (defined, no UB). The two agree for every value that can
+/// legitimately occur (a beam x-coordinate scaled into image-pixel space,
+/// always far inside `i16` range for a real line image) and only diverge on
+/// an already-UB input.
+#[must_use]
+fn clip_to_i16(x: f32) -> i16 {
+    x as i16
 }
 
 impl<'a> RecodeBeamSearch<'a> {
@@ -1489,6 +1563,183 @@ impl<'a> RecodeBeamSearch<'a> {
         xcoords.push(width as i32);
         (unichar_ids, certs, ratings, xcoords)
     }
+
+    /// `ExtractPathAsUnicharIds` with the `character_boundaries` out-parameter
+    /// populated (`recodebeam.cpp:567-632`, the `character_boundaries != nullptr`
+    /// branch) — the variant [`Self::extract_best_path_as_words`] needs for box
+    /// construction. Identical certainty/rating/space-merge walk to
+    /// [`Self::extract_best_path_as_unichar_ids`] (see that method's docs for
+    /// the float contract); additionally tracks the `starts`/`ends` xcoord
+    /// bookkeeping (`recodebeam.cpp:591,617,627`) and feeds it to
+    /// [`calculate_char_boundaries`]. Kept as a separate method (rather than a
+    /// shared-with-boundaries refactor of the public 4-tuple extractor) so the
+    /// existing byte-parity-proven `extract_best_path_as_unichar_ids` is
+    /// untouched by this addition.
+    #[must_use]
+    fn extract_path_as_unichar_ids_with_boundaries(
+        &self,
+        best_nodes: &[u32],
+    ) -> UnicharIdsWithBoundaries {
+        let mut unichar_ids: Vec<i32> = Vec::new();
+        let mut certs: Vec<f32> = Vec::new();
+        let mut ratings: Vec<f32> = Vec::new();
+        let mut xcoords: Vec<i32> = Vec::new();
+        let mut starts: Vec<i32> = Vec::new();
+        let mut ends: Vec<i32> = Vec::new();
+        let width = best_nodes.len();
+        let mut t = 0usize;
+        while t < width {
+            let mut certainty = 0.0_f64;
+            let mut rating = 0.0_f64;
+            while t < width && self.arena[best_nodes[t] as usize].unichar_id == INVALID_UNICHAR_ID {
+                let cert = f64::from(self.arena[best_nodes[t] as usize].certainty);
+                t += 1;
+                if cert < certainty {
+                    certainty = cert;
+                }
+                rating -= cert;
+            }
+            starts.push(t as i32);
+            if t < width {
+                let unichar_id = self.arena[best_nodes[t] as usize].unichar_id;
+                if unichar_id == UNICHAR_SPACE
+                    && !certs.is_empty()
+                    && self.arena[best_nodes[t] as usize].permuter != NO_PERM
+                {
+                    let back = certs.len() - 1;
+                    if certainty < f64::from(certs[back]) {
+                        certs[back] = certainty as f32;
+                    }
+                    ratings[back] = (f64::from(ratings[back]) + rating) as f32;
+                    certainty = 0.0;
+                    rating = 0.0;
+                }
+                unichar_ids.push(unichar_id);
+                xcoords.push(t as i32);
+                loop {
+                    let node = &self.arena[best_nodes[t] as usize];
+                    let cert = f64::from(node.certainty);
+                    let no_perm_space = unichar_id == UNICHAR_SPACE && node.permuter == NO_PERM;
+                    t += 1;
+                    if cert < certainty || no_perm_space {
+                        certainty = cert;
+                    }
+                    rating -= cert;
+                    if !(t < width && self.arena[best_nodes[t] as usize].duplicate) {
+                        break;
+                    }
+                }
+                ends.push(t as i32);
+                certs.push(certainty as f32);
+                ratings.push(rating as f32);
+            } else if !certs.is_empty() {
+                let back = certs.len() - 1;
+                if certainty < f64::from(certs[back]) {
+                    certs[back] = certainty as f32;
+                }
+                ratings[back] = (f64::from(ratings[back]) + rating) as f32;
+            }
+        }
+        starts.push(width as i32);
+        let character_boundaries = calculate_char_boundaries(&starts, &ends, width as i32);
+        xcoords.push(width as i32);
+        (unichar_ids, certs, ratings, xcoords, character_boundaries)
+    }
+
+    /// `ExtractBestPathAsWords` (`recodebeam.cpp:239-322`) — the word/box output
+    /// surface `Tesseract::LSTMRecognizeWord` consumes to build `WERD_RES`. We
+    /// do not port `WERD_RES`/`MATRIX`/`BLOB_CHOICE` (a higher layer that
+    /// actually needs Tesseract's `PAGE_RES` tree would own that); [`WordResult`]
+    /// carries the same information content per word instead. The C++ `debug`
+    /// flag, `lstm_choice_mode`, and the second-choice path (`second_nodes`,
+    /// debug-only) are not ported — `tesseract-rs` never runs the interactive
+    /// choice UI those feed.
+    ///
+    /// `line_box` is `(left, bottom, right, top)` — `TBOX`'s constructor
+    /// argument order (`recodebeam.cpp:647-654`). `scale_factor` un-does any
+    /// `pixScale` pre-processing so boxes land in the ORIGINAL image's pixel
+    /// space.
+    #[must_use]
+    pub fn extract_best_path_as_words(
+        &self,
+        line_box: (i32, i32, i32, i32),
+        scale_factor: f32,
+        charset: &UniCharSet,
+    ) -> Vec<WordResult> {
+        let best_nodes = self.extract_path(self.extract_best_node());
+        let (unichar_ids, certs, ratings, xcoords, character_boundaries) =
+            self.extract_path_as_unichar_ids_with_boundaries(&best_nodes);
+        let num_ids = unichar_ids.len();
+        let (line_left, line_bottom, _line_right, line_top) = line_box;
+
+        let mut words = Vec::new();
+        let mut word_start = 0usize;
+        let mut prev_space_cert = 0.0_f32;
+        while word_start < num_ids {
+            // A word is terminated when a space character or start_of_word flag
+            // is hit. We also want to force a separate word for every non
+            // space-delimited character when not in a dictionary context.
+            let mut word_end = word_start + 1;
+            while word_end < num_ids {
+                if unichar_ids[word_end] == UNICHAR_SPACE {
+                    break;
+                }
+                let index = xcoords[word_end] as usize;
+                if self.arena[best_nodes[index] as usize].start_of_word {
+                    break;
+                }
+                let perm = self.arena[best_nodes[index] as usize].permuter;
+                if perm == TOP_CHOICE_PERM
+                    && (!is_space_delimited(charset, unichar_ids[word_end])
+                        || !is_space_delimited(charset, unichar_ids[word_end - 1]))
+                {
+                    break;
+                }
+                word_end += 1;
+            }
+
+            let space_cert = if word_end < num_ids && unichar_ids[word_end] == UNICHAR_SPACE {
+                certs[word_end]
+            } else {
+                0.0_f32
+            };
+            let leading_space = word_start > 0 && unichar_ids[word_start - 1] == UNICHAR_SPACE;
+            let space_certainty = space_cert.min(prev_space_cert);
+
+            let mut char_boxes = Vec::with_capacity(word_end - word_start);
+            for i in word_start..word_end {
+                if i + 1 < character_boundaries.len() {
+                    let left = i32::from(clip_to_i16(
+                        (character_boundaries[i] as f32 * scale_factor).floor(),
+                    )) + line_left;
+                    let right = i32::from(clip_to_i16(
+                        (character_boundaries[i + 1] as f32 * scale_factor).ceil(),
+                    )) + line_left;
+                    char_boxes.push((left, line_bottom, right, line_top));
+                }
+            }
+
+            let last_index = xcoords[word_end - 1] as usize;
+            let permuter = self.arena[best_nodes[last_index] as usize].permuter;
+
+            words.push(WordResult {
+                unichar_ids: unichar_ids[word_start..word_end].to_vec(),
+                certs: certs[word_start..word_end].to_vec(),
+                ratings: ratings[word_start..word_end].to_vec(),
+                char_boxes,
+                permuter,
+                space_certainty,
+                leading_space,
+            });
+
+            prev_space_cert = space_cert;
+            if word_end < num_ids && unichar_ids[word_end] == UNICHAR_SPACE {
+                word_end += 1;
+            }
+            word_start = word_end;
+        }
+        words
+    }
 }
 
 #[cfg(test)]
@@ -1788,5 +2039,196 @@ mod tests {
             "with the dictionary active, dict_ratio scaling lets the dict word overtake \
              the higher raw-probability non-word sequence"
         );
+    }
+
+    // ---- Word/box output surface: character_boundaries + ExtractBestPathAsWords ----
+
+    /// `calculateCharBoundaries` (`recodebeam.cpp:187-198`) on hand-picked
+    /// `starts`/`ends`, matching the shape a two-character decode of overall
+    /// width 10 would produce.
+    #[test]
+    fn char_boundaries_bracket_each_character() {
+        let starts = [0_i32, 4, 10];
+        let ends = [3_i32, 7];
+        let bounds = calculate_char_boundaries(&starts, &ends, 10);
+        // char 0: middle = (starts[1] - ends[0]) / 2 = (4 - 3) / 2 = 0 -> 3.
+        // char 1: middle = (starts[2] - ends[1]) / 2 = (10 - 7) / 2 = 1 -> 8, but
+        // the last computed boundary is dropped and replaced by max_width (the
+        // C++ pop_back + push(maxWidth) dance, `recodebeam.cpp:196-197`).
+        assert_eq!(bounds, vec![0, 3, 10]);
+    }
+
+    /// `character_boundaries_` from a real (non-dict) decode: one more entry
+    /// than there are characters, starting at 0 and ending at the decode
+    /// width, non-decreasing throughout.
+    #[test]
+    fn boundary_vector_length_matches_unichar_count_on_a_synthetic_decode() {
+        let recoder = passthrough_recoder(5);
+        let rows = [row(5, 1, 4), row(5, 2, 4), row(5, 3, 4)];
+        let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
+        let mut beam = RecodeBeamSearch::new(&recoder, 4, false);
+        beam.decode(&refs, 1.0, 0.0);
+        let best_nodes = beam.extract_path(beam.extract_best_node());
+        let (unichar_ids, _certs, _ratings, _xcoords, boundaries) =
+            beam.extract_path_as_unichar_ids_with_boundaries(&best_nodes);
+        assert_eq!(unichar_ids, vec![1, 2, 3]);
+        assert_eq!(
+            boundaries.len(),
+            unichar_ids.len() + 1,
+            "one more boundary than characters"
+        );
+        assert_eq!(boundaries[0], 0);
+        assert_eq!(
+            *boundaries.last().expect("non-empty"),
+            best_nodes.len() as i32,
+            "last boundary = decode width"
+        );
+        assert!(
+            boundaries.windows(2).all(|w| w[0] <= w[1]),
+            "boundaries are non-decreasing"
+        );
+    }
+
+    /// Hand-builds a `RecodeBeamSearch` whose "decode" is a single fixed chain
+    /// of nodes, bypassing `decode`/`decode_with_dict` entirely — used to test
+    /// [`RecodeBeamSearch::extract_best_path_as_words`]'s SPLIT LOGIC in
+    /// isolation from beam-search dynamics (already covered by
+    /// `decodes_a_clean_sequence`,
+    /// `dict_dawgs_attach_and_transfer_through_the_beam`, and the space-split
+    /// test below, which all exercise a real `decode`). `nodes` is `(code,
+    /// unichar_id, permuter, start_of_word, duplicate, certainty)` in
+    /// ROOT→LEAF order; each becomes one `RecodeNode` chained via `prev`, and
+    /// the last one is placed as the sole entry of the final timestep's
+    /// `beam_index(false, NC_ANYTHING, 0)` heap so
+    /// `extract_best_node`/`extract_path` walk exactly this chain.
+    fn hand_built_beam<'a>(
+        recoder: &'a UnicharCompress,
+        null_char: i32,
+        nodes: &[(i32, i32, PermuterType, bool, bool, f32)],
+    ) -> RecodeBeamSearch<'a> {
+        let mut beam = RecodeBeamSearch::new(recoder, null_char, false);
+        let mut prev = None;
+        let mut score = 0.0_f32;
+        for &(code, unichar_id, permuter, start_of_word, duplicate, certainty) in nodes {
+            score += certainty;
+            let code_hash = beam.compute_code_hash(code, duplicate, prev);
+            let node = RecodeNode {
+                code,
+                unichar_id,
+                permuter,
+                start_of_dawg: false,
+                start_of_word,
+                end_of_word: false,
+                duplicate,
+                certainty,
+                score,
+                prev,
+                dawgs: None,
+                code_hash,
+            };
+            let idx = beam.arena.len() as u32;
+            beam.arena.push(node);
+            prev = Some(idx);
+        }
+        let last_idx = prev.expect("hand_built_beam needs at least one node");
+        let width = nodes.len();
+        beam.beam_size = width;
+        beam.beams = (0..width)
+            .map(|_| core::array::from_fn(|_| MinHeap::default()))
+            .collect();
+        let index = beam_index(false, NC_ANYTHING, 0);
+        beam.beams[width - 1][index].push(HeapPair {
+            key: f64::from(score),
+            idx: last_idx,
+        });
+        beam
+    }
+
+    #[test]
+    fn word_split_on_space_via_real_decode() {
+        // codes 0..5, null=5; charset ids: NULL(space)=0, a=1, b=2, c=3, d=4.
+        let recoder = passthrough_recoder(6);
+        let charset = crate::UniCharSet::load_from_str(
+            "5\nNULL 0 Common\na 0 Latin\nb 0 Latin\nc 0 Latin\nd 0 Latin\n",
+        )
+        .expect("valid unicharset");
+        let mut beam = RecodeBeamSearch::new(&recoder, 5, false);
+        let rows = [row(6, 1, 5), row(6, 2, 5), row(6, 0, 5), row(6, 3, 5)];
+        let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
+        beam.decode(&refs, 1.0, 0.0);
+        let words = beam.extract_best_path_as_words((0, 0, 1000, 36), 1.0, &charset);
+        assert_eq!(words.len(), 2, "the space splits the run into two words");
+        assert_eq!(
+            words[0].unichar_ids,
+            vec![1, 2],
+            "\"a\", \"b\" before the space"
+        );
+        assert!(!words[0].leading_space);
+        assert_eq!(words[1].unichar_ids, vec![3], "\"c\" after the space");
+        assert!(
+            words[1].leading_space,
+            "the second word is preceded by the space character"
+        );
+        // Boxes are non-empty and left-to-right monotone within each word.
+        assert_eq!(words[0].char_boxes.len(), 2);
+        assert!(words[0].char_boxes[0].0 <= words[0].char_boxes[1].0);
+    }
+
+    #[test]
+    fn word_split_on_start_of_word_flag_without_a_space() {
+        let recoder = passthrough_recoder(5);
+        let charset = crate::UniCharSet::load_from_str("3\nNULL 0 Common\na 0 Latin\nb 0 Latin\n")
+            .expect("valid unicharset");
+        // Both "a" and "b" are Latin (space-delimited) and TOP_CHOICE_PERM, so
+        // the ONLY thing that can force a split between them is the
+        // start_of_word flag on b's node — the non-space-delimited-language
+        // dawg-restart case (`recodebeam.cpp:283-284`), isolated here from the
+        // TOP_CHOICE/script branch of the same condition (next test).
+        let nodes = [
+            (1_i32, 1_i32, TOP_CHOICE_PERM, false, false, -0.1_f32), // "a"
+            (2_i32, 2_i32, TOP_CHOICE_PERM, true, false, -0.1_f32),  // "b", start_of_word
+        ];
+        let beam = hand_built_beam(&recoder, 99, &nodes);
+        let words = beam.extract_best_path_as_words((0, 0, 1000, 36), 1.0, &charset);
+        assert_eq!(
+            words.len(),
+            2,
+            "start_of_word forces a split even with no space"
+        );
+        assert_eq!(words[0].unichar_ids, vec![1]);
+        assert_eq!(words[1].unichar_ids, vec![2]);
+        assert!(!words[0].leading_space);
+        assert!(
+            !words[1].leading_space,
+            "no actual space character was involved in this split"
+        );
+    }
+
+    #[test]
+    fn word_split_on_non_space_delimited_script_without_dict() {
+        let recoder = passthrough_recoder(5);
+        let charset =
+            crate::UniCharSet::load_from_str("4\nNULL 0 Common\na 0 Latin\nb 0 Han\nc 0 Latin\n")
+                .expect("valid unicharset");
+        // "b" is Han (not space-delimited); TOP_CHOICE_PERM (the always-active
+        // non-dict permuter) plus a non-space-delimited neighbor on EITHER
+        // side forces a break (`recodebeam.cpp:286-290`), so a Han character
+        // between two Latin ones splits into three one-character words.
+        let nodes = [
+            (1_i32, 1_i32, TOP_CHOICE_PERM, false, false, -0.1_f32), // "a" (Latin)
+            (2_i32, 2_i32, TOP_CHOICE_PERM, false, false, -0.1_f32), // "b" (Han)
+            (3_i32, 3_i32, TOP_CHOICE_PERM, false, false, -0.1_f32), // "c" (Latin)
+        ];
+        let beam = hand_built_beam(&recoder, 99, &nodes);
+        let words = beam.extract_best_path_as_words((0, 0, 1000, 36), 1.0, &charset);
+        assert_eq!(
+            words.len(),
+            3,
+            "a non-space-delimited (Han) neighbor forces a split on both sides"
+        );
+        assert_eq!(words[0].unichar_ids, vec![1]);
+        assert_eq!(words[1].unichar_ids, vec![2]);
+        assert_eq!(words[2].unichar_ids, vec![3]);
+        assert!(words.iter().all(|w| !w.leading_space));
     }
 }
