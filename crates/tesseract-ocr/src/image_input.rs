@@ -25,6 +25,13 @@
 //! [`from_grey_pix`]: tesseract_recognizer::from_grey_pix
 //! [`recognize_grid`]: crate::LstmRecognizer::recognize_grid
 
+/// `L_RED_WEIGHT` (leptonica `pix.h`) — default perceptual weight for red.
+const L_RED_WEIGHT: f32 = 0.3;
+/// `L_GREEN_WEIGHT` (leptonica `pix.h`) — default perceptual weight for green.
+const L_GREEN_WEIGHT: f32 = 0.5;
+/// `L_BLUE_WEIGHT` (leptonica `pix.h`) — default perceptual weight for blue.
+const L_BLUE_WEIGHT: f32 = 0.2;
+
 /// An error parsing a PGM image file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgmError {
@@ -470,6 +477,84 @@ fn exact_halvings(f: f32) -> Option<usize> {
     }
 }
 
+/// `pixConvertRGBToGray` (leptonica 1.82.0 `pixconv.c:826-885`) — weighted
+/// RGB→grey conversion, the LEAF kernel under
+/// `pixConvertTo8 → pixConvertRGBToLuminance → pixConvertRGBToGray`
+/// (`.claude/harvest/leptonica-scale-callgraph.txt` pixconv section).
+///
+/// `rgb` is a plain row-major RGB triple buffer (`3·w·h` bytes, R,G,B per
+/// pixel) — NOT leptonica's packed 32-bit word. Leptonica reads
+/// `(word >> L_RED_SHIFT) & 0xff` etc. (`L_RED_SHIFT`=24, `L_GREEN_SHIFT`=16,
+/// `L_BLUE_SHIFT`=8, `pix.h:210-215`) purely to pull R/G/B back out of one
+/// packed `l_uint32`; a caller already holding separate R/G/B bytes skips
+/// that unpacking entirely and reads them directly — the logical per-pixel
+/// value is identical either way.
+///
+/// `(rwt, gwt, bwt)` are the perceptual weights, each non-negative and
+/// (nominally) summing to `1.0`. `(0.0, 0.0, 0.0)` selects leptonica's
+/// default weights `L_RED_WEIGHT = 0.3`, `L_GREEN_WEIGHT = 0.5`,
+/// `L_BLUE_WEIGHT = 0.2` (`pix.h:246-248`) — the [`rgb_to_luminance`] path
+/// (`pixconv.c:741-745`). If the supplied weights don't sum to `1.0` within
+/// `1e-4`, they are rescaled to preserve their ratios (`pixconv.c:854-860`).
+///
+/// Byte-exact per-pixel arithmetic (`pixconv.c:877-879`): the three weighted
+/// terms are summed in **f32** (matching `l_float32` C arithmetic: `rwt`,
+/// `gwt`, `bwt`, and the promoted-to-f32 pixel bytes are all `l_float32`),
+/// then `+ 0.5` promotes the sum to **f64** (`0.5` is an unsuffixed double
+/// literal in C, so the whole expression becomes `double` for that final
+/// add), truncated to `i32` via the C cast, then masked to the low byte
+/// (`SET_DATA_BYTE`) — the same f32/f64 precision-splice pattern as
+/// [`scale_gray_area_map`]'s LR-corner.
+///
+/// # Panics
+///
+/// Panics if any weight is negative (`pixconv.c:844-845`'s `ERROR_PTR` path)
+/// or `rgb.len() < 3·w·h`.
+#[must_use]
+pub fn rgb_to_gray(rgb: &[u8], w: usize, h: usize, rwt: f32, gwt: f32, bwt: f32) -> Vec<u8> {
+    assert!(rgb.len() >= 3 * w * h, "rgb buffer too small");
+    assert!(
+        rwt >= 0.0 && gwt >= 0.0 && bwt >= 0.0,
+        "weights not all >= 0.0"
+    );
+
+    // "Make sure the sum of weights is 1.0; otherwise, you can get overflow
+    // in the gray value." (pixconv.c:847-848)
+    let (mut rwt, mut gwt, mut bwt) = (rwt, gwt, bwt);
+    if rwt == 0.0 && gwt == 0.0 && bwt == 0.0 {
+        rwt = L_RED_WEIGHT;
+        gwt = L_GREEN_WEIGHT;
+        bwt = L_BLUE_WEIGHT;
+    }
+    let sum: f32 = rwt + gwt + bwt; // l_float32 sum, matching C's operand types
+    if (f64::from(sum) - 1.0).abs() > 0.0001 {
+        // maintain ratios with sum == 1.0 (pixconv.c:857-859); division stays
+        // f32 since both operands are l_float32 in C.
+        rwt /= sum;
+        gwt /= sum;
+        bwt /= sum;
+    }
+
+    let mut out = vec![0u8; w * h];
+    for (i, px) in out.iter_mut().enumerate() {
+        let r = f32::from(rgb[3 * i]);
+        let g = f32::from(rgb[3 * i + 1]);
+        let b = f32::from(rgb[3 * i + 2]);
+        let weighted_f32 = rwt * r + gwt * g + bwt * b; // l_float32 sum-of-products
+        let val = (f64::from(weighted_f32) + 0.5) as i32; // "+ 0.5" is a double literal
+        *px = val as u8; // SET_DATA_BYTE masks to low 8 bits
+    }
+    out
+}
+
+/// `pixConvertRGBToLuminance` (`pixconv.c:741-745`) —
+/// `pixConvertRGBToGray(pixs, 0.0, 0.0, 0.0)`, i.e. the default perceptual
+/// weights. See [`rgb_to_gray`].
+#[must_use]
+pub fn rgb_to_luminance(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
+    rgb_to_gray(rgb, w, h, 0.0, 0.0, 0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +624,56 @@ mod tests {
         let grey: Vec<u8> = (0..24).collect();
         let (out, w) = prescale_grey_to_height(&grey, 4, 6, 3);
         assert_eq!(out.len(), w * 3, "scaled to height 3");
+    }
+
+    #[test]
+    fn rgb_to_gray_default_weights_hand_computed() {
+        // 2x2, default weights (0.3, 0.5, 0.2). Hand-computed:
+        //   px0 (10,20,30):  0.3*10+0.5*20+0.2*30 = 3+10+6     = 19.0 -> 19
+        //   px1 (0,0,0):     0.0                                = 0.0  -> 0
+        //   px2 (255,255,255): sum weights == 1.0 -> 255.0      = 255
+        //   px3 (1,2,3): 0.3*1+0.5*2+0.2*3 = 0.3+1.0+0.6 = 1.9 -> (1.9+0.5)=2.4 -> 2
+        let rgb: Vec<u8> = vec![
+            10, 20, 30, // px0
+            0, 0, 0, // px1
+            255, 255, 255, // px2
+            1, 2, 3, // px3
+        ];
+        let out = rgb_to_gray(&rgb, 2, 2, 0.0, 0.0, 0.0);
+        assert_eq!(out, vec![19, 0, 255, 2]);
+    }
+
+    #[test]
+    fn rgb_to_luminance_matches_default_weights() {
+        let rgb: Vec<u8> = vec![10, 20, 30, 40, 50, 60];
+        assert_eq!(
+            rgb_to_luminance(&rgb, 2, 1),
+            rgb_to_gray(&rgb, 2, 1, 0.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn rgb_to_gray_explicit_weights() {
+        // Weights already sum to 1.0: pure-red selection.
+        let rgb: Vec<u8> = vec![100, 200, 50];
+        let out = rgb_to_gray(&rgb, 1, 1, 1.0, 0.0, 0.0);
+        assert_eq!(out, vec![100]);
+    }
+
+    #[test]
+    fn rgb_to_gray_renormalizes_weights_that_dont_sum_to_one() {
+        // Weights (1.0, 1.0, 1.0) don't sum to 1.0 -> rescaled to (1/3,1/3,1/3),
+        // i.e. an unweighted average (matches pixConvertRGBToGrayGeneral's
+        // L_SELECT_AVERAGE intent, mirrored via renormalization here).
+        let rgb: Vec<u8> = vec![90, 90, 90];
+        let out = rgb_to_gray(&rgb, 1, 1, 1.0, 1.0, 1.0);
+        assert_eq!(out, vec![90]);
+    }
+
+    #[test]
+    #[should_panic(expected = "weights not all >= 0.0")]
+    fn rgb_to_gray_rejects_negative_weight() {
+        let rgb: Vec<u8> = vec![1, 2, 3];
+        let _ = rgb_to_gray(&rgb, 1, 1, -0.1, 0.5, 0.6);
     }
 }

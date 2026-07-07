@@ -16,7 +16,13 @@
 pub mod image_input;
 pub mod lstm_recognizer;
 pub mod network;
+pub mod threshold;
 
 pub use image_input::{parse_pgm, prescale_grey_to_height, PgmError};
 pub use lstm_recognizer::{LstmRecognizer, RecognizerError};
 pub use network::{InputShape, NetError, Network, Node, ReverseKind};
+pub use threshold::{
+    histogram_rect_gray, histogram_rect_multi, histogram_rect_rgb, otsu_stats,
+    otsu_threshold_channels, otsu_threshold_gray, threshold_rect_to_binary,
+    threshold_rect_to_binary_multi, OtsuChannel, OtsuResult, OtsuStatsResult, HISTOGRAM_SIZE,
+};

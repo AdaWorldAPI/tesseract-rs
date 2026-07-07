@@ -342,3 +342,31 @@ Gate: with-dict uids+text == oracle on ≥5 images AND the without-dict sweep
    code) → Sonnet drafts, Opus reviews diff hunk-by-hunk before gates]
 4. B3-full (ExtractBestPathAsWords) — after D1.3, same recodebeam.rs wave.
 5. ruff PR: walk_enums + harvest_tesseract_dict via runbook recipe → ruff main.
+
+## P2 EXECUTED (2026-07-07) — input layer: pixconv + Otsu, both byte-parity green
+
+Ruff-harvest manifests (banked in `.claude/harvest/leptonica-scale-callgraph.txt`):
+`pixConvertTo8 → pixConvertRGBToLuminance → pixConvertRGBToGray` (LEAF, weights
+0.3/0.5/0.2) and `OtsuThreshold → {HistogramRect, OtsuStats}` (both LEAF;
+otsuthr.cpp lives in `ccstruct/`, not textord/). Harvested via the extended
+`harvest_leptonica_scale` (LANG_MODE=c++ / EXTRA_INC, ruff session branch `ee030a0`).
+
+- **pixconv** (`image_input::rgb_to_gray`/`rgb_to_luminance`, pixconv.c:741-885):
+  f32 weighted sum, `+0.5` f64 promotion; weights 0,0,0 → the default trio
+  (exactly `pixConvertRGBToLuminance`). Parity 3/3 (24×36, 33×50, 0.5/0.3/0.2
+  explicit weights) vs REAL `pixConvertRGBToGray`.
+- **Otsu** (`threshold.rs`: `histogram_rect_*`, `otsu_stats` (i32 counts, f64
+  mu/variance), `otsu_threshold_gray`/`_channels`, `threshold_rect_to_binary`,
+  otsuthr.cpp:34/88/118 + thresholder.cpp:394-421): parity 3/3 (24×36, 64×36,
+  37×29) vs REAL `tesseract::OtsuThreshold` + replicated per-pixel predicate.
+  Dump convention: white_result → 255 (grey rendering of 1bpp CLEAR bit;
+  the oracle's first draft dumped the raw bit value = inverted).
+
+Oracles banked at `.claude/harvest/oracles/{pixconv,otsu}_oracle.cpp`. Rebuild:
+```sh
+g++ -std=c++17 pixconv_oracle.cpp -I/usr/include/leptonica $(pkg-config --cflags --libs lept) -o /tmp/pixconv_oracle
+INCS=$(find /tmp/tesseract/src -maxdepth 1 -type d | sed 's/^/-I/' | tr '\n' ' ')
+g++ -std=c++17 -DFAST_FLOAT $INCS -I/tmp/tesseract/include otsu_oracle.cpp $(pkg-config --cflags --libs tesseract) $(pkg-config --libs lept) -o /tmp/otsu_oracle
+```
+Shared inputs: the Rust dumps self-generate + write `/tmp/{pixconv,otsu}_input.bin`;
+run the Rust example FIRST, then the oracle on the bin, then diff.
