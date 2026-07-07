@@ -44,15 +44,21 @@
 //! buffer. The `tesseract-ocr-pdf` binary wires [`extract_page_image`]'s
 //! output straight into it for image-only pages.
 
+use std::io::Write as _;
 use std::path::Path;
 
 use lopdf::Document;
 use tesseract_core::dawg::DawgError;
-use tesseract_core::DictLite;
+use tesseract_core::{ids_to_text, CharSet, DictLite, WordResult};
 use tesseract_ocr::{LstmRecognizer, RecognizerError};
 
 mod image_extract;
 pub use image_extract::{extract_page_image, GreyImage};
+
+mod searchable_pdf;
+pub use searchable_pdf::{
+    render_searchable_pdf, PageOcr, PlacedWord, RenderReport, SearchablePdfError,
+};
 
 /// Failures from the PDF text-layer fast path ([`extract_text_layer`]) and
 /// the scanned-page image extraction path ([`extract_page_image`]).
@@ -292,4 +298,84 @@ impl OcrPipeline {
         self.recognizer
             .recognize_page(grey, w, h, self.dict.as_ref())
     }
+
+    /// **D4.5 wiring** — recognize a pre-rasterized grey PGM file's
+    /// words+boxes, ready for [`render_searchable_pdf`]. The whole page is
+    /// treated as a single `TBOX` line spanning the full image bounds
+    /// (`(left=0, bottom=0, right=w, top=h)`) — this crate has no textord
+    /// line segmentation for the words+boxes path, mirroring
+    /// [`LstmRecognizer::recognize_image_file_words`]'s own single-line
+    /// scope (the same method `tesseract-ocr/examples/recognize_words_dump.rs`
+    /// drives). Returns the placed words plus the page's pixel dimensions
+    /// (needed by the caller to build a [`GreyImage`]/[`PageOcr`]).
+    ///
+    /// # Errors
+    ///
+    /// [`RecognizerError::Io`]/[`RecognizerError::Pgm`] on a bad PGM file;
+    /// otherwise the underlying recognizer/beam error.
+    pub fn ocr_pgm_file_words(
+        &self,
+        path: &Path,
+    ) -> Result<(Vec<PlacedWord>, usize, usize), RecognizerError> {
+        let bytes = std::fs::read(path).map_err(RecognizerError::Io)?;
+        let (_grey, w, h) = tesseract_ocr::parse_pgm(&bytes).map_err(RecognizerError::Pgm)?;
+        let line_box = (0, 0, w as i32, h as i32);
+        let words =
+            self.recognizer
+                .recognize_image_file_words(path, self.dict.clone(), line_box, 1.0)?;
+        let placed = words
+            .iter()
+            .map(|word| word_result_to_placed(word, &self.recognizer.charset, h as i32))
+            .collect();
+        Ok((placed, w, h))
+    }
+}
+
+/// Convert one [`WordResult`] (bottom-up `TBOX`-order `char_boxes`, per
+/// `RecodeBeamSearch::extract_best_path_as_words`) into a [`PlacedWord`]
+/// (top-down image-pixel box, the shape [`render_searchable_pdf`] expects).
+/// Mirrors `tesseract-ocr/src/renderer.rs`'s own `to_image_box`/`union_boxes`
+/// (private to that crate) for exactly the same bottom-up-to-top-down
+/// conversion, specialized to a single word rather than a whole line/block.
+///
+/// A word with no character boxes (never produced by a real beam decode,
+/// kept total rather than panicking) yields a degenerate, zero/negative-area
+/// box; [`render_searchable_pdf`]'s existing zero/negative-area guard
+/// already skips it, so no separate check is needed here.
+fn word_result_to_placed(word: &WordResult, charset: &CharSet, page_h: i32) -> PlacedWord {
+    let ids: Vec<u32> = word.unichar_ids.iter().map(|&id| id as u32).collect();
+    let text = ids_to_text(charset, &ids);
+
+    let (mut left, mut bottom, mut right, mut top) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for &(l, b, r, t) in &word.char_boxes {
+        left = left.min(l);
+        bottom = bottom.min(b);
+        right = right.max(r);
+        top = top.max(t);
+    }
+
+    let img_left = left.max(0).cast_unsigned();
+    let img_top = (page_h - top).clamp(0, page_h).cast_unsigned();
+    let img_right = right.max(0).cast_unsigned();
+    let img_bottom = (page_h - bottom).clamp(0, page_h).cast_unsigned();
+    PlacedWord {
+        text,
+        box_: (img_left, img_top, img_right, img_bottom),
+    }
+}
+
+/// Write a row-major 8-bit grey buffer as a binary (P5) PGM file — the
+/// inverse of [`tesseract_ocr::parse_pgm`], used to hand an in-memory
+/// [`GreyImage`] (e.g. from [`extract_page_image`]) to the file-based
+/// [`LstmRecognizer::recognize_image_file_words`] API via
+/// [`OcrPipeline::ocr_pgm_file_words`].
+///
+/// # Errors
+///
+/// Any [`std::io::Error`] from creating or writing the file.
+pub fn write_pgm(path: &Path, image: &GreyImage) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    write!(file, "P5\n{} {}\n255\n", image.w, image.h)?;
+    file.write_all(&image.data)?;
+    Ok(())
 }

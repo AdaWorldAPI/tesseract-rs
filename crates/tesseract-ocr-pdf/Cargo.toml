@@ -27,13 +27,12 @@ zune-jpeg = "0.5.15"
 # reaches into private internals.
 tesseract-ocr = { path = "../tesseract-ocr", features = ["seg-approx"] }
 tesseract-core = { path = "../tesseract-core" }
-
-[dev-dependencies]
-# Test/example fixtures only (building synthetic FlateDecode-image PDFs with
-# byte-exact control over the compressed stream) — never a runtime dep of the
-# OCR path. Version pinned to match the copy lopdf already pulls transitively
-# (see Cargo.lock), so this adds no new dependency *version*, just a direct
-# edge for test code to call it explicitly.
+# D4.5 (searchable_pdf): zlib-compress the embedded page image, same shape
+# examples/make_scanned_pdf.rs already used as a dev-only fixture builder;
+# promoted to a runtime dependency now that render_searchable_pdf (src/, not
+# a test/example) embeds images the same way. Version pinned to match the
+# copy lopdf already pulls transitively (see Cargo.lock), so this adds no
+# new dependency *version*.
 flate2 = "1.1"
 
 [[bin]]
