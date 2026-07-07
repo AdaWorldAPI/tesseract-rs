@@ -271,3 +271,74 @@ seed — out of scope for the LSTM beam transcode). D1.2b's Rust walker MUST see
 via the `default_dawgs` equivalent to match production `recognize_line` behavior.
 Oracle at `/tmp/def_letter_oracle.cpp`; example: "the" (ids 91 97 92) → perm=8
 SystemDawgPerm, `valid_end=1` after "th" (word-end reached).
+
+---
+
+## P1 execution addendum (planned on Fable, 2026-07-07) — ready-to-fire briefs
+
+### D1.2b — the Dict-lite walker (fire AFTER D1.2a lands with ruff-verified shapes)
+
+**Placement:** `tesseract-core/src/dict_walker.rs` (NOT the Core — the walker is
+beam-coupled compute-free logic like `recodebeam`; the Core carries only the
+dawg TABLE). Consumes `lance_graph_contract::dawg::{SquishedDawg, DawgType,
+PermuterType, NodeRef, NO_EDGE}` re-exported through tesseract-core.
+
+**Shapes (ruff-manifest-sourced, per directive):** `DawgPosition { dawg_ref:
+NodeRef, punc_ref: NodeRef, dawg_index: i8, punc_index: i8, back_to_punc: bool }`
+(+ `PartialEq` for `add_unique`), `DawgArgs`-equivalent as fn params/return
+(`active: &[DawgPosition], out updated: Vec<DawgPosition>, permuter, valid_end`).
+
+**API:**
+```rust
+pub struct DictLite { dawgs: Vec<SquishedDawg>, /* indices: word/punc/number */ }
+impl DictLite {
+    pub fn from_components(word: &[u8], punc: &[u8], number: &[u8]) -> Result<...>;
+    pub fn default_dawgs(&self, suppress_patterns: bool) -> Vec<DawgPosition>;   // dict.cpp:625-647
+    pub fn def_letter_is_okay(&self, active: &[DawgPosition], charset: &UniCharSet,
+        unichar_id: u32, word_end: bool, permuter_in: PermuterType)
+        -> (Vec<DawgPosition>, PermuterType, bool /*valid_end*/);               // dict.cpp:407-571
+}
+```
+**Transcode notes (from the full Opus read, banked):**
+- `GetStartingNode`: `NO_EDGE → 0`; `next_node(edge)==0 → NO_EDGE` (dict.h:397-406).
+- `char_for_dawg`: Number-dawg maps `get_isdigit(ch) → kPatternUnicharID(0)` (dict.h:411-421).
+- Successor sets: `kDawgSuccessors[punc][ty]` — punc→{word,number}; word/number→{punc} (dawg.h:87-92).
+- eng has NO pattern dawg → `ProcessPatternEdges` arm is dead for eng; implement the
+  DAWG_TYPE_PATTERN branch as a documented `unreachable-for-eng` returning no-op (do NOT
+  silently skip — keep the branch structure, note the falsifier gap).
+- Permuter update rule at fn end (dict.cpp:559-566): overwrite unless COMPOUND_PERM kept.
+- `add_unique` = linear dedup on the 5-tuple.
+- Successor lists in Dict are built per-dawg at load (dict.cpp:367ff `SuccessorList`);
+  for 3 dawgs this is: punc→[word_idx, number_idx], word→[punc_idx], number→[punc_idx].
+
+**Byte-parity:** example `dict_walk_dump` — args = space-separated unichar-ids;
+output format EXACTLY the oracle's (`step\t…` + sorted `p\t…` lines).
+Oracle: `/tmp/def_letter_oracle` (built, works; TessBaseAPI+getDict public path;
+needs `/tmp/eng.traineddata` — present, 4.1 MB). Sweep: ≥6 words — "the", "cat",
+negative "qjx", punctuation-wrapped («"the"», ids for quote chars), a number
+("42"), a mixed token — full-step dumps byte-identical.
+
+### D1.3 — beam dict arms (fire AFTER D1.2b green)
+
+**Change surface:** `tesseract-core/src/recodebeam.rs` ONLY:
+1. `RecodeBeamSearch::new_with_dict(recoder, null_char, simple, DictLite)` (keep
+   the existing `new` — non-dict path stays untouched, its 7b parity is regression).
+2. Port `ContinueDawg` + the dict arms of `PushDupOrNoDawgIfBetter` +
+   `PushInitialDawgIfBetter` (recodebeam.cpp:1057-1160) — the currently-dormant
+   branches; `dawgs: Vec<DawgPosition>` rides on `RecodeNode` (arena-friendly:
+   store as `Option<Box<[DawgPosition]>>`).
+3. Live constants: `kDictRatio=2.25`, `kCertOffset=-0.085` enter `Decode` args
+   from `recognize_line` when dict present.
+**Oracle:** extend `/tmp/image_text_oracle.cpp` → `image_text_dict_oracle.cpp`
+with `api.Init + RecodeBeamSearch(recoder, null, simple, dict)` … OR simpler:
+libtesseract full `RecognizeLine` with dict via TessBaseAPI on line images.
+Gate: with-dict uids+text == oracle on ≥5 images AND the without-dict sweep
+(`E-OCR-RECOGNIZE-GRID-1`, 5/5) stays green (regression).
+
+### Sequencing + model split
+1. ruff enum-harvest lands (in flight) → verify D1.2a shapes vs manifest → land D1.2a [Opus verify]
+2. Fire D1.2b brief [Sonnet grind; Opus lands]
+3. Fire D1.3 brief [Sonnet grind on the beam edits is HIGHER RISK (touches proven
+   code) → Sonnet drafts, Opus reviews diff hunk-by-hunk before gates]
+4. B3-full (ExtractBestPathAsWords) — after D1.3, same recodebeam.rs wave.
+5. ruff PR: walk_enums + harvest_tesseract_dict via runbook recipe → ruff main.
