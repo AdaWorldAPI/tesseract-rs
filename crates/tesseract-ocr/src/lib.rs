@@ -35,8 +35,11 @@ pub use network::{InputShape, NetError, Network, Node, ReverseKind};
 pub use renderer::{render_hocr, render_text, render_tsv, LineWords};
 pub use stats::Stats;
 pub use textline::{
-    compute_dropout_distances, compute_height_modes, compute_line_occupation,
-    compute_occupation_threshold, fill_heights, fit_lms_line, DetLineFit, FCoord, ICoord,
+    adjust_row_limits, assign_blobs_to_rows, cleanup_rows_making, compute_dropout_distances,
+    compute_height_modes, compute_line_occupation, compute_occupation_threshold, compute_page_skew,
+    compute_row_stats, delete_non_dropout_rows, expand_rows, fill_heights, fit_lms_line,
+    fit_parallel_lms, fit_parallel_rows, make_initial_textrows, make_rows, DetLineFit, FCoord,
+    ICoord, OverlapState, ToBlockCtx, ToRow,
 };
 pub use threshold::{
     histogram_rect_gray, histogram_rect_multi, histogram_rect_rgb, otsu_stats,
