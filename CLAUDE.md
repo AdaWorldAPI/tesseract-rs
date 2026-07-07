@@ -223,20 +223,28 @@ Board: lance-graph `E-OCR-IMAGE-TEXT-1`.
 pure-Rust, zero leptonica at runtime** (A6b decode+identity-scale+SetRandomSeed →
 A6a grid → B1 forward → 7b beam → C2 extract → recoded_to_text → text).
 
-**The ONE documented boundary — the general-height `pixScale`:** `PreScale` uses
-leptonica's `pixScale(src, f, f)`; at `f == 1.0` (model-height line image) it is a
-copy → identity → the proven path. For other heights `prescale_grey_to_height`
-uses a **MARKED bilinear approximation** (functional, NOT leptonica-byte-exact —
-leptonica's depth/factor-dependent resampler; leptonica ships headers-only here so
-it can't be transcoded from source). A byte-exact `pixScale` is the single
-deferred sub-leaf; it is an ENHANCEMENT, not a core-pipeline gap.
+**The general-height `pixScale` is DONE — `image → text` is byte-exact at ANY
+line-image height** (`E-OCR-PIXSCALE-COMPLETE-1`). The whole grey `pixScale` is
+transcoded RUFF-DRIVEN (`ruff_cpp_spo::walk_free_functions` — the C-library
+free-function + call-graph harvest arm I added, ruff `096689c` local — harvested
+`scale1.c` + `enhance.c` → the manifest that classified the leaf kernels + ordered
+the dispatch): `scale_gray_li`(`pixScaleGrayLI`), `scale_gray_area_map`
+(`scaleGrayAreaMapLow`), `scale_gray_area_map2`(`scaleAreaMapLow2`),
+`unsharp_mask_gray_2d`(`pixUnsharpMaskingGray2D`), composed as `pix_scale_grey` —
+**byte-identical vs the REAL leptonica `pixScale`** (12/12 factors + 4/4 exact
+`2⁻ⁿ`) and wired into `prescale_grey_to_height`. `recognize_image_file` is
+byte-identical to libtesseract at non-model heights (5/5, `f=0.5..0.9`). Manifest
+banked at `.claude/harvest/leptonica-scale-callgraph.txt`. Key finding: the
+area-map LR-corner coords are **f64** in C (the `1.0` double literal), not f32 —
+per-subexpression precision audit is mandatory. (`f<0.02` = `pixScaleSmooth`,
+unported marked-approx — never a real text line; colour `d==32` scale — eng is
+grey.)
 
 **Remaining are accuracy layers, not pipeline gaps:** dict beam (C1) + CJK trie
-(C3) for language-model accuracy; the word/box `ExtractBestPathAsWords` (B3-full);
-the byte-exact `pixScale`. See `.claude/plans/recognizer-image-to-text-v2.md`
-(all leaves EXECUTED through A6b). (Still deferred, unchanged: the bbox/stats
-sub-leaf, gated on a legacy non-LSTM `eng.unicharset`; the 2-D LSTM / softmax-LSTM
-paths — eng.lstm is 1-D non-softmax.)
+(C3) for language-model accuracy; the word/box `ExtractBestPathAsWords` (B3-full).
+See `.claude/plans/recognizer-image-to-text-v2.md`. (Still deferred, unchanged:
+the bbox/stats sub-leaf, gated on a legacy non-LSTM `eng.unicharset`; the 2-D LSTM
+/ softmax-LSTM paths — eng.lstm is 1-D non-softmax.)
 
 ## Network structure — ruff→OGAR sink onto V3 SoA (Core-side, byte-parity proven)
 
