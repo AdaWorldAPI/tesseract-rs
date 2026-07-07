@@ -140,7 +140,10 @@ pub fn matrix_dot_vector_i32(w: ArrayView2<'_, i8>, u: &[i8]) -> Result<Vec<i32>
     let u_col = ArrayView2::from_shape((num_in + 1, 1), u_padded.as_slice())
         .map_err(|e| RecognizerError::Gemm(e.to_string()))?;
     let mut out = Array2::<i32>::zeros((num_out, 1));
-    ndarray::simd_runtime::matmul_i8_to_i32(w, u_col, out.view_mut())
+    // The canonical polyfill import path (W1a: "all SIMD from
+    // `ndarray::simd`") — the same #[inline(always)] tier ladder the old
+    // `simd_runtime::` path wrapped, so this flip is bit-identical.
+    ndarray::simd::matmul_i8_to_i32(w, u_col, out.view_mut())
         .map_err(|e| RecognizerError::Gemm(format!("{e:?}")))?;
     Ok((0..num_out).map(|i| out[[i, 0]]).collect())
 }

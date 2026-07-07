@@ -8,7 +8,7 @@ description = "Pure-Rust Tesseract LSTM recognizer — the compute tier, consumi
 [dependencies]
 # AdaWorldAPI fork, sibling checkout (P0: fork-only, path dep — mirrors the
 # tesseract-core precedent). `runtime-dispatch` exposes
-# `ndarray::simd_runtime::matmul_i8_to_i32` (AMX TDPBUSD → VPDPBUSD-zmm → -ymm →
+# `ndarray::simd::matmul_i8_to_i32` (AMX TDPBUSD → VPDPBUSD-zmm → -ymm →
 # scalar); it implies `std`, which brings the hpc int8 tile GEMM. This is the
 # COMPUTE foundation — the recognizer never re-implements SIMD (the `simd-savant`
 # invariant: all SIMD comes from `ndarray::simd`).
