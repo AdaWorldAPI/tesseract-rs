@@ -9,6 +9,9 @@ description = "In-binary executor for the OGAR-authoritative tesseract-rs OCR ac
 # THE authoritative OCR capability table (Phase 1) — sibling checkout, path dep,
 # no pin, per the workspace's local-repos-are-canonical convention.
 ogar-vocab = { path = "../../../OGAR/crates/ogar-vocab" }
+# The zero-dep SOCKET types (HotPlug) — the generic pattern every consumer
+# migrates to; resolution runs against ogar-vocab in this same binary.
+lance-graph-contract = { path = "../../../lance-graph/crates/lance-graph-contract" }
 # The two OCR foundations + the PDF front-end (path deps, fork-only policy).
 tesseract-ocr = { path = "../tesseract-ocr", features = ["seg-approx"] }
 tesseract-core = { path = "../tesseract-core" }

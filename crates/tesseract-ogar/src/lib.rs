@@ -60,20 +60,20 @@ pub const COVERED_CAPABILITIES: &[&str] = &[
     "render_searchable_pdf",
 ];
 
-/// This crate's self-registration with the AUTHORITATIVE OGAR table — the
-/// consumer's half of the confirmation loop (operator, 2026-07-07): the
-/// authority names its expected executor
-/// (`ogar_vocab::ocr_actions::OCR_EXPECTED_EXECUTORS`), and THIS const is how
-/// the consumer "trägt sich ein" — covered capabilities + the subject
-/// classids it activates. `ogar_vocab::ocr_actions::verify_ocr_registration`
-/// asserts the full roundtrip (expected consumer, coverage both directions,
-/// activated classid set == declared subjects, every id minted) in this
-/// crate's test suite — drift bangs once, in this binary, no serialization.
-pub const REGISTRATION: ogar_vocab::capability_registry::CapabilityRegistration =
-    ogar_vocab::capability_registry::CapabilityRegistration {
+/// This crate's hot-plug declaration — the GENERIC pattern every consumer
+/// migrates to (operator, 2026-07-07): one const naming the classids this
+/// executor hot-plugs and the capabilities it covers. The authority
+/// (`ogar_vocab::capability_registry::resolve_hotplug`, reachable through
+/// the `lance_graph_contract::hotplug::CapabilityAuthority` socket) verifies
+/// the plug and returns BOTH the vocab rows and the action surface for
+/// exactly these classids — classid is the join key on both sides. Drift
+/// bangs once, in this binary, no serialization, no per-consumer plug
+/// mechanism beyond this const.
+pub const HOT_PLUG: lance_graph_contract::hotplug::HotPlug =
+    lance_graph_contract::hotplug::HotPlug {
         consumer: "tesseract-ogar",
+        classids: ogar_vocab::ocr_actions::OCR_SUBJECT_CLASSIDS,
         covered: COVERED_CAPABILITIES,
-        subject_classids: ogar_vocab::ocr_actions::OCR_SUBJECT_CLASSIDS,
     };
 
 // The cheap, allocation-free half of the fuse: OGAR's `OCR_ACTION_NAMES` and
@@ -419,15 +419,22 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
-    /// The full confirmation loop, closed: this crate's [`REGISTRATION`]
-    /// passes the authority's roundtrip verification — expected consumer,
-    /// coverage both directions, activated classid set == the table's
-    /// declared subjects, every id minted. Any drift returns a NAMED
-    /// `RegistrationDrift` arm and fails this test.
+    /// The full confirmation loop, closed generically: this crate's
+    /// [`HOT_PLUG`] resolves through the authority — every hot-plugged
+    /// classid minted and capability-bearing, consumer expected, coverage
+    /// both directions — and returns BOTH the vocab rows and the action
+    /// surface. Any drift is a NAMED `HotplugDrift` arm failing this test.
     #[test]
-    fn registration_roundtrip_is_green() {
-        ogar_vocab::ocr_actions::verify_ocr_registration(&REGISTRATION)
-            .expect("consumer registration drifted from the authoritative OGAR table");
+    fn hotplug_activation_is_green() {
+        let (concepts, capabilities) = ogar_vocab::capability_registry::resolve_hotplug(
+            HOT_PLUG.consumer,
+            HOT_PLUG.classids,
+            HOT_PLUG.covered,
+        )
+        .expect("hot-plug drifted from the authoritative OGAR tables");
+        assert_eq!(concepts.len(), 3, "3 hot-plugged concepts");
+        assert!(concepts.contains(&("textline", 0x0805)));
+        assert_eq!(capabilities.len(), COVERED_CAPABILITIES.len());
     }
 
     /// Both directions of the exhaustiveness fuse: every capability OGAR
