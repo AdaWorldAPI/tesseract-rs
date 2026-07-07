@@ -688,3 +688,180 @@ int main(int argc, char **argv) {
   return 0;
 }
 ```
+
+---
+
+## A6a EXECUTED (2026-07-07) — NetworkIO::FromPix (pixel → int8 grid), byte-parity GREEN
+
+**Shipped** in `crates/tesseract-recognizer/src/input.rs` (`from_grey_pix` +
+private `Stats`/`compute_black_white`) + a `set_pixel` method on `NetworkIo` +
+`examples/from_pix_dump.rs`. Transcodes `NetworkIO::FromPix` →
+`FromPixes`→`Copy2DImage`→`SetPixel` (`networkio.cpp:127-297`) for the 8-bit
+**grey 2-D path** (eng `[1,36,0,1…]`, depth=1, height=36>1):
+- `ComputeBlackWhite` — middle row (y=height/2) local minima/maxima → two
+  `STATS(0,255)` histograms → `black=mins.ile(0.25)`, `white=maxes.ile(0.75)`.
+- `STATS::ile` — bucket walk + linear interp (`statistc.cpp:172-197`), exact.
+- `SetPixel` — `clip(round((INT8_MAX+1)·((pixel−black)/contrast − 1)), ±127)`.
+  **The ×(INT8_MAX+1)=×128 constant is distinct from `write_time_step`'s ×127**
+  — a real gotcha; reusing the Leaf-5 quantizer here would be silently wrong.
+
+**Byte-parity GREEN** on **8/8** synthetic image widths (3, 5, 12, 17, 24, 33,
+48, 64 — width=3 is the min for the `width>=3` extrema branch; odd widths
+included) vs a public-API oracle (`NetworkIO::FromPix` on a leptonica `Pix`
+built from the shared `frompix_input.bin`; `set_int_mode(true)` first, matching
+`RecognizeLine` `lstmrecognizer.cpp:345`). Up to 2304 int8 cells per case,
+all identical.
+
+**t-order note (the structural risk, verified):** `Copy2DImage` walks y-outer /
+x-inner with a plain `t++`; the recognizer `StrideMap` packs **width innermost**
+(`t_increments[WIDTH]=1`, `t(0,y,x)=y·W+x`), so linear `t++` tracks `index.t()`
+exactly — no per-index recompute needed.
+
+**A6b (the leptonica fork) is deliberately OUT of this leaf** and is the one
+architectural decision the founding directive settles toward pure-Rust ("no
+leptonica at runtime; delete the C++ residue"): image file → decode → depth-
+convert (`pixConvertTo8`) → **`pixScale` to target height 36**. `pixScale`
+byte-parity is leptonica's resampling algorithm, NOT a Tesseract algorithm — a
+separate, hard commodity problem. The pragmatic boundary: the consumer supplies
+a pre-decoded 8-bit grey image at height 36 (via `image`-rs for decode; the
+scale is either a documented approximation or a later dedicated leaf), and A6a
+proves the Tesseract-specific normalization exactly. **B3** (`RecognizeLine`
+glue) then threads A6a → `network.forward` (B1) → beam decode
+(`E-OCR-RECODEBEAM-1`) → `ExtractBestPathAsUnicharIds` (C2) → `recoded_to_text`
+(`E-CPP-PARITY-7`). Board: lance-graph `E-OCR-FROMPIX-1`.
+
+**Build/run the parity:**
+```sh
+cargo run -q -p tesseract-recognizer --example from_pix_dump -- /tmp/frompix_input.bin 24 > /tmp/rust_frompix.tsv
+g++ -std=c++17 -DFAST_FLOAT /tmp/frompix_oracle.cpp \
+    -I/tmp/tesseract/src/lstm -I/tmp/tesseract/src/ccstruct -I/tmp/tesseract/src/ccutil \
+    -I/tmp/tesseract/src/arch -I/tmp/tesseract/src/viewer -I/tmp/tesseract/src/dict \
+    -I/tmp/tesseract/src/classify -I/tmp/tesseract/include \
+    $(pkg-config --cflags tesseract) -o /tmp/frompix_oracle \
+    $(pkg-config --libs tesseract) $(pkg-config --libs lept)
+/tmp/frompix_oracle /tmp/frompix_input.bin > /tmp/oracle_frompix.tsv
+diff /tmp/oracle_frompix.tsv /tmp/rust_frompix.tsv   # empty => green
+```
+
+### Oracle source (banked — `/tmp/frompix_oracle.cpp`, public-API only)
+```cpp
+// Byte-parity oracle for the recognizer leaf A6a: `NetworkIO::FromPix` (the
+// image-pixel -> int8 grid step) vs the Rust transcode's FromPix path in
+// tesseract-recognizer.
+//
+// Reads a synthetic 8-bit grey image from a shared .bin (i32 width, i32
+// height, then height*width row-major u8 pixels — row 0 left-to-right, then
+// row 1, ...), builds a REAL leptonica Pix at that size, puts the NetworkIO
+// into int8 mode (matches LSTMRecognizer::RecognizeLine, lstmrecognizer.cpp:345
+// `inputs->set_int_mode(IsIntMode());` called BEFORE
+// Input::PreparePixInput -> NetworkIO::FromPix, input.cpp:142), and calls the
+// REAL public `NetworkIO::FromPix(StaticShape, Image, TRand*)`
+// (networkio.cpp:163) which dispatches to FromPixes -> ComputeBlackWhite ->
+// Copy2DImage -> SetPixel exactly as the C++ library always has. Dumps the
+// resulting int8 grid for a byte-identical diff against the Rust side.
+//
+// The pix is built at the network's target height (36) with shape.width()==0
+// (dynamic), so FromPix does NOT scale and Copy2DImage's fixed-width
+// clip/pad-with-noise branch never fires: this is the pure
+// FromPixes -> Copy2DImage -> SetPixel normalization path, no randomizer
+// draws expected.
+//
+//   ./frompix_oracle [frompix_input.bin]
+#include "networkio.h"
+#include "static_shape.h"
+#include "stridemap.h"
+#include "helpers.h"
+
+#include <allheaders.h>
+
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <vector>
+
+using namespace tesseract;
+
+int main(int argc, char **argv) {
+  const char *bin_path = argc > 1 ? argv[1] : "/tmp/frompix_input.bin";
+
+  // ---- Read the shared input .bin: i32 width, i32 height, then
+  // height*width row-major u8 grey pixels (written by the Rust side). ----
+  FILE *bf = fopen(bin_path, "rb");
+  if (!bf) {
+    fprintf(stderr, "open %s failed\n", bin_path);
+    return 1;
+  }
+  auto read_i32 = [&](int32_t *v) {
+    if (fread(v, sizeof(int32_t), 1, bf) != 1) {
+      fprintf(stderr, "bin truncated (header)\n");
+      exit(1);
+    }
+  };
+  int32_t width = 0, height = 0;
+  read_i32(&width);
+  read_i32(&height);
+  if (width <= 0 || height <= 0) {
+    fprintf(stderr, "bad dims %d x %d\n", width, height);
+    return 1;
+  }
+  std::vector<uint8_t> pixels(static_cast<size_t>(width) * static_cast<size_t>(height));
+  if (fread(pixels.data(), 1, pixels.size(), bf) != pixels.size()) {
+    fprintf(stderr, "bin truncated (pixels)\n");
+    fclose(bf);
+    return 1;
+  }
+  fclose(bf);
+
+  // ---- Build an 8-bit grey Pix from the pixel buffer (row-major, row 0
+  // first). ----
+  Image pix = pixCreate(width, height, 8);
+  if (pix == nullptr) {
+    fprintf(stderr, "pixCreate failed\n");
+    return 1;
+  }
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      pixSetPixel(pix, x, y, pixels[static_cast<size_t>(y) * width + x]);
+    }
+  }
+
+  // ---- Build the input StaticShape: batch=1, height=36 (fixed — the
+  // network's input height; matches the pix height here so FromPix does NOT
+  // scale, since FromPix/FromPixes themselves never scale — only
+  // Input::PreparePixInput does, and we bypass that to test FromPix in
+  // isolation), width=0 (dynamic, so the real pix width drives the
+  // StrideMap and Copy2DImage's noise-pad branch never fires), depth=1
+  // (8-bit grey, single feature). ----
+  StaticShape shape;
+  shape.set_batch(1);
+  shape.set_height(36);
+  shape.set_width(0);
+  shape.set_depth(1);
+
+  // ---- Randomizer: seed 1, no warm-up draw. Only consulted by
+  // Copy2DImage's Randomize() call if the fixed target_width exceeds the
+  // real pix width, which cannot happen here (shape.width()==0). ----
+  TRand rand;
+  rand.set_seed(1);
+
+  // ---- NetworkIO in int8 mode (matches LSTMRecognizer::RecognizeLine's
+  // inputs->set_int_mode(IsIntMode()) called BEFORE FromPix). ----
+  NetworkIO netio;
+  netio.set_int_mode(true);
+  netio.FromPix(shape, pix, &rand);
+  pix.destroy();
+
+  // ---- Dump: shape line then one "i" line per timestep. ----
+  printf("shape\t%d\t%d\t%d\t%d\n", netio.stride_map().Size(FD_HEIGHT),
+         netio.stride_map().Size(FD_WIDTH), netio.NumFeatures(), netio.Width());
+  for (int t = 0; t < netio.Width(); ++t) {
+    printf("i\t%d", t);
+    const int8_t *row = netio.i(t);
+    for (int f = 0; f < netio.NumFeatures(); ++f) {
+      printf("\t%d", static_cast<int>(row[f]));
+    }
+    printf("\n");
+  }
+  return 0;
+}
+```

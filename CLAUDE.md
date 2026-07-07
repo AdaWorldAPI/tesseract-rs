@@ -185,20 +185,32 @@ components (both already `E-CPP-PARITY-1..7`). The 8 trailing-parse fields are
 recoder code_range 111, null 110, int-mode+recoding) all consistent. Board:
 lance-graph `E-OCR-RECOGNIZER-LOAD-1`.
 
-**Next: A6 + B3 — the leptonica image front-end (the last unproven leaf).** The
-canonical continuation plan (proven state + the byte-parity method + every
-remaining leaf with C++ ref / oracle / crate / order) is
-**`.claude/plans/recognizer-image-to-text-v2.md`** — START THERE. `RecognizeLine`
-(`lstmrecognizer.cpp:236-291`): image `Pix` → **A6** `Input::Forward` (THE
-leptonica decision point — pure-Rust image decode vs a leptonica dep — raise to
-operator) → `network_->Forward` (B1, DONE) → softmax logits →
-`RecodeBeamSearch::Decode` (`E-OCR-RECODEBEAM-1`, DONE) →
-`ExtractBestPathAsUnicharIds` (C2, DONE) → `recoded_to_text` (`E-CPP-PARITY-7`,
-DONE). Everything downstream of the image grid is proven; **A6 is the only
-unproven leaf and the one architectural fork.** Then dict beam + CJK trie (C1/C3,
-accuracy). (Still deferred, unchanged: the bbox/stats sub-leaf, gated on a legacy
-non-LSTM `eng.unicharset`; the 2-D LSTM / softmax-LSTM paths — eng.lstm is 1-D
-non-softmax.)
+**A6a is DONE — the pixel → int8 grid step, byte-parity green.**
+`tesseract-recognizer/src/input.rs` (`from_grey_pix`) transcodes
+`NetworkIO::FromPix` → `FromPixes`→`Copy2DImage`→`SetPixel` for the 8-bit grey
+2-D path (eng): `ComputeBlackWhite` middle-row local-extrema → `STATS(0,255)` →
+`black=mins.ile(0.25)`/`white=maxes.ile(0.75)`, then
+`clip(round(128·((pixel−black)/contrast−1)), ±127)` (**×128 = INT8_MAX+1, NOT
+the ×127 of write_time_step** — a real gotcha). Byte-identical vs a public-API
+`FromPix` oracle on **8/8** widths (3..64, incl. odd + the width=3 minimum).
+Board: lance-graph `E-OCR-FROMPIX-1`.
+
+**Next: A6b + B3 — close image→text.** The canonical continuation plan (proven
+state + the byte-parity method + every remaining leaf with C++ ref / oracle /
+crate / order) is **`.claude/plans/recognizer-image-to-text-v2.md`** — START
+THERE. **A6b** = image file → decode → `pixConvertTo8` → **`pixScale` to height
+36** — the leptonica-coupled commodity front of the front-end; per the founding
+directive ("no leptonica at runtime; delete the C++ residue") it is pure-Rust
+(image decode via `image`-rs; `pixScale` byte-parity is leptonica's resampling
+algorithm — a hard, separate problem — so the pragmatic boundary is a
+pre-scaled-8-bit-grey input, with A6a proving the Tesseract-specific
+normalization). **B3** = the `RecognizeLine` glue threading A6(a/b) →
+`network.forward` (B1, DONE) → `RecodeBeamSearch::Decode` (`E-OCR-RECODEBEAM-1`,
+DONE) → `ExtractBestPathAsUnicharIds` (C2, DONE) → `recoded_to_text`
+(`E-CPP-PARITY-7`, DONE). Everything except A6b's image decode+scale is proven.
+Then dict beam + CJK trie (C1/C3, accuracy). (Still deferred, unchanged: the
+bbox/stats sub-leaf, gated on a legacy non-LSTM `eng.unicharset`; the 2-D LSTM /
+softmax-LSTM paths — eng.lstm is 1-D non-softmax.)
 
 ## Network structure — ruff→OGAR sink onto V3 SoA (Core-side, byte-parity proven)
 
