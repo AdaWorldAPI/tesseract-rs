@@ -1,0 +1,278 @@
+From 096689c2ed67f7e25e0be7382867d2603b5c801a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 7 Jul 2026 07:34:47 +0000
+Subject: [PATCH 1/2] =?UTF-8?q?ruff=5Fcpp=5Fspo:=20walk=5Ffree=5Ffunctions?=
+ =?UTF-8?q?=20=E2=80=94=20the=20C-library=20free-function=20+=20call-graph?=
+ =?UTF-8?q?=20harvest=20arm?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+walk_tu harvests C++ classes (the classid->ClassView manifest); a C library
+(leptonica, zlib, ...) is free functions on pointer buffers, so the AR/OO member
+body-arm (method_body_arm) captures nothing there. walk_free_functions adds the
+missing arm: it parses WITH bodies and collects every FunctionDecl definition +
+its general call graph (every CallExpr callee, not just the persistence-mutator
+set BodyArm.calls tracks).
+
+The call graph IS the transcode-driving structure per the Core-First doctrine:
+it mints the 85% (WHICH functions to port + the dispatch order); the numeric
+kernel bodies stay the essential-15% hand-port. Proven on leptonica scale1.c:
+pixScale -> pixScaleGeneral -> {pixScaleGrayLI -> scaleGrayLILow, pixScaleAreaMap,
+pixUnsharpMasking, ...}, with scaleGrayLILow/scaleColorLILow/pixScaleAreaMap2
+correctly surfaced as LEAF kernels (calls=[]) — the hand-port targets, classified
+by the harvest rather than eyeballed. Example: harvest_leptonica_scale.
+
+clippy -D warnings clean; all 17 crate tests pass (--test-threads=1; the parallel
+run trips the documented Clang process-singleton, pre-existing + unrelated).
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016b33swuXE23hKtqxsHu9p1
+---
+ .../examples/harvest_leptonica_scale.rs       | 85 +++++++++++++++++++
+ crates/ruff_cpp_spo/src/clang_walker.rs       | 82 +++++++++++++++++-
+ crates/ruff_cpp_spo/src/lib.rs                | 29 ++++++-
+ 3 files changed, 194 insertions(+), 2 deletions(-)
+ create mode 100644 crates/ruff_cpp_spo/examples/harvest_leptonica_scale.rs
+
+diff --git a/crates/ruff_cpp_spo/examples/harvest_leptonica_scale.rs b/crates/ruff_cpp_spo/examples/harvest_leptonica_scale.rs
+new file mode 100644
+index 0000000..d0de86f
+--- /dev/null
++++ b/crates/ruff_cpp_spo/examples/harvest_leptonica_scale.rs
+@@ -0,0 +1,85 @@
++//! Harvest the leptonica **`pixScale` call graph** — the `ruff>OGAR` structure
++//! that DRIVES the byte-exact `pixScale` transcode (tesseract-rs image
++//! front-end, non-model-height scaling).
++//!
++//! leptonica is a **C library** (free functions on pointer buffers), so this
++//! uses [`walk_free_functions`] — the C-library harvest arm, distinct from the
++//! C++-class [`walk_tu`](ruff_cpp_spo::walk_tu). The numeric kernel BODIES
++//! (`scaleGrayLILow`, the area-map / unsharp low-levels) are the doctrine's
++//! essential-15% hand-port; this manifest is the 85% structure: WHICH functions
++//! the transcode must port and in what **dispatch order** (`pixScale →
++//! pixScaleGeneral → {pixScaleGrayLI → scaleGrayLILow, pixScaleAreaMap,
++//! pixUnsharpMasking}`). Correlating each body to that call graph (fuzzy-recipe
++//! codebook §1) is how the transcode stays driven, not eyeballed.
++//!
++//! Run:
++//! ```sh
++//! LIBCLANG_PATH=/usr/lib/llvm-18/lib SCALE_SRC=/tmp/leptonica-src/scale1.c \
++//!   cargo run -p ruff_cpp_spo --features libclang --example harvest_leptonica_scale
++//! ```
++
++#![expect(
++    clippy::print_stderr,
++    clippy::print_stdout,
++    reason = "manifest-emission CLI example (mirrors harvest_network)"
++)]
++
++use std::path::Path;
++
++use ruff_cpp_spo::walk_free_functions;
++
++fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let src = std::env::var("SCALE_SRC").unwrap_or_else(|_| "/tmp/leptonica-src/scale1.c".to_string());
++    let inc = std::env::var("LEPT_INCLUDE").unwrap_or_else(|_| "/usr/include/leptonica".to_string());
++    let args = [
++        "-x".to_string(),
++        "c".to_string(),
++        "-std=c11".to_string(),
++        format!("-I{inc}"),
++    ];
++
++    let funcs = walk_free_functions(Path::new(&src), &args).map_err(|e| e.to_string())?;
++    eprintln!("[harvest] {} free-function definitions in {src}", funcs.len());
++
++    // The pixScale dispatch subtree — the exact functions the byte-exact
++    // transcode must follow, in dispatch order. Filter each function's callees
++    // to the scale family so the graph is the DISPATCH structure, not every
++    // libc/leptonica helper call.
++    let family = [
++        "pixScale",
++        "pixScaleGeneral",
++        "pixScaleGrayLI",
++        "scaleGrayLILow",
++        "pixScaleColorLI",
++        "scaleColorLILow",
++        "pixScaleAreaMap",
++        "pixScaleAreaMap2",
++        "pixScaleSmooth",
++        "pixScaleBinary",
++        "pixUnsharpMasking",
++        "pixUnsharpMaskingGray",
++        "pixScaleGray2xLI",
++        "pixScaleGray4xLI",
++    ];
++    let is_family = |n: &str| family.contains(&n);
++
++    println!("# pixScale call-graph manifest (ruff_cpp_spo::walk_free_functions on {src})");
++    println!("# <function>\tdispatches_to\t<scale-family callees>");
++    for name in family {
++        match funcs.iter().find(|f| f.name == name) {
++            Some(f) => {
++                let dispatch: Vec<&String> =
++                    f.calls.iter().filter(|c| is_family(c)).collect();
++                let all = f.calls.len();
++                println!(
++                    "{}\tdispatches_to\t{:?}\t(+{} non-family callees)",
++                    f.name,
++                    dispatch,
++                    all - dispatch.len()
++                );
++            }
++            None => println!("{name}\t(not defined in this TU)"),
++        }
++    }
++    Ok(())
++}
+diff --git a/crates/ruff_cpp_spo/src/clang_walker.rs b/crates/ruff_cpp_spo/src/clang_walker.rs
+index 2652ff1..e873ce7 100644
+--- a/crates/ruff_cpp_spo/src/clang_walker.rs
++++ b/crates/ruff_cpp_spo/src/clang_walker.rs
+@@ -38,7 +38,7 @@ use ruff_spo_triplet::{
+     CppAccess, CppBase, CppField, CppFriend, CppMethod, CppTemplate, CppTemplateKind,
+ };
+ 
+-use crate::{CppClass, Declaration};
++use crate::{CppClass, CppFunction, Declaration};
+ 
+ /// A failure walking a translation unit.
+ #[derive(Debug)]
+@@ -84,6 +84,86 @@ pub fn walk_tu(path: &Path, args: &[String]) -> Result<Vec<CppClass>, WalkError>
+     Ok(out)
+ }
+ 
++/// Walk ONE translation unit and collect free-function DEFINITIONS with their
++/// **general call graph** — the C-library dispatch structure (e.g. leptonica
++/// `pixScale` → `pixScaleGeneral` → `pixScaleGrayLI`/`pixScaleAreaMap`/
++/// `pixUnsharpMasking`). Unlike [`walk_tu`] this parses WITH bodies
++/// (`skip_function_bodies(false)`), because the callee set is the point.
++///
++/// This is the missing arm for C libraries: [`walk_tu`] harvests C++ *classes*;
++/// a C library (leptonica, zlib, …) is free functions on pointer buffers, so
++/// the AR/OO member body-arm ([`method_body_arm`]) captures nothing there — but
++/// the call graph IS the transcode-driving structure (which functions to port,
++/// in what dispatch order). Numeric kernel BODIES remain the essential-15%
++/// hand-port (the doctrine); this mints the 85% structure that classifies + orders
++/// them.
++///
++/// # Errors
++///
++/// [`WalkError::Libclang`] if libclang fails to initialise (non-recoverable);
++/// [`WalkError::Parse`] if the TU fails to parse.
++#[cfg(feature = "libclang")]
++pub fn walk_free_functions(path: &Path, args: &[String]) -> Result<Vec<CppFunction>, WalkError> {
++    let clang = Clang::new().map_err(WalkError::Libclang)?;
++    let index = Index::new(&clang, false, false);
++    let tu = index
++        .parser(path)
++        .arguments(args)
++        .skip_function_bodies(false)
++        .parse()
++        .map_err(|e| WalkError::Parse(e.to_string()))?;
++
++    let mut out = Vec::new();
++    collect_functions(&tu.get_entity(), &mut out);
++    Ok(out)
++}
++
++/// Recurse the AST, emitting a [`CppFunction`] for every free-function
++/// DEFINITION (recursing into namespaces). Prototypes (no body) and
++/// system-header functions are skipped — a transcode wants the library's own
++/// definitions.
++#[cfg(feature = "libclang")]
++fn collect_functions(entity: &Entity, out: &mut Vec<CppFunction>) {
++    for child in entity.get_children() {
++        match child.get_kind() {
++            EntityKind::FunctionDecl => {
++                if child.is_definition()
++                    && !in_system_header(&child)
++                    && let Some(name) = child.get_name()
++                {
++                    let mut calls = Vec::new();
++                    collect_calls(&child, &mut calls);
++                    calls.sort();
++                    calls.dedup();
++                    out.push(CppFunction {
++                        namespace: enclosing_scopes(&child),
++                        name,
++                        calls,
++                    });
++                }
++            }
++            EntityKind::Namespace => collect_functions(&child, out),
++            _ => {}
++        }
++    }
++}
++
++/// Recurse a function body collecting EVERY resolvable callee name (the general
++/// call graph). Distinct from [`walk_body`]'s `calls` (persistence mutators
++/// only): here every `CallExpr` callee is the dispatch structure a C-library
++/// transcode follows.
++#[cfg(feature = "libclang")]
++fn collect_calls(node: &Entity, out: &mut Vec<String>) {
++    for child in node.get_children() {
++        if child.get_kind() == EntityKind::CallExpr
++            && let Some(name) = child.get_name()
++        {
++            out.push(name);
++        }
++        collect_calls(&child, out);
++    }
++}
++
+ /// Coverage instrumentation for `CPP-SCHEMA-FIT`: tally the libclang
+ /// `EntityKind` of every DIRECT class-body child cursor across all
+ /// (non-system-header) class/struct definitions in the TU.
+diff --git a/crates/ruff_cpp_spo/src/lib.rs b/crates/ruff_cpp_spo/src/lib.rs
+index 21c6d72..57a551c 100644
+--- a/crates/ruff_cpp_spo/src/lib.rs
++++ b/crates/ruff_cpp_spo/src/lib.rs
+@@ -58,7 +58,9 @@ use ruff_spo_triplet::{
+ #[cfg(feature = "libclang")]
+ mod clang_walker;
+ #[cfg(feature = "libclang")]
+-pub use clang_walker::{MAPPED_CURSOR_KINDS, WalkError, class_body_cursor_histogram, walk_tu};
++pub use clang_walker::{
++    MAPPED_CURSOR_KINDS, WalkError, class_body_cursor_histogram, walk_free_functions, walk_tu,
++};
+ 
+ /// The namespace prefix for C++ machine-plane subjects/objects.
+ ///
+@@ -108,6 +110,31 @@ impl CppClass {
+     }
+ }
+ 
++/// A free (non-member) function DEFINITION and its **general call graph** — the
++/// harvest arm for **C libraries** (leptonica, zlib, …), whose transcode is
++/// driven by function dispatch, not class inheritance.
++///
++/// [`CppClass`] covers C++ *classes* (the `classid → ClassView` manifest);
++/// this covers C *free functions* on pointer buffers, where the OO body-arm
++/// captures nothing. The `calls` set is the dispatch structure — WHICH functions
++/// to transcode and in what order (e.g. `pixScale → pixScaleGeneral →
++/// {pixScaleGrayLI, pixScaleAreaMap, pixUnsharpMasking}`). The numeric kernel
++/// bodies are the doctrine's essential-15% hand-port; this mints the 85%
++/// structure that classifies + orders them.
++#[cfg(feature = "libclang")]
++#[derive(Debug, Clone, Default)]
++pub struct CppFunction {
++    /// Enclosing namespace components, outermost first (empty at global scope,
++    /// the norm for a C library).
++    pub namespace: Vec<String>,
++    /// The function name as written (`pixScaleGrayLI`).
++    pub name: String,
++    /// Every resolvable callee name in the body, deduped + sorted — the call
++    /// graph. Distinct from the AR/OO `BodyArm.calls` (persistence mutators
++    /// only); this is EVERY `CallExpr` callee.
++    pub calls: Vec<String>,
++}
++
+ /// One class-body declaration, discriminated by category.
+ ///
+ /// **Frontend-local IR** (mirrors `ruff_ruby_spo::Declaration`): the shared
+-- 
+2.43.0
+
