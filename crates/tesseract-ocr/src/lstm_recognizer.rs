@@ -311,6 +311,102 @@ impl LstmRecognizer {
         Ok(lines.join("\n"))
     }
 
+    /// **3F₂ — page recognition through the REAL makerow line finder.**
+    ///
+    /// The parity-component composition that supersedes the `seg-approx`
+    /// projection-profile [`Self::recognize_page`]: every stage below is a
+    /// byte-parity-proven transcode; the one documented boundary is the blob
+    /// SOURCE (`pixConnComp` seedfill components vs the real pipeline's
+    /// edge-traced `C_BLOB`s — see `conncomp.rs`'s island-in-hole note).
+    ///
+    /// Chain: Otsu binarize (P2) → [`conn_comp_areas`] (3B + 3F₂ leaf 1) →
+    /// [`filter_blobs`] (3F₂ leaf 2: the `line_size`/`line_spacing`/
+    /// `max_blob_size` seed, `tordmain.cpp:238-360`) → [`make_rows`]
+    /// (waves 1+2) → [`compute_block_xheight`] (wave 3) → each row's
+    /// `[min_y, max_y]` band cropped and recognized via
+    /// [`Self::recognize_grey_line`] (the proven A6b line path).
+    ///
+    /// Coordinate note: components come out in raster space (`y` down);
+    /// makerow runs in Tesseract's y-UP page space, so boxes are flipped
+    /// (`bottom = h - (y + bh)`, `top = h - y`) on the way in and row bands
+    /// flipped back (`img_top = h - ceil(max_y)`) on the way out. Rows are
+    /// kept in the `TO_ROW_LIST` order make_rows maintains (descending
+    /// `min_y` = top of page first), so the joined text reads top-to-bottom.
+    ///
+    /// Remaining documented simplification (line FEEDING, not line FINDING):
+    /// each row's `[min_y, max_y]` band is cropped RAW and rescaled by the
+    /// proven A6b path. `expand_rows` limits are inherently asymmetric about
+    /// the baseline (≈0.75 x-height+ascender fraction above vs 0.25
+    /// descender below — wave-2 parity-proven behavior), so band heights
+    /// vary with layout; the REAL pipeline instead feeds baseline-NORMALIZED
+    /// line images (`ccmain/linerec.cpp`), which is the next fidelity step
+    /// beyond 3F₂'s scope.
+    ///
+    /// # Errors
+    ///
+    /// The first [`RecognizerError`] from any band's recognition.
+    pub fn recognize_page_makerow(
+        &self,
+        grey: &[u8],
+        w: usize,
+        h: usize,
+        dict: Option<&DictLite>,
+    ) -> Result<String, RecognizerError> {
+        use crate::blob_filter::filter_blobs;
+        use crate::conncomp::conn_comp_areas;
+        use crate::textline::{compute_block_xheight, make_rows, ToBlockCtx};
+        use crate::threshold::{otsu_threshold_gray, threshold_rect_to_binary};
+
+        // P2: binarize the whole page (foreground = 0 per the crate's
+        // grey-image convention).
+        let otsu = otsu_threshold_gray(grey, w, 0, 0, w, h);
+        let binary = threshold_rect_to_binary(grey, w, 0, 0, w, h, otsu);
+
+        // 3B + 3F₂ leaf 1: components with ink pixel counts (8-connectivity,
+        // matching the real pipeline's blob granularity most closely).
+        let mut components = conn_comp_areas(&binary, w, h, 8);
+        // Raster space → Tesseract y-UP page space for the makerow math.
+        for c in &mut components {
+            c.bb.y = h as i32 - (c.bb.y + c.bb.h);
+        }
+
+        // 3F₂ leaf 2: noise partition + the line-size seed.
+        let filtered = filter_blobs(&components);
+
+        // Waves 1-3: the real line finder.
+        let mut blocks = [ToBlockCtx {
+            blobs: filtered.blobs,
+            block_left: 0,
+            line_spacing: filtered.line_spacing,
+            line_size: filtered.line_size,
+            max_blob_size: filtered.max_blob_size,
+            ..Default::default()
+        }];
+        let page_m = make_rows(&mut blocks);
+        let [mut block] = blocks;
+        compute_block_xheight(&mut block, page_m, 0.0);
+
+        // Rows (top-of-page first) → image-space bands → the proven line path.
+        let mut lines: Vec<String> = Vec::with_capacity(block.rows.len());
+        for row in &block.rows {
+            if row.blobs.is_empty() {
+                continue;
+            }
+            let img_top = (h as f32 - row.max_y()).floor().max(0.0) as usize;
+            let img_bottom = (h as f32 - row.min_y()).ceil().min(h as f32) as usize;
+            if img_bottom <= img_top {
+                continue;
+            }
+            let band_h = img_bottom - img_top;
+            let crop = &grey[img_top * w..img_bottom * w];
+            let (_ids, text) = self.recognize_grey_line(crop, w, band_h, dict.cloned())?;
+            if !text.is_empty() {
+                lines.push(text);
+            }
+        }
+        Ok(lines.join("\n"))
+    }
+
     /// `LSTMRecognizer::SetRandomSeed` (`lstmrecognizer.h:287-291`): the exact
     /// randomizer seeding `RecognizeLine` uses before the forward pass —
     /// `seed = (i64)sample_iteration · 0x10000001`, `minstd` seed, one warm-up
@@ -555,5 +651,44 @@ mod tests {
             0,
             "int-mode-only model doesn't recode"
         );
+    }
+}
+
+#[cfg(test)]
+mod makerow_page_tests {
+    use super::*;
+
+    /// 3F₂ E2E anchor on the stacked-line synthetic (when the /tmp data
+    /// exists): the REAL makerow line finder must segment the two stacked
+    /// copies into exactly two rows, both recognizing to non-empty,
+    /// DETERMINISTIC text. (The two strings are NOT asserted equal: the
+    /// fixture is a degenerate one-blob-per-line page, and expand_rows's
+    /// faithful asymmetric ascender/descender expansion yields different
+    /// band heights — see recognize_page_makerow's module doc.)
+    #[test]
+    fn stacked_page_finds_two_deterministic_rows() {
+        let paths = [
+            "/tmp/eng.lstm",
+            "/tmp/eng.lstm-unicharset",
+            "/tmp/eng.lstm-recoder",
+            "/tmp/page_test.pgm",
+        ];
+        if paths.iter().any(|p| !std::path::Path::new(p).exists()) {
+            eprintln!("skipping: /tmp eng data or page_test.pgm absent");
+            return;
+        }
+        let lstm = std::fs::read(paths[0]).unwrap();
+        let uni = std::fs::read_to_string(paths[1]).unwrap();
+        let rec = std::fs::read(paths[2]).unwrap();
+        let img = std::fs::read(paths[3]).unwrap();
+        let r = LstmRecognizer::from_components(&lstm, &uni, &rec).unwrap();
+        let (grey, w, h) = crate::image_input::parse_pgm(&img).unwrap();
+
+        let a = r.recognize_page_makerow(&grey, w, h, None).unwrap();
+        let b = r.recognize_page_makerow(&grey, w, h, None).unwrap();
+        assert_eq!(a, b, "must be deterministic");
+        let lines: Vec<&str> = a.split('\n').collect();
+        assert_eq!(lines.len(), 2, "two stacked lines -> two rows: {a:?}");
+        assert!(lines.iter().all(|l| !l.is_empty()));
     }
 }
