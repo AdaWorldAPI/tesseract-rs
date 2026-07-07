@@ -263,3 +263,11 @@ P2 ≈ 2 · P3-alt ≈ 1 · P3 ≈ 8-15 (the marathon) · P4 ≈ 3-4 · P5 ≈ 2
 Plan index: lance-graph `INTEGRATION_PLANS.md` (prepended). Per-batch findings:
 `EPIPHANIES.md` `E-OCR-*`. Status: this file's tables (⬜→✅ in the landing
 commit). Oracles: banked in the consuming plan section, always.
+
+### D1.2 seed decision (finding from oracle draft, 2026-07-07)
+`RecodeBeamSearch::ContinueDawg` (recodebeam.cpp:1108) uses **`default_dawgs()`** for
+word-start, NOT `init_active_dawgs()` (which is `LanguageModel`'s legacy-recognizer
+seed — out of scope for the LSTM beam transcode). D1.2b's Rust walker MUST seed
+via the `default_dawgs` equivalent to match production `recognize_line` behavior.
+Oracle at `/tmp/def_letter_oracle.cpp`; example: "the" (ids 91 97 92) → perm=8
+SystemDawgPerm, `valid_end=1` after "th" (word-end reached).
