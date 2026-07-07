@@ -217,6 +217,72 @@ pub fn scale_gray_li(src: &[u8], ws: usize, hs: usize, wd: usize, hd: usize) -> 
     dst
 }
 
+/// `scaleGrayAreaMapLow` (leptonica 1.82.0 `scale1.c:3521`) — the 8-bit grey
+/// **area-map** downscale kernel `pixScaleAreaMap` uses for the general (non
+/// power-of-2) `f ∈ [0.02, 0.7)` case. Each dest pixel is the coverage-weighted
+/// average of the src pixels its footprint overlaps, in 1/16-sub-pixel units:
+/// the four fractional corners + full interior pixels (`×256`) + the four
+/// fractional edge strips, all over the exact sub-pixel `area`. `src` is
+/// `hs × ws` row-major; output `hd × wd` with `wd = round(f·ws)`,
+/// `hd = round(f·hs)`. Pure integer arithmetic (`val = Σ / area`), so byte-exact.
+/// The exact 0.5/0.25/… reductions route to `pixScaleAreaMap2` (a separate leaf),
+/// not here.
+#[must_use]
+pub fn scale_gray_area_map(src: &[u8], ws: usize, hs: usize, wd: usize, hd: usize) -> Vec<u8> {
+    let scx = 16.0 * ws as f32 / wd as f32;
+    let scy = 16.0 * hs as f32 / hd as f32;
+    let wm2 = ws as i32 - 2;
+    let hm2 = hs as i32 - 2;
+    let get = |y: i32, x: i32| i32::from(src[(y as usize) * ws + x as usize]);
+    let mut dst = vec![0u8; wd * hd];
+    for i in 0..hd {
+        // UL corner: `scy * i` is f32 (int→float). LR corner: `scy * (i + 1.0)`
+        // is f64 — the `1.0` is a double literal in C, promoting the product to
+        // double. Matching the two precisions exactly is what makes this
+        // byte-parity (an f32-only LR corner is off by ±1–2 near boundaries).
+        let yu = (scy * i as f32) as i32;
+        let yl = (f64::from(scy) * (i as f64 + 1.0)) as i32;
+        let (yup, yuf) = (yu >> 4, yu & 0x0f);
+        let (ylp, ylf) = (yl >> 4, yl & 0x0f);
+        let dely = ylp - yup;
+        for j in 0..wd {
+            let xu = (scx * j as f32) as i32;
+            let xl = (f64::from(scx) * (j as f64 + 1.0)) as i32;
+            let (xup, xuf) = (xu >> 4, xu & 0x0f);
+            let (xlp, xlf) = (xl >> 4, xl & 0x0f);
+            let delx = xlp - xup;
+            // Near the edge: just use a src pixel value.
+            if xlp > wm2 || ylp > hm2 {
+                dst[i * wd + j] = get(yup, xup) as u8;
+                continue;
+            }
+            let area = ((16 - xuf) + 16 * (delx - 1) + xlf) * ((16 - yuf) + 16 * (dely - 1) + ylf);
+            let v00 = (16 - xuf) * (16 - yuf) * get(yup, xup);
+            let v10 = xlf * (16 - yuf) * get(yup, xlp);
+            let v01 = (16 - xuf) * ylf * get(yup + dely, xup);
+            let v11 = xlf * ylf * get(yup + dely, xlp);
+            let mut vin = 0_i32; // full interior src pixels
+            for k in 1..dely {
+                for m in 1..delx {
+                    vin += 256 * get(yup + k, xup + m);
+                }
+            }
+            let mut vmid = 0_i32; // fractional edge strips
+            for k in 1..dely {
+                vmid += (16 - xuf) * 16 * get(yup + k, xup); // left
+                vmid += xlf * 16 * get(yup + k, xlp); // right
+            }
+            for m in 1..delx {
+                vmid += 16 * (16 - yuf) * get(yup, xup + m); // top
+                vmid += 16 * ylf * get(yup + dely, xup + m); // bottom
+            }
+            let val = (v00 + v01 + v10 + v11 + vin + vmid + 128) / area;
+            dst[i * wd + j] = val as u8; // SET_DATA_BYTE masks to low 8 bits
+        }
+    }
+    dst
+}
+
 /// `pixUnsharpMaskingGray2D` (leptonica 1.82.0 `enhance.c`) — the 2-D unsharp
 /// mask `pixScale` applies on top of the resample. The ruff harvest of
 /// `enhance.c` showed the dispatch `pixUnsharpMasking → pixUnsharpMaskingGray →
@@ -286,42 +352,67 @@ pub fn unsharp_mask_gray_2d(
     out
 }
 
-/// `pixScale(pixs, f, f)` for 8-bit grey on the **`f ≥ 0.7`** path (leptonica
-/// 1.82.0 `scale1.c` `pixScale` → `pixScaleGeneral`) — the dispatch the ruff
-/// harvest mapped, composed from the two proven leaves:
+/// `pixScale(pixs, f, f)` for 8-bit grey — the **full** dispatch the ruff
+/// harvest mapped (`scale1.c` `pixScale` → `pixScaleGeneral`), composed from the
+/// three proven leaves. `f = target/source` (isotropic):
 ///
 /// - `f == 1.0` → copy (identity; the model-height case).
-/// - `0.7 ≤ f` → `pixScaleGrayLI` ([`scale_gray_li`]); THEN, if `f < 1.4`, the
-///   default sharpen `pixUnsharpMasking(·, 2, 0.4)` ([`unsharp_mask_gray_2d`]);
-///   `f ≥ 1.4` skips the sharpen. `pixScale` sets `sharpfract = 0.4`,
-///   `sharpwidth = 2` for `maxscale ≥ 0.7`.
+/// - `f ≥ 0.7` → [`scale_gray_li`] (`pixScaleGrayLI`); then, if `f < 1.4`,
+///   `pixUnsharpMasking(·, 2, 0.4)` ([`unsharp_mask_gray_2d`]); `f ≥ 1.4` skips
+///   the sharpen.
+/// - `0.2 < f < 0.7` → [`scale_gray_area_map`] (`pixScaleAreaMap`) then
+///   `pixUnsharpMasking(·, 1, 0.2)`.
+/// - `0.02 ≤ f ≤ 0.2` → [`scale_gray_area_map`], no sharpen (`maxscale ≤ 0.2`).
 ///
-/// Returns `(scaled_grey, wd, hd)`. **`f < 0.7` (area-map) is a separate leaf**
-/// (task #31) — this asserts `f ≥ 0.7`.
+/// Returns `(scaled_grey, wd, hd)`.
 ///
 /// # Panics
 ///
-/// Panics if `f < 0.7` (routes to `pixScaleAreaMap`, not yet ported) or the
-/// buffer is too small.
+/// Panics on the exact `2⁻ⁿ` reductions (`f ∈ {0.5, 0.25, 0.125, 0.0625}`, which
+/// route to `pixScaleAreaMap2` — a separate leaf), on `f < 0.02` (`pixScaleSmooth`
+/// — rare), or a small buffer.
 #[must_use]
-pub fn pix_scale_grey_li(grey: &[u8], w: usize, h: usize, f: f32) -> (Vec<u8>, usize, usize) {
+pub fn pix_scale_grey(grey: &[u8], w: usize, h: usize, f: f32) -> (Vec<u8>, usize, usize) {
     assert!(grey.len() >= w * h, "grey buffer too small");
     if f == 1.0 {
         return (grey.to_vec(), w, h); // pixScaleGeneral: scalex==scaley==1 → copy
     }
-    assert!(
-        f >= 0.7,
-        "f < 0.7 routes to pixScaleAreaMap (a separate leaf)"
-    );
-    let wd = ((f * w as f32) + 0.5) as usize; // pixScaleGrayLI's dims
+    let wd = ((f * w as f32) + 0.5) as usize;
     let hd = ((f * h as f32) + 0.5) as usize;
-    let scaled = scale_gray_li(grey, w, h, wd, hd);
-    if f < 1.4 {
-        // pixScale's default sharpen for maxscale ∈ [0.7,1.4): (f32)0.4, width 2.
-        let sharpfract = 0.4_f64 as f32;
-        (unsharp_mask_gray_2d(&scaled, wd, hd, 2, sharpfract), wd, hd)
+
+    if f >= 0.7 {
+        // Linear-interpolation path; default sharpen (2, 0.4) when f < 1.4.
+        let scaled = scale_gray_li(grey, w, h, wd, hd);
+        return if f < 1.4 {
+            (
+                unsharp_mask_gray_2d(&scaled, wd, hd, 2, 0.4_f64 as f32),
+                wd,
+                hd,
+            )
+        } else {
+            (scaled, wd, hd)
+        };
+    }
+
+    // f < 0.7: area-map path.
+    assert!(
+        f >= 0.02,
+        "f < 0.02 routes to pixScaleSmooth (a separate leaf)"
+    );
+    assert!(
+        !(f == 0.5 || f == 0.25 || f == 0.125 || f == 0.0625),
+        "exact 2⁻ⁿ reduction routes to pixScaleAreaMap2 (a separate leaf)"
+    );
+    let scaled = scale_gray_area_map(grey, w, h, wd, hd);
+    if f > 0.2 {
+        // pixScaleGeneral: maxscale > 0.2 → default sharpen (1, 0.2).
+        (
+            unsharp_mask_gray_2d(&scaled, wd, hd, 1, 0.2_f64 as f32),
+            wd,
+            hd,
+        )
     } else {
-        (scaled, wd, hd) // f ≥ 1.4: pixScaleGeneral clones (no sharpen)
+        (scaled, wd, hd) // maxscale ≤ 0.2: no sharpen
     }
 }
 
@@ -362,11 +453,11 @@ mod tests {
     }
 
     #[test]
-    fn pix_scale_grey_li_identity_at_factor_one() {
+    fn pix_scale_grey_identity_at_factor_one() {
         // f == 1.0 → copy. (Real byte-parity vs pixScale is the pixscale_dump
         // example, 6/6 factors f=0.72..1.5.)
         let grey: Vec<u8> = (0..12).collect();
-        let (out, wd, hd) = pix_scale_grey_li(&grey, 4, 3, 1.0);
+        let (out, wd, hd) = pix_scale_grey(&grey, 4, 3, 1.0);
         assert_eq!((wd, hd), (4, 3));
         assert_eq!(out, grey);
     }
