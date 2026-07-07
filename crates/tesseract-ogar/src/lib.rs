@@ -46,6 +46,15 @@ use tesseract_core::DictLite;
 use tesseract_ocr::{LineWords, LstmRecognizer};
 use tesseract_ocr_pdf::{GreyImage, PageOcr, PdfError, RenderReport, SearchablePdfError};
 
+/// The V3-substrate <-> Python-SDK parity probe: walks a loaded `Network`
+/// byte stream into per-node content-blind facets
+/// ([`v3_facet::NodeFacet`], each carrying a `FacetCascade`) and provides the
+/// TSV formatters + Python decode harness shared by
+/// `examples/v3_facet_probe.rs` and `tests/v3_facet_parity.rs`. See that
+/// module's docs for why it re-derives the header walk instead of reusing
+/// `tesseract_ocr::Network`'s tree directly.
+pub mod v3_facet;
+
 /// Every OCR capability this crate's [`OcrExecutor::execute`] handles, in the
 /// same order as [`ogar_vocab::ocr_actions::OCR_ACTION_NAMES`] — this
 /// crate's half of the exhaustiveness fuse (see the module docs).
