@@ -322,29 +322,35 @@ impl LstmRecognizer {
     /// Chain: Otsu binarize (P2) → [`conn_comp_areas`] (3B + 3F₂ leaf 1) →
     /// [`filter_blobs`] (3F₂ leaf 2: the `line_size`/`line_spacing`/
     /// `max_blob_size` seed, `tordmain.cpp:238-360`) → [`make_rows`]
-    /// (waves 1+2) → [`compute_block_xheight`] (wave 3) → each row's
-    /// `[min_y, max_y]` band cropped and recognized via
-    /// [`Self::recognize_grey_line`] (the proven A6b line path).
+    /// (waves 1+2) → [`compute_block_xheight`] (wave 3) → each row fed as
+    /// the TYPOGRAPHIC line box of `Tesseract::LSTMRecognizeWord`
+    /// (`linerec.cpp:239-246`: the row's ink bounding box EXTENDED — never
+    /// shrunk — to `[baseline + descdrop, baseline + xheight + ascrise]`,
+    /// baseline evaluated at the box x-midpoint from the wave-2 parallel
+    /// fit) → `GetRectImage`'s `kImagePadding = 4` pad on all sides + clip
+    /// to the image → [`Self::recognize_grey_line`] (the proven A6b line
+    /// path). In LSTM mode the real pipeline recognizes a whole textline
+    /// per call (the row's words are merged before `LSTMRecognizeWord`), so
+    /// feeding the row box IS the real feeding semantics.
     ///
     /// Coordinate note: components come out in raster space (`y` down);
     /// makerow runs in Tesseract's y-UP page space, so boxes are flipped
-    /// (`bottom = h - (y + bh)`, `top = h - y`) on the way in and row bands
-    /// flipped back (`img_top = h - ceil(max_y)`) on the way out. Rows are
-    /// kept in the `TO_ROW_LIST` order make_rows maintains (descending
-    /// `min_y` = top of page first), so the joined text reads top-to-bottom.
+    /// (`bottom = h - (y + bh)`, `top = h - y`) on the way in and the padded
+    /// typographic box flipped back on the way out. Rows are kept in the
+    /// `TO_ROW_LIST` order make_rows maintains (descending `min_y` = top of
+    /// page first), so the joined text reads top-to-bottom.
     ///
-    /// Remaining documented simplification (line FEEDING, not line FINDING):
-    /// each row's `[min_y, max_y]` band is cropped RAW and rescaled by the
-    /// proven A6b path. `expand_rows` limits are inherently asymmetric about
-    /// the baseline (≈0.75 x-height+ascender fraction above vs 0.25
-    /// descender below — wave-2 parity-proven behavior), so band heights
-    /// vary with layout; the REAL pipeline instead feeds baseline-NORMALIZED
-    /// line images (`ccmain/linerec.cpp`), which is the next fidelity step
-    /// beyond 3F₂'s scope.
+    /// Feeding is position-invariant when nothing clips: identical ink at
+    /// different page positions yields pixel-identical crops (the roomy
+    /// stacked fixture asserts this). Near the image edges the pad+clip
+    /// truncates faithfully, exactly as `GetRectImage` does. Remaining
+    /// documented approximations: the blob source (above) and the
+    /// straight-baseline case (`baseline = m·x + parallel_c`; the real
+    /// `row->base_line()` consults the quadratic spline where one exists).
     ///
     /// # Errors
     ///
-    /// The first [`RecognizerError`] from any band's recognition.
+    /// The first [`RecognizerError`] from any line's recognition.
     pub fn recognize_page_makerow(
         &self,
         grey: &[u8],
@@ -386,20 +392,61 @@ impl LstmRecognizer {
         let [mut block] = blocks;
         compute_block_xheight(&mut block, page_m, 0.0);
 
-        // Rows (top-of-page first) → image-space bands → the proven line path.
+        // Rows (top-of-page first) → the TYPOGRAPHIC line box → the proven
+        // line path. This is the real pipeline's feeding, not the expanded
+        // TO_ROW band: `Tesseract::LSTMRecognizeWord` (`linerec.cpp:239-246`)
+        // starts from the ink's bounding box and EXTENDS it (never shrinks)
+        // to at least `[baseline + descenders, baseline + x_height +
+        // ascenders]` — the baseline evaluated at the box's x-midpoint from
+        // the row's fitted line (straight-baseline case: `m·x + parallel_c`,
+        // our wave-2 parallel fit) — then `GetRectImage` pads by
+        // `kImagePadding = 4` on ALL sides (`imagedata.h:39`) and clips to
+        // the image, cropping x AND y. descdrop/xheight/ascrise come from
+        // wave 3's `compute_block_xheight`. The recognizer input is then the
+        // proven prescale+FromPix path, exactly as `RecognizeLine` does.
+        const K_IMAGE_PADDING: i32 = 4;
         let mut lines: Vec<String> = Vec::with_capacity(block.rows.len());
         for row in &block.rows {
             if row.blobs.is_empty() {
                 continue;
             }
-            let img_top = (h as f32 - row.max_y()).floor().max(0.0) as usize;
-            let img_bottom = (h as f32 - row.min_y()).ceil().min(h as f32) as usize;
-            if img_bottom <= img_top {
+            // Ink bounding box of the row (y-up space).
+            let mut left = i32::MAX;
+            let mut right = i32::MIN;
+            let mut bottom = f32::MAX;
+            let mut top = f32::MIN;
+            for &(l, b, r, t) in &row.blobs {
+                left = left.min(l);
+                right = right.max(r);
+                bottom = bottom.min(b as f32);
+                top = top.max(t as f32);
+            }
+            // linerec.cpp:240-246 — extend to the typographic band.
+            let mid_x = (left + right) as f32 / 2.0;
+            let baseline = row.line_m() * mid_x + row.parallel_c();
+            if baseline + row.descdrop < bottom {
+                bottom = baseline + row.descdrop;
+            }
+            if baseline + row.xheight + row.ascrise > top {
+                top = baseline + row.xheight + row.ascrise;
+            }
+            // GetRectImage: pad 4 all sides, clip to the image (x AND y),
+            // then flip y-up → raster rows for the crop.
+            let img_left = (left - K_IMAGE_PADDING).max(0) as usize;
+            let img_right = ((right + K_IMAGE_PADDING) as usize).min(w);
+            let img_top = ((h as f32 - (top + K_IMAGE_PADDING as f32)).floor()).max(0.0) as usize;
+            let img_bottom =
+                ((h as f32 - (bottom - K_IMAGE_PADDING as f32)).ceil()).min(h as f32) as usize;
+            if img_bottom <= img_top || img_right <= img_left {
                 continue;
             }
+            let band_w = img_right - img_left;
             let band_h = img_bottom - img_top;
-            let crop = &grey[img_top * w..img_bottom * w];
-            let (_ids, text) = self.recognize_grey_line(crop, w, band_h, dict.cloned())?;
+            let mut crop = Vec::with_capacity(band_w * band_h);
+            for y in img_top..img_bottom {
+                crop.extend_from_slice(&grey[y * w + img_left..y * w + img_right]);
+            }
+            let (_ids, text) = self.recognize_grey_line(&crop, band_w, band_h, dict.cloned())?;
             if !text.is_empty() {
                 lines.push(text);
             }
@@ -658,13 +705,17 @@ mod tests {
 mod makerow_page_tests {
     use super::*;
 
-    /// 3F₂ E2E anchor on the stacked-line synthetic (when the /tmp data
-    /// exists): the REAL makerow line finder must segment the two stacked
-    /// copies into exactly two rows, both recognizing to non-empty,
-    /// DETERMINISTIC text. (The two strings are NOT asserted equal: the
-    /// fixture is a degenerate one-blob-per-line page, and expand_rows's
-    /// faithful asymmetric ascender/descender expansion yields different
-    /// band heights — see recognize_page_makerow's module doc.)
+    /// 3F₂/feeding E2E anchor on the stacked-line synthetic (when the /tmp
+    /// data exists; regenerate with
+    /// `.claude/harvest/oracles/gen_page_fixture.py`): the REAL makerow line
+    /// finder must segment the two stacked copies into exactly two rows, and
+    /// — because the typographic feeding (`linerec.cpp:239-246` band +
+    /// `GetRectImage` pad-4) is position-invariant when nothing clips at the
+    /// image edges — the roomy fixture's two rows must recognize to
+    /// IDENTICAL text. (On the legacy tight 24×88 layout
+    /// (`/tmp/page_tight.pgm`) the padded band clips at the top edge for row
+    /// A and the bottom edge for row B — faithful `GetRectImage` clipping —
+    /// so the lines legitimately differ there; that layout is not asserted.)
     #[test]
     fn stacked_page_finds_two_deterministic_rows() {
         let paths = [
@@ -690,5 +741,17 @@ mod makerow_page_tests {
         let lines: Vec<&str> = a.split('\n').collect();
         assert_eq!(lines.len(), 2, "two stacked lines -> two rows: {a:?}");
         assert!(lines.iter().all(|l| !l.is_empty()));
+        // Position invariance: identical ink + identical typographic band
+        // (unclipped) => identical crops => identical text. Skip (with a
+        // note) if the on-disk fixture is the legacy tight layout, whose
+        // edge clipping legitimately breaks the equality.
+        if w >= 72 {
+            assert_eq!(
+                lines[0], lines[1],
+                "roomy fixture: typographic feeding must be position-invariant"
+            );
+        } else {
+            eprintln!("note: tight legacy fixture on disk; equality not asserted");
+        }
     }
 }
