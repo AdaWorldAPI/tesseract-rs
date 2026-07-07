@@ -1,0 +1,95 @@
+# STATS class manifest (ccstruct/statistc.h) — the histogram/percentile
+# primitive makerow.cpp leans on throughout (Textord::compute_block_xheight,
+# compute_row_xheight, fill_heights, compute_xheight_from_modes,
+# compute_row_descdrop, vigorous_noise_removal all construct a `STATS` with
+# an arbitrary [min,max] bucket range).
+#
+# GOTCHA (worth banking): harvest_textord.rs's default include list
+# (textord/ccstruct/ccutil/arch/ccmain/api/dict/classify/wordrec/lstm/include)
+# is MISSING src/viewer/ — statistc.h includes "scrollview.h" (for the
+# GRAPHICS_DISABLED-gated plot()/plotline() declarations), scrollview.h lives
+# in src/viewer/, and without that include dir the whole STATS class
+# definition silently fails to parse (walk_tu reports "0 failed" because the
+# TU itself still parses — clang recovers from the unresolved include by
+# treating trailing declarations as best-effort — but the STATS CXXRecordDecl
+# node never completes, so it's simply ABSENT from the output, not flagged as
+# an error). Confirmed by adding -I<root>/src/viewer and re-running: STATS
+# appears with its full 23-method/4-field surface. This is a live tooling gap
+# in harvest_textord.rs's hardcoded include list, not a statistc.h defect —
+# worth fixing upstream (add src/viewer to the default include set) since any
+# future harvest of a header that pulls in scrollview.h will hit the same
+# silent-drop.
+#
+# Run (ran via a temporary scratch example, harvest_statistc_tmp.rs — NOT
+# committed to ruff; deleted after use — because harvest_textord.rs has no
+# EXTRA_INC override, unlike harvest_leptonica_scale.rs. Reproduce with a
+# copy of harvest_textord.rs's walk_tu call, header=statistc.h, and this arg
+# list):
+#   -std=c++17 -x c++
+#   -I<root>/src/textord -I<root>/src/ccstruct -I<root>/src/ccutil
+#   -I<root>/src/arch -I<root>/src/viewer -I<root>/src/api
+#   -I<root>/include -I/usr/include/leptonica
+#
+# Result: 1 class (STATS), 23 methods, 4 fields, 0 failed.
+tesseract::STATS  23 methods, 4 fields
+  fn STATS               # ctor(min_bucket_value, max_bucket_value)
+  fn STATS               # ctor() = default (empty, for arrays)
+  fn ~STATS
+  fn set_range           # (Re)Sets range + clears counts
+  fn clear                # empty buckets
+  fn add                  # add(value, count) — bump bucket
+  fn mode                 # LEAF: argmax bucket
+  fn mean                 # LEAF: sum(value*count)/total
+  fn sd                   # LEAF: std deviation
+  fn ile                  # LEAF: fractile value (bucket walk + interpolation;
+                          # ALREADY TRANSCODED for the [0,255] specialisation
+                          # in tesseract-recognizer/src/input.rs::Stats::ile,
+                          # statistc.cpp:172-197 — generalizing to arbitrary
+                          # rangemin_ is the only change needed)
+  fn min_bucket           # LEAF: min used entry (not min of supplied range)
+  fn max_bucket           # LEAF: max used entry
+  fn median               # LEAF: more useful than ile(0.5) — see header doc,
+                          # statistc.h:66-70 (splits ties, e.g. 6,6,13,14 ->
+                          # 9.5 not 7.0)
+  fn pile_count           # LEAF, INLINE in header (statistc.h:72-83) — clamped
+                          # bucket read, out-of-range clamps to edge bucket
+  fn get_total            # LEAF, INLINE (statistc.h:85-87) — total_count_
+  fn local_min            # LEAF: is x a local min in the histogram
+  fn smooth               # triangular smoothing filter (factor = weight of
+                          # centre) — NOT used by makerow.cpp itself; used by
+                          # callers of the row/block xheight pipeline upstream
+                          # (deferred for the minimal leaf chain)
+  fn cluster              # k-cluster iteration — NOT used by makerow.cpp
+                          # (deferred)
+  fn top_n_modes          # returns <mean,count> peaks via KDPairInc — NOT
+                          # used by makerow.cpp (deferred; used elsewhere,
+                          # e.g. wordrec repeated-char detection)
+  fn print                # tprintf-only, inert for an oracle
+  fn print_summary        # tprintf-only, inert for an oracle
+  fn plot                 # GRAPHICS_DISABLED-gated, inert for a headless oracle
+  fn plotline             # GRAPHICS_DISABLED-gated, inert for a headless oracle
+  field rangemin_         # int32_t
+  field rangemax_         # int32_t
+  field total_count_      # int32_t
+  field buckets_          # int32_t* (heap array, size rangemax_-rangemin_+1)
+
+# ============================================================
+# Overlap with the existing tesseract-recognizer Stats type
+# ============================================================
+# tesseract-recognizer/src/input.rs (A6a leaf, ComputeBlackWhite) already
+# ports a NARROWED STATS: fixed [0,255] range (`buckets: [i32; 256]`, stack
+# array not heap `Vec`/`Box`), only `add()` and `ile()` implemented. That is
+# CORRECT for its scope (ComputeBlackWhite only ever constructs STATS(0,255))
+# but it is NOT the general STATS makerow.cpp needs:
+#   - arbitrary min/max bucket range (STATS(min_height,max_height) with
+#     min/max computed per-row from block->line_size via get_min_max_xheight,
+#     NOT a fixed 0..255)
+#   - mode() / median() / pile_count() / get_total() / min_bucket() /
+#     max_bucket() all required by the minimal leaf chain below
+# Recommendation for the port: a general `Stats` (heap-backed Vec<i32>,
+# arbitrary range, full LEAF-tagged accessor surface above) should live
+# as its own primitive (tesseract-recognizer or a shared support module),
+# with the existing A6a `Stats` either becoming a thin specialisation on top
+# of it or staying a deliberately-scoped duplicate documented as such — NOT
+# silently diverging. This is a structural note for the next porting wave,
+# not a decision made here (harvest-only task).
