@@ -16,3 +16,18 @@ lance-graph-contract = { path = "../../../lance-graph/crates/lance-graph-contrac
 tesseract-ocr = { path = "../tesseract-ocr", features = ["seg-approx"] }
 tesseract-core = { path = "../tesseract-core" }
 tesseract-ocr-pdf = { path = "../tesseract-ocr-pdf" }
+# Compute-tier payload-length readers (`Lstm::from_le_bytes`,
+# `WeightMatrix::from_le_bytes_prefix`) reused verbatim by `v3_facet`'s header
+# walk to skip leaf payloads between nodes — never re-derived by hand. Already
+# a transitive dep via `tesseract-ocr`; made direct because `v3_facet` calls
+# it. Path dep, fork-only policy (same as the two foundations above).
+tesseract-recognizer = { path = "../tesseract-recognizer" }
+
+[dev-dependencies]
+# The V3-substrate <-> Python-SDK parity probe (`v3_facet`, `examples/
+# v3_facet_probe.rs`, `tests/v3_facet_parity.rs`) emits this crate's
+# generated Python SDK fresh every run — never a hand-maintained copy — and
+# decodes the SAME facet bytes through its `Facet.from_bytes`. Dev-only: a
+# codegen/SDK-emission tool, not something the production `OcrExecutor`
+# needs at runtime.
+ogar-adapter-python = { path = "../../../OGAR/crates/ogar-adapter-python" }
