@@ -20,18 +20,21 @@
 //! recoder are then pulled from their own components (`LoadCharsets`, the
 //! `!include_charsets` branch).
 
+use std::path::Path;
+
 use tesseract_core::{
     ids_to_text, RecodeBeamSearch, RecoderError, UniCharSet, UniCharSetError, UnicharCompress,
 };
-use tesseract_recognizer::{NetworkIo, TRand};
+use tesseract_recognizer::{from_grey_pix, NetworkIo, TRand};
 
+use crate::image_input::{parse_pgm, prescale_grey_to_height, PgmError};
 use crate::network::{NetError, Network};
 
 /// `TF_COMPRESS_UNICHARSET` (`lstmrecognizer.h` `TrainingFlags`): the recoder is
 /// present (recoding on) rather than a pass-through identity codec.
 const TF_COMPRESS_UNICHARSET: i32 = 64;
 
-/// A failure assembling the recognizer from its components.
+/// A failure assembling the recognizer from its components, or recognizing.
 #[derive(Debug)]
 pub enum RecognizerError {
     /// The network (B1) failed to load, or the trailing fields were truncated.
@@ -40,6 +43,10 @@ pub enum RecognizerError {
     Charset(UniCharSetError),
     /// The recoder binary component failed to parse.
     Recoder(RecoderError),
+    /// An image file could not be read.
+    Io(std::io::Error),
+    /// An image file could not be parsed.
+    Pgm(PgmError),
 }
 
 impl std::fmt::Display for RecognizerError {
@@ -48,6 +55,8 @@ impl std::fmt::Display for RecognizerError {
             Self::Network(e) => write!(f, "network/tail load: {e}"),
             Self::Charset(e) => write!(f, "unicharset load: {e:?}"),
             Self::Recoder(e) => write!(f, "recoder load: {e:?}"),
+            Self::Io(e) => write!(f, "image read: {e}"),
+            Self::Pgm(e) => write!(f, "image parse: {e}"),
         }
     }
 }
@@ -146,6 +155,42 @@ impl LstmRecognizer {
         let ids: Vec<u32> = uids.iter().map(|&i| i as u32).collect();
         let text = ids_to_text(&self.charset, &ids);
         Ok((uids, text))
+    }
+
+    /// **A6b — image FILE on disk → text.** The full pure-Rust
+    /// `RecognizeLine`-equivalent: read a P5 PGM → pre-scale to the network input
+    /// height (A6b) → `from_grey_pix` (A6a) → `recognize_grid` (B3-core).
+    /// Returns `(unichar_ids, text)`.
+    ///
+    /// **Byte-parity vs libtesseract holds when the image is at the model input
+    /// height** (leptonica `pixScale` at factor 1.0 is a copy, so the scale is
+    /// identity and every downstream step is proven). Other heights use the
+    /// marked bilinear approximation in
+    /// [`prescale_grey_to_height`](crate::image_input::prescale_grey_to_height)
+    /// (functional, NOT leptonica-`pixScale`-exact).
+    ///
+    /// `rng` feeds `Convolve`'s out-of-image noise (seed it as the recognizer
+    /// does, e.g. `1`); the pre-scale + `from_grey_pix` make no draws for a
+    /// full-width image, so it enters the forward pass at its seeded state.
+    ///
+    /// # Errors
+    ///
+    /// [`RecognizerError::Io`] / [`RecognizerError::Pgm`] on a bad image;
+    /// [`RecognizerError::Network`] on a forward failure.
+    pub fn recognize_image_file(
+        &self,
+        path: &Path,
+        rng: &mut TRand,
+    ) -> Result<(Vec<i32>, String), RecognizerError> {
+        let bytes = std::fs::read(path).map_err(RecognizerError::Io)?;
+        let (grey, w, h) = parse_pgm(&bytes).map_err(RecognizerError::Pgm)?;
+        let target_h = self
+            .network
+            .input_shape
+            .map_or(36, |s| s.height.max(1) as usize);
+        let (scaled, sw) = prescale_grey_to_height(&grey, w, h, target_h);
+        let grid = from_grey_pix(&scaled, sw, target_h, target_h as i32, 0, rng);
+        self.recognize_grid(&grid, rng)
     }
 
     /// Assemble from the three split `.traineddata` components (the
