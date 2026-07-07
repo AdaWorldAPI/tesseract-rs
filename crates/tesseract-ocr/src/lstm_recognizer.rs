@@ -20,7 +20,10 @@
 //! recoder are then pulled from their own components (`LoadCharsets`, the
 //! `!include_charsets` branch).
 
-use tesseract_core::{RecoderError, UniCharSet, UniCharSetError, UnicharCompress};
+use tesseract_core::{
+    ids_to_text, RecodeBeamSearch, RecoderError, UniCharSet, UniCharSetError, UnicharCompress,
+};
+use tesseract_recognizer::{NetworkIo, TRand};
 
 use crate::network::{NetError, Network};
 
@@ -101,6 +104,48 @@ impl LstmRecognizer {
     #[must_use]
     pub fn is_int_mode(&self) -> bool {
         self.training_flags & 1 != 0
+    }
+
+    /// **B3-core** — recognize an already-prepared int8 feature grid → text (the
+    /// A6b-independent core of `LSTMRecognizer::RecognizeLine`,
+    /// `lstmrecognizer.cpp:247-291`). Threads the proven pieces: `network.forward`
+    /// (B1) → the softmax logits → `RecodeBeamSearch::decode` (`E-OCR-RECODEBEAM-1`)
+    /// → `extract_best_path_as_unichar_ids` (C2) → `ids_to_text`
+    /// (`E-CPP-PARITY-1`). Returns `(unichar_ids, text)`.
+    ///
+    /// `input` is the network's Input-shaped grid (e.g. from A6a
+    /// [`from_grey_pix`](tesseract_recognizer::from_grey_pix) for a grey image;
+    /// B3-core proves the grid→text seam independently of A6b's image decode).
+    /// `rng` feeds `Convolve`'s out-of-image noise; seed it as the recognizer
+    /// does. Decode uses `dict_ratio = 1.0`, `cert_offset = 0.0` — the best path
+    /// is invariant to a uniform certainty transform, so this matches
+    /// `RecognizeLine`'s `kDictRatio`/`kCertOffset` result on the non-dict path.
+    ///
+    /// # Errors
+    ///
+    /// [`RecognizerError::Network`] on a forward-pass failure, or if the output
+    /// is int-mode (a non-softmax network — this path expects the softmax float
+    /// logits the beam consumes).
+    pub fn recognize_grid(
+        &self,
+        input: &NetworkIo,
+        rng: &mut TRand,
+    ) -> Result<(Vec<i32>, String), RecognizerError> {
+        let outputs = self.network.forward(input, rng)?;
+        if outputs.int_mode() {
+            return Err(RecognizerError::Network(NetError::Forward(
+                "recognize_grid expects softmax float logits (int-mode output)",
+            )));
+        }
+        // SimpleTextOutput == (OutputLossType == LT_SOFTMAX) == float output.
+        let simple = !outputs.int_mode();
+        let rows: Vec<&[f32]> = (0..outputs.width()).map(|t| outputs.f(t)).collect();
+        let mut beam = RecodeBeamSearch::new(&self.recoder, self.null_char, simple);
+        beam.decode(&rows, 1.0, 0.0);
+        let (uids, _certs, _ratings, _xcoords) = beam.extract_best_path_as_unichar_ids();
+        let ids: Vec<u32> = uids.iter().map(|&i| i as u32).collect();
+        let text = ids_to_text(&self.charset, &ids);
+        Ok((uids, text))
     }
 
     /// Assemble from the three split `.traineddata` components (the
@@ -226,6 +271,10 @@ mod tests {
         assert_eq!(65 & TF_COMPRESS_UNICHARSET, 64, "eng recodes");
         assert_eq!(65 & 1, 1, "eng is int-mode");
         // TF_INT_MODE(1) only, no TF_COMPRESS_UNICHARSET(64) → pass-through codec.
-        assert_eq!(1 & TF_COMPRESS_UNICHARSET, 0, "int-mode-only model doesn't recode");
+        assert_eq!(
+            1 & TF_COMPRESS_UNICHARSET,
+            0,
+            "int-mode-only model doesn't recode"
+        );
     }
 }
