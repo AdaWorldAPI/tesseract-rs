@@ -187,8 +187,18 @@ fn walk(cur: &mut Cursor<'_>, out: &mut Vec<NodeFacet>) -> Result<(), FacetWalkE
             cur.take(8)?; // 2 x i32 (x_scale/half_x, y_scale/half_y)
         }
         NetworkType::Lstm | NetworkType::LstmSummary => {
-            let (_, used) = Lstm::from_le_bytes(cur.remaining()).map_err(FacetWalkError::Lstm)?;
+            let (lstm, used) =
+                Lstm::from_le_bytes(cur.remaining()).map_err(FacetWalkError::Lstm)?;
             cur.pos += used;
+            // Mirror the main loader (network.rs): Lstm::from_le_bytes reads
+            // only the 1-D four-gate prefix. A 2-D LSTM carries a 5th (GFS)
+            // gate this walk cannot consume, so `used` would be short and the
+            // walk would mis-parse the stream. Reject it here instead of
+            // advancing a bogus offset (codex P2 on #15).
+            let (ni, ns) = (lstm.num_inputs(), lstm.state_size());
+            if hdr.ni as usize + 2 * ns == ni + ns {
+                return Err(FacetWalkError::Unsupported("2-D LSTM (GFS gate)"));
+            }
         }
         NetworkType::Logistic
         | NetworkType::PosClip
