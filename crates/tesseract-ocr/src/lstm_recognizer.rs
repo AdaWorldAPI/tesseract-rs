@@ -251,6 +251,14 @@ impl LstmRecognizer {
     /// [`find_text_lines`](crate::line_segment::find_text_lines), `seg-approx`
     /// feature) doesn't need to round-trip through a temporary PGM file.
     ///
+    /// Lines whose PRE-SCALED dimensions fall below the network's
+    /// [`x_scale_factor`](Network::x_scale_factor) are unrecognizable and
+    /// return empty — the transcribed `Input::PrepareLSTMInputs` guard
+    /// (`input.cpp:92-96`, "Image too small to scale!!"; `RecognizeLine`
+    /// then reports the line as not recognized and the caller skips it).
+    /// Without the guard, degenerate scene-text bands (scaled width 1-2 px)
+    /// walk `Maxpool`'s ragged window off the grid.
+    ///
     /// # Errors
     ///
     /// Same as [`Self::recognize_grid`] / [`Self::recognize_grid_with_dict`].
@@ -261,6 +269,24 @@ impl LstmRecognizer {
         h: usize,
         dict: Option<DictLite>,
     ) -> Result<(Vec<i32>, String), RecognizerError> {
+        // PrepareLSTMInputs' min-size check, on the same post-PreScale dims
+        // it sees: scaled height == target height, scaled width == the
+        // uniform-scale width prepare_grid computes.
+        let target_h = self
+            .network
+            .input_shape
+            .map_or(36, |s| s.height.max(1) as usize);
+        let min_width = self.network.x_scale_factor().max(1) as usize;
+        let scaled_w = if h == 0 {
+            0
+        } else {
+            // Mirrors ImageData::PreScale's scaled_width for the same factor
+            // prescale_grey_to_height applies (identity when h == target_h).
+            (w as f32 * (target_h as f32 / h as f32)).round() as usize
+        };
+        if scaled_w < min_width || target_h < min_width {
+            return Ok((Vec::new(), String::new()));
+        }
         let (grid, mut rng) = self.prepare_grid(grey, w, h);
         match dict {
             Some(dict) => self.recognize_grid_with_dict(&grid, &mut rng, dict),
