@@ -160,8 +160,12 @@ impl LstmRecognizer {
                 "recognize_grid expects softmax float logits (int-mode output)",
             )));
         }
-        // SimpleTextOutput == (OutputLossType == LT_SOFTMAX) == float output.
-        let simple = !outputs.int_mode();
+        // SimpleTextOutput() == (OutputLossType() == LT_SOFTMAX) — derived
+        // from the loaded tree (Network::simple_text_output). eng.lstm's
+        // O1c111 head is NT_SOFTMAX = softmax activation with CTC LOSS, so
+        // this is FALSE and the beam runs full CTC dup-collapse semantics.
+        // (Softmax activation does NOT imply LT_SOFTMAX loss.)
+        let simple = self.network.simple_text_output();
         let rows: Vec<&[f32]> = (0..outputs.width()).map(|t| outputs.f(t)).collect();
         let mut beam = RecodeBeamSearch::new(&self.recoder, self.null_char, simple);
         beam.decode(&rows, 1.0, 0.0);
@@ -197,7 +201,7 @@ impl LstmRecognizer {
                 "recognize_grid_with_dict expects softmax float logits (int-mode output)",
             )));
         }
-        let simple = !outputs.int_mode();
+        let simple = self.network.simple_text_output();
         let rows: Vec<&[f32]> = (0..outputs.width()).map(|t| outputs.f(t)).collect();
         let mut beam = RecodeBeamSearch::new_with_dict(
             &self.recoder,
@@ -442,6 +446,10 @@ impl LstmRecognizer {
             }
             let band_w = img_right - img_left;
             let band_h = img_bottom - img_top;
+            eprintln!(
+                "DBG band: ink yup[{bottom},{top}] base={baseline} xh={} asc={} desc={} -> {band_w}x{band_h}",
+                row.xheight, row.ascrise, row.descdrop
+            );
             let mut crop = Vec::with_capacity(band_w * band_h);
             for y in img_top..img_bottom {
                 crop.extend_from_slice(&grey[y * w + img_left..y * w + img_right]);
@@ -550,7 +558,7 @@ impl LstmRecognizer {
                 "recognize_image_file_words expects softmax float logits (int-mode output)",
             )));
         }
-        let simple = !outputs.int_mode();
+        let simple = self.network.simple_text_output();
         let rows: Vec<&[f32]> = (0..outputs.width()).map(|t| outputs.f(t)).collect();
         let words = if let Some(dict) = dict {
             let mut beam = RecodeBeamSearch::new_with_dict(
