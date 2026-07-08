@@ -228,18 +228,34 @@ impl LstmRecognizer {
     /// performed inline — no behavior change.
     ///
     /// [`seeded_randomizer`]: LstmRecognizer::seeded_randomizer
-    fn prepare_grid(&self, grey: &[u8], w: usize, h: usize) -> (NetworkIo, TRand) {
+    ///
+    /// Returns [`None`] when the line is too small to recognize — the
+    /// transcribed `Input::PrepareLSTMInputs` min-size gate (`input.cpp:92-96`,
+    /// "Image too small to scale!!"; `RecognizeLine` then reports the line as
+    /// not recognized and the caller skips it). The gate is checked on the
+    /// **actual** prescaled width `sw` (the value `from_grey_pix` builds the
+    /// grid from — floored for exact 2⁻ⁿ halvings via `scale_gray_area_map2`,
+    /// so it is byte-faithful to the C++ `width`), NOT an independent
+    /// `round(w·f)` estimate: on an odd-width exact halving (e.g. 5×72 → width
+    /// 2) a rounded estimate reads 3 and would let a width-2 grid reach
+    /// `Maxpool`'s ragged window off the grid. Gating here covers every
+    /// forward call site.
+    fn prepare_grid(&self, grey: &[u8], w: usize, h: usize) -> Option<(NetworkIo, TRand)> {
         let target_h = self
             .network
             .input_shape
             .map_or(36, |s| s.height.max(1) as usize);
         let (scaled, sw) = prescale_grey_to_height(grey, w, h, target_h);
+        let min_width = self.network.x_scale_factor().max(1) as usize;
+        if sw < min_width || target_h < min_width {
+            return None;
+        }
         // Seed exactly as RecognizeLine (SetRandomSeed) — the Convolve noise
         // depends on it. from_grey_pix makes no draws for a full-width image, so
         // the randomizer enters the forward pass at the post-warm-up state.
         let mut rng = self.seeded_randomizer();
         let grid = from_grey_pix(&scaled, sw, target_h, target_h as i32, 0, &mut rng);
-        (grid, rng)
+        Some((grid, rng))
     }
 
     /// **D3.0 plumbing** — recognize a single already-cropped grey line strip
@@ -269,25 +285,12 @@ impl LstmRecognizer {
         h: usize,
         dict: Option<DictLite>,
     ) -> Result<(Vec<i32>, String), RecognizerError> {
-        // PrepareLSTMInputs' min-size check, on the same post-PreScale dims
-        // it sees: scaled height == target height, scaled width == the
-        // uniform-scale width prepare_grid computes.
-        let target_h = self
-            .network
-            .input_shape
-            .map_or(36, |s| s.height.max(1) as usize);
-        let min_width = self.network.x_scale_factor().max(1) as usize;
-        let scaled_w = if h == 0 {
-            0
-        } else {
-            // Mirrors ImageData::PreScale's scaled_width for the same factor
-            // prescale_grey_to_height applies (identity when h == target_h).
-            (w as f32 * (target_h as f32 / h as f32)).round() as usize
-        };
-        if scaled_w < min_width || target_h < min_width {
+        // PrepareLSTMInputs' min-size gate lives in prepare_grid, on the
+        // actual prescaled width — None means the line is too small to
+        // recognize, so RecognizeLine skips it (empty result).
+        let Some((grid, mut rng)) = self.prepare_grid(grey, w, h) else {
             return Ok((Vec::new(), String::new()));
-        }
-        let (grid, mut rng) = self.prepare_grid(grey, w, h);
+        };
         match dict {
             Some(dict) => self.recognize_grid_with_dict(&grid, &mut rng, dict),
             None => self.recognize_grid(&grid, &mut rng),
@@ -573,7 +576,12 @@ impl LstmRecognizer {
     ) -> Result<Vec<WordResult>, RecognizerError> {
         let bytes = std::fs::read(path).map_err(RecognizerError::Io)?;
         let (grey, w, h) = parse_pgm(&bytes).map_err(RecognizerError::Pgm)?;
-        let (grid, mut rng) = self.prepare_grid(&grey, w, h);
+        // Same min-size gate as recognize_grey_line: a line too small to scale
+        // yields no words (RecognizeLine skips it) rather than walking Maxpool
+        // off a degenerate grid.
+        let Some((grid, mut rng)) = self.prepare_grid(&grey, w, h) else {
+            return Ok(Vec::new());
+        };
         let outputs = self.network.forward(&grid, &mut rng)?;
         if outputs.int_mode() {
             return Err(RecognizerError::Network(NetError::Forward(
@@ -769,6 +777,35 @@ mod makerow_page_tests {
         assert_eq!(
             lines[0], lines[1],
             "roomy fixture: typographic feeding must be position-invariant"
+        );
+    }
+
+    /// The min-size gate must fire on the actual (floored) prescaled width, not
+    /// a rounded estimate. Codex P2: an odd source width at an EXACT 2⁻ⁿ halving
+    /// scales through `scale_gray_area_map2`, whose width is FLOORED — a 5×72
+    /// eng-model line prescales to width `floor(5/2) = 2`, below `XScaleFactor`
+    /// (3, from `Mp3,3`), so the line must be skipped (empty). A `round(5·36/72)
+    /// = 3` estimate would wrongly pass it and walk `Maxpool` off the width-2
+    /// grid. This drives the exact geometry the guard exists for; it must NOT
+    /// panic and must return empty.
+    #[test]
+    fn odd_width_exact_halving_below_min_width_is_skipped_not_crashed() {
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+        let lstm = std::fs::read(corpus.join("model/eng.lstm")).unwrap();
+        let uni = std::fs::read_to_string(corpus.join("model/eng.lstm-unicharset")).unwrap();
+        let rec = std::fs::read(corpus.join("model/eng.lstm-recoder")).unwrap();
+        let r = LstmRecognizer::from_components(&lstm, &uni, &rec).unwrap();
+        // 5 wide × 72 tall → target 36 → factor 0.5 (exact halving) → width
+        // floor(5/2) = 2 < XScaleFactor 3. A mid-grey strip; content is
+        // irrelevant, the geometry is the point.
+        let (w, h) = (5usize, 72usize);
+        let grey = vec![128u8; w * h];
+        let (ids, text) = r
+            .recognize_grey_line(&grey, w, h, None)
+            .expect("too-small line returns Ok, not a panic/error");
+        assert!(
+            ids.is_empty() && text.is_empty(),
+            "too-small line yields nothing"
         );
     }
 }
