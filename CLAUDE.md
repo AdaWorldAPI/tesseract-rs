@@ -289,8 +289,9 @@ http/https-only, non-public-IP reject incl. `169.254.169.254`, redirects off,
 10 MB/10 s cap). Railway: binds `0.0.0.0:$PORT` read from env (8080 is only the
 local fallback — `PORT` is NOT hardcoded/pinned; Railway injects it). The
 `Dockerfile` clones the `lance-graph` + `ndarray` siblings at build via a
-`GH_TOKEN` secret/arg and trims `tesseract-ogar` from the workspace (web tree is
-OGAR-free). 5 inline tests (bin-only crate) + CI `-p tesseract-ocr-web`. No Core
+`GH_TOKEN`/`GITHUB_TOKEN` secret/arg (the token Railway's GitHub login already
+grants — set it as a build variable) and trims `tesseract-ogar` from the
+workspace (web tree is OGAR-free) → one binary. 5 inline tests (bin-only crate) + CI `-p tesseract-ocr-web`. No Core
 change → no lance-graph board entry; this crate + this note are the record.
 
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)

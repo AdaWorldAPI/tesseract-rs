@@ -78,12 +78,14 @@ tesseract-core       → ../../../lance-graph/crates/lance-graph-contract
 tesseract-recognizer → ../../../ndarray
 ```
 
-so the **builder stage fetches those two siblings itself**. Provide a GitHub
-token so the private repos can be cloned:
+so the **builder stage fetches those two siblings itself** — everything ends up
+in one binary. It just needs a token that can read the private repos, which is
+exactly the access Railway's GitHub login already grants you:
 
-- **Railway:** add a build variable `GH_TOKEN` (a PAT / `x-access-token` with
-  read access to `AdaWorldAPI/lance-graph` and `AdaWorldAPI/ndarray`). Railway
-  auto-detects `railway.toml` and builds `crates/tesseract-ocr-web/Dockerfile`.
+- **Railway:** add a build variable `GH_TOKEN` (or `GITHUB_TOKEN`) set to that
+  token. Railway exposes service variables at build time, so the Dockerfile
+  reads it directly — no per-repo wiring, no submodules. Railway auto-detects
+  `railway.toml` and builds `crates/tesseract-ocr-web/Dockerfile`.
 - Optionally pin the siblings with `LANCE_GRAPH_REF` / `NDARRAY_REF` build args
   (default = each repo's default branch, matching CI).
 

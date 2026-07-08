@@ -5,10 +5,11 @@
 # it is deliberately NOT set here (and NOT in the Dockerfile). Do not add a PORT
 # variable; let Railway own it.
 #
-# The Docker build needs a GitHub token to fetch the lance-graph + ndarray
-# sibling repos (see crates/tesseract-ocr-web/Dockerfile). Set a build-time
-# variable GH_TOKEN in the Railway service, or wire a BuildKit secret named
-# gh_token.
+# The Docker build fetches the lance-graph + ndarray sibling repos and compiles
+# everything into one binary (see crates/tesseract-ocr-web/Dockerfile). It needs
+# a token that can read those private repos — the same access Railway's GitHub
+# login already grants. Set it as a build-time variable GH_TOKEN (or
+# GITHUB_TOKEN); Railway exposes service variables at build time.
 
 [build]
 builder = "dockerfile"

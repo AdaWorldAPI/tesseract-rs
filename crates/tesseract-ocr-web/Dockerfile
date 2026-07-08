@@ -38,15 +38,20 @@ WORKDIR /src
 COPY . /src/tesseract-rs
 
 # Fetch the two sibling repos next to the checkout (unless already supplied).
+# Railway makes the service's variables available at build time, so a token with
+# access to the private repos (the one Railway's GitHub login already granted)
+# drops straight in as GH_TOKEN or GITHUB_TOKEN — no per-repo setup. Locally,
+# prefer the BuildKit secret.
 ARG GH_TOKEN=""
+ARG GITHUB_TOKEN=""
 ARG LANCE_GRAPH_REF=""
 ARG NDARRAY_REF=""
 RUN --mount=type=secret,id=gh_token,required=false set -eu; \
-    TOKEN="$(cat /run/secrets/gh_token 2>/dev/null || printf '%s' "${GH_TOKEN:-}")"; \
+    TOKEN="$(cat /run/secrets/gh_token 2>/dev/null || printf '%s' "${GH_TOKEN:-${GITHUB_TOKEN:-}}")"; \
     clone() { \
       name="$1"; ref="$2"; \
       if [ -f "/src/$name/Cargo.toml" ]; then echo "using pre-supplied /src/$name"; return; fi; \
-      [ -n "$TOKEN" ] || { echo "FATAL: /src/$name absent and no GH_TOKEN (build secret or arg)" >&2; exit 1; }; \
+      [ -n "$TOKEN" ] || { echo "FATAL: /src/$name absent and no GH_TOKEN/GITHUB_TOKEN (build secret or arg)" >&2; exit 1; }; \
       git clone --depth 1 ${ref:+--branch "$ref"} \
         "https://x-access-token:${TOKEN}@github.com/AdaWorldAPI/$name.git" "/src/$name"; \
       echo "cloned $name @ ${ref:-default branch}"; \
