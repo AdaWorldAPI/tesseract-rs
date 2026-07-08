@@ -118,6 +118,30 @@ CLI runs the SAME bytes the Rust side loads, not the host's installed
 default English data, codex P2. Dict decoding does more work than the plain
 beam, but `forward` still dominates.)
 
+### Parallel scaling (page-chunk rayon, the throughput lever)
+
+The 7.2× line-speed gap is single-thread-vs-single-thread. Since lines/pages are
+independent (`&self` recognition, per-line seeded RNG, no shared mutable state),
+the fix is data parallelism over page-chunk jobs (`OcrPipeline::ocr_pages_parallel`,
+feature `parallel`, rayon `into_par_iter` over `PageJob`s, reassembled by
+`sort_by (doc_id, page_no)` — no global crop pool, no nested parallelism, the
+inner forward stays single-threaded). `par_bench` on the 10 committed pages:
+
+| rayon threads | speedup vs serial | efficiency |
+|---|---|---|
+| 1 | 0.99× (self-check = serial) | — |
+| 2 | 1.94× | 97% |
+| 4 | **3.34×** | 84% |
+
+**Byte-identical to serial at every thread count** (the determinism self-check +
+`parallel_determinism` test are the hard gate — parallel output must equal serial
+exactly; nothing about the math changes, only scheduling). On this 4-core box the
+3.34× turns the ~15 lines/s into ~50, closing the matched gap from 7.2× to ~2×;
+the remainder is per-core throughput (width-bucketed batch-forward to fill VNNI
+tiles) — a later, probe-gated lever. Note the CLI can also thread (OpenMP); a
+fully-fair many-core comparison threads both — but the page-job scaling here shows
+the Rust side parallelizes cleanly and losslessly, which was the open question.
+
 **`network.forward` is 99.4% of the time.** The whole gap is the dense int8
 LSTM GEMM over timesteps, single-threaded. This is NOT a compute-primitive
 problem — the forward already runs ndarray's AVX-512 VNNI path (byte-parity

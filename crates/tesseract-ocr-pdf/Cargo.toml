@@ -34,6 +34,16 @@ tesseract-core = { path = "../tesseract-core" }
 # copy lopdf already pulls transitively (see Cargo.lock), so this adds no
 # new dependency *version*.
 flate2 = "1.1"
+# Outer-parallelism owner for page-chunk OCR (`parallel` feature, `src/parallel.rs`):
+# rayon fans work OUT across (doc_id, page_no) jobs, each running the existing
+# SEQUENTIAL page path. The recognizer forward (`ndarray::simd_runtime::matmul_i8_to_i32`)
+# is single-threaded by design, so there is no nested-parallelism hazard to guard
+# against inside a job — rayon owns ALL the CPU parallelism in this crate.
+rayon = { version = "1", optional = true }
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
 
 [[bin]]
 name = "tesseract-ocr-pdf"
@@ -42,3 +52,10 @@ path = "src/main.rs"
 [[example]]
 name = "make_scanned_pdf"
 path = "examples/make_scanned_pdf.rs"
+
+# par_bench references the `parallel` feature's rayon + PageJob API, so it must
+# not be auto-discovered under `--no-default-features` (codex/review P1).
+[[example]]
+name = "par_bench"
+path = "examples/par_bench.rs"
+required-features = ["parallel"]
