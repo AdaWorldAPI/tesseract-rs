@@ -54,8 +54,14 @@ def crop_list(cap: int) -> list[str]:
 def run_batch(flist: pathlib.Path) -> float:
     """One CLI process over the whole image list; returns wall seconds."""
     t0 = time.perf_counter()
+    cmd = ["tesseract", str(flist), "stdout", "--psm", "7"]
+    # codex P2: pin the CLI to the committed model bytes, not the host's
+    # installed eng.traineddata.
+    if _PINNED_TESSDATA is not None:
+        cmd += ["--tessdata-dir", str(_PINNED_TESSDATA)]
+    cmd += ["-l", "eng", "--oem", "1"]
     r = subprocess.run(
-        ["tesseract", str(flist), "stdout", "--psm", "7", "-l", "eng", "--oem", "1"],
+        cmd,
         capture_output=True,
         text=True,
         env={"OMP_THREAD_LIMIT": "1", "PATH": "/usr/bin:/bin"},
@@ -67,11 +73,50 @@ def run_batch(flist: pathlib.Path) -> float:
     return dt
 
 
+# Filled in by main(): a temp dir holding an eng.traineddata recombined from the
+# committed corpus/model components, so the CLI runs the SAME model the Rust
+# side loads (codex P2). None => combine_tessdata unavailable, host model used.
+_PINNED_TESSDATA = None
+
+
+def pin_model() -> "pathlib.Path | None":
+    """Recombine corpus/model/eng.lstm* into a temp eng.traineddata via
+    combine_tessdata; return its dir for --tessdata-dir, or None on failure."""
+    import shutil
+    import tempfile
+
+    model = CORPUS / "model"
+    comps = [
+        "eng.lstm", "eng.lstm-unicharset", "eng.lstm-recoder",
+        "eng.lstm-word-dawg", "eng.lstm-punc-dawg", "eng.lstm-number-dawg",
+    ]
+    if not all((model / c).exists() for c in comps):
+        return None
+    dst = pathlib.Path(tempfile.mkdtemp(prefix="tesseract_h2h_pin_"))
+    for c in comps:
+        shutil.copy(model / c, dst / c)
+    r = subprocess.run(
+        ["combine_tessdata", str(dst / "eng.")],
+        capture_output=True, text=True,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+    if r.returncode == 0 and (dst / "eng.traineddata").exists():
+        return dst
+    return None
+
+
 def main() -> None:
+    global _PINNED_TESSDATA
     cap = int(sys.argv[1]) if len(sys.argv) > 1 else 100
     crops = crop_list(cap)
     if not crops:
         raise SystemExit("no crops — run gen_hiertext_lines.py first")
+
+    _PINNED_TESSDATA = pin_model()
+    if _PINNED_TESSDATA is not None:
+        print(f"CLI pinned to committed model: --tessdata-dir {_PINNED_TESSDATA}")
+    else:
+        print("WARNING: combine_tessdata unavailable — CLI uses host eng.traineddata (codex P2)")
 
     flist = HERE / "_cli_speed_flist.txt"
     flist.write_text("\n".join(crops) + "\n")

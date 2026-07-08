@@ -353,24 +353,57 @@ fn detect_cli() -> bool {
 /// single-text-line PSM, English, LSTM-only engine, single-threaded. Returns
 /// its stdout trimmed of trailing whitespace/newlines, or `None` if the
 /// process could not be spawned or run at all.
-fn run_cli(crop_path: &Path) -> Option<String> {
-    let output = Command::new("tesseract")
-        .arg(crop_path)
-        .arg("stdout")
-        .arg("--psm")
-        .arg("7")
-        .arg("-l")
+fn run_cli(crop_path: &Path, tessdata_dir: Option<&Path>) -> Option<String> {
+    let mut cmd = Command::new("tesseract");
+    cmd.arg(crop_path).arg("stdout").arg("--psm").arg("7");
+    // codex P2: pin the CLI to the committed model bytes, not the host's
+    // installed eng.traineddata — `--tessdata-dir` points at the recombined
+    // corpus/model components so both engines run the SAME model.
+    if let Some(dir) = tessdata_dir {
+        cmd.arg("--tessdata-dir").arg(dir);
+    }
+    cmd.arg("-l")
         .arg("eng")
         .arg("--oem")
         .arg("1")
-        .env("OMP_THREAD_LIMIT", "1")
-        .output()
-        .ok()?;
+        .env("OMP_THREAD_LIMIT", "1");
+    let output = cmd.output().ok()?;
+    // codex P2: a non-zero exit (e.g. the model failed to load) is a FAILURE,
+    // not an empty OCR result — returning Some("") here would corrupt every
+    // CER/attribution bucket. Report it as n/a instead.
+    if !output.status.success() {
+        return None;
+    }
     Some(
         String::from_utf8_lossy(&output.stdout)
             .trim_end()
             .to_string(),
     )
+}
+
+/// codex P2 — pin the CLI to the EXACT committed model: recombine the split
+/// `corpus/model/eng.lstm*` components into an `eng.traineddata` in a temp dir
+/// (via `combine_tessdata`), which `run_cli` passes through `--tessdata-dir`.
+/// Returns the dir on success, or `None` (caller warns + falls back to the
+/// host `-l eng`) when `combine_tessdata` is absent or fails.
+fn pin_cli_model(model_dir: &Path) -> Option<PathBuf> {
+    let dir = std::env::temp_dir().join("tesseract_h2h_pinned_tessdata");
+    fs::create_dir_all(&dir).ok()?;
+    for comp in [
+        "eng.lstm",
+        "eng.lstm-unicharset",
+        "eng.lstm-recoder",
+        "eng.lstm-word-dawg",
+        "eng.lstm-punc-dawg",
+        "eng.lstm-number-dawg",
+    ] {
+        fs::copy(model_dir.join(comp), dir.join(comp)).ok()?;
+    }
+    let status = Command::new("combine_tessdata")
+        .arg(dir.join("eng."))
+        .status()
+        .ok()?;
+    (status.success() && dir.join("eng.traineddata").exists()).then_some(dir)
 }
 
 /// Everything computed for one manifest line: the three texts, the CER/WER
@@ -659,9 +692,28 @@ fn main() {
         .unwrap_or_else(|e| fail("DictLite::from_components", e));
 
     let cli_ok = detect_cli();
-    if !cli_ok {
+    let tessdata_dir = if cli_ok {
+        match pin_cli_model(&model_dir) {
+            Some(d) => {
+                eprintln!(
+                    "CLI pinned to committed model: --tessdata-dir {}",
+                    d.display()
+                );
+                Some(d)
+            }
+            None => {
+                eprintln!(
+                    "WARNING: combine_tessdata unavailable — CLI uses the HOST eng.traineddata, \
+                     NOT guaranteed the same model bytes (codex P2). Attribution is only a \
+                     same-model comparison if the host tessdata matches corpus/model."
+                );
+                None
+            }
+        }
+    } else {
         eprintln!("SKIP: tesseract CLI not found");
-    }
+        None
+    };
 
     let mut records: Vec<LineRecord> = Vec::with_capacity(entries.len());
     let mut skipped = 0usize;
@@ -698,7 +750,11 @@ fn main() {
                 continue;
             }
         };
-        let cli = if cli_ok { run_cli(&crop_path) } else { None };
+        let cli = if cli_ok {
+            run_cli(&crop_path, tessdata_dir.as_deref())
+        } else {
+            None
+        };
 
         let gt = entry.gt_text.clone();
         let cer_cs = cer(&ours, &gt);

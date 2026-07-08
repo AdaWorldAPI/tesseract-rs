@@ -88,10 +88,13 @@ load once and run single-threaded:
 | peak RSS | **8.4 MB** | 38.3 MB | ours **4.6× leaner** |
 | cold model-load | 0.5 ms | 98 ms | ours 196× faster to load |
 
-Our side: `h2h_speed` (in-process, model loaded once, 3 timed passes, min).
-CLI side: `run_cli_speed.py` (image-list batch mode = one process over all crops,
-`OMP_THREAD_LIMIT=1`, peak child RSS via `getrusage`). Both on the same 300
-HierText line crops.
+Our side: `h2h_speed` (in-process, model loaded once, 3 timed passes, min, dict
+path). CLI side: `run_cli_speed.py` (image-list batch mode = one process over
+all crops, `OMP_THREAD_LIMIT=1`, peak child RSS via `getrusage`). Both on the
+same 300 HierText line crops, both pinned to the committed model
+(`--tessdata-dir` on the recombined `corpus/model` components, codex P2 — the
+CLI runs the SAME bytes the Rust side loads, not the host's installed
+`eng.traineddata`).
 
 ### Where our time goes (per-stage, our side)
 
@@ -101,7 +104,11 @@ HierText line crops.
 | prescale_grey_to_height | 68.8 | 0.1 |
 | from_grey_pix (grid build) | 46.3 | 0.1 |
 | **network.forward** | **~77000** | **99.4** |
-| beam + extract + text (derived) | 200 | 0.4 |
+| beam + extract + text (dict, derived) | ~800 | 0.6 |
+
+(The beam row is the **dict** path — matched to the quality harness + the CLI's
+default English data, codex P2. Dict decoding does more work than the plain
+beam, but `forward` still dominates.)
 
 **`network.forward` is 99.4% of the time.** The whole gap is the dense int8
 LSTM GEMM over timesteps, single-threaded. This is NOT a compute-primitive

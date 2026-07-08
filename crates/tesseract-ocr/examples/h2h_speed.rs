@@ -28,6 +28,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use tesseract_core::DictLite;
 use tesseract_ocr::{parse_pgm, prescale_grey_to_height, LstmRecognizer};
 use tesseract_recognizer::{from_grey_pix, TRand};
 
@@ -142,8 +143,8 @@ fn seeded_rng(sample_iteration: i32) -> TRand {
 }
 
 /// The stage boundaries timed for one line, one pass. `grid_to_text` already
-/// includes `forward` internally (`LstmRecognizer::recognize_grid` = forward
-/// + beam) — the beam-only cost is derived later by subtraction.
+/// includes `forward` internally (`LstmRecognizer::recognize_grid_with_dict`
+/// = forward + dict beam) — the beam-only cost is derived later by subtraction.
 struct StageTimes {
     parse: Duration,
     prescale: Duration,
@@ -161,6 +162,7 @@ struct StageTimes {
 /// pass, exactly as production drops it rather than crashing.
 fn time_one_line(
     recognizer: &LstmRecognizer,
+    dict: &DictLite,
     path: &Path,
     bytes: &[u8],
     target_h: usize,
@@ -202,12 +204,16 @@ fn time_one_line(
         return None;
     }
 
+    // codex P2: time the SAME dict-beam path the quality harness measures
+    // (recognize_grey_line loads DictLite) and the CLI uses (default English
+    // language data) — not the non-dict recognize_grid. The derived beam row
+    // below is therefore the DICT beam, matching the compared configuration.
     let t0 = Instant::now();
     let mut rng = seeded_rng(recognizer.sample_iteration);
-    let grid_to_text_result = recognizer.recognize_grid(&grid, &mut rng);
+    let grid_to_text_result = recognizer.recognize_grid_with_dict(&grid, &mut rng, dict.clone());
     let grid_to_text = t0.elapsed();
     if let Err(e) = grid_to_text_result {
-        eprintln!("skip {}: recognize_grid: {e}", path.display());
+        eprintln!("skip {}: recognize_grid_with_dict: {e}", path.display());
         return None;
     }
 
@@ -242,7 +248,7 @@ impl PassTotals {
     }
 
     /// The DERIVED beam+extract+text total for this pass: `recognize_grid`
-    /// time minus `network.forward` time (since `recognize_grid` = forward +
+    /// time minus `network.forward` time (since `recognize_grid_with_dict` = forward +
     /// beam). `saturating_sub` guards the (unexpected) case where per-pass
     /// timing jitter makes the standalone `forward` call read slower than
     /// the `forward` folded inside `recognize_grid`.
@@ -262,13 +268,14 @@ impl PassTotals {
 /// actually warms what gets timed.
 fn run_pass(
     recognizer: &LstmRecognizer,
+    dict: &DictLite,
     crops: &[(PathBuf, Vec<u8>)],
     target_h: usize,
     min_width: usize,
 ) -> PassTotals {
     let mut totals = PassTotals::default();
     for (path, bytes) in crops {
-        if let Some(t) = time_one_line(recognizer, path, bytes, target_h, min_width) {
+        if let Some(t) = time_one_line(recognizer, dict, path, bytes, target_h, min_width) {
             totals.add(&t);
         }
     }
@@ -314,6 +321,17 @@ fn main() {
         .unwrap_or_else(|e| fail("LstmRecognizer::from_components", e));
     let load_cold = load_t0.elapsed();
 
+    // codex P2: load the DAWGs so the timed path matches the quality harness's
+    // dict-beam configuration (see time_one_line).
+    let word = std::fs::read(model_dir.join("eng.lstm-word-dawg"))
+        .unwrap_or_else(|e| fail("read eng.lstm-word-dawg", e));
+    let punc = std::fs::read(model_dir.join("eng.lstm-punc-dawg"))
+        .unwrap_or_else(|e| fail("read eng.lstm-punc-dawg", e));
+    let number = std::fs::read(model_dir.join("eng.lstm-number-dawg"))
+        .unwrap_or_else(|e| fail("read eng.lstm-number-dawg", e));
+    let dict = DictLite::from_components(&word, &punc, &number)
+        .unwrap_or_else(|e| fail("DictLite::from_components", e));
+
     let (crop_paths, corpus_source) = discover_crops(&root, cap);
     if crop_paths.is_empty() {
         fail(
@@ -346,11 +364,11 @@ fn main() {
     eprintln!("corpus: {corpus_source} ({} crops, cap {cap})", crops.len());
 
     // One untimed warm-up pass over the whole corpus.
-    run_pass(&recognizer, &crops, target_h, min_width);
+    run_pass(&recognizer, &dict, &crops, target_h, min_width);
 
     // TIMED_PASSES timed full-corpus passes.
     let passes: Vec<PassTotals> = (0..TIMED_PASSES)
-        .map(|_| run_pass(&recognizer, &crops, target_h, min_width))
+        .map(|_| run_pass(&recognizer, &dict, &crops, target_h, min_width))
         .collect();
 
     // Per-stage MIN total across passes (the steadiest reading, independently
@@ -489,7 +507,7 @@ fn main() {
         "Footnote: `parse_pgm`, `prescale_grey_to_height`, `from_grey_pix` (grid build), and `network.forward` are REAL, independently-measured boundaries reached through this crate's PUBLIC API."
     );
     println!(
-        "`beam + extract + text` is DERIVED by subtraction per pass (`LstmRecognizer::recognize_grid` time minus `Network::forward` time on the same grid, since `recognize_grid` redoes the forward pass internally then decodes it: `recognize_grid = forward + beam`); the per-pass derived beam totals are then min'd across passes like every other row."
+        "`beam + extract + text` is the DICT beam (matched to the quality harness + the CLI's default English data, codex P2), DERIVED by subtraction per pass (`LstmRecognizer::recognize_grid_with_dict` time minus `Network::forward` time on the same grid, since `recognize_grid_with_dict` redoes the forward internally then dict-decodes it: `recognize_grid_with_dict = forward + dict_beam`); the per-pass derived beam totals are then min'd across passes like every other row."
     );
     println!(
         "Each of the five rows is independently the minimum total across {TIMED_PASSES} timed passes (the steadiest reading per stage), so a row's minimum can come from a different pass than another row's — the \"end-to-end\" total is therefore the SUM of these five independently-steadied minimums, not one pass's literal wall-clock time."
