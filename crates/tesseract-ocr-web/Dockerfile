@@ -42,6 +42,10 @@ COPY . /src/tesseract-rs
 # access to the private repos (the one Railway's GitHub login already granted)
 # drops straight in as GH_TOKEN or GITHUB_TOKEN — no per-repo setup. Locally,
 # prefer the BuildKit secret.
+#
+# LANCE_GRAPH_REF / NDARRAY_REF pin the siblings for a reproducible build; they
+# are passed to `git clone --branch`, so they must be a BRANCH or TAG name (not
+# a commit SHA). Unset = each repo's default branch (what CI uses).
 ARG GH_TOKEN=""
 ARG GITHUB_TOKEN=""
 ARG LANCE_GRAPH_REF=""
@@ -61,8 +65,15 @@ RUN --mount=type=secret,id=gh_token,required=false set -eu; \
 
 WORKDIR /src/tesseract-rs
 # Trim the one workspace member that path-deps the OGAR sibling (the web binary
-# needs neither tesseract-ogar nor OGAR), so cargo can resolve without it.
-RUN sed -i 's#, "crates/tesseract-ogar"##' Cargo.toml
+# needs neither tesseract-ogar nor OGAR), so cargo can resolve without it. The
+# guard makes a silent no-op (e.g. if the members line is ever reformatted
+# one-entry-per-line) a hard build failure instead of a confusing later
+# "failed to load OGAR/Cargo.toml".
+RUN sed -i 's#, "crates/tesseract-ogar"##' Cargo.toml; \
+    if grep -q '"crates/tesseract-ogar"' Cargo.toml; then \
+      echo "FATAL: failed to trim tesseract-ogar from workspace members (Cargo.toml reformatted?)" >&2; \
+      exit 1; \
+    fi
 
 # Strip the release binary via cargo (no binutils needed in the slim runtime).
 ENV CARGO_PROFILE_RELEASE_STRIP=true
@@ -79,6 +90,11 @@ WORKDIR /app
 COPY --from=builder /usr/local/bin/tesseract-ocr-web /app/tesseract-ocr-web
 # The eng model (~4 MB): eng.lstm + unicharset + recoder + the three DAWGs.
 COPY --from=builder /src/tesseract-rs/corpus/model /app/model
+
+# Drop root — the app only READS /app (binary + model) and writes nothing to
+# disk (the download is an in-memory data: URI), so a non-root user suffices.
+RUN useradd --system --uid 10001 --no-create-home appuser
+USER appuser
 
 # MODEL_DIR is safe to pin (it is not the port); the binary reads it at startup.
 ENV MODEL_DIR=/app/model

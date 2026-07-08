@@ -5,9 +5,11 @@
 //! request handlers via `Arc` — recognition is `&self`, never mutating.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use tesseract_core::DictLite;
 use tesseract_ocr::LstmRecognizer;
+use tokio::sync::Semaphore;
 
 /// The model tissue, loaded once at startup and shared read-only.
 pub struct AppState {
@@ -15,6 +17,11 @@ pub struct AppState {
     pub recognizer: LstmRecognizer,
     /// The dictionary DAWGs for the production dict beam (optional).
     pub dict: Option<DictLite>,
+    /// Bounds how many CPU-bound recognitions run at once. Recognition is heavy
+    /// synchronous work dispatched via `spawn_blocking`; without a cap a burst
+    /// of uploads would flood the blocking pool and the box's memory. Sized to
+    /// the machine's parallelism so we saturate cores without oversubscribing.
+    pub recognize_permits: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -56,6 +63,17 @@ impl AppState {
             }
         };
 
-        Ok(Self { recognizer, dict })
+        // One permit per hardware thread: enough to keep every core busy under
+        // load without letting a burst of uploads oversubscribe CPU + memory.
+        let permits = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        let recognize_permits = Arc::new(Semaphore::new(permits));
+
+        Ok(Self {
+            recognizer,
+            dict,
+            recognize_permits,
+        })
     }
 }

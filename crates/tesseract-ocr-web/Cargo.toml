@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.7", features = ["multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 askama = "0.12"
 tower-http = { version = "0.5", features = ["limit"] }
 # Image decode for uploads (PNG / JPEG / PNM) — trimmed features, no C deps.

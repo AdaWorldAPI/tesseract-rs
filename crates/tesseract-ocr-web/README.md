@@ -18,7 +18,7 @@ the glibc-linked binary and ~4 MB of `eng` model data.
 | Runtime | `tokio` | Async, single binary |
 | Image decode | `image` 0.25 (png/jpeg/pnm) | Pure Rust, no C deps |
 | URL fetch | `reqwest` 0.12 (rustls) | rustls only — never openssl |
-| Body cap | `tower-http` `RequestBodyLimitLayer` | 12 MB upload ceiling |
+| Body cap | axum `DefaultBodyLimit` + `tower-http` | 12 MB upload ceiling (both raised) |
 | OCR | `tesseract-ocr` + `tesseract-core` | The pure-Rust recognizer |
 
 ## Run locally
@@ -50,13 +50,31 @@ Don't add `ENV PORT=...`; it would shadow Railway's value.
 Fetching a user-supplied URL is an SSRF vector, so `fetch_image_url`:
 
 1. allows **http/https only**;
-2. resolves the host and **rejects any non-public IP** — loopback, private
-   (10/8, 172.16/12, 192.168/16), link-local incl. `169.254.169.254` (cloud
-   metadata), ULA `fc00::/7`, v6 link-local `fe80::/10`, unspecified — with
-   v4-mapped-v6 unwrapped;
-3. **disables redirects** (a 3xx could bounce past the guard);
-4. caps the download at **10 MB / 10 s** (content-length pre-check + a hard
-   streaming cap so a lying/omitted length can't OOM the process).
+2. resolves the host **once**, **rejects any non-global IP** — loopback, private
+   (10/8, 172.16/12, 192.168/16), CGNAT (100.64/10, incl. Alibaba metadata
+   `100.100.100.200`), link-local incl. `169.254.169.254` (cloud metadata),
+   multicast, reserved (240/4), TEST-NET / benchmarking ranges, `0.0.0.0/8`,
+   ULA `fc00::/7`, v6 link-local `fe80::/10` / multicast, and IPv4 embedded in
+   IPv6 (mapped / compatible / 6to4 / Teredo);
+3. **pins the request to those vetted addresses** (`resolve_to_addrs`) so
+   reqwest cannot re-resolve to a different IP at connect time (DNS rebinding),
+   and **disables env proxies** (`no_proxy`, else a proxy would connect on our
+   behalf);
+4. **disables redirects** (a 3xx could bounce past the guard);
+5. caps the download at **10 MB / 10 s** (content-length pre-check + a hard
+   streaming cap so a lying/omitted length can't OOM the process), and returns
+   **generic** errors (detail is logged) so it is not a host/port oracle.
+
+## Resource limits
+
+Recognition is heavy CPU work, so the server protects itself:
+
+- **Decode bounds** — the decoder is capped (max dimension + 256 MiB alloc) and
+  the decoded pixel count is rejected above **40 MP** *before* the grey buffer
+  is allocated, so a small "decompression bomb" upload can't force a ~GB raster.
+- **Off-runtime + bounded** — OCR runs via `spawn_blocking` (never on the async
+  worker threads) behind a semaphore sized to the machine's parallelism, so a
+  burst of uploads can't stall the healthcheck or oversubscribe CPU/RAM.
 
 ## Tests
 

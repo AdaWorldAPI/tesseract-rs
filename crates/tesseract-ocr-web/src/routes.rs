@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use askama::Template;
-use axum::extract::{Multipart, State};
+use axum::extract::{DefaultBodyLimit, Multipart, State};
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::Router;
@@ -31,20 +31,32 @@ struct ResultTemplate {
     download_datauri: String,
 }
 
-/// Build the application router. Body limit is 12 MB (uploads); the URL-fetch
-/// arm has its own 10 MB cap in [`fetch_image_url`].
+/// Build the application router. Uploads are capped at 12 MB — this needs BOTH
+/// limits: axum's per-extractor `DefaultBodyLimit` defaults to 2 MB (and would
+/// reject larger multipart uploads before the handler runs), and tower-http's
+/// `RequestBodyLimitLayer` caps the raw body; the smaller of the two wins, so
+/// both are raised together. The URL-fetch arm has its own 10 MB cap in
+/// [`fetch_image_url`].
 pub fn router(state: Arc<AppState>) -> Router {
+    const MAX_UPLOAD: usize = 12 * 1024 * 1024;
     Router::new()
         .route("/", get(index))
         .route("/ocr", post(ocr))
-        .layer(RequestBodyLimitLayer::new(12 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD))
+        .layer(RequestBodyLimitLayer::new(MAX_UPLOAD))
         .with_state(state)
 }
 
 fn render<T: Template>(t: &T) -> Html<String> {
     match t.render() {
         Ok(s) => Html(s),
-        Err(e) => Html(format!("<h1>template error</h1><pre>{e}</pre>")),
+        Err(e) => {
+            // The templates only Display `usize`/`String`, so this is effectively
+            // unreachable; keep the fallback a static string (never interpolate
+            // `e` into raw HTML) and log the detail.
+            eprintln!("template render error: {e}");
+            Html("<h1>internal template error</h1>".to_string())
+        }
     }
 }
 
@@ -99,13 +111,32 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
         return err_page("please choose an image file or paste an image URL");
     };
 
-    match ocr_image_bytes(&state, &bytes) {
-        Ok(out) => render(&result_of(&out)),
-        Err(e) => err_page(e),
+    // Recognition is heavy synchronous CPU work. Bound how many run at once
+    // (a permit), then run it OFF the async worker threads via `spawn_blocking`
+    // so a slow/large OCR can never stall the executor (healthcheck + other
+    // requests keep flowing). The permit is moved into the blocking task and
+    // released when it finishes.
+    let permit = match state.recognize_permits.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => return err_page("server is shutting down"),
+    };
+    let st = state.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        ocr_image_bytes(&st, &bytes)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(out)) => render(&result_of(out)),
+        Ok(Err(e)) => err_page(e),
+        Err(e) => {
+            eprintln!("ocr: recognition task failed: {e}");
+            err_page("recognition failed unexpectedly")
+        }
     }
 }
 
-fn result_of(out: &OcrOutcome) -> ResultTemplate {
+fn result_of(out: OcrOutcome) -> ResultTemplate {
     let datauri = format!(
         "data:text/plain;charset=utf-8;base64,{}",
         base64_encode(out.text.as_bytes())
@@ -116,7 +147,7 @@ fn result_of(out: &OcrOutcome) -> ResultTemplate {
         char_count: out.char_count,
         line_count: out.line_count,
         elapsed_ms: format!("{:.1}", out.elapsed_ms),
-        text: out.text.clone(),
+        text: out.text,
         download_datauri: datauri,
     }
 }
@@ -170,22 +201,45 @@ mod tests {
     fn ssrf_guard_blocks_private_loopback_metadata() {
         use crate::fetch::ip_is_blocked;
         for ip in [
+            // RFC1918 + loopback + link-local + unspecified.
             "127.0.0.1",
             "10.0.0.1",
             "172.16.5.4",
             "192.168.1.1",
-            "169.254.169.254", // cloud metadata
+            "169.254.169.254", // AWS/GCP/Azure metadata
             "0.0.0.0",
+            "0.1.2.3", // 0.0.0.0/8 "this network"
+            // Non-RFC1918 special-use that still targets internal infra.
+            "100.64.0.1",      // CGNAT 100.64.0.0/10
+            "100.100.100.200", // Alibaba Cloud metadata (inside CGNAT)
+            "198.18.0.5",      // benchmarking 198.18.0.0/15
+            "192.0.2.10",      // TEST-NET-1
+            "198.51.100.10",   // TEST-NET-2
+            "203.0.113.10",    // TEST-NET-3
+            "224.0.0.1",       // multicast
+            "240.0.0.1",       // reserved 240/4
+            "255.255.255.255", // broadcast
+            // IPv6 forms, incl. IPv4 embeddings.
             "::1",
-            "fc00::1",
-            "fe80::1",
+            "fc00::1",       // ULA
+            "fe80::1",       // link-local
+            "ff02::1",       // multicast
+            "::7f00:1",      // IPv4-compatible ::127.0.0.1
+            "2002:7f00:1::", // 6to4 wrapping 127.0.0.1
         ] {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(ip_is_blocked(ip), "{ip} must be blocked");
         }
-        // A public address must be allowed.
-        assert!(!ip_is_blocked("1.1.1.1".parse().unwrap()));
-        assert!(!ip_is_blocked("8.8.8.8".parse().unwrap()));
+        // Public addresses must be allowed.
+        for ip in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(!ip_is_blocked(ip), "{ip} must be allowed");
+        }
     }
 
     #[tokio::test]
