@@ -1,0 +1,4 @@
+Invoice number 4471 is now due.
+Please remit payment within 30 days.
+Contact billing with any questions.
+Thank you for your continued business.
