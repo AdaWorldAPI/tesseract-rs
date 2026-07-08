@@ -84,9 +84,17 @@ load once and run single-threaded:
 
 | metric | tesseract-rs | C++ CLI (batch) | ratio |
 |---|---|---|---|
-| lines/sec | **12.88** | 93.97 | CLI **7.3× faster** |
-| peak RSS | **8.4 MB** | 38.3 MB | ours **4.6× leaner** |
-| cold model-load | 0.5 ms | 98 ms | ours 196× faster to load |
+| lines/sec | **~14** | ~105 | CLI **~7.2× faster** |
+| peak RSS (both dict) | **~20 MB** | ~36 MB | ours **~1.85× leaner** |
+| cold model-load | 0.5 ms | ~92 ms | ours **~180× faster** to load |
+
+(Two matched runs: 300 crops → 12.88 vs 93.97 lines/s, 8.4 vs 38.3 MB;
+200 crops → 15.40 vs 110.13 lines/s, 19.7 vs 36.4 MB. Speed ratio is stable at
+~7.2×. **RSS correction:** the 300-crop run predates the codex P2-3 fix and
+timed OUR side WITHOUT the DAWGs (non-dict, 8.4 MB) against the CLI which always
+loads them — an unfair 4.6×. Once both load the DAWGs (dict, the 200-crop run)
+the fair figure is **~1.85× leaner**, not 4.6×. Still leaner, but the honest
+matched number is 1.85×.)
 
 Our side: `h2h_speed` (in-process, model loaded once, 3 timed passes, min, dict
 path). CLI side: `run_cli_speed.py` (image-list batch mode = one process over
