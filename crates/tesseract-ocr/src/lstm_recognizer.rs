@@ -446,10 +446,6 @@ impl LstmRecognizer {
             }
             let band_w = img_right - img_left;
             let band_h = img_bottom - img_top;
-            eprintln!(
-                "DBG band: ink yup[{bottom},{top}] base={baseline} xh={} asc={} desc={} -> {band_w}x{band_h}",
-                row.xheight, row.ascrise, row.descdrop
-            );
             let mut crop = Vec::with_capacity(band_w * band_h);
             for y in img_top..img_bottom {
                 crop.extend_from_slice(&grey[y * w + img_left..y * w + img_right]);
