@@ -1,0 +1,33 @@
+# Docker build context trimming for crates/tesseract-ocr-web/Dockerfile.
+# Keep: crates/ source, Cargo.toml, corpus/model (bundled at runtime).
+# (Cargo.lock is gitignored repo-wide, so the build resolves deps fresh — pin
+# LANCE_GRAPH_REF / NDARRAY_REF for reproducibility.)
+# Drop everything heavy or build-irrelevant so the context upload stays small.
+
+# Build residue (the single biggest item — can be many GB).
+target/
+**/target/
+
+# VCS + CI + editor.
+.git/
+.github/
+.gitignore
+.vscode/
+.idea/
+
+# Agent/session material and harvested oracles — not needed to build the binary.
+.claude/
+
+# Corpus: only corpus/model is needed (copied into the runtime image). Drop the
+# rest (test pages, golden / hiertext fixtures) so a local `docker build` does
+# not upload them.
+corpus/*
+!corpus/model
+
+# Docs.
+*.md
+**/*.md
+
+# Local env / secrets — never ship these into a build context.
+.env
+*.env

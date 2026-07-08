@@ -276,6 +276,24 @@ See `.claude/plans/recognizer-image-to-text-v2.md`. (Still deferred, unchanged:
 the bbox/stats sub-leaf, gated on a legacy non-LSTM `eng.unicharset`; the 2-D LSTM
 / softmax-LSTM paths — eng.lstm is 1-D non-softmax.)
 
+## Web demo (`crates/tesseract-ocr-web`)
+
+A single-binary **consumer** demo (axum + askama + tokio) proving the pipeline
+end-to-end over HTTP: upload an image OR paste an image URL → `recognize_page_makerow`
+→ text + stats + `.txt` download. Deps only `tesseract-ocr` + `tesseract-core`
+(BBB-clean, no lance-graph engine). The point: **zero C OCR libs at runtime** —
+image decode (`image`, png/jpeg/pnm) and TLS (`reqwest` rustls + webpki-roots)
+are pure Rust, so the Docker runtime image is just the glibc binary + ~4 MB
+`corpus/model`. The URL arm is **SSRF-guarded** (`fetch.rs::ip_is_blocked`:
+http/https-only, non-public-IP reject incl. `169.254.169.254`, redirects off,
+10 MB/10 s cap). Railway: binds `0.0.0.0:$PORT` read from env (8080 is only the
+local fallback — `PORT` is NOT hardcoded/pinned; Railway injects it). The
+`Dockerfile` clones the `lance-graph` + `ndarray` siblings at build via a
+`GH_TOKEN`/`GITHUB_TOKEN` secret/arg (the token Railway's GitHub login already
+grants — set it as a build variable) and trims `tesseract-ogar` from the
+workspace (web tree is OGAR-free) → one binary. 5 inline tests (bin-only crate) + CI `-p tesseract-ocr-web`. No Core
+change → no lance-graph board entry; this crate + this note are the record.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the

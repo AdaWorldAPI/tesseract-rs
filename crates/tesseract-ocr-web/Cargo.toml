@@ -1,0 +1,33 @@
+# tesseract-ocr-web — a single-binary web demo for the pure-Rust OCR.
+#
+# The whole point: this server does OCR with ZERO C libraries — no
+# libtesseract, no leptonica, no OpenCV. Just the Rust recognizer + the eng
+# model. The Docker image is the static-ish binary + ~4 MB of model data.
+[package]
+name = "tesseract-ocr-web"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+publish = false
+
+[[bin]]
+name = "tesseract-ocr-web"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["multipart"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+askama = "0.12"
+tower-http = { version = "0.5", features = ["limit"] }
+# Image decode for uploads (PNG / JPEG / PNM) — trimmed features, no C deps.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "pnm"] }
+# URL fetch for the "web link" arm — rustls ONLY (never openssl), keeps the
+# Docker image lean and free of a system TLS dependency.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+futures-util = { version = "0.3", default-features = false }
+# The pure-Rust OCR.
+tesseract-ocr = { path = "../tesseract-ocr" }
+tesseract-core = { path = "../tesseract-core" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] } # ServiceExt::oneshot for router tests
