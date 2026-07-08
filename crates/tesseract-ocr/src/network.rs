@@ -260,6 +260,28 @@ impl Network {
     /// LOSS — conflating the two makes the beam re-emit every per-timestep
     /// spike as a fresh character (systematic repeats like `TTTThhheee` on
     /// real text; unfalsifiable on noise fixtures).
+    /// `Network::XScaleFactor()` (`network.h:214`, overrides in
+    /// `series.cpp:90-96` / `reconfig.cpp` / `plumbing.cpp:124-126`): the
+    /// tree's total x-subsampling — `Reconfig`/`Maxpool` contribute their
+    /// `x_scale`, `Series` multiplies its children, plumbing wrappers take
+    /// their first child, everything else is 1 (eng.lstm: 3, from `Mp3,3`).
+    /// `Input::PrepareLSTMInputs` uses it as the minimum width/height a line
+    /// image must have after `PreScale` — smaller lines are UNRECOGNIZABLE
+    /// and the real pipeline skips them ("Image too small to scale!!").
+    #[must_use]
+    pub fn x_scale_factor(&self) -> i32 {
+        fn xsf(node: &Node) -> i32 {
+            match node {
+                Node::Maxpool { x_scale, .. } | Node::Reconfig { x_scale, .. } => *x_scale,
+                Node::Series(children) => children.iter().map(xsf).product(),
+                Node::Parallel(children) => children.first().map_or(1, xsf),
+                Node::Reversed { child, .. } => xsf(child),
+                _ => 1,
+            }
+        }
+        xsf(&self.root)
+    }
+
     #[must_use]
     pub fn simple_text_output(&self) -> bool {
         fn loss_is_softmax(node: &Node) -> bool {
