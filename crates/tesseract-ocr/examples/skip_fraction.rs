@@ -47,19 +47,29 @@ struct PageTally {
     empty_cols: usize,
 }
 
-/// Count, within a band spanning raster rows `[top, bottom)` of a `w`-wide grey
-/// image, the interior (between first and last ink column) total vs empty
-/// columns. `is_ink[y*w + x]` is precomputed page-wide (grey < otsu).
+/// Count the columns of the crop `recognize_page_makerow` actually feeds the
+/// LSTM for a band spanning raster rows `[top, bottom)` of a `w`-wide grey
+/// image: the ink bbox `[first, last]` **extended by `K_IMAGE_PADDING = 4` on
+/// each x edge, clipped to the image** (`lstm_recognizer.rs` `GetRectImage`).
+/// Returns `(total_cols, empty_cols)`. The padding columns are blank, so they
+/// count toward BOTH the skippable-empty numerator and the fed-volume
+/// denominator — omitting them (codex P1) under-sizes the tally right at the
+/// 30% gate. `is_ink[y*w + x]` is precomputed page-wide (ink == binary 0).
 fn tally_band(is_ink: &[bool], w: usize, top: usize, bottom: usize) -> (usize, usize) {
+    const K_IMAGE_PADDING: usize = 4;
     let col_has_ink = |x: usize| (top..bottom).any(|y| is_ink[y * w + x]);
     let first = (0..w).find(|&x| col_has_ink(x));
     let last = (0..w).rev().find(|&x| col_has_ink(x));
     let (Some(first), Some(last)) = (first, last) else {
         return (0, 0); // band with no ink at all — contributes nothing
     };
-    let interior = last - first + 1;
-    let empty = (first..=last).filter(|&x| !col_has_ink(x)).count();
-    (interior, empty)
+    // Padding actually applied by GetRectImage: 4 px each side, clipped to image.
+    let left_pad = first.min(K_IMAGE_PADDING);
+    let right_pad = (w - 1 - last).min(K_IMAGE_PADDING);
+    let ink_span_empty = (first..=last).filter(|&x| !col_has_ink(x)).count();
+    let total = (last - first + 1) + left_pad + right_pad;
+    let empty = ink_span_empty + left_pad + right_pad; // padding is blank input
+    (total, empty)
 }
 
 fn main() {
