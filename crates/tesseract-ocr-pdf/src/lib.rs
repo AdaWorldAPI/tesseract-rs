@@ -60,6 +60,11 @@ pub use searchable_pdf::{
     render_searchable_pdf, PageOcr, PlacedWord, RenderReport, SearchablePdfError,
 };
 
+#[cfg(feature = "parallel")]
+mod parallel;
+#[cfg(feature = "parallel")]
+pub use parallel::{PageJob, PageResult};
+
 /// Failures from the PDF text-layer fast path ([`extract_text_layer`]) and
 /// the scanned-page image extraction path ([`extract_page_image`]).
 #[derive(Debug)]

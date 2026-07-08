@@ -84,9 +84,17 @@ load once and run single-threaded:
 
 | metric | tesseract-rs | C++ CLI (batch) | ratio |
 |---|---|---|---|
-| lines/sec | **12.88** | 93.97 | CLI **7.3× faster** |
-| peak RSS | **8.4 MB** | 38.3 MB | ours **4.6× leaner** |
-| cold model-load | 0.5 ms | 98 ms | ours 196× faster to load |
+| lines/sec | **~14** | ~105 | CLI **~7.2× faster** |
+| peak RSS (both dict) | **~20 MB** | ~36 MB | ours **~1.85× leaner** |
+| cold model-load | 0.5 ms | ~92 ms | ours **~180× faster** to load |
+
+(Two matched runs: 300 crops → 12.88 vs 93.97 lines/s, 8.4 vs 38.3 MB;
+200 crops → 15.40 vs 110.13 lines/s, 19.7 vs 36.4 MB. Speed ratio is stable at
+~7.2×. **RSS correction:** the 300-crop run predates the codex P2-3 fix and
+timed OUR side WITHOUT the DAWGs (non-dict, 8.4 MB) against the CLI which always
+loads them — an unfair 4.6×. Once both load the DAWGs (dict, the 200-crop run)
+the fair figure is **~1.85× leaner**, not 4.6×. Still leaner, but the honest
+matched number is 1.85×.)
 
 Our side: `h2h_speed` (in-process, model loaded once, 3 timed passes, min, dict
 path). CLI side: `run_cli_speed.py` (image-list batch mode = one process over
@@ -109,6 +117,30 @@ CLI runs the SAME bytes the Rust side loads, not the host's installed
 (The beam row is the **dict** path — matched to the quality harness + the CLI's
 default English data, codex P2. Dict decoding does more work than the plain
 beam, but `forward` still dominates.)
+
+### Parallel scaling (page-chunk rayon, the throughput lever)
+
+The 7.2× line-speed gap is single-thread-vs-single-thread. Since lines/pages are
+independent (`&self` recognition, per-line seeded RNG, no shared mutable state),
+the fix is data parallelism over page-chunk jobs (`OcrPipeline::ocr_pages_parallel`,
+feature `parallel`, rayon `into_par_iter` over `PageJob`s, reassembled by
+`sort_by (doc_id, page_no)` — no global crop pool, no nested parallelism, the
+inner forward stays single-threaded). `par_bench` on the 10 committed pages:
+
+| rayon threads | speedup vs serial | efficiency |
+|---|---|---|
+| 1 | 0.99× (self-check = serial) | — |
+| 2 | 1.94× | 97% |
+| 4 | **3.34×** | 84% |
+
+**Byte-identical to serial at every thread count** (the determinism self-check +
+`parallel_determinism` test are the hard gate — parallel output must equal serial
+exactly; nothing about the math changes, only scheduling). On this 4-core box the
+3.34× turns the ~15 lines/s into ~50, closing the matched gap from 7.2× to ~2×;
+the remainder is per-core throughput (width-bucketed batch-forward to fill VNNI
+tiles) — a later, probe-gated lever. Note the CLI can also thread (OpenMP); a
+fully-fair many-core comparison threads both — but the page-job scaling here shows
+the Rust side parallelizes cleanly and losslessly, which was the open question.
 
 **`network.forward` is 99.4% of the time.** The whole gap is the dense int8
 LSTM GEMM over timesteps, single-threaded. This is NOT a compute-primitive
