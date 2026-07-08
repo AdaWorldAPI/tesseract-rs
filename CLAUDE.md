@@ -227,6 +227,28 @@ so this bit-matches the ACTUAL `RecognizeLine`, not just an arbitrary seed).
 36 = the model input height = identity `pixScale`): e.g. `img_24.pgm → "qLLiy,,"`.
 Board: lance-graph `E-OCR-IMAGE-TEXT-1`.
 
+> **⚠ CTC CORRECTION (2026-07-08, `E-OCR-CTC-SIMPLETEXT-1`):** every A6b/7b/C1
+> anchor string above was produced with `simple_text=true` — WRONG for eng.lstm.
+> The model head is `O1c111` = `NT_SOFTMAX` = softmax **activation** with **CTC
+> loss** (`fullyconnected.cpp:47-58` maps it to `LT_CTC`), so the real
+> `SimpleTextOutput()` (`lstmrecognizer.h:84-86`, `== LT_SOFTMAX`) is **false**
+> and the beam runs full CTC dup-collapse. The old flag re-emitted every
+> per-timestep spike (`TTTThhheee` on real text; on noise fixtures the bug was
+> UNFALSIFIABLE — both sides of every parity diff carried the same wrong flag,
+> so oracle==rust stayed green). Found by the P6 corpus smoke test (rendered
+> text pages), pinned by a 9-stage bisect (pixel-identical `PreparePixInput`
+> input via gdb, identical logits via argmax fingerprint, the CLI's production
+> beam params captured live: `dict_ratio=2.25 cert_offset=-0.085
+> worst_dict_cert=-25/7`, `lstm_choice_mode=0`). Fix:
+> `Network::simple_text_output()` derives the flag from the loaded tree (final
+> FC `SoftmaxNoCtc` → simple; `Softmax` → CTC). **Re-anchored byte-identical vs
+> the corrected oracle 8/8** (6 ramps + 2 real-text bands; new ramp anchors:
+> `img_24 → "y,"`, `line36 dict → "i,"` — which equals the CLI, closing the
+> earlier "Ly," vs "i," discrepancy). Corrected oracle banked at
+> `.claude/harvest/oracles/image_text_oracle_ctc.cpp` (has a `nodict`
+> self-check arm + a real-`Dict` arm via `TessBaseAPI::Init`). Noise-fixture
+> lesson: decode-SEMANTICS bugs need text falsifiers, not ramp falsifiers.
+
 **The whole `image file on disk → text` pipeline is now byte-parity proven,
 pure-Rust, zero leptonica at runtime** (A6b decode+identity-scale+SetRandomSeed →
 A6a grid → B1 forward → 7b beam → C2 extract → recoded_to_text → text).

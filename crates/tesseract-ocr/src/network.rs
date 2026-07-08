@@ -243,6 +243,40 @@ impl Network {
     pub fn forward(&self, input: &NetworkIo, rng: &mut TRand) -> Result<NetworkIo, NetError> {
         self.root.forward_io(input, rng)
     }
+
+    /// `LSTMRecognizer::SimpleTextOutput()` (`lstmrecognizer.h:84-86`):
+    /// `OutputLossType() == LT_SOFTMAX`. The loss type comes from the tree's
+    /// `OutputShape` walk (`fullyconnected.cpp:47-58`): only the
+    /// fully-connected family sets it — `NT_SOFTMAX → LT_CTC`,
+    /// `NT_SOFTMAX_NO_CTC → LT_SOFTMAX`, `NT_LOGISTIC → LT_LOGISTIC`; every
+    /// other node passes its input shape through, so the FINAL
+    /// output-producing node decides (`Series` → last child, wrappers → their
+    /// child).
+    ///
+    /// **The distinction that matters:** eng.lstm ends in `O1c111` — the `c`
+    /// is `NT_SOFTMAX` = softmax activation WITH **CTC** loss → this returns
+    /// `false`, and the beam must run the full CTC semantics (top-n flags,
+    /// duplicate collapse). Softmax ACTIVATION does NOT imply `LT_SOFTMAX`
+    /// LOSS — conflating the two makes the beam re-emit every per-timestep
+    /// spike as a fresh character (systematic repeats like `TTTThhheee` on
+    /// real text; unfalsifiable on noise fixtures).
+    #[must_use]
+    pub fn simple_text_output(&self) -> bool {
+        fn loss_is_softmax(node: &Node) -> bool {
+            match node {
+                Node::FullyConnected { activation, .. } => {
+                    matches!(activation, FcActivation::SoftmaxNoCtc)
+                }
+                Node::Series(children) => children.last().is_some_and(loss_is_softmax),
+                Node::Reversed { child, .. } => loss_is_softmax(child),
+                // Parallel joins outputs; loss stays LT_NONE unless a branch
+                // sets it — eng never hits this, mirror the pass-through.
+                Node::Parallel(children) => children.last().is_some_and(loss_is_softmax),
+                _ => false,
+            }
+        }
+        loss_is_softmax(&self.root)
+    }
 }
 
 /// `Plumbing::DeSerialize` reads a trailing `learning_rates_` (`Vec<f32>`) —

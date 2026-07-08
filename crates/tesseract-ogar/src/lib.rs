@@ -573,8 +573,13 @@ mod tests {
     /// `tesseract-rs/CLAUDE.md`'s "the proven method"). Early-returns (with
     /// an explanation) when the data isn't present, so this test never fails
     /// CI in an environment that hasn't staged those files — it only proves
-    /// the executor reproduces the ALREADY-proven `"qLLiy,,"` regression
-    /// when the data IS present.
+    /// the executor reproduces the proven `"y,"` regression when the data IS
+    /// present. (The anchor changed from the historical `"qLLiy,,"` when the
+    /// `SimpleTextOutput` transcode bug was fixed: eng.lstm is `O1c111` =
+    /// softmax activation with CTC LOSS, so the beam runs CTC dup-collapse
+    /// semantics — the old string was an artifact of `simple_text=true`
+    /// re-emitting every per-timestep spike; re-anchored byte-identical vs
+    /// the corrected libtesseract oracle, 8/8 fixtures.)
     #[test]
     fn smoke_recognize_line_matches_proven_regression() {
         let lstm = Path::new("/tmp/eng.lstm");
@@ -605,10 +610,7 @@ mod tests {
 
         match response {
             OcrResponse::Recognized { text, .. } => {
-                assert_eq!(
-                    text, "qLLiy,,",
-                    "regression vs the proven eng.lstm baseline"
-                );
+                assert_eq!(text, "y,", "regression vs the proven eng.lstm baseline");
             }
             other => panic!("unexpected response variant: {other:?}"),
         }
