@@ -87,6 +87,16 @@ jobs:
     - name: Clippy (ogar)
       working-directory: tesseract-rs
       run: cargo clippy -p tesseract-ogar --all-targets -- -D warnings
+    - name: Build (ocr-web)
+      working-directory: tesseract-rs
+      run: cargo build -p tesseract-ocr-web --verbose
+    - name: Test (ocr-web)
+      # Uses the committed corpus/ model + pages; hermetic, no network.
+      working-directory: tesseract-rs
+      run: cargo test -p tesseract-ocr-web --verbose
+    - name: Clippy (ocr-web)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-ocr-web --all-targets -- -D warnings
     - name: Check formatting
       # SCOPED to -p (NOT --all): the path deps would walk into the sibling
       # lance-graph / ndarray workspaces.
@@ -97,3 +107,4 @@ jobs:
         cargo fmt -p tesseract-ocr -- --check
         cargo fmt -p tesseract-ocr-pdf -- --check
         cargo fmt -p tesseract-ogar -- --check
+        cargo fmt -p tesseract-ocr-web -- --check

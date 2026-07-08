@@ -1,0 +1,29 @@
+# Docker build context trimming for crates/tesseract-ocr-web/Dockerfile.
+# Keep: crates/ source, Cargo.{toml,lock}, corpus/model (bundled at runtime).
+# Drop everything heavy or build-irrelevant so the context upload stays small.
+
+# Build residue (the single biggest item — can be many GB).
+target/
+**/target/
+
+# VCS + CI + editor.
+.git/
+.github/
+.gitignore
+.vscode/
+.idea/
+
+# Agent/session material and harvested oracles — not needed to build the binary.
+.claude/
+
+# Test fixtures / golden pages — only corpus/model is needed at runtime.
+corpus/pages/
+corpus/**/*.gt.txt
+
+# Docs.
+*.md
+**/*.md
+
+# Local env / secrets — never ship these into a build context.
+.env
+*.env

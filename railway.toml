@@ -1,0 +1,21 @@
+# Railway deployment config for the tesseract-ocr-web demo.
+# https://docs.railway.com/reference/config-as-code
+#
+# The service binds 0.0.0.0:$PORT at runtime — Railway injects PORT itself, so
+# it is deliberately NOT set here (and NOT in the Dockerfile). Do not add a PORT
+# variable; let Railway own it.
+#
+# The Docker build needs a GitHub token to fetch the lance-graph + ndarray
+# sibling repos (see crates/tesseract-ocr-web/Dockerfile). Set a build-time
+# variable GH_TOKEN in the Railway service, or wire a BuildKit secret named
+# gh_token.
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "crates/tesseract-ocr-web/Dockerfile"
+
+[deploy]
+healthcheckPath = "/"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tesseract-rs — pure-Rust OCR</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    line-height: 1.5; margin: 0; padding: 2rem 1rem;
+    background: Canvas; color: CanvasText;
+  }
+  main { max-width: 42rem; margin: 0 auto; }
+  h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+  .tag { color: color-mix(in srgb, CanvasText 60%, Canvas); font-size: .95rem; margin: 0 0 1.5rem; }
+  .card {
+    border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
+    border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem;
+  }
+  label { display: block; font-weight: 600; margin-bottom: .35rem; }
+  input[type=file], input[type=url] {
+    width: 100%; padding: .55rem; border-radius: 8px;
+    border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
+    background: Canvas; color: CanvasText; font-size: 1rem;
+  }
+  .or { text-align: center; color: color-mix(in srgb, CanvasText 50%, Canvas);
+        margin: .9rem 0; font-size: .85rem; letter-spacing: .05em; }
+  button {
+    margin-top: 1rem; width: 100%; padding: .7rem 1rem; font-size: 1rem;
+    font-weight: 600; border: 0; border-radius: 8px; cursor: pointer;
+    background: #2563eb; color: #fff;
+  }
+  button:hover { background: #1d4ed8; }
+  .error {
+    border: 1px solid #ef4444; background: color-mix(in srgb, #ef4444 12%, Canvas);
+    color: color-mix(in srgb, #ef4444 85%, CanvasText);
+    padding: .75rem 1rem; border-radius: 8px; margin-bottom: 1rem;
+  }
+  .note { font-size: .85rem; color: color-mix(in srgb, CanvasText 55%, Canvas); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
+  footer { margin-top: 2rem; font-size: .8rem; color: color-mix(in srgb, CanvasText 50%, Canvas); }
+</style>
+</head>
+<body>
+<main>
+  <h1>tesseract-rs</h1>
+  <p class="tag">Pure-Rust Tesseract OCR — no libtesseract, no leptonica, no OpenCV. Just the Rust recognizer and the <code>eng</code> model.</p>
+
+  {% if let Some(msg) = error %}
+  <div class="error">{{ msg }}</div>
+  {% endif %}
+
+  <form class="card" action="/ocr" method="post" enctype="multipart/form-data">
+    <label for="file">Upload an image</label>
+    <input id="file" type="file" name="file" accept="image/png,image/jpeg,image/x-portable-graymap,image/*">
+
+    <div class="or">— OR —</div>
+
+    <label for="url">Scan an image URL</label>
+    <input id="url" type="url" name="url" placeholder="https://example.com/line.png">
+    <p class="note">Private, loopback, and link-local addresses are refused (SSRF guard); 10&nbsp;MB / 10&nbsp;s cap.</p>
+
+    <button type="submit">Run OCR</button>
+  </form>
+
+  <p class="note">Best on single text-line images at the model height (36&nbsp;px); larger pages are line-found and recognized top-to-bottom. PNG, JPEG, and PNM (PGM/PPM) are accepted.</p>
+
+  <footer>Result is served back as text with a download link and recognition stats.</footer>
+</main>
+</body>
+</html>
