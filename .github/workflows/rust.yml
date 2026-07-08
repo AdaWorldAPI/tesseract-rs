@@ -54,6 +54,39 @@ jobs:
     - name: Clippy (recognizer)
       working-directory: tesseract-rs
       run: cargo clippy -p tesseract-recognizer --all-targets -- -D warnings
+    - name: Build (ocr)
+      working-directory: tesseract-rs
+      run: cargo build -p tesseract-ocr --verbose
+    - name: Test (ocr)
+      # Runs the golden suite: tests/golden_lines.rs + tests/golden_pages.rs
+      # read the committed corpus/ fixtures. Hermetic: no network, no C++
+      # tesseract at any point.
+      working-directory: tesseract-rs
+      run: cargo test -p tesseract-ocr --verbose
+    - name: Clippy (ocr)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-ocr --all-targets -- -D warnings
+    - name: Clippy (ocr, seg-approx)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-ocr --features seg-approx --all-targets -- -D warnings
+    - name: Build (ocr-pdf)
+      working-directory: tesseract-rs
+      run: cargo build -p tesseract-ocr-pdf --verbose
+    - name: Test (ocr-pdf)
+      working-directory: tesseract-rs
+      run: cargo test -p tesseract-ocr-pdf --verbose
+    - name: Clippy (ocr-pdf)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-ocr-pdf --all-targets -- -D warnings
+    - name: Build (ogar)
+      working-directory: tesseract-rs
+      run: cargo build -p tesseract-ogar --verbose
+    - name: Test (ogar)
+      working-directory: tesseract-rs
+      run: cargo test -p tesseract-ogar --verbose
+    - name: Clippy (ogar)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-ogar --all-targets -- -D warnings
     - name: Check formatting
       # SCOPED to -p (NOT --all): the path deps would walk into the sibling
       # lance-graph / ndarray workspaces.
@@ -61,3 +94,6 @@ jobs:
       run: |
         cargo fmt -p tesseract-core -- --check
         cargo fmt -p tesseract-recognizer -- --check
+        cargo fmt -p tesseract-ocr -- --check
+        cargo fmt -p tesseract-ocr-pdf -- --check
+        cargo fmt -p tesseract-ogar -- --check

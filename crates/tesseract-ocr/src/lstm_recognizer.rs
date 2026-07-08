@@ -705,33 +705,25 @@ mod tests {
 mod makerow_page_tests {
     use super::*;
 
-    /// 3F₂/feeding E2E anchor on the stacked-line synthetic (when the /tmp
-    /// data exists; regenerate with
+    /// 3F₂/feeding E2E anchor on the stacked-line synthetic (hermetic: reads
+    /// the committed `corpus/` fixtures; regenerate with
     /// `.claude/harvest/oracles/gen_page_fixture.py`): the REAL makerow line
     /// finder must segment the two stacked copies into exactly two rows, and
     /// — because the typographic feeding (`linerec.cpp:239-246` band +
     /// `GetRectImage` pad-4) is position-invariant when nothing clips at the
     /// image edges — the roomy fixture's two rows must recognize to
     /// IDENTICAL text. (On the legacy tight 24×88 layout
-    /// (`/tmp/page_tight.pgm`) the padded band clips at the top edge for row
-    /// A and the bottom edge for row B — faithful `GetRectImage` clipping —
-    /// so the lines legitimately differ there; that layout is not asserted.)
+    /// (`corpus/lines/page_tight.pgm`) the padded band clips at the top edge
+    /// for row A and the bottom edge for row B — faithful `GetRectImage`
+    /// clipping — so the lines legitimately differ there; that layout is not
+    /// asserted.)
     #[test]
     fn stacked_page_finds_two_deterministic_rows() {
-        let paths = [
-            "/tmp/eng.lstm",
-            "/tmp/eng.lstm-unicharset",
-            "/tmp/eng.lstm-recoder",
-            "/tmp/page_test.pgm",
-        ];
-        if paths.iter().any(|p| !std::path::Path::new(p).exists()) {
-            eprintln!("skipping: /tmp eng data or page_test.pgm absent");
-            return;
-        }
-        let lstm = std::fs::read(paths[0]).unwrap();
-        let uni = std::fs::read_to_string(paths[1]).unwrap();
-        let rec = std::fs::read(paths[2]).unwrap();
-        let img = std::fs::read(paths[3]).unwrap();
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+        let lstm = std::fs::read(corpus.join("model/eng.lstm")).unwrap();
+        let uni = std::fs::read_to_string(corpus.join("model/eng.lstm-unicharset")).unwrap();
+        let rec = std::fs::read(corpus.join("model/eng.lstm-recoder")).unwrap();
+        let img = std::fs::read(corpus.join("lines/page_roomy.pgm")).unwrap();
         let r = LstmRecognizer::from_components(&lstm, &uni, &rec).unwrap();
         let (grey, w, h) = crate::image_input::parse_pgm(&img).unwrap();
 
@@ -742,16 +734,11 @@ mod makerow_page_tests {
         assert_eq!(lines.len(), 2, "two stacked lines -> two rows: {a:?}");
         assert!(lines.iter().all(|l| !l.is_empty()));
         // Position invariance: identical ink + identical typographic band
-        // (unclipped) => identical crops => identical text. Skip (with a
-        // note) if the on-disk fixture is the legacy tight layout, whose
-        // edge clipping legitimately breaks the equality.
-        if w >= 72 {
-            assert_eq!(
-                lines[0], lines[1],
-                "roomy fixture: typographic feeding must be position-invariant"
-            );
-        } else {
-            eprintln!("note: tight legacy fixture on disk; equality not asserted");
-        }
+        // (unclipped, the committed roomy layout) => identical crops =>
+        // identical text.
+        assert_eq!(
+            lines[0], lines[1],
+            "roomy fixture: typographic feeding must be position-invariant"
+        );
     }
 }
