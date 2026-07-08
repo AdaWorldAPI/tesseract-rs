@@ -22,3 +22,10 @@ seg-approx = []
 [[example]]
 name = "recognize_page_dump"
 required-features = ["seg-approx"]
+
+# skip_fraction is `#![cfg(feature = "seg-approx")]` (it uses find_text_lines);
+# gate it so the default `--all-targets` clippy/build job doesn't try to compile
+# an empty (no-main) example (codex P2).
+[[example]]
+name = "skip_fraction"
+required-features = ["seg-approx"]
