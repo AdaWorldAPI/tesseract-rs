@@ -1,0 +1,10 @@
+# Generated H2H corpus — reproducible from gen_hiertext_lines.py (fetches GT +
+# streams a bounded set of HierText validation images from S3). The generator
+# script and the harnesses are committed; the derived image crops + manifest are
+# NOT (large image data, license-derived, regenerated on demand — the H2H is a
+# reported comparison, not a hermetic CI gate).
+lines/
+lines_manifest.jsonl
+validation.jsonl.gz
+_cli_speed_*.txt
+__pycache__/
