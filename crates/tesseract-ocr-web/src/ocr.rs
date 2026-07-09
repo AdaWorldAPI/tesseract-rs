@@ -37,7 +37,8 @@ pub struct OcrOutcome {
     pub elapsed_ms: f64,
 }
 
-/// Decode `bytes` (PNG / JPEG / PNM — via the `image` crate, all pure Rust) to
+/// Decode `bytes` (PNG / JPEG / WebP / TIFF / GIF / BMP / PNM — via the `image`
+/// crate, all pure-Rust decoders) to
 /// 8-bit grey and run the full page-recognition path
 /// ([`LstmRecognizer::recognize_page_makerow`]). Returns text + stats, or a
 /// user-safe error string.
@@ -61,9 +62,9 @@ pub fn ocr_image_bytes(state: &AppState, bytes: &[u8]) -> Result<OcrOutcome, Str
     limits.max_alloc = Some(MAX_DECODE_ALLOC);
     reader.limits(limits);
 
-    let dynimg = reader
-        .decode()
-        .map_err(|e| format!("could not decode image (PNG/JPEG/PNM supported): {e}"))?;
+    let dynimg = reader.decode().map_err(|e| {
+        format!("could not decode image (PNG, JPEG, WebP, TIFF, GIF, BMP, PNM supported): {e}")
+    })?;
 
     let (w, h) = (dynimg.width() as usize, dynimg.height() as usize);
     if w == 0 || h == 0 {

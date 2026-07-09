@@ -23,6 +23,7 @@ pub mod morph;
 pub mod network;
 pub mod renderer;
 pub mod stats;
+pub mod structured;
 pub mod textline;
 pub mod threshold;
 
@@ -36,6 +37,11 @@ pub use morph::{close_brick, dilate_brick, erode_brick, open_brick};
 pub use network::{InputShape, NetError, Network, Node, ReverseKind};
 pub use renderer::{render_hocr, render_text, render_tsv, LineWords};
 pub use stats::Stats;
+pub use structured::{
+    german_invoice_fields, harden_numeric_token, harden_numeric_tokens, harvest_fields,
+    iban_mod97_ok, looks_like_guid, looks_like_iban, parse_amount_cents, render_json, DocLine,
+    DocPage, DocWord, FieldKind, FieldSpec, HarvestedField,
+};
 pub use textline::{
     adjust_row_limits, assign_blobs_to_rows, cleanup_rows_making, compute_block_xheight,
     compute_dropout_distances, compute_height_modes, compute_line_occupation,

@@ -2,7 +2,7 @@
 #
 # The whole selling point: the runtime image contains NO C OCR libraries — no
 # libtesseract, no leptonica, no OpenCV. Just the Rust binary (glibc-linked) and
-# ~4 MB of eng model data. Image decode (PNG/JPEG/PNM) and TLS (rustls +
+# ~4 MB of eng model data. Image decode (PNG/JPEG/WebP/TIFF/GIF/BMP/PNM) and TLS (rustls +
 # bundled webpki roots) are pure Rust, so the runtime needs no ca-certificates
 # and no system TLS.
 #

@@ -5,7 +5,7 @@ A single-binary web demo for the pure-Rust Tesseract transcode. Upload an image
 plus stats, with a one-click `.txt` download.
 
 **The selling point:** OCR with **zero C libraries at runtime** — no
-libtesseract, no leptonica, no OpenCV. Image decode (PNG/JPEG/PNM) and TLS
+libtesseract, no leptonica, no OpenCV. Image decode (PNG/JPEG/WebP/TIFF/GIF/BMP/PNM) and TLS
 (rustls + bundled webpki roots) are pure Rust too, so the Docker image is just
 the glibc-linked binary and ~4 MB of `eng` model data.
 
@@ -16,7 +16,7 @@ the glibc-linked binary and ~4 MB of `eng` model data.
 | HTTP | `axum` 0.7 (+ multipart) | Tower ecosystem, typed extractors |
 | Templates | `askama` 0.12 | Compile-time-checked HTML, no runtime engine |
 | Runtime | `tokio` | Async, single binary |
-| Image decode | `image` 0.25 (png/jpeg/pnm) | Pure Rust, no C deps |
+| Image decode | `image` 0.25 (png/jpeg/webp/tiff/gif/bmp/pnm) | Pure Rust, no C deps |
 | URL fetch | `reqwest` 0.12 (rustls) | rustls only — never openssl |
 | Body cap | axum `DefaultBodyLimit` + `tower-http` | 12 MB upload ceiling (both raised) |
 | OCR | `tesseract-ocr` + `tesseract-core` | The pure-Rust recognizer |
