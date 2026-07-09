@@ -97,7 +97,7 @@ pub struct LineWords {
 
 /// Clamp `v` into `[lo, hi]` — `ClipToRange` (`ccutil/helpers.h`), used
 /// throughout `PageIterator::BoundingBox`/`LTRResultIterator::Confidence`.
-fn clip_to_range(v: i32, lo: i32, hi: i32) -> i32 {
+pub(crate) fn clip_to_range(v: i32, lo: i32, hi: i32) -> i32 {
     v.max(lo).min(hi)
 }
 
@@ -107,7 +107,9 @@ fn clip_to_range(v: i32, lo: i32, hi: i32) -> i32 {
 /// An empty input yields the degenerate box `(0, 0, 0, 0)` (never hit for a
 /// non-empty [`WordResult::char_boxes`] on real recognizer output, but kept
 /// total rather than panicking).
-fn union_boxes(boxes: impl Iterator<Item = (i32, i32, i32, i32)>) -> (i32, i32, i32, i32) {
+pub(crate) fn union_boxes(
+    boxes: impl Iterator<Item = (i32, i32, i32, i32)>,
+) -> (i32, i32, i32, i32) {
     boxes.fold(
         (i32::MAX, i32::MAX, i32::MIN, i32::MIN),
         |(l, b, r, t), (l2, b2, r2, t2)| (l.min(l2), b.min(b2), r.max(r2), t.max(t2)),
@@ -121,7 +123,11 @@ fn union_boxes(boxes: impl Iterator<Item = (i32, i32, i32, i32)>) -> (i32, i32, 
 /// scaling in this crate). This is the raw `(left, top, right, bottom)` shape
 /// hOCR's `title="bbox L T R B"` prints directly; [`to_image_rect`] derives
 /// the TSV `(left, top, width, height)` shape from it.
-fn to_image_box(bx: (i32, i32, i32, i32), page_w: i32, page_h: i32) -> (i32, i32, i32, i32) {
+pub(crate) fn to_image_box(
+    bx: (i32, i32, i32, i32),
+    page_w: i32,
+    page_h: i32,
+) -> (i32, i32, i32, i32) {
     let (left, bottom, right, top) = bx;
     // The degenerate union_boxes() empty case maps cleanly through clip_to_range
     // to (0, page_h, 0, 0)-ish output; documented above, not special-cased here.
@@ -143,7 +149,7 @@ fn to_image_rect(bx: (i32, i32, i32, i32), page_w: i32, page_h: i32) -> (i32, i3
 /// A word's unichar ids as text — `AppendUTF8WordText` (`resultiterator.cpp:705-719`):
 /// concatenate `word->BestUTF8(i, false)` for every character in the word,
 /// which for our transcode is exactly [`ids_to_text`] over the word's ids.
-fn word_text(charset: &CharSet, word: &WordResult) -> String {
+pub(crate) fn word_text(charset: &CharSet, word: &WordResult) -> String {
     let ids: Vec<u32> = word.unichar_ids.iter().map(|&id| id as u32).collect();
     ids_to_text(charset, &ids)
 }
@@ -154,7 +160,7 @@ fn word_text(charset: &CharSet, word: &WordResult) -> String {
 /// (`ClipToRange(100 + 5 * min(word certs), 0.0, 100.0)`). Shared by
 /// [`render_tsv`] (formatted `{:.6}`) and [`render_hocr`]
 /// (`static_cast<int>`-truncated for `x_wconf`).
-fn word_confidence(word: &WordResult) -> f32 {
+pub(crate) fn word_confidence(word: &WordResult) -> f32 {
     let min_cert = word.certs.iter().copied().fold(f32::MAX, f32::min);
     (100.0 + 5.0 * min_cert).clamp(0.0, 100.0)
 }
