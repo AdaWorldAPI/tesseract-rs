@@ -38,26 +38,19 @@ WORKDIR /src
 COPY . /src/tesseract-rs
 
 # Fetch the two sibling repos next to the checkout (unless already supplied).
-# Railway makes the service's variables available at build time, so a token with
-# access to the private repos (the one Railway's GitHub login already granted)
-# drops straight in as GH_TOKEN or GITHUB_TOKEN — no per-repo setup. Locally,
-# prefer the BuildKit secret.
-#
-# LANCE_GRAPH_REF / NDARRAY_REF pin the siblings for a reproducible build; they
-# are passed to `git clone --branch`, so they must be a BRANCH or TAG name (not
-# a commit SHA). Unset = each repo's default branch (what CI uses).
-ARG GH_TOKEN=""
-ARG GITHUB_TOKEN=""
+# Railway's builder already carries the GitHub credential from the account's
+# first-login OAuth, so a plain `git clone` of the private siblings just works —
+# no token to pass, no secret mount. Locally, your own git credentials do the
+# same. LANCE_GRAPH_REF / NDARRAY_REF pin a branch/tag for reproducibility;
+# unset = each repo's default branch (what CI uses).
 ARG LANCE_GRAPH_REF=""
 ARG NDARRAY_REF=""
-RUN --mount=type=secret,id=gh_token,required=false set -eu; \
-    TOKEN="$(cat /run/secrets/gh_token 2>/dev/null || printf '%s' "${GH_TOKEN:-${GITHUB_TOKEN:-}}")"; \
+RUN set -eu; \
     clone() { \
       name="$1"; ref="$2"; \
       if [ -f "/src/$name/Cargo.toml" ]; then echo "using pre-supplied /src/$name"; return; fi; \
-      [ -n "$TOKEN" ] || { echo "FATAL: /src/$name absent and no GH_TOKEN/GITHUB_TOKEN (build secret or arg)" >&2; exit 1; }; \
       git clone --depth 1 ${ref:+--branch "$ref"} \
-        "https://x-access-token:${TOKEN}@github.com/AdaWorldAPI/$name.git" "/src/$name"; \
+        "https://github.com/AdaWorldAPI/$name.git" "/src/$name"; \
       echo "cloned $name @ ${ref:-default branch}"; \
     }; \
     clone lance-graph "$LANCE_GRAPH_REF"; \
@@ -77,8 +70,8 @@ RUN sed -i 's#, "crates/tesseract-ogar"##' Cargo.toml; \
 
 # Strip the release binary via cargo (no binutils needed in the slim runtime).
 ENV CARGO_PROFILE_RELEASE_STRIP=true
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/tesseract-rs/target \
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=tesseract-target,target=/src/tesseract-rs/target \
     cargo build --release -p tesseract-ocr-web \
     && cp target/release/tesseract-ocr-web /usr/local/bin/tesseract-ocr-web
 
