@@ -43,13 +43,13 @@
 
   <ul class="stats">
     <li>Image: <b>{{ width }}&times;{{ height }}</b> px</li>
-    <li>Characters: <b>{{ char_count }}</b></li>
+    <li>{{ primary_label }}: <b>{{ primary_count }}</b></li>
     <li>Lines: <b>{{ line_count }}</b></li>
     <li>Recognition: <b>{{ elapsed_ms }}</b> ms</li>
   </ul>
 
   <div class="actions">
-    <a class="btn btn-primary" href="{{ download_datauri }}" download="ocr.txt">Download .txt</a>
+    <a class="btn btn-primary" href="{{ download_datauri }}" download="{{ download_filename }}">Download {{ download_filename }}</a>
     <a class="btn btn-secondary" href="/">Scan another</a>
   </div>
 

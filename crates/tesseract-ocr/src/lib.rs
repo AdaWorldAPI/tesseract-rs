@@ -21,11 +21,13 @@ pub mod line_segment;
 pub mod lstm_recognizer;
 pub mod morph;
 pub mod network;
+pub mod page_furniture;
 pub mod renderer;
 pub mod stats;
 pub mod structured;
 pub mod textline;
 pub mod threshold;
+pub mod xy_cut;
 
 pub use blob_filter::{filter_blobs, FilteredBlobs};
 pub use conncomp::{conn_comp_areas, conn_comp_bb, ConnComp, ConnCompBox};
@@ -35,6 +37,7 @@ pub use line_segment::{find_text_lines, LineBand};
 pub use lstm_recognizer::{LstmRecognizer, RecognizerError};
 pub use morph::{close_brick, dilate_brick, erode_brick, open_brick};
 pub use network::{InputShape, NetError, Network, Node, ReverseKind};
+pub use page_furniture::{detect_page_furniture, PageFurniture};
 pub use renderer::{render_hocr, render_text, render_tsv, LineWords};
 pub use stats::Stats;
 pub use structured::{
@@ -55,3 +58,4 @@ pub use threshold::{
     otsu_threshold_channels, otsu_threshold_gray, threshold_rect_to_binary,
     threshold_rect_to_binary_multi, OtsuChannel, OtsuResult, OtsuStatsResult, HISTOGRAM_SIZE,
 };
+pub use xy_cut::{xy_cut, PageRect, XyCutParams};

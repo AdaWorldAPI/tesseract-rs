@@ -41,6 +41,9 @@
   .note { font-size: .85rem; color: color-mix(in srgb, CanvasText 55%, Canvas); }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
   footer { margin-top: 2rem; font-size: .8rem; color: color-mix(in srgb, CanvasText 50%, Canvas); }
+  .format-choice { display: flex; gap: 1.5rem; margin-bottom: 1rem; }
+  .format-choice label { display: inline-flex; align-items: center; gap: .4rem; font-weight: 400; margin: 0; }
+  .format-choice input[type=radio] { width: auto; }
 </style>
 </head>
 <body>
@@ -61,6 +64,11 @@
     <label for="url">Scan an image URL</label>
     <input id="url" type="url" name="url" placeholder="https://example.com/line.png">
     <p class="note">Private, loopback, and link-local addresses are refused (SSRF guard); 10&nbsp;MB / 10&nbsp;s cap.</p>
+
+    <div class="format-choice">
+      <label><input type="radio" name="format" value="text" checked> Text</label>
+      <label><input type="radio" name="format" value="json"> JSON (Struktur + Felder)</label>
+    </div>
 
     <button type="submit">Run OCR</button>
   </form>

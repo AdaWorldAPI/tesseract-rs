@@ -10,7 +10,7 @@ use axum::Router;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::fetch::fetch_image_url;
-use crate::ocr::{ocr_image_bytes, OcrOutcome};
+use crate::ocr::{ocr_image_bytes, ocr_image_bytes_json, OcrJsonOutcome, OcrOutcome, OutputFormat};
 use crate::state::AppState;
 
 #[derive(Template)]
@@ -24,11 +24,18 @@ struct IndexTemplate {
 struct ResultTemplate {
     width: usize,
     height: usize,
-    char_count: usize,
+    /// "Characters" (text mode) or "Words" (JSON mode — a character count is
+    /// meaningless for a JSON document).
+    primary_label: &'static str,
+    primary_count: usize,
     line_count: usize,
     elapsed_ms: String,
+    /// The text to show in the result `<pre>` block: recognized text, or the
+    /// rendered JSON document. Askama HTML-escapes this on render.
     text: String,
     download_datauri: String,
+    /// The download link's filename: `ocr.txt` or `result.json`.
+    download_filename: &'static str,
 }
 
 /// Build the application router. Uploads are capped at 12 MB — this needs BOTH
@@ -73,6 +80,7 @@ fn err_page(msg: impl Into<String>) -> Html<String> {
 async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Html<String> {
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut url: Option<String> = None;
+    let mut format = OutputFormat::Text;
 
     loop {
         match multipart.next_field().await {
@@ -89,6 +97,13 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
                             if !t.trim().is_empty() {
                                 url = Some(t.trim().to_string());
                             }
+                        }
+                    }
+                    "format" => {
+                        // Never a hard error: an unrecognized/malformed format
+                        // field just falls back to text (OutputFormat::from_field).
+                        if let Ok(t) = field.text().await {
+                            format = OutputFormat::from_field(Some(t.trim()));
                         }
                     }
                     _ => {}
@@ -121,22 +136,41 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
         Err(_) => return err_page("server is shutting down"),
     };
     let st = state.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        ocr_image_bytes(&st, &bytes)
-    })
-    .await;
-    match outcome {
-        Ok(Ok(out)) => render(&result_of(out)),
-        Ok(Err(e)) => err_page(e),
-        Err(e) => {
-            eprintln!("ocr: recognition task failed: {e}");
-            err_page("recognition failed unexpectedly")
+    match format {
+        OutputFormat::Text => {
+            let outcome = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                ocr_image_bytes(&st, &bytes)
+            })
+            .await;
+            match outcome {
+                Ok(Ok(out)) => render(&result_of_text(out)),
+                Ok(Err(e)) => err_page(e),
+                Err(e) => {
+                    eprintln!("ocr: recognition task failed: {e}");
+                    err_page("recognition failed unexpectedly")
+                }
+            }
+        }
+        OutputFormat::Json => {
+            let outcome = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                ocr_image_bytes_json(&st, &bytes)
+            })
+            .await;
+            match outcome {
+                Ok(Ok(out)) => render(&result_of_json(out)),
+                Ok(Err(e)) => err_page(e),
+                Err(e) => {
+                    eprintln!("ocr: recognition task failed: {e}");
+                    err_page("recognition failed unexpectedly")
+                }
+            }
         }
     }
 }
 
-fn result_of(out: OcrOutcome) -> ResultTemplate {
+fn result_of_text(out: OcrOutcome) -> ResultTemplate {
     let datauri = format!(
         "data:text/plain;charset=utf-8;base64,{}",
         base64_encode(out.text.as_bytes())
@@ -144,11 +178,31 @@ fn result_of(out: OcrOutcome) -> ResultTemplate {
     ResultTemplate {
         width: out.width,
         height: out.height,
-        char_count: out.char_count,
+        primary_label: "Characters",
+        primary_count: out.char_count,
         line_count: out.line_count,
         elapsed_ms: format!("{:.1}", out.elapsed_ms),
         text: out.text,
         download_datauri: datauri,
+        download_filename: "ocr.txt",
+    }
+}
+
+fn result_of_json(out: OcrJsonOutcome) -> ResultTemplate {
+    let datauri = format!(
+        "data:application/json;charset=utf-8;base64,{}",
+        base64_encode(out.json.as_bytes())
+    );
+    ResultTemplate {
+        width: out.width,
+        height: out.height,
+        primary_label: "Words",
+        primary_count: out.word_count,
+        line_count: out.line_count,
+        elapsed_ms: format!("{:.1}", out.elapsed_ms),
+        text: out.json,
+        download_datauri: datauri,
+        download_filename: "result.json",
     }
 }
 
@@ -269,6 +323,32 @@ mod tests {
             out.text.contains("clock"),
             "expected 'clock' from page_01, got: {:?}",
             out.text
+        );
+    }
+
+    #[test]
+    fn ocr_a_corpus_page_produces_json() {
+        use crate::ocr::ocr_image_bytes_json;
+
+        let dir = model_dir();
+        if !dir.join("eng.lstm").exists() {
+            eprintln!("skipping: corpus model absent");
+            return;
+        }
+        let state = AppState::load(&dir).expect("load model");
+        let page = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pages/page_01.pgm");
+        let bytes = std::fs::read(&page).expect("read page_01.pgm");
+        let out = ocr_image_bytes_json(&state, &bytes).expect("ocr json");
+        assert!(out.width > 0 && out.height > 0);
+        assert!(
+            out.json.starts_with("{\"schema\":\"tesseract-rs/doc.v1\""),
+            "got: {:?}",
+            &out.json[..out.json.len().min(80)]
+        );
+        assert!(
+            out.json.contains("\"words\""),
+            "expected a words array, got: {:?}",
+            out.json
         );
     }
 
