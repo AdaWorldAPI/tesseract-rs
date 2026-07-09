@@ -19,8 +19,11 @@ axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 askama = "0.12"
 tower-http = { version = "0.5", features = ["limit"] }
-# Image decode for uploads (PNG / JPEG / PNM) — trimmed features, no C deps.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "pnm"] }
+# Image decode for uploads — all pure-Rust decoders (no C deps): the raster
+# photo formats (PNG/JPEG/WebP/GIF/BMP), the classic scan container TIFF, and
+# PNM (PGM/PPM). `image` 0.25 dropped its C-backed decoders, so every one of
+# these keeps the "zero C libraries at runtime" promise.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "tiff", "gif", "bmp", "pnm"] }
 # URL fetch for the "web link" arm — rustls ONLY (never openssl), keeps the
 # Docker image lean and free of a system TLS dependency.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }

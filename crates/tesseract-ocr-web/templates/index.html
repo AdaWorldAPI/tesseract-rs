@@ -54,7 +54,7 @@
 
   <form class="card" action="/ocr" method="post" enctype="multipart/form-data">
     <label for="file">Upload an image</label>
-    <input id="file" type="file" name="file" accept="image/png,image/jpeg,image/x-portable-graymap,image/*">
+    <input id="file" type="file" name="file" accept="image/png,image/jpeg,image/webp,image/tiff,image/gif,image/bmp,image/x-portable-graymap,image/*">
 
     <div class="or">— OR —</div>
 
@@ -65,7 +65,7 @@
     <button type="submit">Run OCR</button>
   </form>
 
-  <p class="note">Best on single text-line images at the model height (36&nbsp;px); larger pages are line-found and recognized top-to-bottom. PNG, JPEG, and PNM (PGM/PPM) are accepted.</p>
+  <p class="note">Best on single text-line images at the model height (36&nbsp;px); larger pages are line-found and recognized top-to-bottom. PNG, JPEG, WebP, TIFF, GIF, BMP, and PNM (PGM/PPM) are accepted.</p>
 
   <footer>Result is served back as text with a download link and recognition stats.</footer>
 </main>
