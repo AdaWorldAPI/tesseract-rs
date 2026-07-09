@@ -26,7 +26,9 @@ async fn main() {
     let model_dir =
         PathBuf::from(std::env::var("MODEL_DIR").unwrap_or_else(|_| "corpus/model".to_string()));
 
-    eprintln!(
+    // Informational startup lines go to STDOUT so log platforms (Railway) don't
+    // tag them `severity: error` — stderr is reserved for actual `fatal:` failures.
+    println!(
         "tesseract-ocr-web: loading model from {}",
         model_dir.display()
     );
@@ -41,7 +43,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    eprintln!(
+    println!(
         "tesseract-ocr-web: model loaded (dict beam: {})",
         if state.dict.is_some() { "on" } else { "off" }
     );
@@ -58,7 +60,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    eprintln!("tesseract-ocr-web: listening on http://{addr}");
+    println!("tesseract-ocr-web: listening on http://{addr}");
 
     let app = routes::router(state);
     if let Err(e) = axum::serve(listener, app).await {
