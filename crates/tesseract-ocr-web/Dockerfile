@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-#
 # tesseract-ocr-web — Railway-ready image for the pure-Rust OCR demo.
 #
 # The whole selling point: the runtime image contains NO C OCR libraries — no
@@ -70,9 +68,9 @@ RUN sed -i 's#, "crates/tesseract-ogar"##' Cargo.toml; \
 
 # Strip the release binary via cargo (no binutils needed in the slim runtime).
 ENV CARGO_PROFILE_RELEASE_STRIP=true
-RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=tesseract-target,target=/src/tesseract-rs/target \
-    cargo build --release -p tesseract-ocr-web \
+# No BuildKit cache mount — Railway's builder rejects the mount syntax, and a
+# plain build works on every builder (just no cross-deploy caching).
+RUN cargo build --release -p tesseract-ocr-web \
     && cp target/release/tesseract-ocr-web /usr/local/bin/tesseract-ocr-web
 
 # ── runtime ─────────────────────────────────────────────────────────────────
