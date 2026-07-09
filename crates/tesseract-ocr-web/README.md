@@ -96,33 +96,31 @@ tesseract-core       → ../../../lance-graph/crates/lance-graph-contract
 tesseract-recognizer → ../../../ndarray
 ```
 
-so the **builder stage fetches those two siblings itself** — everything ends up
-in one binary. It just needs a token that can read the private repos, which is
-exactly the access Railway's GitHub login already grants you:
+so the **builder stage clones those two siblings itself** — everything ends up in
+one binary. They're private, but **Railway's builder already carries the
+account's GitHub credential** (the implicit OAuth from first login), so the plain
+`git clone` just works:
 
-- **Railway:** add a build variable `GH_TOKEN` (or `GITHUB_TOKEN`) set to that
-  token. Railway exposes service variables at build time, so the Dockerfile
-  reads it directly — no per-repo wiring, no submodules. Railway auto-detects
-  `railway.toml` and builds `crates/tesseract-ocr-web/Dockerfile`.
+- **Railway:** connect the repo and deploy — Railway auto-detects `railway.toml`
+  and builds `crates/tesseract-ocr-web/Dockerfile`. **No token variable to set.**
 - Optionally pin the siblings with `LANCE_GRAPH_REF` / `NDARRAY_REF` build args
   (default = each repo's default branch, matching CI).
 
 ### Local Docker build
 
+The Dockerfile clones the private siblings with a plain `git clone`, so a local
+build uses **your own git credentials** (a credential helper, or an `insteadOf` /
+`~/.netrc` rewrite for `github.com`). From the repo root:
+
 ```sh
-# From the repo root, with BuildKit and a token in $GH_TOKEN:
-DOCKER_BUILDKIT=1 docker build \
-  -f crates/tesseract-ocr-web/Dockerfile \
-  --secret id=gh_token,src=<(printf %s "$GH_TOKEN") \
-  -t ocr-web .
+docker build -f crates/tesseract-ocr-web/Dockerfile -t ocr-web .
 
 docker run --rm -e PORT=8080 -p 8080:8080 ocr-web
 # → http://localhost:8080
 ```
 
-The `GH_TOKEN` build arg also works (`--build-arg GH_TOKEN=...`), but it is
-baked into the (discarded) builder layer; prefer the BuildKit secret. The final
-runtime image never contains the token or the source — only the binary + model.
+The final runtime image contains only the binary + model — no source, no
+credentials.
 
 ## Routes
 

@@ -6,10 +6,10 @@
 # variable; let Railway own it.
 #
 # The Docker build fetches the lance-graph + ndarray sibling repos and compiles
-# everything into one binary (see crates/tesseract-ocr-web/Dockerfile). It needs
-# a token that can read those private repos — the same access Railway's GitHub
-# login already grants. Set it as a build-time variable GH_TOKEN (or
-# GITHUB_TOKEN); Railway exposes service variables at build time.
+# everything into one binary (see crates/tesseract-ocr-web/Dockerfile). Those are
+# private repos, but Railway's builder already carries the account's GitHub
+# credential (the implicit OAuth from first login), so the plain `git clone`
+# just works — no token variable to set.
 
 [build]
 builder = "dockerfile"
