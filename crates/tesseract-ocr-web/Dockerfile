@@ -12,15 +12,13 @@
 #   tesseract-recognizer → ../../../ndarray
 # i.e. cargo expects `lance-graph/` and `ndarray/` as SIBLINGS of the repo
 # (exactly how CI checks them out). Railway clones a single repo, so the builder
-# stage fetches those two siblings itself. Provide a GitHub token as either a
-# BuildKit secret (`--secret id=gh_token,src=...`, preferred) or a `GH_TOKEN`
-# build arg (Railway build variable). Pin the siblings with LANCE_GRAPH_REF /
-# NDARRAY_REF if you need a reproducible build (default = each repo's default
-# branch, which is what CI uses).
+# stage clones those two siblings itself with a plain `git clone` — Railway's
+# builder already carries the account's GitHub OAuth credential, so the private
+# repos need no token. Pin the siblings with LANCE_GRAPH_REF / NDARRAY_REF for a
+# reproducible build (default = each repo's default branch = CI).
 #
-# Local build (from the tesseract-rs repo root):
-#   DOCKER_BUILDKIT=1 docker build -f crates/tesseract-ocr-web/Dockerfile \
-#     --secret id=gh_token,src=<(printf %s "$GH_TOKEN") -t ocr-web .
+# Local build (from the tesseract-rs repo root, using your own git credentials):
+#   docker build -f crates/tesseract-ocr-web/Dockerfile -t ocr-web .
 # Local run:  docker run --rm -e PORT=8080 -p 8080:8080 ocr-web
 
 # ── builder ─────────────────────────────────────────────────────────────────
