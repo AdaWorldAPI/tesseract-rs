@@ -83,6 +83,21 @@ impl From<NetError> for RecognizerError {
     }
 }
 
+/// The result of [`LstmRecognizer::recognize_document`] — the rendered
+/// `tesseract-rs/doc.v1` JSON, the harvested typed fields, and word/line
+/// counts for callers that want stats without re-parsing the JSON.
+#[derive(Clone, Debug)]
+pub struct Document {
+    /// The rendered `doc.v1` JSON document (structure + classified regions).
+    pub json: String,
+    /// The harvested typed fields (empty when no harvest profile was given).
+    pub fields: Vec<crate::structured::HarvestedField>,
+    /// Total recognized words across all lines.
+    pub word_count: usize,
+    /// Number of non-empty recognized lines.
+    pub line_count: usize,
+}
+
 /// A loaded LSTM recognizer — the network plus the char-set / recoder tissue and
 /// the scalar fields `LSTMRecognizer::DeSerialize` reads. This is the object
 /// `RecognizeLine` (B3) drives; the training-only scalars are carried for
@@ -657,6 +672,101 @@ impl LstmRecognizer {
         Ok(out)
     }
 
+    /// **The one-shot structured-document path** — consumer-side composition
+    /// (NOT a Tesseract transcode; see the `structured.rs` / `xy_cut.rs` /
+    /// `pageseg.rs` / `page_furniture.rs` banners). Recognizes the grey page
+    /// to word/box output, builds the `doc.v1` DOM, hardens numeric tokens,
+    /// optionally harvests typed fields, classifies regions (page furniture +
+    /// XY-cut layout blocks + halftone-mask figures), and renders the
+    /// `tesseract-rs/doc.v1` JSON.
+    ///
+    /// **This is the single canonical composition** the web demo's JSON arm
+    /// and the `tesseract-ogar` `recognize_document` executor arm both call,
+    /// so the two consumers cannot drift.
+    ///
+    /// `harvest` selects the field harvest: `Some(specs)` runs
+    /// [`harvest_fields`](crate::structured::harvest_fields) (e.g. with
+    /// [`german_invoice_fields`](crate::structured::german_invoice_fields));
+    /// `None` harvests nothing (`"fields":[]`).
+    ///
+    /// # Errors
+    ///
+    /// [`RecognizerError`] from the underlying word recognition.
+    pub fn recognize_document(
+        &self,
+        grey: &[u8],
+        w: usize,
+        h: usize,
+        dict: Option<&DictLite>,
+        harvest: Option<&[crate::structured::FieldSpec]>,
+    ) -> Result<Document, RecognizerError> {
+        let lines = self.recognize_page_makerow_words(grey, w, h, dict)?;
+        let mut page =
+            crate::structured::DocPage::from_line_words(&lines, &self.charset, w as u32, h as u32);
+        crate::structured::harden_numeric_tokens(&mut page);
+        let fields = match harvest {
+            Some(specs) => crate::structured::harvest_fields(&page, specs),
+            None => Vec::new(),
+        };
+
+        // Region classification over the SAME grey page: furniture
+        // (header/footer), XY-cut layout blocks (reading order), halftone
+        // figures. All three are the parity-proven library layers.
+        let furniture = crate::page_furniture::detect_page_furniture(&page);
+        let blocks: Vec<(i32, i32, i32, i32)> =
+            crate::xy_cut::xy_cut(grey, w, h, &crate::xy_cut::XyCutParams::default())
+                .into_iter()
+                .map(|r| (r.left as i32, r.top as i32, r.right as i32, r.bottom as i32))
+                .collect();
+        let figures = Self::halftone_figures(grey, w, h);
+        let regions = crate::structured::build_regions(
+            &page,
+            &furniture.header_lines,
+            &furniture.footer_lines,
+            &blocks,
+            &figures,
+        );
+        let json = crate::structured::render_json_with_regions(&page, &regions, &fields);
+        let word_count = page.lines.iter().map(|l| l.words.len()).sum();
+        let line_count = page.lines.len();
+        Ok(Document {
+            json,
+            fields,
+            word_count,
+            line_count,
+        })
+    }
+
+    /// Halftone (image-region) figure bboxes for [`Self::recognize_document`]'s
+    /// region classification: binarize (Otsu, with the same fixed-128 fallback
+    /// the library segmenters use when Otsu declines), run the leptonica-parity
+    /// [`generate_halftone_mask`](crate::pageseg::generate_halftone_mask) (only
+    /// above its `MinWidth`/`MinHeight` gate), and return the found mask's
+    /// connected components as page-space `(l, t, r, b)` rects. Empty when the
+    /// page is too small or holds no halftone region.
+    fn halftone_figures(grey: &[u8], w: usize, h: usize) -> Vec<(i32, i32, i32, i32)> {
+        if w < crate::pageseg::MIN_WIDTH || h < crate::pageseg::MIN_HEIGHT {
+            return Vec::new();
+        }
+        let otsu = crate::threshold::otsu_threshold_gray(grey, w, 0, 0, w, h);
+        let binary: Vec<u8> = if otsu.hi_value == -1 {
+            grey.iter()
+                .map(|&p| if p < 128 { 0 } else { 255 })
+                .collect()
+        } else {
+            crate::threshold::threshold_rect_to_binary(grey, w, 0, 0, w, h, otsu)
+        };
+        crate::pageseg::generate_halftone_mask(&binary, w, h)
+            .filter(|hm| hm.found)
+            .map(|hm| {
+                crate::conncomp::conn_comp_bb(&hm.mask, hm.mask_w, hm.mask_h, 8)
+                    .into_iter()
+                    .map(|b| (b.x, b.y, b.x + b.w, b.y + b.h))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// `LSTMRecognizer::SetRandomSeed` (`lstmrecognizer.h:287-291`): the exact
     /// randomizer seeding `RecognizeLine` uses before the forward pass —
     /// `seed = (i64)sample_iteration · 0x10000001`, `minstd` seed, one warm-up
@@ -1080,5 +1190,56 @@ mod makerow_page_tests {
             string_out,
             "render_text(words).trim_end() must equal the string surface"
         );
+    }
+
+    /// `recognize_document` composes the word surface into `doc.v1` JSON: the
+    /// canonical one-shot both the web demo and the tesseract-ogar executor
+    /// call. It must produce well-formed doc.v1, report the same line count as
+    /// the word surface, and — with the German-invoice harvest profile — carry
+    /// a `fields` array (possibly empty on a non-invoice fixture, but the key
+    /// is always present). The no-harvest arm must emit `"fields":[]`.
+    #[test]
+    fn recognize_document_composes_docv1_and_counts() {
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+        if !corpus.join("model/eng.lstm").exists() || !corpus.join("lines/page_roomy.pgm").exists()
+        {
+            return;
+        }
+        let lstm = std::fs::read(corpus.join("model/eng.lstm")).unwrap();
+        let uni = std::fs::read_to_string(corpus.join("model/eng.lstm-unicharset")).unwrap();
+        let rec = std::fs::read(corpus.join("model/eng.lstm-recoder")).unwrap();
+        let img = std::fs::read(corpus.join("lines/page_roomy.pgm")).unwrap();
+        let r = LstmRecognizer::from_components(&lstm, &uni, &rec).unwrap();
+        let (grey, w, h) = crate::image_input::parse_pgm(&img).unwrap();
+
+        let words = r.recognize_page_makerow_words(&grey, w, h, None).unwrap();
+
+        // No-harvest arm: valid doc.v1, empty fields, counts consistent.
+        let plain = r.recognize_document(&grey, w, h, None, None).unwrap();
+        assert!(plain
+            .json
+            .starts_with("{\"schema\":\"tesseract-rs/doc.v1\""));
+        assert!(
+            plain.json.contains("\"fields\":[]"),
+            "no-harvest → empty fields"
+        );
+        assert_eq!(
+            plain.line_count,
+            words.len(),
+            "line count matches word surface"
+        );
+        assert_eq!(
+            plain.word_count,
+            words.iter().map(|l| l.words.len()).sum::<usize>()
+        );
+
+        // Harvest arm: the fields key is present (array may be empty on a
+        // non-invoice fixture, but the harvest ran without panicking).
+        let specs = crate::structured::german_invoice_fields();
+        let harvested = r
+            .recognize_document(&grey, w, h, None, Some(&specs))
+            .unwrap();
+        assert!(harvested.json.contains("\"fields\":"));
+        assert_eq!(harvested.line_count, words.len());
     }
 }
