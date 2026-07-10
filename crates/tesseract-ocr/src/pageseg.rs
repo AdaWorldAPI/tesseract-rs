@@ -53,7 +53,10 @@
 //! [`crate::threshold`]), assumed 150–200 ppi per the C's header comment.
 
 use crate::binreduce::{expand_replicate, reduce_rank_binary_cascade};
-use crate::morph::{close_safe_brick, open_brick};
+use crate::morph::{close_safe_brick, morph_sequence, open_brick};
+use crate::morphapp::{
+    morph_sequence_by_component, select_by_size, SelectRelation, SelectType, SizeFilter,
+};
 use crate::seedfill::seedfill_binary;
 
 /// `MinWidth` (`pageseg.c:90`) — inputs narrower than this are rejected.
@@ -131,16 +134,133 @@ pub fn generate_halftone_mask(binary: &[u8], w: usize, h: usize) -> Option<Halft
     })
 }
 
+/// Invert a bitonal buffer (ink ↔ background) — `pixInvert` on 1 bpp.
+fn invert(binary: &[u8]) -> Vec<u8> {
+    binary
+        .iter()
+        .map(|&p| if p == 0 { 255 } else { 0 })
+        .collect()
+}
+
+/// `a AND NOT b` on same-shaped bitonal buffers — `pixSubtract` on 1 bpp
+/// (equal dimensions; the clipped-overlap variant lives in
+/// [`generate_halftone_mask`], which is the only mismatched-size call site).
+fn subtract(a: &[u8], b: &[u8]) -> Vec<u8> {
+    a.iter()
+        .zip(b)
+        .map(|(&pa, &pb)| if pa == 0 && pb != 0 { 0 } else { 255 })
+        .collect()
+}
+
+/// The result of [`gen_textline_mask`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextlineMask {
+    /// The textline mask (`w × h`).
+    pub mask: Vec<u8>,
+    /// The vertical-whitespace mask (`w × h`) — `pixGenTextblockMask`'s
+    /// second input, returned alongside exactly as the C's `*ppixvws`.
+    pub vws: Vec<u8>,
+    /// `true` iff the mask has at least one ON pixel (`*ptlfound`).
+    pub found: bool,
+}
+
+/// Generate the textline mask + vertical-whitespace mask of a binarized,
+/// deskewed, halftone-free page — `pixGenTextlineMask`
+/// (`pageseg.c:389-453`):
+///
+/// ```text
+/// pix1 = invert(src)
+/// pix1 -= comp_seq(pix1, "o80.60")        // remove huge bg blocks so the
+///                                          // whitespace mask can't break
+///                                          // textlines at page margins
+/// vws  = comp_seq(pix1, "o5.1 + o1.200")  // long vertical bg corridors
+/// mask = open3x3( seq(src, "c30.1") − vws )
+/// ```
+///
+/// Sequences run through [`morph_sequence`] — see its doc for why the
+/// comp-sequence call sites are served by the same implementation (exact
+/// factorization; oracle-pinned). Returns `None` when the page is smaller
+/// than [`MIN_WIDTH`]`×`[`MIN_HEIGHT`] (C error) — sequence failure is
+/// unreachable with these fixed strings.
+///
+/// # Panics
+/// Panics if `binary.len() != w * h`.
+#[must_use]
+pub fn gen_textline_mask(binary: &[u8], w: usize, h: usize) -> Option<TextlineMask> {
+    assert_eq!(binary.len(), w * h, "binary buffer length must be w * h");
+    if w < MIN_WIDTH || h < MIN_HEIGHT {
+        return None;
+    }
+
+    let inverted = invert(binary);
+    let (big_bg, _, _) = morph_sequence(&inverted, w, h, "o80.60")?;
+    let bg = subtract(&inverted, &big_bg);
+    let (vws, _, _) = morph_sequence(&bg, w, h, "o5.1 + o1.200")?;
+
+    let (closed, _, _) = morph_sequence(binary, w, h, "c30.1")?;
+    let diff = subtract(&closed, &vws);
+    let mask = open_brick(&diff, w, h, 3, 3);
+    let found = mask.contains(&0);
+
+    Some(TextlineMask { mask, vws, found })
+}
+
+/// Generate the textblock mask from a textline mask + vertical-whitespace
+/// mask — `pixGenTextblockMask` (`pageseg.c:480-529`):
+///
+/// ```text
+/// pix1 = seq(textline_mask, "c1.10 + o4.1")   // join lines vertically
+/// (empty → None — the C returns NULL with an INFO message)
+/// pix2 = by_component(pix1, "c30.30 + d3.3", 8)  // solidify per block
+/// pix2 = close_safe(pix2, 10, 1)                 // small horizontal join
+/// pix3 = pix2 − vws                              // reopen column corridors
+/// mask = select_by_size(pix3, 25, 5, 8, IF_BOTH, GTE)  // drop noise blocks
+/// ```
+///
+/// Returns `None` when the page is smaller than [`MIN_WIDTH`]`×`
+/// [`MIN_HEIGHT`] OR the vertical join comes up empty (both are the C's
+/// `NULL` returns; the oracle pins the non-empty arm via `tb_null_flag 0`).
+///
+/// # Panics
+/// Panics if buffer lengths are not `w * h`.
+#[must_use]
+pub fn gen_textblock_mask(textline_mask: &[u8], vws: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
+    assert_eq!(textline_mask.len(), w * h, "mask length must be w * h");
+    assert_eq!(vws.len(), w * h, "vws length must be w * h");
+    if w < MIN_WIDTH || h < MIN_HEIGHT {
+        return None;
+    }
+
+    let (joined, _, _) = morph_sequence(textline_mask, w, h, "c1.10 + o4.1")?;
+    if !joined.contains(&0) {
+        return None; // "no fg pixels in textblock mask" (pageseg.c:503-507)
+    }
+    let solid = morph_sequence_by_component(&joined, w, h, "c30.30 + d3.3", 8, 0, 0)?;
+    let closed = close_safe_brick(&solid, w, h, 10, 1);
+    let carved = subtract(&closed, vws);
+    select_by_size(
+        &carved,
+        w,
+        h,
+        8,
+        SizeFilter {
+            width: 25,
+            height: 5,
+            select_type: SelectType::IfBoth,
+            relation: SelectRelation::Gte,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// Parse the banked pageseg oracle dump: `"name w h"` + rows sections
-    /// into `name → (w, h, buffer)` (crate convention: `'1'` → `0` = ink),
-    /// and `"name_flag v"` lines into `name_flag → (v, 0, [])`.
-    fn oracle() -> HashMap<String, (usize, usize, Vec<u8>)> {
-        let text = include_str!("../../../.claude/harvest/oracles/pageseg_oracle_out.txt");
+    /// Parse a banked oracle dump: `"name w h"` + rows sections into
+    /// `name → (w, h, buffer)` (crate convention: `'1'` → `0` = ink), and
+    /// `"name_flag v"` lines into `name_flag → (v, 0, [])`.
+    fn parse_dump(text: &str) -> HashMap<String, (usize, usize, Vec<u8>)> {
         let mut out = HashMap::new();
         let mut lines = text.lines();
         while let Some(header) = lines.next() {
@@ -162,6 +282,117 @@ mod tests {
             out.insert(name, (w, h, buf));
         }
         out
+    }
+
+    fn oracle() -> HashMap<String, (usize, usize, Vec<u8>)> {
+        parse_dump(include_str!(
+            "../../../.claude/harvest/oracles/pageseg_oracle_out.txt"
+        ))
+    }
+
+    fn oracle2() -> HashMap<String, (usize, usize, Vec<u8>)> {
+        parse_dump(include_str!(
+            "../../../.claude/harvest/oracles/pageseg2_oracle_out.txt"
+        ))
+    }
+
+    /// The 260×220 two-column text-page fixture — must match the pageseg2
+    /// oracle's `fixture()` exactly.
+    fn text_page_fixture() -> (Vec<u8>, usize, usize) {
+        let (w, h) = (260usize, 220usize);
+        let mut buf = vec![255u8; w * h];
+        for (c0, c1) in [(15usize, 115usize), (155, 245)] {
+            let mut yb = 20;
+            while yb <= 188 {
+                for y in yb..yb + 5 {
+                    for x in c0..c1 {
+                        if (x - c0) % 24 < 18 {
+                            buf[y * w + x] = 0;
+                        }
+                    }
+                }
+                yb += 12;
+            }
+        }
+        for y in 10..13 {
+            for x in 250..253 {
+                buf[y * w + x] = 0;
+            }
+        }
+        (buf, w, h)
+    }
+
+    #[test]
+    fn morph_sequences_match_liblept_incl_comp_variants() {
+        let o = oracle2();
+        let (buf, w, h) = text_page_fixture();
+        assert_eq!(o["tl_src"], (w, h, buf.clone()), "fixture == oracle input");
+
+        // The comp-sequence pins: the REAL pixMorphCompSequence vs OUR
+        // single implementation — the exact-factorization equivalence proof.
+        for (name, seq) in [
+            ("seqcomp_o80_60", "o80.60"),
+            ("seqcomp_o5_1_o1_200", "o5.1 + o1.200"),
+            ("seq_c30_1", "c30.1"),
+            ("seq_c1_10_o4_1", "c1.10 + o4.1"),
+        ] {
+            let (got, gw, gh) = morph_sequence(&buf, w, h, seq).expect("valid sequence");
+            let (ow, oh, obuf) = &o[name];
+            assert_eq!((gw, gh), (*ow, *oh), "{name} dims");
+            assert_eq!(&got, obuf, "{name} pixels");
+        }
+    }
+
+    #[test]
+    fn by_component_and_select_by_size_match_liblept() {
+        let o = oracle2();
+        let (buf, w, h) = text_page_fixture();
+
+        let got = morph_sequence_by_component(&buf, w, h, "c30.30 + d3.3", 8, 0, 0).expect("valid");
+        assert_eq!(&got, &o["bycomp_c30_30_d3_3"].2, "by-component pixels");
+
+        let got = select_by_size(
+            &buf,
+            w,
+            h,
+            8,
+            SizeFilter {
+                width: 25,
+                height: 5,
+                select_type: SelectType::IfBoth,
+                relation: SelectRelation::Gte,
+            },
+        )
+        .expect("valid");
+        assert_eq!(&got, &o["selsize_25_5_both_gte"].2, "select-by-size pixels");
+    }
+
+    #[test]
+    fn textline_mask_matches_liblept() {
+        let o = oracle2();
+        let (buf, w, h) = text_page_fixture();
+        let r = gen_textline_mask(&buf, w, h).expect("big enough");
+        assert_eq!(o["tl_found_flag"].0, 1);
+        assert!(r.found);
+        assert_eq!(&r.vws, &o["tl_vws"].2, "vertical whitespace mask");
+        assert_eq!(&r.mask, &o["tl_mask"].2, "textline mask");
+    }
+
+    #[test]
+    fn textblock_mask_matches_liblept() {
+        let o = oracle2();
+        let (buf, w, h) = text_page_fixture();
+        let tl = gen_textline_mask(&buf, w, h).expect("big enough");
+        assert_eq!(o["tb_null_flag"].0, 0, "oracle produced a block mask");
+        let tb = gen_textblock_mask(&tl.mask, &tl.vws, w, h).expect("non-empty");
+        assert_eq!(&tb, &o["tb_mask"].2, "textblock mask");
+    }
+
+    #[test]
+    fn textline_and_textblock_reject_small_pages() {
+        let buf = vec![255u8; 99 * 200];
+        assert!(gen_textline_mask(&buf, 99, 200).is_none());
+        assert!(gen_textblock_mask(&buf, &buf, 99, 200).is_none());
     }
 
     /// The 97×61 close-safe fixture — the binreduce oracle's formula.

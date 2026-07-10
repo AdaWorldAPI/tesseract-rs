@@ -21,6 +21,7 @@ pub mod image_input;
 pub mod line_segment;
 pub mod lstm_recognizer;
 pub mod morph;
+pub mod morphapp;
 pub mod network;
 pub mod page_furniture;
 pub mod pageseg;
@@ -41,10 +42,18 @@ pub use image_input::{parse_pgm, prescale_grey_to_height, PgmError};
 #[cfg(feature = "seg-approx")]
 pub use line_segment::{find_text_lines, LineBand};
 pub use lstm_recognizer::{LstmRecognizer, RecognizerError};
-pub use morph::{close_brick, close_safe_brick, dilate_brick, erode_brick, open_brick};
+pub use morph::{
+    close_brick, close_safe_brick, dilate_brick, erode_brick, morph_sequence, open_brick,
+};
+pub use morphapp::{
+    morph_sequence_by_component, select_by_size, SelectRelation, SelectType, SizeFilter,
+};
 pub use network::{InputShape, NetError, Network, Node, ReverseKind};
 pub use page_furniture::{detect_page_furniture, PageFurniture};
-pub use pageseg::{generate_halftone_mask, HalftoneMask, MIN_HEIGHT, MIN_WIDTH};
+pub use pageseg::{
+    gen_textblock_mask, gen_textline_mask, generate_halftone_mask, HalftoneMask, TextlineMask,
+    MIN_HEIGHT, MIN_WIDTH,
+};
 pub use renderer::{render_hocr, render_text, render_tsv, LineWords};
 pub use seedfill::seedfill_binary;
 pub use stats::Stats;
