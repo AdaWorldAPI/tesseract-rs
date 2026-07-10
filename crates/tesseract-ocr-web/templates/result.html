@@ -35,6 +35,11 @@
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .95rem;
   }
   .empty { color: color-mix(in srgb, CanvasText 55%, Canvas); font-style: italic; }
+  .warn {
+    border: 1px solid #f59e0b; background: color-mix(in srgb, #f59e0b 12%, Canvas);
+    color: color-mix(in srgb, #b45309 88%, CanvasText);
+    padding: .75rem 1rem; border-radius: 8px; margin: 0 0 1.25rem; font-size: .9rem;
+  }
 </style>
 </head>
 <body>
@@ -45,8 +50,20 @@
     <li>Image: <b>{{ width }}&times;{{ height }}</b> px</li>
     <li>{{ primary_label }}: <b>{{ primary_count }}</b></li>
     <li>Lines: <b>{{ line_count }}</b></li>
+    <li>Confidence: <b>{{ confidence }}</b>/100</li>
     <li>Recognition: <b>{{ elapsed_ms }}</b> ms</li>
   </ul>
+
+  {% if low_confidence %}
+  <div class="warn">
+    <strong>Low recognition confidence.</strong> The model is not sure about this
+    image. The bundled <code>eng</code> model is trained on <em>printed</em> text
+    only &mdash; <strong>handwriting is not supported</strong> and will produce
+    confident-looking but wrong output. Low confidence also happens on
+    low-resolution scans or images that aren&rsquo;t printed text. The text below
+    is likely unreliable.
+  </div>
+  {% endif %}
 
   <div class="actions">
     <a class="btn btn-primary" href="{{ download_datauri }}" download="{{ download_filename }}">Download {{ download_filename }}</a>

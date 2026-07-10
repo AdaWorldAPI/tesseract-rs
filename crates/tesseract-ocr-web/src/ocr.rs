@@ -4,7 +4,9 @@ use std::io::Cursor;
 use std::time::Instant;
 
 use image::{ImageReader, Limits};
-use tesseract_ocr::german_invoice_fields;
+use tesseract_ocr::{
+    german_invoice_fields, mean_word_confidence, render_text, DocPage, LOW_CONFIDENCE_THRESHOLD,
+};
 
 use crate::state::AppState;
 
@@ -60,6 +62,11 @@ pub struct OcrOutcome {
     pub char_count: usize,
     /// Number of non-empty recognized lines.
     pub line_count: usize,
+    /// Mean word confidence 0–100 (`-1` sentinel when no words).
+    pub mean_conf: f32,
+    /// `true` when the recognizer is not confident — likely handwriting /
+    /// low-resolution / non-printed input (`eng.lstm` is print-trained).
+    pub low_confidence: bool,
     /// Wall-clock recognition time in milliseconds (decode excluded).
     pub elapsed_ms: f64,
 }
@@ -79,6 +86,12 @@ pub struct OcrJsonOutcome {
     pub word_count: usize,
     /// Number of non-empty recognized lines.
     pub line_count: usize,
+    /// Mean word confidence 0–100 (`-1` sentinel when no words), rounded.
+    pub mean_conf: f32,
+    /// `true` when the recognizer is not confident — the image is likely
+    /// handwriting / low-resolution / not printed text (`eng.lstm` is a
+    /// print-trained model).
+    pub low_confidence: bool,
     /// Wall-clock recognition time in milliseconds (decode excluded).
     pub elapsed_ms: f64,
 }
@@ -128,9 +141,14 @@ fn decode_grey(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
     Ok((grey.into_raw(), w, h)) // Vec<u8>, row-major, len == w*h
 }
 
-/// Decode `bytes` to grey and run the full page-recognition path
-/// ([`LstmRecognizer::recognize_page_makerow`]). Returns text + stats, or a
-/// user-safe error string.
+/// Decode `bytes` to grey and run the page recognition via the WORD path
+/// ([`LstmRecognizer::recognize_page_makerow_words`]), rendering the plain
+/// text with [`render_text`]. This is byte-identical to the old string surface
+/// (`render_text(words).trim_end() == recognize_page_makerow`, a proven
+/// property) but ALSO yields per-word confidence, so text mode can report the
+/// same honesty signal as JSON mode — a low mean confidence flags likely
+/// handwriting / low-resolution / non-printed input. Returns text + stats, or
+/// a user-safe error string.
 ///
 /// This is heavy synchronous CPU work — callers MUST run it off the async
 /// runtime (via `spawn_blocking`); see [`crate::routes`].
@@ -138,12 +156,17 @@ pub fn ocr_image_bytes(state: &AppState, bytes: &[u8]) -> Result<OcrOutcome, Str
     let (raw, w, h) = decode_grey(bytes)?;
 
     let t0 = Instant::now();
-    let text = state
+    let lines = state
         .recognizer
-        .recognize_page_makerow(&raw, w, h, state.dict.as_ref())
+        .recognize_page_makerow_words(&raw, w, h, state.dict.as_ref())
         .map_err(|e| format!("recognition failed: {e}"))?;
+    let text = render_text(&lines, &state.recognizer.charset)
+        .trim_end()
+        .to_string();
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
+    let page = DocPage::from_line_words(&lines, &state.recognizer.charset, w as u32, h as u32);
+    let mean = mean_word_confidence(&page);
     let char_count = text.chars().count();
     let line_count = text.lines().filter(|l| !l.trim().is_empty()).count();
     Ok(OcrOutcome {
@@ -152,6 +175,8 @@ pub fn ocr_image_bytes(state: &AppState, bytes: &[u8]) -> Result<OcrOutcome, Str
         height: h,
         char_count,
         line_count,
+        mean_conf: mean.unwrap_or(-1.0),
+        low_confidence: mean.is_some_and(|mc| mc < LOW_CONFIDENCE_THRESHOLD),
         elapsed_ms,
     })
 }
@@ -181,6 +206,8 @@ pub fn ocr_image_bytes_json(state: &AppState, bytes: &[u8]) -> Result<OcrJsonOut
         height: h,
         word_count: doc.word_count,
         line_count: doc.line_count,
+        mean_conf: doc.mean_confidence.unwrap_or(-1.0),
+        low_confidence: doc.low_confidence,
         elapsed_ms,
     })
 }
