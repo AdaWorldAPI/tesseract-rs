@@ -20,6 +20,7 @@ the glibc-linked binary and ~4 MB of `eng` model data.
 | URL fetch | `reqwest` 0.12 (rustls) | rustls only — never openssl |
 | Body cap | axum `DefaultBodyLimit` + `tower-http` | 12 MB upload ceiling (both raised) |
 | OCR | `tesseract-ocr` + `tesseract-core` | The pure-Rust recognizer |
+| Structured output | `tesseract_ocr::structured` | `doc.v1` JSON DOM + German-invoice field harvest (numeric hardening, IBAN checksum, label-proximity fields) |
 
 ## Run locally
 
@@ -35,8 +36,18 @@ PORT=3000 MODEL_DIR=/path/to/model cargo run -p tesseract-ocr-web
 ```
 
 - **`file`** upload wins over a **`url`** when both are given.
-- The result page shows image size, character/line counts, and recognition
-  time, plus a **Download .txt** link (a `data:` URI, no temp files).
+- The form's **Text / JSON** radio (multipart field `format`, values `text` |
+  `json`; absent or unrecognized = `text`) picks the output shape:
+  - **Text** (default) — plain recognized text via
+    `LstmRecognizer::recognize_page_makerow`.
+  - **JSON** — the `tesseract-rs/doc.v1` structured document via
+    `LstmRecognizer::recognize_page_makerow_words` →
+    `DocPage::from_line_words` → `harden_numeric_tokens` →
+    `harvest_fields(german_invoice_fields())` → `render_json` (see
+    `tesseract_ocr::structured` for the schema).
+- The result page shows image size, a primary count (characters for text,
+  words for JSON), line count, and recognition time, plus a **Download**
+  link (a `data:` URI, no temp files) — `ocr.txt` or `result.json`.
 
 ## Ports — `$PORT`, not hardcoded
 
@@ -83,9 +94,12 @@ cargo test -p tesseract-ocr-web
 ```
 
 Covers the base64 download encoder (RFC 4648 vectors), the SSRF blocklist on
-literal IPs, non-http scheme rejection, a real corpus-page OCR (`page_01.pgm`
-→ contains "clock"), and a `GET /` 200 via `tower`'s `oneshot`. Tests that need
-the model skip gracefully if `corpus/model` is absent.
+literal IPs, non-http scheme rejection, the `format` field parser
+(`OutputFormat::from_field`), a real corpus-page OCR in both text mode
+(`page_01.pgm` → contains "clock") and JSON mode (→ starts with
+`{"schema":"tesseract-rs/doc.v1"` and contains a `"words"` array), and a
+`GET /` 200 via `tower`'s `oneshot`. Tests that need the model skip
+gracefully if `corpus/model` is absent.
 
 ## Deploy on Railway
 
@@ -127,4 +141,4 @@ credentials.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/` | Upload/URL form |
-| `POST` | `/ocr` | Multipart `file` or `url` → result page |
+| `POST` | `/ocr` | Multipart `file` or `url` (+ optional `format`: `text`\|`json`) → result page |

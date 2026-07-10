@@ -391,6 +391,52 @@ impl LstmRecognizer {
         h: usize,
         dict: Option<&DictLite>,
     ) -> Result<String, RecognizerError> {
+        // The shared makerow layout prefix (binarize → components → y-flip →
+        // filter → make_rows → xheight → per-row typographic crop) lives in
+        // [`Self::makerow_row_crops`] so this string method and
+        // [`Self::recognize_page_makerow_words`] cannot drift. The tail below
+        // is byte-identical to the pre-refactor loop: each non-empty row's
+        // crop → [`recognize_grey_line`] → keep the non-empty text → join with
+        // `'\n'`. (Rows the prefix skipped — empty `row.blobs` or a degenerate
+        // padded box — never surface as crops, exactly as the old `continue`s.)
+        //
+        // [`recognize_grey_line`]: LstmRecognizer::recognize_grey_line
+        let crops = self.makerow_row_crops(grey, w, h);
+        let mut lines: Vec<String> = Vec::with_capacity(crops.len());
+        for row in &crops {
+            let (_ids, text) =
+                self.recognize_grey_line(&row.crop, row.band_w, row.band_h, dict.cloned())?;
+            if !text.is_empty() {
+                lines.push(text);
+            }
+        }
+        Ok(lines.join("\n"))
+    }
+
+    /// The shared makerow layout prefix behind both
+    /// [`Self::recognize_page_makerow`] and
+    /// [`Self::recognize_page_makerow_words`]: binarize the page, find
+    /// components, run the real make_rows line finder, and emit — per
+    /// recognizable row, in top-of-page-first order — the padded typographic
+    /// crop plus that row's bottom-up `TBOX` line box in PAGE space.
+    ///
+    /// Factored out verbatim from the original `recognize_page_makerow` body so
+    /// the string and word surfaces feed the recognizer IDENTICAL crops in
+    /// IDENTICAL order; see [`Self::recognize_page_makerow`]'s doc comment for
+    /// the full chain rationale (Otsu → [`conn_comp_areas`] → [`filter_blobs`]
+    /// → [`make_rows`] → [`compute_block_xheight`] → `linerec.cpp:239-246`
+    /// typographic band + `GetRectImage` `kImagePadding = 4` pad/clip).
+    ///
+    /// Rows the pipeline cannot feed produce NO entry (mirroring the original
+    /// inline `continue`s): a row with empty `row.blobs`, or one whose
+    /// padded+clipped box is degenerate (`img_bottom <= img_top` or
+    /// `img_right <= img_left`).
+    ///
+    /// [`conn_comp_areas`]: crate::conncomp::conn_comp_areas
+    /// [`filter_blobs`]: crate::blob_filter::filter_blobs
+    /// [`make_rows`]: crate::textline::make_rows
+    /// [`compute_block_xheight`]: crate::textline::compute_block_xheight
+    fn makerow_row_crops(&self, grey: &[u8], w: usize, h: usize) -> Vec<MakerowRowCrop> {
         use crate::blob_filter::filter_blobs;
         use crate::conncomp::conn_comp_areas;
         use crate::textline::{compute_block_xheight, make_rows, ToBlockCtx};
@@ -438,7 +484,7 @@ impl LstmRecognizer {
         // wave 3's `compute_block_xheight`. The recognizer input is then the
         // proven prescale+FromPix path, exactly as `RecognizeLine` does.
         const K_IMAGE_PADDING: i32 = 4;
-        let mut lines: Vec<String> = Vec::with_capacity(block.rows.len());
+        let mut out: Vec<MakerowRowCrop> = Vec::with_capacity(block.rows.len());
         for row in &block.rows {
             if row.blobs.is_empty() {
                 continue;
@@ -479,12 +525,136 @@ impl LstmRecognizer {
             for y in img_top..img_bottom {
                 crop.extend_from_slice(&grey[y * w + img_left..y * w + img_right]);
             }
-            let (_ids, text) = self.recognize_grey_line(&crop, band_w, band_h, dict.cloned())?;
-            if !text.is_empty() {
-                lines.push(text);
-            }
+            // The raster crop rectangle → the bottom-up TBOX line box in PAGE
+            // space (renderer.rs:88-95 `LineWords::line_box` order). The prefix
+            // built img_* in raster (y-down) space; flip y back to the page's
+            // y-UP `TBOX` frame: bottom = h - img_bottom, top = h - img_top. x
+            // is unchanged (left = img_left, right = img_right). This is the box
+            // `extract_best_path_as_words` (recodebeam.rs:1663-1718) offsets
+            // char boundaries into, so char x lands at `img_left + boundary`.
+            let line_box = (
+                img_left as i32,
+                (h - img_bottom) as i32,
+                img_right as i32,
+                (h - img_top) as i32,
+            );
+            out.push(MakerowRowCrop {
+                crop,
+                band_w,
+                band_h,
+                line_box,
+            });
         }
-        Ok(lines.join("\n"))
+        out
+    }
+
+    /// **The word/box page surface** — the [`WordResult`]-returning counterpart
+    /// of [`Self::recognize_page_makerow`]. Runs the SAME makerow layout prefix
+    /// ([`Self::makerow_row_crops`] — so the two cannot drift and every crop is
+    /// byte-identical to the string path), then per row decodes to WORDS the way
+    /// [`Self::recognize_image_file_words`] does (`prepare_grid` →
+    /// `network.forward` → [`RecodeBeamSearch`] with the `None`/`Some(dict)`
+    /// arm's constants → [`RecodeBeamSearch::extract_best_path_as_words`],
+    /// recodebeam.rs:1663-1718). Returns one [`LineWords`](crate::renderer::LineWords)
+    /// per recognized row, top-of-page first — ready for
+    /// [`render_text`](crate::renderer::render_text) / `render_tsv` / `render_hocr`.
+    ///
+    /// ## The two precision points (both proven against the cited source)
+    ///
+    /// 1. **`line_box`** is the row's crop rectangle in bottom-up `TBOX` PAGE
+    ///    space `(left, bottom, right, top)` — [`makerow_row_crops`] flips the
+    ///    raster crop (`bottom = h - img_bottom`, `top = h - img_top`; x
+    ///    unchanged), matching `LineWords::line_box` (renderer.rs:88-95).
+    ///    `extract_best_path_as_words` (recodebeam.rs:1712-1718) offsets every
+    ///    char boundary by `line_box.left` and stamps `line_box.bottom` /
+    ///    `line_box.top` as the char box's vertical extent, so the words land in
+    ///    the row's page rectangle.
+    /// 2. **`scale_factor`** un-does the crop's prescale so char x lands in
+    ///    ORIGINAL page pixels. The crop (height `band_h`) is scaled to the
+    ///    network input height `target_h` by `im_factor = target_h / band_h`
+    ///    (`prescale_grey_to_height`, image_input.rs:137; the eng network is 1:1
+    ///    in x, so an output timestep column maps to one scaled-crop pixel
+    ///    column). `extract_best_path_as_words` MULTIPLIES char boundaries by
+    ///    `scale_factor` (recodebeam.rs:1713/1716), so the inverse
+    ///    `scale_factor = band_h / target_h = 1 / im_factor` recovers original
+    ///    crop pixels — exactly `ImageData::PreScale`'s `*scale_factor =
+    ///    1 / im_factor`. `target_h` is read as in [`prepare_grid`]
+    ///    (lstm_recognizer.rs:244-247); at model height (`band_h == target_h`)
+    ///    the factor is `1.0`, matching [`Self::recognize_image_file_words`].
+    ///
+    /// ## Skips (mirroring the string path)
+    ///
+    /// A row is dropped (nothing pushed) when its crop is too small to scale
+    /// (`prepare_grid` returns [`None`] — the `PrepareLSTMInputs` min-size gate,
+    /// input.cpp:92-96) OR when the beam yields no words — the word-surface
+    /// analogue of [`Self::recognize_page_makerow`] skipping an empty-text row,
+    /// so both surfaces report the same set of recognized lines.
+    ///
+    /// # Errors
+    ///
+    /// The first [`RecognizerError`] from any row's forward pass (or an
+    /// unexpected int-mode output — this path needs the softmax float logits).
+    ///
+    /// [`makerow_row_crops`]: LstmRecognizer::makerow_row_crops
+    /// [`prepare_grid`]: LstmRecognizer::prepare_grid
+    pub fn recognize_page_makerow_words(
+        &self,
+        grey: &[u8],
+        w: usize,
+        h: usize,
+        dict: Option<&DictLite>,
+    ) -> Result<Vec<crate::renderer::LineWords>, RecognizerError> {
+        // Same target height prepare_grid derives (lstm_recognizer.rs:244-247);
+        // scale_factor = band_h / target_h = 1 / im_factor un-does the prescale.
+        let target_h = self
+            .network
+            .input_shape
+            .map_or(36, |s| s.height.max(1) as usize);
+        let crops = self.makerow_row_crops(grey, w, h);
+        let mut out: Vec<crate::renderer::LineWords> = Vec::with_capacity(crops.len());
+        for row in &crops {
+            // PrepareLSTMInputs min-size gate (input.cpp:92-96): a crop too
+            // small to scale is unrecognizable — RecognizeLine skips it, so we
+            // push nothing (the word analogue of the string path's empty-text
+            // skip).
+            let Some((grid, mut rng)) = self.prepare_grid(&row.crop, row.band_w, row.band_h) else {
+                continue;
+            };
+            let outputs = self.network.forward(&grid, &mut rng)?;
+            if outputs.int_mode() {
+                return Err(RecognizerError::Network(NetError::Forward(
+                    "recognize_page_makerow_words expects softmax float logits (int-mode output)",
+                )));
+            }
+            let simple = self.network.simple_text_output();
+            let logits: Vec<&[f32]> = (0..outputs.width()).map(|t| outputs.f(t)).collect();
+            let scale_factor = row.band_h as f32 / target_h as f32;
+            let words = if let Some(dict) = dict.cloned() {
+                let mut beam = RecodeBeamSearch::new_with_dict(
+                    &self.recoder,
+                    self.null_char,
+                    simple,
+                    dict,
+                    self.charset.clone(),
+                );
+                beam.decode_with_dict(&logits, K_DICT_RATIO, K_CERT_OFFSET, K_WORST_DICT_CERT);
+                beam.extract_best_path_as_words(row.line_box, scale_factor, &self.charset)
+            } else {
+                let mut beam = RecodeBeamSearch::new(&self.recoder, self.null_char, simple);
+                beam.decode(&logits, 1.0, 0.0);
+                beam.extract_best_path_as_words(row.line_box, scale_factor, &self.charset)
+            };
+            // Mirror the string path's `if !text.is_empty()`: a row that decodes
+            // to no words contributes nothing.
+            if words.is_empty() {
+                continue;
+            }
+            out.push(crate::renderer::LineWords {
+                words,
+                line_box: row.line_box,
+            });
+        }
+        Ok(out)
     }
 
     /// `LSTMRecognizer::SetRandomSeed` (`lstmrecognizer.h:287-291`): the exact
@@ -656,6 +826,23 @@ impl LstmRecognizer {
     }
 }
 
+/// One recognizable row emitted by [`LstmRecognizer::makerow_row_crops`]: the
+/// padded typographic crop (raster grey, `band_h × band_w`) plus that row's
+/// bottom-up `TBOX` line box in PAGE space `(left, bottom, right, top)`. The
+/// shared unit consumed by both `recognize_page_makerow` (string) and
+/// `recognize_page_makerow_words` (words) so the two feed identical crops.
+struct MakerowRowCrop {
+    /// Raster-order grey crop, `band_h` rows of `band_w` bytes.
+    crop: Vec<u8>,
+    /// Crop width in original page pixels.
+    band_w: usize,
+    /// Crop height in original page pixels.
+    band_h: usize,
+    /// The crop rectangle in bottom-up `TBOX` PAGE space `(left, bottom, right,
+    /// top)` — the `line_box` passed to `extract_best_path_as_words`.
+    line_box: (i32, i32, i32, i32),
+}
+
 /// Reads the lstm component's trailing scalar fields (`TFile` LE encoding,
 /// starting where `Network::from_le_bytes` stopped).
 struct TailReader<'a> {
@@ -806,6 +993,92 @@ mod makerow_page_tests {
         assert!(
             ids.is_empty() && text.is_empty(),
             "too-small line yields nothing"
+        );
+    }
+
+    /// The word page surface must report the SAME set of recognized lines as the
+    /// string surface (both run [`LstmRecognizer::makerow_row_crops`], so a row
+    /// that produces text must produce ≥1 word and vice-versa), and every word's
+    /// char box must sit inside its row's `line_box` — the second precision
+    /// point. Char boxes come back in bottom-up PAGE space `(left, bottom,
+    /// right, top)` from `extract_best_path_as_words`; `line_box` bottom/top were
+    /// derived from the raster crop via `h` (`bottom = h - img_bottom`,
+    /// `top = h - img_top`). Allow the `kImagePadding = 4` slack on all sides.
+    #[test]
+    fn words_page_matches_string_lines_and_boxes_within_line_box() {
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+        // Graceful skip when the (gitignored) model / fixtures are absent.
+        if !corpus.join("model/eng.lstm").exists() || !corpus.join("lines/page_roomy.pgm").exists()
+        {
+            return;
+        }
+        let lstm = std::fs::read(corpus.join("model/eng.lstm")).unwrap();
+        let uni = std::fs::read_to_string(corpus.join("model/eng.lstm-unicharset")).unwrap();
+        let rec = std::fs::read(corpus.join("model/eng.lstm-recoder")).unwrap();
+        let img = std::fs::read(corpus.join("lines/page_roomy.pgm")).unwrap();
+        let r = LstmRecognizer::from_components(&lstm, &uni, &rec).unwrap();
+        let (grey, w, h) = crate::image_input::parse_pgm(&img).unwrap();
+
+        let string_out = r.recognize_page_makerow(&grey, w, h, None).unwrap();
+        let string_lines = string_out.split('\n').count();
+        let words = r.recognize_page_makerow_words(&grey, w, h, None).unwrap();
+
+        assert_eq!(
+            words.len(),
+            string_lines,
+            "word surface must report the same non-empty line count as the string surface: \
+             string={string_out:?} words={} lines",
+            words.len()
+        );
+
+        const PAD: i32 = 4;
+        for line in &words {
+            let (lb_left, lb_bottom, lb_right, lb_top) = line.line_box;
+            for word in &line.words {
+                for &(cl, cb, cr, ct) in &word.char_boxes {
+                    // Char boxes carry line_box's own bottom/top verbatim
+                    // (extract_best_path_as_words stamps them), so the vertical
+                    // extent is exact; x is offset by line_box.left and must land
+                    // within [left - PAD, right + PAD].
+                    assert_eq!(cb, lb_bottom, "char box bottom = line_box bottom");
+                    assert_eq!(ct, lb_top, "char box top = line_box top");
+                    assert!(
+                        cl >= lb_left - PAD && cr <= lb_right + PAD,
+                        "char x [{cl},{cr}] must lie within line_box x \
+                         [{lb_left},{lb_right}] (±{PAD})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `render_text` over the word surface must reconstruct the string surface's
+    /// page text (bar the renderer's trailing `line_separator_` newline, hence
+    /// `trim_end`). Both walk the same beam output per row; the word split drops
+    /// the `UNICHAR_SPACE` separators and `render_text` re-inserts them from
+    /// [`WordResult::leading_space`], so the per-line concatenation equals
+    /// `ids_to_text` over the row's full id run — the string path's text.
+    #[test]
+    fn render_text_of_words_equals_string_surface() {
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+        if !corpus.join("model/eng.lstm").exists() || !corpus.join("lines/page_roomy.pgm").exists()
+        {
+            return;
+        }
+        let lstm = std::fs::read(corpus.join("model/eng.lstm")).unwrap();
+        let uni = std::fs::read_to_string(corpus.join("model/eng.lstm-unicharset")).unwrap();
+        let rec = std::fs::read(corpus.join("model/eng.lstm-recoder")).unwrap();
+        let img = std::fs::read(corpus.join("lines/page_roomy.pgm")).unwrap();
+        let r = LstmRecognizer::from_components(&lstm, &uni, &rec).unwrap();
+        let (grey, w, h) = crate::image_input::parse_pgm(&img).unwrap();
+
+        let string_out = r.recognize_page_makerow(&grey, w, h, None).unwrap();
+        let words = r.recognize_page_makerow_words(&grey, w, h, None).unwrap();
+        let rendered = crate::renderer::render_text(&words, &r.charset);
+        assert_eq!(
+            rendered.trim_end(),
+            string_out,
+            "render_text(words).trim_end() must equal the string surface"
         );
     }
 }
