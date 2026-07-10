@@ -23,24 +23,30 @@ pub mod lstm_recognizer;
 pub mod morph;
 pub mod network;
 pub mod page_furniture;
+pub mod pageseg;
 pub mod renderer;
+pub mod seedfill;
 pub mod stats;
 pub mod structured;
 pub mod textline;
 pub mod threshold;
 pub mod xy_cut;
 
-pub use binreduce::{expand_binary_power2, reduce_rank_binary2, reduce_rank_binary_cascade};
+pub use binreduce::{
+    expand_binary_power2, expand_replicate, reduce_rank_binary2, reduce_rank_binary_cascade,
+};
 pub use blob_filter::{filter_blobs, FilteredBlobs};
 pub use conncomp::{conn_comp_areas, conn_comp_bb, ConnComp, ConnCompBox};
 pub use image_input::{parse_pgm, prescale_grey_to_height, PgmError};
 #[cfg(feature = "seg-approx")]
 pub use line_segment::{find_text_lines, LineBand};
 pub use lstm_recognizer::{LstmRecognizer, RecognizerError};
-pub use morph::{close_brick, dilate_brick, erode_brick, open_brick};
+pub use morph::{close_brick, close_safe_brick, dilate_brick, erode_brick, open_brick};
 pub use network::{InputShape, NetError, Network, Node, ReverseKind};
 pub use page_furniture::{detect_page_furniture, PageFurniture};
+pub use pageseg::{generate_halftone_mask, HalftoneMask, MIN_HEIGHT, MIN_WIDTH};
 pub use renderer::{render_hocr, render_text, render_tsv, LineWords};
+pub use seedfill::seedfill_binary;
 pub use stats::Stats;
 pub use structured::{
     german_invoice_fields, harden_numeric_token, harden_numeric_tokens, harvest_fields,
