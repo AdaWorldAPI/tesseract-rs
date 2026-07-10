@@ -16,6 +16,7 @@
 //!   "schema": "tesseract-rs/doc.v1",
 //!   "pages": [{
 //!     "page": 1, "width": 2480, "height": 3508,
+//!     "quality": {"mean_conf": 96.10, "low_confidence": false},
 //!     "regions": [{
 //!       "type": "paragraph",
 //!       "bbox": [l, t, r, b],
@@ -43,6 +44,11 @@
 //!   (XY-cut blocks, reading order), `"figure"` (halftone-mask components),
 //!   `"header"`/`"footer"` (page furniture). Additive `type` values;
 //!   consumers must ignore unknown ones.
+//! - `quality.mean_conf` is the mean word confidence 0–100 (`null` when no
+//!   words), and `low_confidence` flags a page below
+//!   [`LOW_CONFIDENCE_THRESHOLD`] — the honesty signal that the input is
+//!   likely handwriting / low-resolution / not printed text (`eng.lstm` is
+//!   print-trained). See [`mean_word_confidence`].
 //! - `numeric_norm` appears only on words the numeric hardening pass changed;
 //!   `fields` only when a harvest ran. Consumers must ignore unknown keys.
 //!
@@ -171,6 +177,35 @@ fn json_escape(text: &str) -> String {
 fn json_bbox(b: (i32, i32, i32, i32)) -> String {
     format!("[{},{},{},{}]", b.0, b.1, b.2, b.3)
 }
+
+/// The mean word confidence (0–100) over all words on the page, or `None`
+/// when the page has no words. This is the page-level quality signal: the
+/// recognizer's per-word confidence is the min over its character CTC
+/// certainties (`100 + 5·min_cert`, clamped) — on clean printed text it sits
+/// in the high 80s–100s; on OUT-OF-DISTRIBUTION input (handwriting,
+/// low-resolution, or non-text) the softmax flattens, the certainties
+/// collapse, and the mean drops sharply. It is a signal, NOT a proof — see
+/// [`LOW_CONFIDENCE_THRESHOLD`].
+#[must_use]
+pub fn mean_word_confidence(page: &DocPage) -> Option<f32> {
+    let (sum, n) = page
+        .lines
+        .iter()
+        .flat_map(|l| &l.words)
+        .fold((0.0_f32, 0_usize), |(s, n), w| (s + w.conf, n + 1));
+    (n > 0).then(|| sum / n as f32)
+}
+
+/// The mean-confidence floor below which a page is flagged `low_confidence`
+/// in `doc.v1` — a **heuristic**, deliberately conservative, NOT calibrated
+/// against a labelled handwriting corpus. `eng.lstm` is a PRINT-trained model
+/// (Tesseract's CTC-LSTM has no handwriting support in the standard tessdata),
+/// so a handwritten or otherwise unreadable page produces confidently-shaped
+/// but low-certainty garbage; this floor lets a consumer surface "the model is
+/// not confident — this may be handwriting / low-res / not printed text"
+/// instead of returning the garbage silently. Tune per deployment; the raw
+/// `mean_conf` value is always emitted so a consumer can apply its own gate.
+pub const LOW_CONFIDENCE_THRESHOLD: f32 = 65.0;
 
 /// Internal emit unit shared by both renderers: the `type` string, the
 /// region bbox, and the owned line indices.
@@ -350,6 +385,17 @@ fn render_doc(page: &DocPage, regions: &[EmitRegion], fields: &[HarvestedField])
         "\"page\":1,\"width\":{},\"height\":{},",
         page.width, page.height
     ));
+
+    // Page-level quality signal (the honesty layer): mean word confidence +
+    // the low-confidence flag. `mean_conf` is `null` on a page with no words.
+    match mean_word_confidence(page) {
+        Some(mc) => out.push_str(&format!(
+            "\"quality\":{{\"mean_conf\":{:.2},\"low_confidence\":{}}},",
+            mc,
+            mc < LOW_CONFIDENCE_THRESHOLD
+        )),
+        None => out.push_str("\"quality\":{\"mean_conf\":null,\"low_confidence\":false},"),
+    }
 
     out.push_str("\"regions\":[");
     for (ri, (kind, bbox, line_indices)) in regions.iter().enumerate() {
@@ -1138,6 +1184,7 @@ mod tests {
         let expected = concat!(
             "{\"schema\":\"tesseract-rs/doc.v1\",\"pages\":[{",
             "\"page\":1,\"width\":10,\"height\":10,",
+            "\"quality\":{\"mean_conf\":100.00,\"low_confidence\":false},",
             "\"regions\":[{\"type\":\"paragraph\",\"bbox\":[0,0,10,10],",
             "\"lines\":[{\"bbox\":[0,0,10,10],\"words\":[",
             "{\"text\":\"a\",\"bbox\":[0,0,4,10],\"conf\":100.00,\"leading_space\":false}",
@@ -1160,8 +1207,43 @@ mod tests {
         assert_eq!(
             json,
             "{\"schema\":\"tesseract-rs/doc.v1\",\"pages\":[{\"page\":1,\
-             \"width\":5,\"height\":5,\"regions\":[],\"fields\":[]}]}"
+             \"width\":5,\"height\":5,\"quality\":{\"mean_conf\":null,\
+             \"low_confidence\":false},\"regions\":[],\"fields\":[]}]}"
         );
+    }
+
+    #[test]
+    fn low_confidence_flags_garbled_output_but_not_clean_text() {
+        // Clean text: high conf → not flagged.
+        let clean = DocPage {
+            width: 100,
+            height: 20,
+            lines: vec![dl(
+                (0, 0, 100, 20),
+                vec![dw("Rechnung", (0, 0, 80, 20), 96.0)],
+            )],
+        };
+        assert_eq!(mean_word_confidence(&clean), Some(96.0));
+        assert!(render_json(&clean, &[]).contains("\"low_confidence\":false"));
+
+        // Garble (e.g. handwriting): low conf across words → flagged.
+        let garble = DocPage {
+            width: 100,
+            height: 20,
+            lines: vec![dl(
+                (0, 0, 100, 20),
+                vec![
+                    dw("xq", (0, 0, 20, 20), 41.0),
+                    dw("z,", (30, 0, 50, 20), 38.0),
+                ],
+            )],
+        };
+        let mc = mean_word_confidence(&garble).unwrap();
+        assert!(
+            mc < LOW_CONFIDENCE_THRESHOLD,
+            "garble mean {mc} must be below floor"
+        );
+        assert!(render_json(&garble, &[]).contains("\"low_confidence\":true"));
     }
 
     #[test]

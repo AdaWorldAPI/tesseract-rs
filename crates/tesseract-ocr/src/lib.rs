@@ -59,9 +59,9 @@ pub use seedfill::seedfill_binary;
 pub use stats::Stats;
 pub use structured::{
     build_regions, german_invoice_fields, harden_numeric_token, harden_numeric_tokens,
-    harvest_fields, iban_mod97_ok, looks_like_guid, looks_like_iban, parse_amount_cents,
-    render_json, render_json_with_regions, DocLine, DocPage, DocRegion, DocWord, FieldKind,
-    FieldSpec, HarvestedField, RegionKind,
+    harvest_fields, iban_mod97_ok, looks_like_guid, looks_like_iban, mean_word_confidence,
+    parse_amount_cents, render_json, render_json_with_regions, DocLine, DocPage, DocRegion,
+    DocWord, FieldKind, FieldSpec, HarvestedField, RegionKind, LOW_CONFIDENCE_THRESHOLD,
 };
 pub use textline::{
     adjust_row_limits, assign_blobs_to_rows, cleanup_rows_making, compute_block_xheight,

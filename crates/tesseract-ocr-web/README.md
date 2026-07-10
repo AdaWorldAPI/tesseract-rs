@@ -38,16 +38,21 @@ PORT=3000 MODEL_DIR=/path/to/model cargo run -p tesseract-ocr-web
 - **`file`** upload wins over a **`url`** when both are given.
 - The form's **Text / JSON** radio (multipart field `format`, values `text` |
   `json`; absent or unrecognized = `text`) picks the output shape:
-  - **Text** (default) — plain recognized text via
-    `LstmRecognizer::recognize_page_makerow`.
+  - **Text** (default) — plain recognized text (via the word path +
+    `render_text`, so it carries a confidence score too).
   - **JSON** — the `tesseract-rs/doc.v1` structured document via
-    `LstmRecognizer::recognize_page_makerow_words` →
-    `DocPage::from_line_words` → `harden_numeric_tokens` →
-    `harvest_fields(german_invoice_fields())` → `render_json` (see
-    `tesseract_ocr::structured` for the schema).
+    `LstmRecognizer::recognize_document` (word recognition →
+    `DocPage` → numeric hardening → German-invoice harvest → region
+    classification → `render_json_with_regions`), the one canonical
+    composition this crate and the `tesseract-ogar` executor share.
+- Both modes report a **confidence** score (mean word confidence 0–100) and
+  flag a **low-confidence** result with a warning banner. The bundled `eng`
+  model is trained on **printed text only** — handwriting is not supported
+  and produces confident-looking but wrong output, so a low score (or the
+  banner) means the text is unreliable, not that recognition failed silently.
 - The result page shows image size, a primary count (characters for text,
-  words for JSON), line count, and recognition time, plus a **Download**
-  link (a `data:` URI, no temp files) — `ocr.txt` or `result.json`.
+  words for JSON), line count, confidence, and recognition time, plus a
+  **Download** link (a `data:` URI, no temp files) — `ocr.txt` or `result.json`.
 
 ## Ports — `$PORT`, not hardcoded
 

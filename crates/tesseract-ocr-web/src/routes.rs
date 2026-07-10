@@ -30,12 +30,27 @@ struct ResultTemplate {
     primary_count: usize,
     line_count: usize,
     elapsed_ms: String,
+    /// Mean word confidence rendered for display (`"96"`, or `"—"` when no
+    /// words were recognized).
+    confidence: String,
+    /// `true` when the recognizer was not confident — the result page shows a
+    /// warning banner (likely handwriting / low-resolution / non-printed text).
+    low_confidence: bool,
     /// The text to show in the result `<pre>` block: recognized text, or the
     /// rendered JSON document. Askama HTML-escapes this on render.
     text: String,
     download_datauri: String,
     /// The download link's filename: `ocr.txt` or `result.json`.
     download_filename: &'static str,
+}
+
+/// Render a mean-confidence value (`-1` sentinel = no words) for display.
+fn confidence_str(mean_conf: f32) -> String {
+    if mean_conf < 0.0 {
+        "\u{2014}".to_string() // em dash
+    } else {
+        format!("{}", mean_conf.round() as i32)
+    }
 }
 
 /// Build the application router. Uploads are capped at 12 MB — this needs BOTH
@@ -182,6 +197,8 @@ fn result_of_text(out: OcrOutcome) -> ResultTemplate {
         primary_count: out.char_count,
         line_count: out.line_count,
         elapsed_ms: format!("{:.1}", out.elapsed_ms),
+        confidence: confidence_str(out.mean_conf),
+        low_confidence: out.low_confidence,
         text: out.text,
         download_datauri: datauri,
         download_filename: "ocr.txt",
@@ -200,6 +217,8 @@ fn result_of_json(out: OcrJsonOutcome) -> ResultTemplate {
         primary_count: out.word_count,
         line_count: out.line_count,
         elapsed_ms: format!("{:.1}", out.elapsed_ms),
+        confidence: confidence_str(out.mean_conf),
+        low_confidence: out.low_confidence,
         text: out.json,
         download_datauri: datauri,
         download_filename: "result.json",

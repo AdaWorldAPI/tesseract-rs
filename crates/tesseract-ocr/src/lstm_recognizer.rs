@@ -96,6 +96,15 @@ pub struct Document {
     pub word_count: usize,
     /// Number of non-empty recognized lines.
     pub line_count: usize,
+    /// Mean word confidence (0–100), or `None` when no words were recognized.
+    /// The honesty signal — see [`crate::structured::mean_word_confidence`].
+    pub mean_confidence: Option<f32>,
+    /// `true` when `mean_confidence` is below
+    /// [`LOW_CONFIDENCE_THRESHOLD`](crate::structured::LOW_CONFIDENCE_THRESHOLD)
+    /// — the page is likely handwriting / low-resolution / not printed text
+    /// (`eng.lstm` is a print-trained model). A conservative heuristic, not a
+    /// proof.
+    pub low_confidence: bool,
 }
 
 /// A loaded LSTM recognizer — the network plus the char-set / recoder tissue and
@@ -729,11 +738,16 @@ impl LstmRecognizer {
         let json = crate::structured::render_json_with_regions(&page, &regions, &fields);
         let word_count = page.lines.iter().map(|l| l.words.len()).sum();
         let line_count = page.lines.len();
+        let mean_confidence = crate::structured::mean_word_confidence(&page);
+        let low_confidence =
+            mean_confidence.is_some_and(|mc| mc < crate::structured::LOW_CONFIDENCE_THRESHOLD);
         Ok(Document {
             json,
             fields,
             word_count,
             line_count,
+            mean_confidence,
+            low_confidence,
         })
     }
 
