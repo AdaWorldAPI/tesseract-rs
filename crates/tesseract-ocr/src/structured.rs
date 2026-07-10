@@ -37,10 +37,12 @@
 //!   the other renderers use).
 //! - `conf` is the same 0–100 word confidence as TSV/hOCR
 //!   (`ClipToRange(100 + 5·min(cert))`).
-//! - `regions` currently holds exactly ONE `"paragraph"` region (this crate
-//!   has no layout classifier yet — same single-block APPROX as TSV/hOCR).
-//!   The array shape is deliberate: a future region classifier
-//!   (table/figure/header/footer) extends `type` without a schema break.
+//! - `regions`: [`render_json`] emits ONE `"paragraph"` region (the plain
+//!   default, byte-stable); [`render_json_with_regions`] emits CLASSIFIED
+//!   regions built by [`build_regions`] from the layout stack — `"text"`
+//!   (XY-cut blocks, reading order), `"figure"` (halftone-mask components),
+//!   `"header"`/`"footer"` (page furniture). Additive `type` values;
+//!   consumers must ignore unknown ones.
 //! - `numeric_norm` appears only on words the numeric hardening pass changed;
 //!   `fields` only when a harvest ran. Consumers must ignore unknown keys.
 //!
@@ -170,6 +172,10 @@ fn json_bbox(b: (i32, i32, i32, i32)) -> String {
     format!("[{},{},{},{}]", b.0, b.1, b.2, b.3)
 }
 
+/// Internal emit unit shared by both renderers: the `type` string, the
+/// region bbox, and the owned line indices.
+type EmitRegion<'a> = (&'a str, (i32, i32, i32, i32), Vec<usize>);
+
 /// Serialize one page (plus an optional field harvest) as a `doc.v1` JSON
 /// document — see the module docs for the schema. `fields` may be empty
 /// (serialized as `"fields":[]` so the key is always present and consumers
@@ -179,6 +185,165 @@ fn json_bbox(b: (i32, i32, i32, i32)) -> String {
 /// 0.5-steps the `100 + 5·cert` formula produces, without float noise.
 #[must_use]
 pub fn render_json(page: &DocPage, fields: &[HarvestedField]) -> String {
+    // Default region synthesis: one "paragraph" over all lines — bbox = union
+    // of the line boxes, same APPROX policy as TSV/hOCR's block/par rows. An
+    // all-empty page emits an empty regions array. (The typed-region surface
+    // is [`render_json_with_regions`]; this default keeps the plain renderer's
+    // output byte-stable.)
+    let default_regions: Vec<EmitRegion> = if page.lines.is_empty() {
+        Vec::new()
+    } else {
+        let region_box = page.lines.iter().skip(1).fold(page.lines[0].bbox, |a, l| {
+            let b = l.bbox;
+            (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+        });
+        vec![("paragraph", region_box, (0..page.lines.len()).collect())]
+    };
+    render_doc(page, &default_regions, fields)
+}
+
+/// The kind of a classified [`DocRegion`] — the `type` value it serializes
+/// as in `doc.v1`. Additive to the schema: `"paragraph"` (the
+/// [`render_json`] default) and these four coexist; consumers must ignore
+/// unknown values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionKind {
+    /// Body text (an XY-cut block's lines).
+    Text,
+    /// An image / halftone region (from the halftone mask; carries no lines).
+    Figure,
+    /// Page-furniture header lines.
+    Header,
+    /// Page-furniture footer lines.
+    Footer,
+}
+
+impl RegionKind {
+    /// The `doc.v1` `type` string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RegionKind::Text => "text",
+            RegionKind::Figure => "figure",
+            RegionKind::Header => "header",
+            RegionKind::Footer => "footer",
+        }
+    }
+}
+
+/// One classified page region: its kind, its top-down bbox, and the indices
+/// of the [`DocPage::lines`] it owns (empty for [`RegionKind::Figure`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocRegion {
+    /// The region's kind (serialized as the `type` value).
+    pub kind: RegionKind,
+    /// Top-down image bbox `(left, top, right, bottom)`.
+    pub bbox: (i32, i32, i32, i32),
+    /// Indices into [`DocPage::lines`], in reading order.
+    pub line_indices: Vec<usize>,
+}
+
+/// Union of two top-down boxes.
+fn union_bbox(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+}
+
+/// Assemble typed regions from the classifier outputs:
+///
+/// - `header_lines` / `footer_lines` — line indices from the page-furniture
+///   detector (`crate::page_furniture`).
+/// - `blocks` — layout blocks in READING ORDER (e.g. `crate::xy_cut` leaves as
+///   top-down `(l, t, r, b)`); each remaining line joins the FIRST block
+///   containing its bbox center.
+/// - `figures` — image-region bboxes (e.g. halftone-mask components,
+///   `crate::pageseg`); they own no lines.
+///
+/// Emission order: header, blocks (with their lines, block order), a
+/// catch-all `Text` region for body lines no block claimed (only if any),
+/// figures, footer. Line-bearing regions get the union of their lines'
+/// bboxes; empty blocks are dropped.
+#[must_use]
+pub fn build_regions(
+    page: &DocPage,
+    header_lines: &[usize],
+    footer_lines: &[usize],
+    blocks: &[(i32, i32, i32, i32)],
+    figures: &[(i32, i32, i32, i32)],
+) -> Vec<DocRegion> {
+    let mut block_members: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
+    let mut header: Vec<usize> = Vec::new();
+    let mut footer: Vec<usize> = Vec::new();
+    let mut orphans: Vec<usize> = Vec::new();
+
+    for (i, line) in page.lines.iter().enumerate() {
+        if header_lines.contains(&i) {
+            header.push(i);
+            continue;
+        }
+        if footer_lines.contains(&i) {
+            footer.push(i);
+            continue;
+        }
+        let cx = (line.bbox.0 + line.bbox.2) / 2;
+        let cy = (line.bbox.1 + line.bbox.3) / 2;
+        match blocks
+            .iter()
+            .position(|&(l, t, r, b)| cx >= l && cx < r && cy >= t && cy < b)
+        {
+            Some(bi) => block_members[bi].push(i),
+            None => orphans.push(i),
+        }
+    }
+
+    let lines_region = |kind: RegionKind, members: &[usize]| -> Option<DocRegion> {
+        let first = *members.first()?;
+        let bbox = members
+            .iter()
+            .skip(1)
+            .fold(page.lines[first].bbox, |a, &i| {
+                union_bbox(a, page.lines[i].bbox)
+            });
+        Some(DocRegion {
+            kind,
+            bbox,
+            line_indices: members.to_vec(),
+        })
+    };
+
+    let mut out: Vec<DocRegion> = Vec::new();
+    out.extend(lines_region(RegionKind::Header, &header));
+    for members in &block_members {
+        out.extend(lines_region(RegionKind::Text, members));
+    }
+    out.extend(lines_region(RegionKind::Text, &orphans));
+    out.extend(figures.iter().map(|&bbox| DocRegion {
+        kind: RegionKind::Figure,
+        bbox,
+        line_indices: Vec::new(),
+    }));
+    out.extend(lines_region(RegionKind::Footer, &footer));
+    out
+}
+
+/// Serialize with CLASSIFIED regions (see [`build_regions`]) instead of the
+/// single-`"paragraph"` default. Same `doc.v1` shape; `type` takes the
+/// [`RegionKind`] values.
+#[must_use]
+pub fn render_json_with_regions(
+    page: &DocPage,
+    regions: &[DocRegion],
+    fields: &[HarvestedField],
+) -> String {
+    let mapped: Vec<EmitRegion> = regions
+        .iter()
+        .map(|r| (r.kind.as_str(), r.bbox, r.line_indices.clone()))
+        .collect();
+    render_doc(page, &mapped, fields)
+}
+
+/// The shared `doc.v1` emitter over `(type, bbox, line indices)` regions —
+/// both public renderers route through here so the schema cannot fork.
+fn render_doc(page: &DocPage, regions: &[EmitRegion], fields: &[HarvestedField]) -> String {
     let mut out = String::new();
     out.push_str("{\"schema\":\"tesseract-rs/doc.v1\",\"pages\":[{");
     out.push_str(&format!(
@@ -186,19 +351,16 @@ pub fn render_json(page: &DocPage, fields: &[HarvestedField]) -> String {
         page.width, page.height
     ));
 
-    // Exactly one "paragraph" region today (no layout classifier yet) —
-    // bbox = union of the line boxes, same APPROX policy as TSV/hOCR's
-    // block/par rows. An all-empty page emits an empty regions array.
     out.push_str("\"regions\":[");
-    if !page.lines.is_empty() {
-        let region_box = page.lines.iter().skip(1).fold(page.lines[0].bbox, |a, l| {
-            let b = l.bbox;
-            (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
-        });
-        out.push_str("{\"type\":\"paragraph\",\"bbox\":");
-        out.push_str(&json_bbox(region_box));
+    for (ri, (kind, bbox, line_indices)) in regions.iter().enumerate() {
+        if ri > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("{{\"type\":\"{kind}\",\"bbox\":"));
+        out.push_str(&json_bbox(*bbox));
         out.push_str(",\"lines\":[");
-        for (li, line) in page.lines.iter().enumerate() {
+        for (li, &line_idx) in line_indices.iter().enumerate() {
+            let line = &page.lines[line_idx];
             if li > 0 {
                 out.push(',');
             }
@@ -1016,6 +1178,99 @@ mod tests {
         let json = render_json(&page, &[]);
         assert!(json.contains("\"text\":\"2S0,00\""));
         assert!(json.contains("\"numeric_norm\":\"250,00\""));
+    }
+
+    // --- regions -----------------------------------------------------------
+
+    /// Synthetic classified page: header line, two body lines in two blocks,
+    /// an orphan body line outside every block, a footer line, one figure.
+    #[test]
+    fn build_regions_assigns_kinds_blocks_and_orphans_in_order() {
+        let page = DocPage {
+            width: 400,
+            height: 300,
+            lines: vec![
+                dl((10, 5, 200, 15), vec![dw("Kopf", (10, 5, 60, 15), 95.0)]), // 0 header
+                dl((10, 50, 180, 70), vec![dw("links", (10, 50, 80, 70), 95.0)]), // 1 block A
+                dl(
+                    (210, 50, 380, 70),
+                    vec![dw("rechts", (210, 50, 300, 70), 95.0)],
+                ), // 2 block B
+                dl(
+                    (10, 150, 180, 170),
+                    vec![dw("verwaist", (10, 150, 100, 170), 95.0)],
+                ), // 3 orphan
+                dl(
+                    (10, 280, 200, 295),
+                    vec![dw("Seite", (10, 280, 60, 295), 95.0)],
+                ), // 4 footer
+            ],
+        };
+        let blocks = [(0, 40, 200, 100), (200, 40, 400, 100)];
+        let figures = [(250, 150, 380, 250)];
+        let regions = build_regions(&page, &[0], &[4], &blocks, &figures);
+
+        let kinds: Vec<&str> = regions.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            ["header", "text", "text", "text", "figure", "footer"],
+            "order: header, blocks, orphan catch-all, figures, footer"
+        );
+        assert_eq!(regions[0].line_indices, [0]);
+        assert_eq!(regions[1].line_indices, [1]);
+        assert_eq!(regions[2].line_indices, [2]);
+        assert_eq!(regions[3].line_indices, [3], "orphan catch-all");
+        assert!(regions[4].line_indices.is_empty(), "figures own no lines");
+        assert_eq!(regions[4].bbox, (250, 150, 380, 250));
+        assert_eq!(regions[5].line_indices, [4]);
+        // Line-bearing region bbox = union of member line bboxes.
+        assert_eq!(regions[1].bbox, (10, 50, 180, 70));
+    }
+
+    #[test]
+    fn build_regions_drops_empty_blocks_and_skips_missing_sections() {
+        let page = DocPage {
+            width: 100,
+            height: 100,
+            lines: vec![dl(
+                (10, 10, 90, 30),
+                vec![dw("nur", (10, 10, 40, 30), 95.0)],
+            )],
+        };
+        // Two blocks, only the first is populated; no furniture, no figures.
+        let blocks = [(0, 0, 100, 50), (0, 50, 100, 100)];
+        let regions = build_regions(&page, &[], &[], &blocks, &[]);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].kind, RegionKind::Text);
+        assert_eq!(regions[0].line_indices, [0]);
+    }
+
+    #[test]
+    fn render_json_with_regions_emits_typed_regions() {
+        let page = DocPage {
+            width: 50,
+            height: 50,
+            lines: vec![dl((0, 0, 50, 10), vec![dw("a", (0, 0, 10, 10), 100.0)])],
+        };
+        let regions = vec![
+            DocRegion {
+                kind: RegionKind::Text,
+                bbox: (0, 0, 50, 10),
+                line_indices: vec![0],
+            },
+            DocRegion {
+                kind: RegionKind::Figure,
+                bbox: (5, 20, 45, 45),
+                line_indices: vec![],
+            },
+        ];
+        let json = render_json_with_regions(&page, &regions, &[]);
+        assert!(json.contains("\"type\":\"text\""));
+        assert!(json.contains("{\"type\":\"figure\",\"bbox\":[5,20,45,45],\"lines\":[]}"));
+        assert!(!json.contains("\"type\":\"paragraph\""));
+        // The plain renderer still emits the byte-stable default.
+        let plain = render_json(&page, &[]);
+        assert!(plain.contains("\"type\":\"paragraph\""));
     }
 
     // --- from_line_words ---------------------------------------------------
