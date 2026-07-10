@@ -13,6 +13,7 @@
 //! `ruff_cpp_spo` C++ SPO harvest); the compute **payloads** come from the
 //! recognizer's proven leaves. See `.claude/plans/recognizer-image-to-text-v2.md`.
 
+pub mod binreduce;
 pub mod blob_filter;
 pub mod conncomp;
 pub mod image_input;
@@ -29,6 +30,7 @@ pub mod textline;
 pub mod threshold;
 pub mod xy_cut;
 
+pub use binreduce::{expand_binary_power2, reduce_rank_binary2, reduce_rank_binary_cascade};
 pub use blob_filter::{filter_blobs, FilteredBlobs};
 pub use conncomp::{conn_comp_areas, conn_comp_bb, ConnComp, ConnCompBox};
 pub use image_input::{parse_pgm, prescale_grey_to_height, PgmError};
