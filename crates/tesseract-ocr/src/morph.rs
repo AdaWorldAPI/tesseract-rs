@@ -317,6 +317,123 @@ pub fn close_safe_brick(binary: &[u8], w: usize, h: usize, hsize: usize, vsize: 
     out
 }
 
+/// Run a leptonica morphology SEQUENCE string — `pixMorphSequence`
+/// (`morphseq.c:137-254`), and equally the call sites that use
+/// `pixMorphCompSequence` (`morphseq.c:304-422`): the comp variant swaps each
+/// brick primitive for its composite-`SEL` twin purely as a SPEED device, and
+/// for brick sizes that factor exactly (every size `pixGetRegionsBinary`'s
+/// sequences use: 80=8·10, 60=6·10, 200=10·20, 30=5·6, 10=2·5, 5, 4=2·2, 3, 1)
+/// the results are identical — pinned bit-for-bit by the banked pageseg2
+/// oracle, whose `seqcomp_*` sections run the REAL `pixMorphCompSequence`
+/// against THIS function.
+///
+/// Vocabulary (the C's `switch (op[0])`, `morphseq.c:179-229`; whitespace is
+/// stripped anywhere, ops are `+`-separated, letters case-insensitive):
+///
+/// - `dW.H` → [`dilate_brick`], `eW.H` → [`erode_brick`], `oW.H` →
+///   [`open_brick`] — the PLAIN bricks (`pixDilateBrick` etc.).
+/// - `cW.H` → [`close_safe_brick`] — the C uses the SAFE close in sequences
+///   ("Safe closing is used atomically", `morphseq.c:201/369`), NOT the plain
+///   close. Easy to get wrong.
+/// - `rL…` → [`crate::binreduce::reduce_rank_binary_cascade`] (1-4 digit
+///   levels), `xF` → [`crate::binreduce::expand_replicate`] — these CHANGE the
+///   buffer dimensions, hence the `(buf, w, h)` return.
+/// - `bN` → add an N-pixel background border now, removed after the LAST op
+///   (`morphseq.c:172,222-224,240-243`).
+///
+/// Returns `None` for an empty/blank sequence, an unknown op letter, an
+/// unparsable size, or a size < 1 (the C's `morphSequenceVerify` rejects the
+/// sequence up front).
+#[must_use]
+pub fn morph_sequence(
+    binary: &[u8],
+    w: usize,
+    h: usize,
+    sequence: &str,
+) -> Option<(Vec<u8>, usize, usize)> {
+    let ops: Vec<String> = sequence
+        .split('+')
+        .map(|raw| raw.replace([' ', '\n', '\t'], ""))
+        .collect();
+    if ops.is_empty() || ops.iter().any(String::is_empty) {
+        return None;
+    }
+
+    // Parse "W.H" after the op letter.
+    fn wh(rest: &str) -> Option<(usize, usize)> {
+        let (a, b) = rest.split_once('.')?;
+        let (w, h) = (a.parse::<usize>().ok()?, b.parse::<usize>().ok()?);
+        (w >= 1 && h >= 1).then_some((w, h))
+    }
+
+    let mut cur = binary.to_vec();
+    let (mut cw, mut ch) = (w, h);
+    let mut border = 0usize;
+    for op in &ops {
+        let letter = op.chars().next()?;
+        let rest = &op[1..];
+        match letter.to_ascii_lowercase() {
+            'd' => {
+                let (bw, bh) = wh(rest)?;
+                cur = dilate_brick(&cur, cw, ch, bw, bh);
+            }
+            'e' => {
+                let (bw, bh) = wh(rest)?;
+                cur = erode_brick(&cur, cw, ch, bw, bh);
+            }
+            'o' => {
+                let (bw, bh) = wh(rest)?;
+                cur = open_brick(&cur, cw, ch, bw, bh);
+            }
+            'c' => {
+                let (bw, bh) = wh(rest)?;
+                cur = close_safe_brick(&cur, cw, ch, bw, bh);
+            }
+            'r' => {
+                if rest.is_empty() || rest.len() > 4 {
+                    return None;
+                }
+                let mut levels = [0u32; 4];
+                for (i, ch_) in rest.chars().enumerate() {
+                    levels[i] = ch_.to_digit(10)?;
+                }
+                let (nb, nw, nh) =
+                    crate::binreduce::reduce_rank_binary_cascade(&cur, cw, ch, levels)?;
+                (cur, cw, ch) = (nb, nw, nh);
+            }
+            'x' => {
+                let f = rest.parse::<usize>().ok()?;
+                let (nb, nw, nh) = crate::binreduce::expand_replicate(&cur, cw, ch, f, f)?;
+                (cur, cw, ch) = (nb, nw, nh);
+            }
+            'b' => {
+                border = rest.parse::<usize>().ok()?;
+                if border == 0 {
+                    return None;
+                }
+                let (bw2, bh2) = (cw + 2 * border, ch + 2 * border);
+                let mut bordered = vec![255u8; bw2 * bh2];
+                for y in 0..ch {
+                    let off = (y + border) * bw2 + border;
+                    bordered[off..off + cw].copy_from_slice(&cur[y * cw..(y + 1) * cw]);
+                }
+                (cur, cw, ch) = (bordered, bw2, bh2);
+            }
+            _ => return None,
+        }
+    }
+    if border > 0 {
+        let (iw, ih) = (cw - 2 * border, ch - 2 * border);
+        let mut inner = vec![255u8; iw * ih];
+        for y in 0..ih {
+            let off = (y + border) * cw + border;
+            inner[y * iw..(y + 1) * iw].copy_from_slice(&cur[off..off + iw]);
+        }
+        (cur, cw, ch) = (inner, iw, ih);
+    }
+    Some((cur, cw, ch))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
