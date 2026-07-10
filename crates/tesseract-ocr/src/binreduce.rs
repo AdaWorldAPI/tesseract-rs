@@ -156,6 +156,44 @@ pub fn expand_binary_power2(
     Some((out, wd, hd))
 }
 
+/// General-factor binary expansion by pixel replication —
+/// `pixExpandBinaryReplicate` (`binexpand.c:70-133`); also the 1 bpp
+/// semantics of `pixExpandReplicate` (`expand.c`), which is what
+/// `pixGenerateHalftoneMask` actually calls (`pageseg.c:329`) — on 1 bpp both
+/// are plain per-pixel replication, and the banked pageseg oracle pins THIS
+/// function against the real `pixExpandReplicate` (factors 3 and 4).
+/// `xfact == yfact == 1` returns a copy; a zero factor is an error (`None`,
+/// mirroring the C's `<= 0` error).
+#[must_use]
+pub fn expand_replicate(
+    binary: &[u8],
+    w: usize,
+    h: usize,
+    xfact: usize,
+    yfact: usize,
+) -> Option<(Vec<u8>, usize, usize)> {
+    if xfact == 0 || yfact == 0 {
+        return None;
+    }
+    if xfact == 1 && yfact == 1 {
+        return Some((binary.to_vec(), w, h));
+    }
+    let wd = w * xfact;
+    let hd = h * yfact;
+    let mut out = vec![255u8; wd * hd];
+    for y in 0..h {
+        for x in 0..w {
+            if binary[y * w + x] == 0 {
+                for dy in 0..yfact {
+                    let row = (y * yfact + dy) * wd;
+                    out[row + x * xfact..row + (x + 1) * xfact].fill(0);
+                }
+            }
+        }
+    }
+    Some((out, wd, hd))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

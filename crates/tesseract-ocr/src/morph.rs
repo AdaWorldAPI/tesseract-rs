@@ -275,6 +275,48 @@ pub fn close_brick(binary: &[u8], w: usize, h: usize, hsize: usize, vsize: usize
     from_on(&closed)
 }
 
+/// `pixCloseSafeBrick(pixd=NULL, pixs, hsize, vsize)` (`morph.c:977-1046`) —
+/// closing made boundary-safe under the library's `ASYMMETRIC_MORPH_BC` by
+/// adding an all-background border of
+/// `bordsize = 32 · ceil(max(hsize/2, vsize/2) / 32)` pixels (full 32-bit
+/// words in the C), closing inside the enlarged image (the same separable
+/// dilate-h → dilate-v → erode-h → erode-v chain [`close_brick`] transcodes —
+/// the asymmetric border clears now fall in the added margin, not the image),
+/// then removing the border. `hsize == vsize == 1` returns a copy (C early
+/// return). Parity vs the REAL `pixCloseSafeBrick` is pinned by the banked
+/// pageseg oracle (`.claude/harvest/oracles/pageseg_oracle.*`: sizes 4×4,
+/// 1×7, 6×1 on the 97×61 fixture — the 1-D sizes exercise the C's
+/// non-separable single-`SEL` arm, which is identical for 1-D bricks).
+///
+/// # Panics
+/// Panics if `hsize < 1`, `vsize < 1`, or `binary.len() != w * h`.
+#[must_use]
+pub fn close_safe_brick(binary: &[u8], w: usize, h: usize, hsize: usize, vsize: usize) -> Vec<u8> {
+    assert!(hsize >= 1 && vsize >= 1, "hsize and vsize must be >= 1");
+    assert_eq!(binary.len(), w * h, "binary buffer length must be w * h");
+    if hsize == 1 && vsize == 1 {
+        return binary.to_vec();
+    }
+    let maxtrans = (hsize / 2).max(vsize / 2);
+    // C: `32 * ((maxtrans + 31) / 32)` — full 32-bit words (morph.c:1003).
+    let bordsize = maxtrans.div_ceil(32) * 32;
+    let bw = w + 2 * bordsize;
+    let bh = h + 2 * bordsize;
+    let mut bordered = vec![255u8; bw * bh];
+    for y in 0..h {
+        let src = &binary[y * w..(y + 1) * w];
+        let dst_off = (y + bordsize) * bw + bordsize;
+        bordered[dst_off..dst_off + w].copy_from_slice(src);
+    }
+    let closed = close_brick(&bordered, bw, bh, hsize, vsize);
+    let mut out = vec![255u8; w * h];
+    for y in 0..h {
+        let src_off = (y + bordsize) * bw + bordsize;
+        out[y * w..(y + 1) * w].copy_from_slice(&closed[src_off..src_off + w]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
