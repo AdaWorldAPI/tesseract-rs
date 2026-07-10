@@ -41,7 +41,7 @@ pub use conncomp::{conn_comp_areas, conn_comp_bb, ConnComp, ConnCompBox};
 pub use image_input::{parse_pgm, prescale_grey_to_height, PgmError};
 #[cfg(feature = "seg-approx")]
 pub use line_segment::{find_text_lines, LineBand};
-pub use lstm_recognizer::{LstmRecognizer, RecognizerError};
+pub use lstm_recognizer::{Document, LstmRecognizer, RecognizerError};
 pub use morph::{
     close_brick, close_safe_brick, dilate_brick, erode_brick, morph_sequence, open_brick,
 };

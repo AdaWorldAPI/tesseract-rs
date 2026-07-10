@@ -4,12 +4,7 @@ use std::io::Cursor;
 use std::time::Instant;
 
 use image::{ImageReader, Limits};
-use tesseract_ocr::{
-    build_regions, conn_comp_bb, detect_page_furniture, generate_halftone_mask,
-    german_invoice_fields, harden_numeric_tokens, harvest_fields, otsu_threshold_gray,
-    render_json_with_regions, threshold_rect_to_binary, xy_cut, DocPage, XyCutParams, MIN_HEIGHT,
-    MIN_WIDTH,
-};
+use tesseract_ocr::german_invoice_fields;
 
 use crate::state::AppState;
 
@@ -161,74 +156,31 @@ pub fn ocr_image_bytes(state: &AppState, bytes: &[u8]) -> Result<OcrOutcome, Str
     })
 }
 
-/// Decode `bytes` to grey and run the word/box recognition path
-/// ([`LstmRecognizer::recognize_page_makerow_words`]), then build the
-/// structured `doc.v1` JSON document: numeric hardening
-/// ([`harden_numeric_tokens`]) followed by the German-invoice field harvest
-/// ([`harvest_fields`] with [`german_invoice_fields`]), rendered via
-/// [`render_json`]. Same off-runtime contract as [`ocr_image_bytes`] — heavy
-/// synchronous CPU work, callers MUST run it via `spawn_blocking`.
+/// Decode `bytes` to grey and run the canonical one-shot structured-document
+/// path ([`LstmRecognizer::recognize_document`]): word/box recognition →
+/// `doc.v1` DOM → numeric hardening → German-invoice field harvest → region
+/// classification (page furniture + XY-cut blocks + halftone figures) →
+/// `doc.v1` JSON. The composition itself lives in `tesseract-ocr` so this
+/// demo and the `tesseract-ogar` executor share ONE source of truth. Same
+/// off-runtime contract as [`ocr_image_bytes`] — heavy synchronous CPU work,
+/// callers MUST run it via `spawn_blocking`.
 pub fn ocr_image_bytes_json(state: &AppState, bytes: &[u8]) -> Result<OcrJsonOutcome, String> {
     let (raw, w, h) = decode_grey(bytes)?;
 
     let t0 = Instant::now();
-    let lines = state
+    let specs = german_invoice_fields();
+    let doc = state
         .recognizer
-        .recognize_page_makerow_words(&raw, w, h, state.dict.as_ref())
+        .recognize_document(&raw, w, h, state.dict.as_ref(), Some(&specs))
         .map_err(|e| format!("recognition failed: {e}"))?;
-    let mut page = DocPage::from_line_words(&lines, &state.recognizer.charset, w as u32, h as u32);
-    harden_numeric_tokens(&mut page);
-    let fields = harvest_fields(&page, &german_invoice_fields());
-
-    // Region classification over the SAME decoded grey: page furniture
-    // (header/footer), XY-cut layout blocks (reading order), and the
-    // halftone/image mask (figure regions; only defined for pages >= the
-    // leptonica MinWidth/MinHeight gate). All three are the parity-proven
-    // library layers — this is just their doc.v1 wiring.
-    let furniture = detect_page_furniture(&page);
-    let blocks: Vec<(i32, i32, i32, i32)> = xy_cut(&raw, w, h, &XyCutParams::default())
-        .into_iter()
-        .map(|r| (r.left as i32, r.top as i32, r.right as i32, r.bottom as i32))
-        .collect();
-    let figures: Vec<(i32, i32, i32, i32)> = if w >= MIN_WIDTH && h >= MIN_HEIGHT {
-        let otsu = otsu_threshold_gray(&raw, w, 0, 0, w, h);
-        let binary: Vec<u8> = if otsu.hi_value == -1 {
-            // Otsu "no opinion" (degenerate page): fixed mid-grey split, the
-            // same fallback the library's own segmenters use.
-            raw.iter().map(|&p| if p < 128 { 0 } else { 255 }).collect()
-        } else {
-            threshold_rect_to_binary(&raw, w, 0, 0, w, h, otsu)
-        };
-        generate_halftone_mask(&binary, w, h)
-            .filter(|hm| hm.found)
-            .map(|hm| {
-                conn_comp_bb(&hm.mask, hm.mask_w, hm.mask_h, 8)
-                    .into_iter()
-                    .map(|b| (b.x, b.y, b.x + b.w, b.y + b.h))
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let regions = build_regions(
-        &page,
-        &furniture.header_lines,
-        &furniture.footer_lines,
-        &blocks,
-        &figures,
-    );
-    let json = render_json_with_regions(&page, &regions, &fields);
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    let word_count = page.lines.iter().map(|l| l.words.len()).sum();
-    let line_count = page.lines.len();
     Ok(OcrJsonOutcome {
-        json,
+        json: doc.json,
         width: w,
         height: h,
-        word_count,
-        line_count,
+        word_count: doc.word_count,
+        line_count: doc.line_count,
         elapsed_ms,
     })
 }

@@ -1,9 +1,12 @@
 //! # tesseract-ogar — the in-binary executor for the OGAR OCR action table
 //!
 //! [`ogar_vocab::ocr_actions`] is the **authoritative** declaration of the
-//! eight OCR capabilities `tesseract-rs` exposes (`recognize_line` /
-//! `recognize_page` / `extract_text_layer` / `extract_page_image` /
-//! `render_text` / `render_tsv` / `render_hocr` / `render_searchable_pdf`).
+//! OCR capabilities `tesseract-rs` exposes — the original eight
+//! (`recognize_line` / `recognize_page` / `extract_text_layer` /
+//! `extract_page_image` / `render_text` / `render_tsv` / `render_hocr` /
+//! `render_searchable_pdf`) plus the v2 structured-document surface
+//! (`recognize_page_words` / `recognize_document` / `harvest_fields` /
+//! `segment_page` / `detect_halftone_regions` / `detect_page_furniture`).
 //! This crate is that table's executor: OGAR declares, this crate runs.
 //!
 //! ## Typed, not serialized
@@ -43,7 +46,11 @@ use std::path::Path;
 
 use tesseract_core::dawg::DawgError;
 use tesseract_core::DictLite;
-use tesseract_ocr::{LineWords, LstmRecognizer};
+use tesseract_ocr::{
+    conn_comp_bb, detect_page_furniture, generate_halftone_mask, german_invoice_fields,
+    harden_numeric_tokens, harvest_fields, xy_cut, DocPage, Document, HarvestedField, LineWords,
+    LstmRecognizer, PageFurniture, PageRect, XyCutParams,
+};
 use tesseract_ocr_pdf::{GreyImage, PageOcr, PdfError, RenderReport, SearchablePdfError};
 
 /// The V3-substrate <-> Python-SDK parity probe: walks a loaded `Network`
@@ -67,6 +74,13 @@ pub const COVERED_CAPABILITIES: &[&str] = &[
     "render_tsv",
     "render_hocr",
     "render_searchable_pdf",
+    // v2 (2026-07-10) — the structured-document + layout-classifier surface.
+    "recognize_page_words",
+    "recognize_document",
+    "harvest_fields",
+    "segment_page",
+    "detect_halftone_regions",
+    "detect_page_furniture",
 ];
 
 /// This crate's hot-plug declaration — the GENERIC pattern every consumer
@@ -179,6 +193,81 @@ pub enum OcrRequest<'a> {
         /// The embedded image resolution, in DPI.
         dpi: u32,
     },
+    /// `recognize_page_words` — a full grey page recognized to WORD/box
+    /// output (the word-level counterpart of `recognize_page`).
+    RecognizePageWords {
+        /// Row-major 8-bit grey page.
+        grey: &'a [u8],
+        /// Width in pixels.
+        width: usize,
+        /// Height in pixels.
+        height: usize,
+        /// Use the loaded dictionary beam, if any.
+        with_dict: bool,
+    },
+    /// `recognize_document` — the ONE-SHOT: grey page → `doc.v1` JSON
+    /// (classified regions) + typed field harvest. `harvest_profile`
+    /// selects the field set (`Some("german_invoice")`; `None` / empty = no
+    /// harvest; any other value FAILS with
+    /// [`OcrExecError::UnknownHarvestProfile`]).
+    RecognizeDocument {
+        /// Row-major 8-bit grey page.
+        grey: &'a [u8],
+        /// Width in pixels.
+        width: usize,
+        /// Height in pixels.
+        height: usize,
+        /// Use the loaded dictionary beam, if any.
+        with_dict: bool,
+        /// The field-harvest profile (`None` = no harvest).
+        harvest_profile: Option<&'a str>,
+    },
+    /// `harvest_fields` — the typed field harvest over an already-recognized
+    /// page's word output. `harvest_profile` is required (unknown / empty
+    /// FAILS with [`OcrExecError::UnknownHarvestProfile`]).
+    HarvestFields {
+        /// Recognized lines, in reading order.
+        line_words: &'a [LineWords],
+        /// Page width in pixels.
+        page_w: u32,
+        /// Page height in pixels.
+        page_h: u32,
+        /// The field-harvest profile (e.g. `"german_invoice"`).
+        harvest_profile: &'a str,
+    },
+    /// `segment_page` — recursive XY-cut layout segmentation (columns /
+    /// deimposition) → reading-ordered region rects.
+    SegmentPage {
+        /// Row-major 8-bit grey page.
+        grey: &'a [u8],
+        /// Width in pixels.
+        width: usize,
+        /// Height in pixels.
+        height: usize,
+        /// XY-cut tuning (the `min_gap_frac` / `min_region_px` / `max_depth`
+        /// optional params; [`XyCutParams::default`] for the defaults).
+        params: XyCutParams,
+    },
+    /// `detect_halftone_regions` — the leptonica-parity halftone (image)
+    /// region detector over a BINARIZED page (`0` = ink convention).
+    DetectHalftoneRegions {
+        /// Row-major binarized page (`0` = foreground/ink, `255` = bg).
+        binary: &'a [u8],
+        /// Width in pixels.
+        width: usize,
+        /// Height in pixels.
+        height: usize,
+    },
+    /// `detect_page_furniture` — header / footer / page-number detection over
+    /// an already-recognized page's word output.
+    DetectPageFurniture {
+        /// Recognized lines, in reading order.
+        line_words: &'a [LineWords],
+        /// Page width in pixels.
+        page_w: u32,
+        /// Page height in pixels.
+        page_h: u32,
+    },
 }
 
 /// One typed response per declared OGAR OCR capability — see
@@ -228,6 +317,34 @@ pub enum OcrResponse {
         /// Per-page WinAnsi lossy-substitution counts.
         report: RenderReport,
     },
+    /// `recognize_page_words`'s `line_words` output.
+    LineWordsOut(Vec<LineWords>),
+    /// `recognize_document`'s `doc_json, fields` outputs.
+    DocumentOut {
+        /// The rendered `tesseract-rs/doc.v1` JSON.
+        doc_json: String,
+        /// The harvested typed fields (empty when no harvest ran).
+        fields: Vec<HarvestedField>,
+    },
+    /// `harvest_fields`'s `fields` output.
+    Fields(Vec<HarvestedField>),
+    /// `segment_page`'s `regions_rects` output (reading-ordered leaf rects).
+    Regions(Vec<PageRect>),
+    /// `detect_halftone_regions`'s `figure_rects, mask_w, mask_h, found`
+    /// outputs. Figure rects are page-space `(left, top, right, bottom)`.
+    HalftoneRegions {
+        /// Figure component bboxes `(left, top, right, bottom)`.
+        figure_rects: Vec<(i32, i32, i32, i32)>,
+        /// Halftone mask width (may be smaller than the page).
+        mask_w: usize,
+        /// Halftone mask height.
+        mask_h: usize,
+        /// Whether any halftone region was found.
+        found: bool,
+    },
+    /// `detect_page_furniture`'s `header_lines, footer_lines, page_number`
+    /// outputs.
+    PageFurnitureOut(PageFurniture),
 }
 
 /// A failure loading [`OcrExecutor`] or executing an [`OcrRequest`].
@@ -244,6 +361,10 @@ pub enum OcrExecError {
     Pdf(PdfError),
     /// [`tesseract_ocr_pdf::render_searchable_pdf`] failed.
     SearchablePdf(SearchablePdfError),
+    /// A `harvest_profile` value the executor does not recognize — fail-closed
+    /// so a typo can never silently drop invoice-field validation (v2, the
+    /// spec's V2-3 rule). The only value understood today is `"german_invoice"`.
+    UnknownHarvestProfile(String),
 }
 
 impl std::fmt::Display for OcrExecError {
@@ -254,7 +375,27 @@ impl std::fmt::Display for OcrExecError {
             Self::Dawg(e) => write!(f, "dictionary assembly: {e:?}"),
             Self::Pdf(e) => write!(f, "PDF: {e}"),
             Self::SearchablePdf(e) => write!(f, "searchable PDF render: {e}"),
+            Self::UnknownHarvestProfile(p) => {
+                write!(
+                    f,
+                    "unknown harvest_profile {p:?} (known: \"german_invoice\")"
+                )
+            }
         }
+    }
+}
+
+/// Map a `harvest_profile` string to its [`tesseract_ocr::FieldSpec`] set.
+/// `None`/empty → no harvest (`Ok(None)`); `"german_invoice"` → the German
+/// invoice field set; anything else fails closed
+/// ([`OcrExecError::UnknownHarvestProfile`]).
+fn harvest_specs(
+    profile: Option<&str>,
+) -> Result<Option<Vec<tesseract_ocr::FieldSpec>>, OcrExecError> {
+    match profile.filter(|p| !p.is_empty()) {
+        None => Ok(None),
+        Some("german_invoice") => Ok(Some(german_invoice_fields())),
+        Some(other) => Err(OcrExecError::UnknownHarvestProfile(other.to_owned())),
     }
 }
 
@@ -333,6 +474,12 @@ impl OcrExecutor {
             OcrRequest::RenderTsv { .. } => "render_tsv",
             OcrRequest::RenderHocr { .. } => "render_hocr",
             OcrRequest::RenderSearchablePdf { .. } => "render_searchable_pdf",
+            OcrRequest::RecognizePageWords { .. } => "recognize_page_words",
+            OcrRequest::RecognizeDocument { .. } => "recognize_document",
+            OcrRequest::HarvestFields { .. } => "harvest_fields",
+            OcrRequest::SegmentPage { .. } => "segment_page",
+            OcrRequest::DetectHalftoneRegions { .. } => "detect_halftone_regions",
+            OcrRequest::DetectPageFurniture { .. } => "detect_page_furniture",
         }
     }
 
@@ -418,6 +565,93 @@ impl OcrExecutor {
                     .map_err(OcrExecError::SearchablePdf)?;
                 Ok(OcrResponse::PdfBytes { bytes, report })
             }
+            OcrRequest::RecognizePageWords {
+                grey,
+                width,
+                height,
+                with_dict,
+            } => {
+                let dict = if with_dict { self.dict.as_ref() } else { None };
+                let lines = self
+                    .recognizer
+                    .recognize_page_makerow_words(grey, width, height, dict)
+                    .map_err(OcrExecError::Recognizer)?;
+                Ok(OcrResponse::LineWordsOut(lines))
+            }
+            OcrRequest::RecognizeDocument {
+                grey,
+                width,
+                height,
+                with_dict,
+                harvest_profile,
+            } => {
+                let dict = if with_dict { self.dict.as_ref() } else { None };
+                let specs = harvest_specs(harvest_profile)?;
+                let Document { json, fields, .. } = self
+                    .recognizer
+                    .recognize_document(grey, width, height, dict, specs.as_deref())
+                    .map_err(OcrExecError::Recognizer)?;
+                Ok(OcrResponse::DocumentOut {
+                    doc_json: json,
+                    fields,
+                })
+            }
+            OcrRequest::HarvestFields {
+                line_words,
+                page_w,
+                page_h,
+                harvest_profile,
+            } => {
+                // harvest_profile is required here; empty/unknown fails closed.
+                let specs = harvest_specs(Some(harvest_profile))?.ok_or_else(|| {
+                    OcrExecError::UnknownHarvestProfile(harvest_profile.to_owned())
+                })?;
+                let mut page =
+                    DocPage::from_line_words(line_words, &self.recognizer.charset, page_w, page_h);
+                harden_numeric_tokens(&mut page);
+                Ok(OcrResponse::Fields(harvest_fields(&page, &specs)))
+            }
+            OcrRequest::SegmentPage {
+                grey,
+                width,
+                height,
+                params,
+            } => Ok(OcrResponse::Regions(xy_cut(grey, width, height, &params))),
+            OcrRequest::DetectHalftoneRegions {
+                binary,
+                width,
+                height,
+            } => {
+                // No halftone mask (page below MinWidth/MinHeight, or empty) →
+                // found=false, no rects, zero mask dims.
+                let (figure_rects, mask_w, mask_h, found) =
+                    match generate_halftone_mask(binary, width, height) {
+                        Some(hm) if hm.found => {
+                            let rects = conn_comp_bb(&hm.mask, hm.mask_w, hm.mask_h, 8)
+                                .into_iter()
+                                .map(|b| (b.x, b.y, b.x + b.w, b.y + b.h))
+                                .collect();
+                            (rects, hm.mask_w, hm.mask_h, true)
+                        }
+                        Some(hm) => (Vec::new(), hm.mask_w, hm.mask_h, false),
+                        None => (Vec::new(), 0, 0, false),
+                    };
+                Ok(OcrResponse::HalftoneRegions {
+                    figure_rects,
+                    mask_w,
+                    mask_h,
+                    found,
+                })
+            }
+            OcrRequest::DetectPageFurniture {
+                line_words,
+                page_w,
+                page_h,
+            } => {
+                let page =
+                    DocPage::from_line_words(line_words, &self.recognizer.charset, page_w, page_h);
+                Ok(OcrResponse::PageFurnitureOut(detect_page_furniture(&page)))
+            }
         }
     }
 }
@@ -441,8 +675,13 @@ mod tests {
             HOT_PLUG.covered,
         )
         .expect("hot-plug drifted from the authoritative OGAR tables");
-        assert_eq!(concepts.len(), 3, "3 hot-plugged concepts");
+        assert_eq!(
+            concepts.len(),
+            ogar_vocab::ocr_actions::OCR_SUBJECT_CLASSIDS.len(),
+            "one concept per hot-plugged subject classid"
+        );
         assert!(concepts.contains(&("textline", 0x0805)));
+        assert!(concepts.contains(&("page_layout", 0x0807)), "v2 subject");
         assert_eq!(capabilities.len(), COVERED_CAPABILITIES.len());
     }
 
@@ -502,6 +741,41 @@ mod tests {
                 image_name: "",
             },
             OcrRequest::RenderSearchablePdf { pages: &[], dpi: 0 },
+            OcrRequest::RecognizePageWords {
+                grey: &[],
+                width: 0,
+                height: 0,
+                with_dict: false,
+            },
+            OcrRequest::RecognizeDocument {
+                grey: &[],
+                width: 0,
+                height: 0,
+                with_dict: false,
+                harvest_profile: None,
+            },
+            OcrRequest::HarvestFields {
+                line_words: &[],
+                page_w: 0,
+                page_h: 0,
+                harvest_profile: "german_invoice",
+            },
+            OcrRequest::SegmentPage {
+                grey: &[],
+                width: 0,
+                height: 0,
+                params: XyCutParams::default(),
+            },
+            OcrRequest::DetectHalftoneRegions {
+                binary: &[],
+                width: 0,
+                height: 0,
+            },
+            OcrRequest::DetectPageFurniture {
+                line_words: &[],
+                page_w: 0,
+                page_h: 0,
+            },
         ];
         assert_eq!(
             samples.len(),
@@ -547,6 +821,26 @@ mod tests {
             ("render_hocr", "image_name") => Some("image_name"),
             ("render_searchable_pdf", "pages") => Some("pages"),
             ("render_searchable_pdf", "dpi") => Some("dpi"),
+            // v2 rows.
+            ("recognize_page_words", "grey_page") => Some("grey"),
+            ("recognize_page_words", "width") => Some("width"),
+            ("recognize_page_words", "height") => Some("height"),
+            ("recognize_document", "grey_page") => Some("grey"),
+            ("recognize_document", "width") => Some("width"),
+            ("recognize_document", "height") => Some("height"),
+            ("harvest_fields", "line_words") => Some("line_words"),
+            ("harvest_fields", "page_w") => Some("page_w"),
+            ("harvest_fields", "page_h") => Some("page_h"),
+            ("harvest_fields", "harvest_profile") => Some("harvest_profile"),
+            ("segment_page", "grey_page") => Some("grey"),
+            ("segment_page", "width") => Some("width"),
+            ("segment_page", "height") => Some("height"),
+            ("detect_halftone_regions", "binary_page") => Some("binary"),
+            ("detect_halftone_regions", "width") => Some("width"),
+            ("detect_halftone_regions", "height") => Some("height"),
+            ("detect_page_furniture", "line_words") => Some("line_words"),
+            ("detect_page_furniture", "page_w") => Some("page_w"),
+            ("detect_page_furniture", "page_h") => Some("page_h"),
             _ => None,
         }
     }
