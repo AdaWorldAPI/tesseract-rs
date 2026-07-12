@@ -636,6 +636,32 @@ pub fn decode_image(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), ImageDecode
     use image::{ImageReader, Limits};
     use std::io::Cursor;
 
+    // Vet the declared dimensions from the HEADER before decoding any raster:
+    // `into_dimensions` parses only the header, so a 20000×20000 (400 MP) file —
+    // within the per-axis cap but far over the pixel budget — is rejected before
+    // a single raster byte allocates. The `image` crate's `max_alloc` is
+    // best-effort, so this pre-decode gate is the real bomb guard (codex #43 P1).
+    // `(w·h) as u64` cannot overflow: `(2³²−1)² < u64::MAX`.
+    let (dw, dh) = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| ImageDecodeError::Read(e.to_string()))?
+        .into_dimensions()
+        .map_err(|e| ImageDecodeError::Decode(e.to_string()))?;
+    let (w, h) = (dw as usize, dh as usize);
+    if w < 3 || h < 3 {
+        return Err(ImageDecodeError::TooSmall {
+            width: w,
+            height: h,
+        });
+    }
+    if (dw as u64) * (dh as u64) > DECODE_MAX_PIXELS {
+        return Err(ImageDecodeError::TooLarge {
+            width: w,
+            height: h,
+        });
+    }
+
+    // Dimensions vetted → decode under explicit limits (belt-and-suspenders).
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| ImageDecodeError::Read(e.to_string()))?;
@@ -644,23 +670,9 @@ pub fn decode_image(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), ImageDecode
     limits.max_image_height = Some(DECODE_MAX_DIM);
     limits.max_alloc = Some(DECODE_MAX_ALLOC);
     reader.limits(limits);
-
     let dynimg = reader
         .decode()
         .map_err(|e| ImageDecodeError::Decode(e.to_string()))?;
-    let (w, h) = (dynimg.width() as usize, dynimg.height() as usize);
-    if w < 3 || h < 3 {
-        return Err(ImageDecodeError::TooSmall {
-            width: w,
-            height: h,
-        });
-    }
-    if (w as u64) * (h as u64) > DECODE_MAX_PIXELS {
-        return Err(ImageDecodeError::TooLarge {
-            width: w,
-            height: h,
-        });
-    }
     let grey = dynimg.to_luma8();
     Ok((grey.into_raw(), w, h))
 }
@@ -816,5 +828,55 @@ mod tests {
 
         // Garbage bytes are rejected, not panicked on.
         assert!(decode_image(&[0xde, 0xad, 0xbe, 0xef]).is_err());
+    }
+
+    #[cfg(feature = "image-decode")]
+    #[test]
+    fn decode_image_rejects_dimension_bomb_before_decoding() {
+        use image::{DynamicImage, GrayImage, ImageFormat};
+        use std::io::Cursor;
+
+        // PNG's standard CRC-32 (ISO-HDLC), over the chunk type + data.
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for &b in data {
+                crc ^= u32::from(b);
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+
+        // Encode a real tiny grey PNG, then patch its IHDR to DECLARE 30000×30000
+        // (900 MP) while the file stays a few bytes. decode_image must reject it
+        // via the pre-decode dimension gate (`TooLarge`) — it must never attempt
+        // to allocate the 900 MP raster the header claims (codex #43 P1).
+        let mut png = Vec::new();
+        DynamicImage::ImageLuma8(GrayImage::from_raw(10, 10, vec![128u8; 100]).unwrap())
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .unwrap();
+        // IHDR data is at offset 16 (8 sig + 4 len + 4 "IHDR"): width[16..20],
+        // height[20..24]; the IHDR CRC covers bytes [12..29] and sits at [29..33].
+        png[16..20].copy_from_slice(&30_000u32.to_be_bytes());
+        png[20..24].copy_from_slice(&30_000u32.to_be_bytes());
+        let crc = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+
+        assert!(
+            matches!(
+                decode_image(&png),
+                Err(ImageDecodeError::TooLarge {
+                    width: 30000,
+                    height: 30000
+                })
+            ),
+            "a 900 MP header must be rejected pre-decode, got {:?}",
+            decode_image(&png)
+        );
     }
 }
