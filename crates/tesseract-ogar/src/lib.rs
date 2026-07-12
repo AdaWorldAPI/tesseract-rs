@@ -110,6 +110,13 @@ const _: () = assert!(
     "tesseract-ogar::COVERED_CAPABILITIES has drifted from ogar_vocab::ocr_actions::OCR_ACTION_NAMES's length"
 );
 
+/// Pure-Rust encoded-image (PNG/JPEG/…) → grey decode, re-exported so a
+/// consumer decodes container bytes via this executor crate and hands the grey
+/// straight to [`OcrExecutor::execute`]. Available with the `image-decode`
+/// feature.
+#[cfg(feature = "image-decode")]
+pub use tesseract_ocr::{decode_image, ImageDecodeError};
+
 /// One typed request per declared OGAR OCR capability. Plain Rust types,
 /// zero serialization — see the module docs.
 #[derive(Debug, Clone, Copy)]

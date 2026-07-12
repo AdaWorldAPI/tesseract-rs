@@ -11,6 +11,17 @@ description = "Pure-Rust Tesseract OCR assembly tier — loads the .lstm network
 tesseract-recognizer = { path = "../tesseract-recognizer" }
 # content — charset + recoder + CTC beam (re-exports the lance-graph-contract Core surfaces).
 tesseract-core = { path = "../tesseract-core" }
+# Pure-Rust PNG/JPEG/… container decode for `image_input::decode_image`
+# (feature-gated so the default surface stays PGM/RGB-only, no extra deps).
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+    "tiff",
+    "gif",
+    "bmp",
+    "pnm",
+], optional = true }
 
 [features]
 # D3.0 (Batch 3-alt): the projection-profile line segmenter + page-level
@@ -18,6 +29,9 @@ tesseract-core = { path = "../tesseract-core" }
 # replaced by the textord parity batches (plan §P3). Gated so it can never be
 # mistaken for a proven leaf on the crate's default surface.
 seg-approx = []
+# Pure-Rust encoded-image (PNG/JPEG/WebP/TIFF/GIF/BMP/PNM) → grey decode, so a
+# consumer hands the OGAR executor container bytes without wiring `image` itself.
+image-decode = ["dep:image"]
 
 [[example]]
 name = "recognize_page_dump"

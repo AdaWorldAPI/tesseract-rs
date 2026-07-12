@@ -38,6 +38,8 @@ pub use binreduce::{
 };
 pub use blob_filter::{filter_blobs, FilteredBlobs};
 pub use conncomp::{conn_comp_areas, conn_comp_bb, ConnComp, ConnCompBox};
+#[cfg(feature = "image-decode")]
+pub use image_input::{decode_image, ImageDecodeError};
 pub use image_input::{parse_pgm, prescale_grey_to_height, PgmError};
 #[cfg(feature = "seg-approx")]
 pub use line_segment::{find_text_lines, LineBand};
