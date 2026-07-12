@@ -210,7 +210,12 @@ pub const LOW_CONFIDENCE_THRESHOLD: f32 = 65.0;
 
 /// Internal emit unit shared by both renderers: the `type` string, the
 /// region bbox, and the owned line indices.
-type EmitRegion<'a> = (&'a str, (i32, i32, i32, i32), Vec<usize>);
+type EmitRegion<'a> = (
+    &'a str,
+    (i32, i32, i32, i32),
+    Vec<usize>,
+    Option<&'a TableGrid>,
+);
 
 /// Serialize one page (plus an optional field harvest) as a `doc.v1` JSON
 /// document — see the module docs for the schema. `fields` may be empty
@@ -233,7 +238,12 @@ pub fn render_json(page: &DocPage, fields: &[HarvestedField]) -> String {
             let b = l.bbox;
             (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
         });
-        vec![("paragraph", region_box, (0..page.lines.len()).collect())]
+        vec![(
+            "paragraph",
+            region_box,
+            (0..page.lines.len()).collect(),
+            None,
+        )]
     };
     render_doc(page, &default_regions, fields)
 }
@@ -272,8 +282,41 @@ impl RegionKind {
     }
 }
 
-/// One classified page region: its kind, its top-down bbox, and the indices
-/// of the [`DocPage::lines`] it owns (empty for [`RegionKind::Figure`]).
+/// One cell of a [`TableGrid`] — its grid position, image bbox, and the
+/// concatenated text of the words that fell inside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableCell {
+    /// 0-based row (a recognized text line within the table region).
+    pub row: usize,
+    /// 0-based column (a whitespace-separated band).
+    pub col: usize,
+    /// Top-down image bbox — the union of the cell's words.
+    pub bbox: (i32, i32, i32, i32),
+    /// The cell's words joined in reading order.
+    pub text: String,
+    /// `true` for the first row (the likely header).
+    pub header: bool,
+}
+
+/// The reconstructed grid of a [`RegionKind::Table`] region — rows are the
+/// recognized text lines, columns are the whitespace-separated bands. This is
+/// doc.v1's delicate-feature **seed** for downstream structure mining
+/// (`lance-graph-arm-discovery` / DeepNSM); it is pragmatic synthesis over the
+/// proven word surface (like the rest of this module), NOT a Tesseract
+/// transcode. Emitted inside a `"table"` region as `rows`/`cols`/`cells`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableGrid {
+    /// Row count (= recognized lines in the region).
+    pub rows: usize,
+    /// Column count (whitespace-separated bands).
+    pub cols: usize,
+    /// The occupied cells; empty grid positions are omitted.
+    pub cells: Vec<TableCell>,
+}
+
+/// One classified page region: its kind, its top-down bbox, the indices of the
+/// [`DocPage::lines`] it owns (empty for [`RegionKind::Figure`]), and — for a
+/// [`RegionKind::Table`] — its reconstructed [`TableGrid`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DocRegion {
     /// The region's kind (serialized as the `type` value).
@@ -282,11 +325,127 @@ pub struct DocRegion {
     pub bbox: (i32, i32, i32, i32),
     /// Indices into [`DocPage::lines`], in reading order.
     pub line_indices: Vec<usize>,
+    /// The cell grid, present only for [`RegionKind::Table`] regions.
+    pub table: Option<TableGrid>,
 }
 
 /// Union of two top-down boxes.
 fn union_bbox(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
     (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+}
+
+/// Reconstruct a [`TableGrid`] from a table region's `lines` — the delicate
+/// feature that makes doc.v1 a good seed. Rows ARE the recognized lines;
+/// columns come from the vertical whitespace gaps across all the region's
+/// words (a gap ≥ one median word-height separates columns). Each word joins
+/// the column band its x-center lands in; a cell is one line's words in one
+/// column. Pragmatic synthesis over the proven word surface — no rule-mask or
+/// C-transcode dependency, so it handles ruled and borderless tables alike.
+#[must_use]
+pub fn extract_table_grid(lines: &[&DocLine]) -> TableGrid {
+    let all: Vec<&DocWord> = lines.iter().flat_map(|l| l.words.iter()).collect();
+    if all.is_empty() {
+        return TableGrid {
+            rows: lines.len(),
+            cols: 0,
+            cells: Vec::new(),
+        };
+    }
+
+    // Column cut positions from the x-whitespace gaps.
+    let x0 = all.iter().map(|w| w.bbox.0).min().unwrap();
+    let x1 = all.iter().map(|w| w.bbox.2).max().unwrap();
+    let mut heights: Vec<i32> = all.iter().map(|w| (w.bbox.3 - w.bbox.1).max(1)).collect();
+    heights.sort_unstable();
+    let gap_min = heights[heights.len() / 2].max(1) as usize;
+
+    let width = (x1 - x0).max(1) as usize;
+    let mut covered = vec![false; width];
+    for w in &all {
+        let a = (w.bbox.0 - x0).clamp(0, x1 - x0) as usize;
+        let b = (w.bbox.2 - x0).clamp(0, x1 - x0) as usize;
+        for c in covered.iter_mut().take(b).skip(a) {
+            *c = true;
+        }
+    }
+    // Cuts at the midpoint of every whitespace gap wide enough to be a column
+    // separator; the outer edges 0 and width bound the first/last columns.
+    let mut cuts: Vec<usize> = vec![0];
+    let mut gap_start: Option<usize> = None;
+    for (x, &cov) in covered.iter().enumerate() {
+        if cov {
+            if let Some(s) = gap_start.take() {
+                if x - s >= gap_min {
+                    cuts.push((s + x) / 2);
+                }
+            }
+        } else if gap_start.is_none() {
+            gap_start = Some(x);
+        }
+    }
+    cuts.push(width);
+    let cols = cuts.len() - 1;
+    let col_of = |cx: i32| -> usize {
+        let p = (cx - x0).clamp(0, width as i32 - 1) as usize;
+        cuts.windows(2)
+            .position(|w| p >= w[0] && p < w[1])
+            .unwrap_or(cols - 1)
+    };
+
+    let mut cells = Vec::new();
+    for (row, line) in lines.iter().enumerate() {
+        let mut by_col: Vec<Vec<&DocWord>> = vec![Vec::new(); cols];
+        for w in &line.words {
+            let cx = (w.bbox.0 + w.bbox.2) / 2;
+            by_col[col_of(cx)].push(w);
+        }
+        for (col, ws) in by_col.iter().enumerate() {
+            let Some((first, rest)) = ws.split_first() else {
+                continue;
+            };
+            let bbox = rest.iter().fold(first.bbox, |a, w| union_bbox(a, w.bbox));
+            let text = ws
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            cells.push(TableCell {
+                row,
+                col,
+                bbox,
+                text,
+                header: row == 0,
+            });
+        }
+    }
+    TableGrid {
+        rows: lines.len(),
+        cols,
+        cells,
+    }
+}
+
+/// Emit a [`TableGrid`] as the `rows`/`cols`/`cells` tail of a `"table"`
+/// region object (leading comma; no surrounding braces).
+fn emit_table_json(out: &mut String, grid: &TableGrid) {
+    out.push_str(&format!(
+        ",\"rows\":{},\"cols\":{},\"cells\":[",
+        grid.rows, grid.cols
+    ));
+    for (i, c) in grid.cells.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"row\":{},\"col\":{},\"bbox\":{},\"text\":\"{}\",\"header\":{}}}",
+            c.row,
+            c.col,
+            json_bbox(c.bbox),
+            json_escape(&c.text),
+            c.header
+        ));
+    }
+    out.push(']');
 }
 
 /// Assemble typed regions from the classifier outputs:
@@ -356,24 +515,35 @@ pub fn build_regions(
             kind,
             bbox,
             line_indices: members.to_vec(),
+            table: None,
         })
     };
 
     let mut out: Vec<DocRegion> = Vec::new();
     out.extend(lines_region(RegionKind::Header, &header));
     for (bi, members) in block_members.iter().enumerate() {
-        let kind = if table_blocks.get(bi).copied().unwrap_or(false) {
+        let is_table = table_blocks.get(bi).copied().unwrap_or(false);
+        let kind = if is_table {
             RegionKind::Table
         } else {
             RegionKind::Text
         };
-        out.extend(lines_region(kind, members));
+        if let Some(mut region) = lines_region(kind, members) {
+            if is_table {
+                // Reconstruct the cell grid from the block's own lines — the
+                // doc.v1 delicate-feature seed (rows = lines, cols = whitespace).
+                let region_lines: Vec<&DocLine> = members.iter().map(|&i| &page.lines[i]).collect();
+                region.table = Some(extract_table_grid(&region_lines));
+            }
+            out.push(region);
+        }
     }
     out.extend(lines_region(RegionKind::Text, &orphans));
     out.extend(figures.iter().map(|&bbox| DocRegion {
         kind: RegionKind::Figure,
         bbox,
         line_indices: Vec::new(),
+        table: None,
     }));
     out.extend(lines_region(RegionKind::Footer, &footer));
     out
@@ -390,7 +560,14 @@ pub fn render_json_with_regions(
 ) -> String {
     let mapped: Vec<EmitRegion> = regions
         .iter()
-        .map(|r| (r.kind.as_str(), r.bbox, r.line_indices.clone()))
+        .map(|r| {
+            (
+                r.kind.as_str(),
+                r.bbox,
+                r.line_indices.clone(),
+                r.table.as_ref(),
+            )
+        })
         .collect();
     render_doc(page, &mapped, fields)
 }
@@ -417,7 +594,7 @@ fn render_doc(page: &DocPage, regions: &[EmitRegion], fields: &[HarvestedField])
     }
 
     out.push_str("\"regions\":[");
-    for (ri, (kind, bbox, line_indices)) in regions.iter().enumerate() {
+    for (ri, (kind, bbox, line_indices, table)) in regions.iter().enumerate() {
         if ri > 0 {
             out.push(',');
         }
@@ -450,7 +627,11 @@ fn render_doc(page: &DocPage, regions: &[EmitRegion], fields: &[HarvestedField])
             }
             out.push_str("]}");
         }
-        out.push_str("]}");
+        out.push(']'); // close the lines array
+        if let Some(grid) = table {
+            emit_table_json(&mut out, grid);
+        }
+        out.push('}'); // close the region object
     }
     out.push_str("],");
 
@@ -1380,11 +1561,13 @@ mod tests {
                 kind: RegionKind::Text,
                 bbox: (0, 0, 50, 10),
                 line_indices: vec![0],
+                table: None,
             },
             DocRegion {
                 kind: RegionKind::Figure,
                 bbox: (5, 20, 45, 45),
                 line_indices: vec![],
+                table: None,
             },
         ];
         let json = render_json_with_regions(&page, &regions, &[]);
@@ -1394,6 +1577,100 @@ mod tests {
         // The plain renderer still emits the byte-stable default.
         let plain = render_json(&page, &[]);
         assert!(plain.contains("\"type\":\"paragraph\""));
+    }
+
+    #[test]
+    fn extract_table_grid_splits_columns_by_whitespace() {
+        // A 3-row × 4-column invoice-like table: Pos | Artikel | Menge | Preis.
+        let rows = vec![
+            dl(
+                (10, 10, 470, 30),
+                vec![
+                    dw("Pos", (10, 10, 40, 30), 99.0),
+                    dw("Artikel", (100, 10, 180, 30), 99.0),
+                    dw("Menge", (250, 10, 320, 30), 99.0),
+                    dw("Preis", (400, 10, 470, 30), 99.0),
+                ],
+            ),
+            dl(
+                (10, 40, 450, 60),
+                vec![
+                    dw("1", (10, 40, 25, 60), 99.0),
+                    dw("Kabel", (100, 40, 160, 60), 99.0),
+                    dw("2", (250, 40, 265, 60), 99.0),
+                    dw("5,00", (400, 40, 450, 60), 99.0),
+                ],
+            ),
+            dl(
+                (10, 70, 445, 90),
+                vec![
+                    dw("2", (10, 70, 25, 90), 99.0),
+                    dw("Stecker", (100, 70, 180, 90), 99.0),
+                    dw("10", (250, 70, 280, 90), 99.0),
+                    dw("3,50", (400, 70, 445, 90), 99.0),
+                ],
+            ),
+        ];
+        let line_refs: Vec<&DocLine> = rows.iter().collect();
+        let grid = extract_table_grid(&line_refs);
+
+        assert_eq!(grid.rows, 3, "rows are the recognized lines");
+        assert_eq!(grid.cols, 4, "four whitespace-separated columns");
+        assert_eq!(grid.cells.len(), 12, "3×4 fully populated");
+        // Header flag is on row 0 only.
+        assert_eq!(grid.cells.iter().filter(|c| c.header).count(), 4);
+        assert!(grid.cells.iter().filter(|c| c.header).all(|c| c.row == 0));
+        // Words land in the right cells.
+        let price = grid
+            .cells
+            .iter()
+            .find(|c| c.row == 1 && c.col == 3)
+            .unwrap();
+        assert_eq!(price.text, "5,00");
+        let art = grid
+            .cells
+            .iter()
+            .find(|c| c.row == 2 && c.col == 1)
+            .unwrap();
+        assert_eq!(art.text, "Stecker");
+    }
+
+    #[test]
+    fn render_json_emits_table_cells() {
+        let page = DocPage {
+            width: 500,
+            height: 100,
+            lines: vec![
+                dl(
+                    (10, 10, 470, 30),
+                    vec![
+                        dw("Pos", (10, 10, 40, 30), 99.0),
+                        dw("Preis", (400, 10, 470, 30), 99.0),
+                    ],
+                ),
+                dl(
+                    (10, 40, 450, 60),
+                    vec![
+                        dw("1", (10, 40, 25, 60), 99.0),
+                        dw("5,00", (400, 40, 450, 60), 99.0),
+                    ],
+                ),
+            ],
+        };
+        let line_refs: Vec<&DocLine> = page.lines.iter().collect();
+        let grid = extract_table_grid(&line_refs);
+        let regions = vec![DocRegion {
+            kind: RegionKind::Table,
+            bbox: (10, 10, 470, 60),
+            line_indices: vec![0, 1],
+            table: Some(grid),
+        }];
+        let json = render_json_with_regions(&page, &regions, &[]);
+        assert!(json.contains("\"type\":\"table\""), "table region type");
+        assert!(json.contains("\"cols\":2"), "two columns");
+        assert!(json.contains("\"rows\":2"));
+        assert!(json.contains("\"text\":\"5,00\""), "cell text emitted");
+        assert!(json.contains("\"header\":true"), "row 0 flagged header");
     }
 
     // --- from_line_words ---------------------------------------------------

@@ -324,6 +324,27 @@ page's own resolution (robust for typical document scales, not yet ppi-exact).
 That deskew wave is now the one remaining region-classifier gap. No Core change →
 this file + the commit are the record.
 
+**★ Table STRUCTURE → doc.v1 — the delicate-feature seed.** `structured.rs`
+`extract_table_grid` reconstructs a `Table` region's cell grid: rows ARE the
+recognized lines, columns come from the vertical whitespace gaps across the
+region's words (a gap ≥ one median word-height separates columns), each word
+joins the column its x-center lands in, a cell is one line's words in one
+column (header flag on row 0). It emits inside a `"table"` region as
+`rows`/`cols`/`cells:[{row,col,bbox,text,header}]`. This is **pragmatic
+synthesis over the proven word surface** — NOT a `TableFinder` transcode — which
+is the right layer: doc.v1 is explicitly this crate's own output surface, not a
+Tesseract transcode, so "faithfully" lives in the recognition PRIMITIVES
+(words/boxes/regions/rule-masks, all byte-parity) while the JSON assembly is
+ours (like the rest of `structured.rs`). Handles ruled + borderless tables
+alike (no rule-mask dependency). Wired: `build_regions` attaches the grid to
+every `Table` region; `recognize_document` therefore emits it automatically.
+Unit-proven (`extract_table_grid_splits_columns_by_whitespace` 3×4 invoice
+grid; `render_json_emits_table_cells`). **This is the operator-set boundary:
+tesseract-rs = faithful recognition → rich doc.v1; the JSON is the OPTIONAL
+seed a consumer feeds (via OGAR) to `lance-graph-arm-discovery` / DeepNSM.
+Store / graph / KV / PDF-from-data are NOT tesseract-rs concerns.** No Core
+change → this file + the commit are the record.
+
 ## Web demo (`crates/tesseract-ocr-web`)
 
 A single-binary **consumer** demo (axum + askama + tokio) proving the pipeline
