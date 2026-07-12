@@ -276,6 +276,29 @@ See `.claude/plans/recognizer-image-to-text-v2.md`. (Still deferred, unchanged:
 the bbox/stats sub-leaf, gated on a legacy non-LSTM `eng.unicharset`; the 2-D LSTM
 / softmax-LSTM paths — eng.lstm is 1-D non-softmax.)
 
+**★ The region classifier is CLOSED — `pixGetRegionsBinary` byte-parity, wired
+into `recognize_document`.** The composition (`pageseg.c:113`, production
+`pixadb==NULL` path) is transcoded as `pageseg::get_regions_binary`: 2×-reduce
+(`pixReduceRankBinaryCascade [1,0,0,0]`) → the three ALREADY-proven mask
+generators (`pixGenerateHalftoneMask`/`pixGenTextlineMask`/`pixGenTextblockMask`)
+→ `pixSelectBySize(60,60, IF_EITHER, GTE, conn4)` (drop small blocks) → expand×2
++ 8-conn seedfill-fill-back (halftone) / dilate-3×3 (textline, textblock).
+**Byte-identical vs the REAL `pixGetRegionsBinary`** — all three masks (halftone
+ON=8000 == exactly the 100×80 image block, textline, textblock) on a 320×280
+image-block+text-columns fixture — via a `-llept` 1.82.0 oracle
+(`.claude/harvest/oracles/pageseg_regions_oracle.*`; masks share dims only at
+mult-of-8 sizes, so each carries its own `*_w/*_h`, following the flooring of the
+proven expand/reduce sub-leaves). `recognize_document`'s image ("figure")
+regions now come from this leaf (`region_figures`), REPLACING the old full-res
+`generate_halftone_mask` approximation that skipped the 2×-reduce + seedfill
+fill-back; text-block reading order stays with `xy_cut`. Live-verified: page_01
+(text page) → figures empty, all `type:"text"`, `mean_conf` 99.47 unchanged;
+`region_figures_boxes_the_image_block` proves an image page yields exactly one
+figure. **Table detection (`pixDecideIfTable`) is the one region leaf still open**
+— NOT in the `pixGetRegionsBinary` path (line-grid via morph bricks is the
+interim); a separate follow-up. No Core change (pageseg is tesseract-ocr-local) →
+this file + the commit are the record.
+
 ## Web demo (`crates/tesseract-ocr-web`)
 
 A single-binary **consumer** demo (axum + askama + tokio) proving the pipeline

@@ -719,15 +719,16 @@ impl LstmRecognizer {
         };
 
         // Region classification over the SAME grey page: furniture
-        // (header/footer), XY-cut layout blocks (reading order), halftone
-        // figures. All three are the parity-proven library layers.
+        // (header/footer), XY-cut layout blocks (reading order), and image
+        // ("figure") regions from the byte-parity leptonica pixGetRegionsBinary
+        // composition. All are parity-proven library layers.
         let furniture = crate::page_furniture::detect_page_furniture(&page);
         let blocks: Vec<(i32, i32, i32, i32)> =
             crate::xy_cut::xy_cut(grey, w, h, &crate::xy_cut::XyCutParams::default())
                 .into_iter()
                 .map(|r| (r.left as i32, r.top as i32, r.right as i32, r.bottom as i32))
                 .collect();
-        let figures = Self::halftone_figures(grey, w, h);
+        let figures = Self::region_figures(grey, w, h);
         let regions = crate::structured::build_regions(
             &page,
             &furniture.header_lines,
@@ -751,14 +752,22 @@ impl LstmRecognizer {
         })
     }
 
-    /// Halftone (image-region) figure bboxes for [`Self::recognize_document`]'s
-    /// region classification: binarize (Otsu, with the same fixed-128 fallback
-    /// the library segmenters use when Otsu declines), run the leptonica-parity
-    /// [`generate_halftone_mask`](crate::pageseg::generate_halftone_mask) (only
-    /// above its `MinWidth`/`MinHeight` gate), and return the found mask's
-    /// connected components as page-space `(l, t, r, b)` rects. Empty when the
-    /// page is too small or holds no halftone region.
-    fn halftone_figures(grey: &[u8], w: usize, h: usize) -> Vec<(i32, i32, i32, i32)> {
+    /// Image-region ("figure") bboxes for [`Self::recognize_document`]'s region
+    /// classification — the byte-parity leptonica `pixGetRegionsBinary`
+    /// composition ([`get_regions_binary`](crate::pageseg::get_regions_binary)).
+    /// Binarize (Otsu, with the same fixed-128 fallback the library segmenters
+    /// use when Otsu declines), run the composition, and return the halftone
+    /// (image) mask's 8-connected components as page-space `(l, t, r, b)` rects.
+    /// Empty when the page is too small or holds no image region.
+    ///
+    /// This runs the "is it a picture?" half of the classifier through the REAL
+    /// leptonica leaf — the 2×-reduce → seed → seedfill-fill-back → expand chain
+    /// — rather than the previous full-resolution `generate_halftone_mask`
+    /// approximation. Text-block reading order stays with
+    /// [`xy_cut`](crate::xy_cut::xy_cut); the textblock mask
+    /// ([`Regions::textblock`](crate::pageseg::Regions::textblock)) is the
+    /// pixel-level text-region witness the same composition also yields.
+    fn region_figures(grey: &[u8], w: usize, h: usize) -> Vec<(i32, i32, i32, i32)> {
         if w < crate::pageseg::MIN_WIDTH || h < crate::pageseg::MIN_HEIGHT {
             return Vec::new();
         }
@@ -770,15 +779,16 @@ impl LstmRecognizer {
         } else {
             crate::threshold::threshold_rect_to_binary(grey, w, 0, 0, w, h, otsu)
         };
-        crate::pageseg::generate_halftone_mask(&binary, w, h)
-            .filter(|hm| hm.found)
-            .map(|hm| {
-                crate::conncomp::conn_comp_bb(&hm.mask, hm.mask_w, hm.mask_h, 8)
-                    .into_iter()
-                    .map(|b| (b.x, b.y, b.x + b.w, b.y + b.h))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let Some(regions) = crate::pageseg::get_regions_binary(&binary, w, h) else {
+            return Vec::new();
+        };
+        if !regions.halftone.contains(&0) {
+            return Vec::new(); // no image region on the page
+        }
+        crate::conncomp::conn_comp_bb(&regions.halftone, regions.halftone_w, regions.halftone_h, 8)
+            .into_iter()
+            .map(|b| (b.x, b.y, b.x + b.w, b.y + b.h))
+            .collect()
     }
 
     /// `LSTMRecognizer::SetRandomSeed` (`lstmrecognizer.h:287-291`): the exact
@@ -1255,5 +1265,51 @@ mod makerow_page_tests {
             .unwrap();
         assert!(harvested.json.contains("\"fields\":"));
         assert_eq!(harvested.line_count, words.len());
+    }
+
+    /// The region-classifier figure path (`region_figures`) is corpus-free —
+    /// it takes a grey page and runs the byte-parity `get_regions_binary`
+    /// composition. A page with a solid image block + text columns must yield
+    /// exactly one image ("figure") region boxing the block, proving the
+    /// recognize_document wiring consumes the real leptonica leaf (not the old
+    /// full-res halftone approximation).
+    #[test]
+    fn region_figures_boxes_the_image_block() {
+        let (w, h) = (320usize, 280usize);
+        let mut grey = vec![255u8; w * h];
+        // Solid dark 100×80 image block.
+        for y in 30..110 {
+            for x in 30..130 {
+                grey[y * w + x] = 0;
+            }
+        }
+        // Two text columns (thin stripes) — must NOT be classified as image.
+        for c0 in [160usize, 250] {
+            let mut yb = 20;
+            while yb + 5 <= 260 {
+                for y in yb..yb + 5 {
+                    for x in c0..c0 + 60 {
+                        if (x - c0) % 24 < 18 {
+                            grey[y * w + x] = 0;
+                        }
+                    }
+                }
+                yb += 12;
+            }
+        }
+
+        let figures = LstmRecognizer::region_figures(&grey, w, h);
+        assert_eq!(figures.len(), 1, "exactly the one solid image block");
+        let (l, t, r, b) = figures[0];
+        // The seedfill-fill-back recovers the full 100×80 block; the bbox hugs
+        // its extent (±2 for the 2×-reduction flooring).
+        assert!(
+            (28..=32).contains(&l) && (28..=32).contains(&t),
+            "origin {l},{t}"
+        );
+        assert!(
+            (128..=132).contains(&r) && (108..=112).contains(&b),
+            "extent {r},{b}"
+        );
     }
 }
