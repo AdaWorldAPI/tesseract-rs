@@ -51,8 +51,8 @@ pub use morphapp::{
 pub use network::{InputShape, NetError, Network, Node, ReverseKind};
 pub use page_furniture::{detect_page_furniture, PageFurniture};
 pub use pageseg::{
-    gen_textblock_mask, gen_textline_mask, generate_halftone_mask, HalftoneMask, TextlineMask,
-    MIN_HEIGHT, MIN_WIDTH,
+    gen_textblock_mask, gen_textline_mask, generate_halftone_mask, get_regions_binary,
+    HalftoneMask, Regions, TextlineMask, MIN_HEIGHT, MIN_WIDTH,
 };
 pub use renderer::{render_hocr, render_text, render_tsv, LineWords};
 pub use seedfill::seedfill_binary;

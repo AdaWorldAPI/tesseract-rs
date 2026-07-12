@@ -53,7 +53,7 @@
 //! [`crate::threshold`]), assumed 150–200 ppi per the C's header comment.
 
 use crate::binreduce::{expand_replicate, reduce_rank_binary_cascade};
-use crate::morph::{close_safe_brick, morph_sequence, open_brick};
+use crate::morph::{close_safe_brick, dilate_brick, morph_sequence, open_brick};
 use crate::morphapp::{
     morph_sequence_by_component, select_by_size, SelectRelation, SelectType, SizeFilter,
 };
@@ -149,6 +149,16 @@ fn subtract(a: &[u8], b: &[u8]) -> Vec<u8> {
     a.iter()
         .zip(b)
         .map(|(&pa, &pb)| if pa == 0 && pb != 0 { 0 } else { 255 })
+        .collect()
+}
+
+/// `a OR b` on same-shaped bitonal buffers — `pixOr` on 1 bpp: ON iff either
+/// input is ON. Used by [`get_regions_binary`] to merge the seedfill-grown
+/// halftone mask back into the expanded one (`pageseg.c:151`).
+fn or(a: &[u8], b: &[u8]) -> Vec<u8> {
+    a.iter()
+        .zip(b)
+        .map(|(&pa, &pb)| if pa == 0 || pb == 0 { 0 } else { 255 })
         .collect()
 }
 
@@ -252,6 +262,127 @@ pub fn gen_textblock_mask(textline_mask: &[u8], vws: &[u8], w: usize, h: usize) 
     )
 }
 
+/// The three full-resolution region masks returned by [`get_regions_binary`],
+/// each carrying its own dimensions (they coincide when `w`/`h` are multiples
+/// of 8; otherwise each floors independently through its own expand chain —
+/// see [`get_regions_binary`]). This crate's `0` = ON convention.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Regions {
+    /// Halftone (image-region) mask. Connected components are the picture
+    /// bboxes — the "Bild" half of the classifier.
+    pub halftone: Vec<u8>,
+    /// Halftone mask width.
+    pub halftone_w: usize,
+    /// Halftone mask height.
+    pub halftone_h: usize,
+    /// Textline mask.
+    pub textline: Vec<u8>,
+    /// Textline mask width.
+    pub textline_w: usize,
+    /// Textline mask height.
+    pub textline_h: usize,
+    /// Textblock mask — connected components are the text-block bboxes. Empty
+    /// (all background, full page size) when the page has no text blocks,
+    /// matching the C's `pixCreateTemplate`.
+    pub textblock: Vec<u8>,
+    /// Textblock mask width.
+    pub textblock_w: usize,
+    /// Textblock mask height.
+    pub textblock_h: usize,
+}
+
+/// Split a binarized page into halftone (image), textline, and textblock
+/// masks — `pixGetRegionsBinary` (`pageseg.c:113-266`, the production path
+/// with `pixadb == NULL`). THE region-classifier composition: it 2×-reduces
+/// the page, runs the three parity-proven mask generators
+/// ([`generate_halftone_mask`] / [`gen_textline_mask`] / [`gen_textblock_mask`])
+/// at that scale, drops textblocks smaller than 60×60 in *either* dimension,
+/// then expands every mask back to full resolution — the halftone mask grown
+/// through the page by an 8-connected seedfill + OR, the textline/textblock
+/// masks each dilated 3×3.
+///
+/// ```text
+/// pixr       = reduce_rank_cascade(pixs, [1,0,0,0])   // 2× reduce → 150-200 ppi
+/// hm2,text,_ = generate_halftone_mask(pixr)
+/// tm2,vws,_  = gen_textline_mask(text)
+/// tb2        = gen_textblock_mask(tm2, vws)           // Option (None → empty tb)
+/// tbf2       = tb2 ? select_by_size(60,60, IF_EITHER, GTE, conn4) : None
+/// hm  = expand2(hm2); hm |= seedfill8(hm, pixs)       // fill to full coverage
+/// tm  = dilate3x3(expand2(tm2))
+/// tb  = tbf2 ? dilate3x3(expand2(tbf2)) : empty(pixs)
+/// ```
+///
+/// Returns `None` only when `w < `[`MIN_WIDTH`]` || h < `[`MIN_HEIGHT`] — the
+/// C's top-level size error. (The 2×-reduced masks impose their own MinWidth
+/// gate internally; a page that clears the top gate but whose halved
+/// dimensions fall under 100 yields empty masks, exactly as the C composes its
+/// `NULL` sub-results.)
+///
+/// # Panics
+/// Panics if `binary.len() != w * h`.
+#[must_use]
+pub fn get_regions_binary(binary: &[u8], w: usize, h: usize) -> Option<Regions> {
+    assert_eq!(binary.len(), w * h, "binary buffer length must be w * h");
+    if w < MIN_WIDTH || h < MIN_HEIGHT {
+        return None;
+    }
+
+    // 2× reduce to 150-200 ppi (pageseg.c:143) — a single rank-1 level.
+    let (pixr, rw, rh) = reduce_rank_binary_cascade(binary, w, h, [1, 0, 0, 0])?;
+
+    // The three masks at the reduced scale (pageseg.c:146-152).
+    let hm = generate_halftone_mask(&pixr, rw, rh)?;
+    let tl = gen_textline_mask(&hm.text, rw, rh)?;
+    let tb2 = gen_textblock_mask(&tl.mask, &tl.vws, rw, rh);
+
+    // Drop textblocks under 60×60 in EITHER dimension (pageseg.c:161-166).
+    let tbf2 = tb2.and_then(|tb| {
+        select_by_size(
+            &tb,
+            rw,
+            rh,
+            4,
+            SizeFilter {
+                width: 60,
+                height: 60,
+                select_type: SelectType::IfEither,
+                relation: SelectRelation::Gte,
+            },
+        )
+    });
+
+    // Expand back to full resolution + fill/dilate for coverage
+    // (pageseg.c:170-190). The halftone mask is grown through the full page
+    // by an 8-connected seedfill, then OR'd back in.
+    let (hm_exp, hw, hh) = expand_replicate(&hm.mask, hm.mask_w, hm.mask_h, 2, 2)?;
+    let grown = seedfill_binary(&hm_exp, hw, hh, binary, w, h, 8)?;
+    let halftone = or(&hm_exp, &grown);
+
+    let (tm_exp, tw, th) = expand_replicate(&tl.mask, rw, rh, 2, 2)?;
+    let textline = dilate_brick(&tm_exp, tw, th, 3, 3);
+
+    let (textblock, tbw, tbh) = match tbf2 {
+        Some(tbf) => {
+            let (tb_exp, bw, bh) = expand_replicate(&tbf, rw, rh, 2, 2)?;
+            (dilate_brick(&tb_exp, bw, bh, 3, 3), bw, bh)
+        }
+        // pixCreateTemplate(pixs): empty mask at the FULL page size.
+        None => (vec![255u8; w * h], w, h),
+    };
+
+    Some(Regions {
+        halftone,
+        halftone_w: hw,
+        halftone_h: hh,
+        textline,
+        textline_w: tw,
+        textline_h: th,
+        textblock,
+        textblock_w: tbw,
+        textblock_h: tbh,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +425,45 @@ mod tests {
         parse_dump(include_str!(
             "../../../.claude/harvest/oracles/pageseg2_oracle_out.txt"
         ))
+    }
+
+    fn oracle3() -> HashMap<String, (usize, usize, Vec<u8>)> {
+        parse_dump(include_str!(
+            "../../../.claude/harvest/oracles/pageseg_regions_oracle_out.txt"
+        ))
+    }
+
+    /// The 320×280 region-classifier fixture — a solid 100×80 image block plus
+    /// two columns of horizontal text stripes. MUST match the
+    /// `pageseg_regions_oracle`'s `ink_at` byte-for-byte.
+    fn regions_fixture() -> (Vec<u8>, usize, usize) {
+        let (w, h) = (320usize, 280usize);
+        let mut buf = vec![255u8; w * h];
+        let ink = |x: usize, y: usize| -> bool {
+            if x >= 30 && x < 130 && y >= 30 && y < 110 {
+                return true;
+            }
+            for c0 in [160usize, 250] {
+                if x >= c0 && x < c0 + 60 {
+                    let mut yb = 20;
+                    while yb + 5 <= 260 {
+                        if y >= yb && y < yb + 5 && (x - c0) % 24 < 18 {
+                            return true;
+                        }
+                        yb += 12;
+                    }
+                }
+            }
+            false
+        };
+        for y in 0..h {
+            for x in 0..w {
+                if ink(x, y) {
+                    buf[y * w + x] = 0;
+                }
+            }
+        }
+        (buf, w, h)
     }
 
     /// The 260×220 two-column text-page fixture — must match the pageseg2
@@ -393,6 +563,37 @@ mod tests {
         let buf = vec![255u8; 99 * 200];
         assert!(gen_textline_mask(&buf, 99, 200).is_none());
         assert!(gen_textblock_mask(&buf, &buf, 99, 200).is_none());
+    }
+
+    #[test]
+    fn get_regions_binary_matches_liblept() {
+        let o = oracle3();
+        let (buf, w, h) = regions_fixture();
+        assert_eq!(
+            o["regions_src"],
+            (w, h, buf.clone()),
+            "fixture == oracle input"
+        );
+
+        let r = get_regions_binary(&buf, w, h).expect("big enough");
+        // All three region masks, byte-for-byte vs the REAL pixGetRegionsBinary.
+        let (hw, hh, hbuf) = &o["regions_hm"];
+        assert_eq!((r.halftone_w, r.halftone_h), (*hw, *hh), "halftone dims");
+        assert_eq!(&r.halftone, hbuf, "halftone (image) mask pixels");
+        let (tw, th, tbuf) = &o["regions_tm"];
+        assert_eq!((r.textline_w, r.textline_h), (*tw, *th), "textline dims");
+        assert_eq!(&r.textline, tbuf, "textline mask pixels");
+        let (bw, bh, bbuf) = &o["regions_tb"];
+        assert_eq!((r.textblock_w, r.textblock_h), (*bw, *bh), "textblock dims");
+        assert_eq!(&r.textblock, bbuf, "textblock mask pixels");
+    }
+
+    #[test]
+    fn get_regions_binary_rejects_small_pages() {
+        let buf = vec![255u8; 99 * 200];
+        assert!(get_regions_binary(&buf, 99, 200).is_none());
+        let buf = vec![255u8; 200 * 99];
+        assert!(get_regions_binary(&buf, 200, 99).is_none());
     }
 
     /// The 97×61 close-safe fixture — the binreduce oracle's formula.
