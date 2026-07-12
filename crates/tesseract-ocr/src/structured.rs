@@ -41,9 +41,10 @@
 //! - `regions`: [`render_json`] emits ONE `"paragraph"` region (the plain
 //!   default, byte-stable); [`render_json_with_regions`] emits CLASSIFIED
 //!   regions built by [`build_regions`] from the layout stack — `"text"`
-//!   (XY-cut blocks, reading order), `"figure"` (halftone-mask components),
-//!   `"header"`/`"footer"` (page furniture). Additive `type` values;
-//!   consumers must ignore unknown ones.
+//!   (XY-cut blocks, reading order), `"table"` (a block whose leptonica
+//!   `decide_if_table` score cleared the threshold), `"figure"` (halftone-mask
+//!   components), `"header"`/`"footer"` (page furniture). Additive `type`
+//!   values; consumers must ignore unknown ones.
 //! - `quality.mean_conf` is the mean word confidence 0–100 (`null` when no
 //!   words), and `low_confidence` flags a page below
 //!   [`LOW_CONFIDENCE_THRESHOLD`] — the honesty signal that the input is
@@ -295,6 +296,13 @@ fn union_bbox(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, i3
 /// - `blocks` — layout blocks in READING ORDER (e.g. `crate::xy_cut` leaves as
 ///   top-down `(l, t, r, b)`); each remaining line joins the FIRST block
 ///   containing its bbox center.
+/// - `table_blocks` — parallel to `blocks`: `true` marks a block a table (its
+///   region gets [`RegionKind::Table`] instead of [`RegionKind::Text`]). The
+///   caller decides this on the FULL block bbox (see
+///   [`crate::LstmRecognizer::recognize_document`]), not the emitted text-line
+///   union — a shorter/positional slice would strip the rules and column
+///   corridors `pageseg::decide_if_table` keys on. A short slice (or empty)
+///   defaults every block to `Text`.
 /// - `figures` — image-region bboxes (e.g. halftone-mask components,
 ///   `crate::pageseg`); they own no lines.
 ///
@@ -308,6 +316,7 @@ pub fn build_regions(
     header_lines: &[usize],
     footer_lines: &[usize],
     blocks: &[(i32, i32, i32, i32)],
+    table_blocks: &[bool],
     figures: &[(i32, i32, i32, i32)],
 ) -> Vec<DocRegion> {
     let mut block_members: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
@@ -352,8 +361,13 @@ pub fn build_regions(
 
     let mut out: Vec<DocRegion> = Vec::new();
     out.extend(lines_region(RegionKind::Header, &header));
-    for members in &block_members {
-        out.extend(lines_region(RegionKind::Text, members));
+    for (bi, members) in block_members.iter().enumerate() {
+        let kind = if table_blocks.get(bi).copied().unwrap_or(false) {
+            RegionKind::Table
+        } else {
+            RegionKind::Text
+        };
+        out.extend(lines_region(kind, members));
     }
     out.extend(lines_region(RegionKind::Text, &orphans));
     out.extend(figures.iter().map(|&bbox| DocRegion {
@@ -1295,7 +1309,7 @@ mod tests {
         };
         let blocks = [(0, 40, 200, 100), (200, 40, 400, 100)];
         let figures = [(250, 150, 380, 250)];
-        let regions = build_regions(&page, &[0], &[4], &blocks, &figures);
+        let regions = build_regions(&page, &[0], &[4], &blocks, &[false, false], &figures);
 
         let kinds: Vec<&str> = regions.iter().map(|r| r.kind.as_str()).collect();
         assert_eq!(
@@ -1326,10 +1340,32 @@ mod tests {
         };
         // Two blocks, only the first is populated; no furniture, no figures.
         let blocks = [(0, 0, 100, 50), (0, 50, 100, 100)];
-        let regions = build_regions(&page, &[], &[], &blocks, &[]);
+        let regions = build_regions(&page, &[], &[], &blocks, &[], &[]);
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].kind, RegionKind::Text);
         assert_eq!(regions[0].line_indices, [0]);
+    }
+
+    #[test]
+    fn build_regions_marks_table_blocks() {
+        let page = DocPage {
+            width: 200,
+            height: 200,
+            lines: vec![
+                dl((10, 10, 90, 30), vec![dw("cell", (10, 10, 40, 30), 95.0)]),
+                dl(
+                    (10, 110, 90, 130),
+                    vec![dw("para", (10, 110, 40, 130), 95.0)],
+                ),
+            ],
+        };
+        let blocks = [(0, 0, 100, 50), (0, 100, 100, 150)];
+        // First block flagged a table, second a plain text block.
+        let regions = build_regions(&page, &[], &[], &blocks, &[true, false], &[]);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].kind, RegionKind::Table, "flagged block → table");
+        assert_eq!(regions[0].line_indices, [0]);
+        assert_eq!(regions[1].kind, RegionKind::Text, "unflagged block → text");
     }
 
     #[test]
