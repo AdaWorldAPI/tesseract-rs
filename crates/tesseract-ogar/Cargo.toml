@@ -23,6 +23,13 @@ tesseract-ocr-pdf = { path = "../tesseract-ocr-pdf" }
 # it. Path dep, fork-only policy (same as the two foundations above).
 tesseract-recognizer = { path = "../tesseract-recognizer" }
 
+[features]
+# Pure-Rust encoded-image (PNG/JPEG/WebP/TIFF/GIF/BMP/PNM) → grey decode,
+# re-exported from tesseract-ocr so a consumer decodes container bytes via THIS
+# crate (the executor they already use) — no direct tesseract-ocr dep, no
+# `image` wiring. Opt-in; off keeps the executor lean (PGM/grey only).
+image-decode = ["tesseract-ocr/image-decode"]
+
 [dev-dependencies]
 # The V3-substrate <-> Python-SDK parity probe (`v3_facet`, `examples/
 # v3_facet_probe.rs`, `tests/v3_facet_parity.rs`) emits this crate's

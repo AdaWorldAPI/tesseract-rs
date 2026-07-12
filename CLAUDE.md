@@ -345,6 +345,18 @@ seed a consumer feeds (via OGAR) to `lance-graph-arm-discovery` / DeepNSM.
 Store / graph / KV / PDF-from-data are NOT tesseract-rs concerns.** No Core
 change → this file + the commit are the record.
 
+**★ Consumer surface — the low-debt OGAR adoption path.** `docs/CONSUMER-GUIDE.md`
+is the copy-paste manual (classid → `OcrExecutor` → `doc.v1`; the boundary; the
+14 caps; the seed shape; BBB-clean deps). Companion: `tesseract_ocr::decode_image`
+(feature `image-decode`, forwarded + re-exported as `tesseract_ogar::decode_image`)
+— pure-Rust PNG/JPEG/WebP/TIFF/GIF/BMP/PNM → grey, bomb-bounded (dim/pixel/alloc
+caps), lifted from the proven `tesseract-ocr-web` decode. So a consumer's ingest
+is two pure-Rust calls through the ONE executor crate — `decode_image` then
+`execute` — no `image` wiring, no direct recognizer dep. Feature off = lean
+PGM/grey-only executor. This is the operator's "make the implementation debt to
+get used to the OGAR adapters small" delivered. No Core change → this file + the
+commit are the record.
+
 ## Web demo (`crates/tesseract-ocr-web`)
 
 A single-binary **consumer** demo (axum + askama + tokio) proving the pipeline

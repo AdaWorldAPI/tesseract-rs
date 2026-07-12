@@ -555,6 +555,116 @@ pub fn rgb_to_luminance(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
     rgb_to_gray(rgb, w, h, 0.0, 0.0, 0.0)
 }
 
+/// An error decoding an encoded image container in [`decode_image`].
+#[cfg(feature = "image-decode")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageDecodeError {
+    /// The bytes could not be read / the format could not be sniffed.
+    Read(String),
+    /// The image failed to decode (or exceeded the decoder's alloc cap).
+    Decode(String),
+    /// The decoded image is below the recognizer's 3px floor.
+    TooSmall {
+        /// Decoded width.
+        width: usize,
+        /// Decoded height.
+        height: usize,
+    },
+    /// The decoded pixel count exceeds the safety budget.
+    TooLarge {
+        /// Decoded width.
+        width: usize,
+        /// Decoded height.
+        height: usize,
+    },
+}
+
+#[cfg(feature = "image-decode")]
+impl std::fmt::Display for ImageDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(e) => write!(f, "could not read image: {e}"),
+            Self::Decode(e) => write!(f, "could not decode image: {e}"),
+            Self::TooSmall { width, height } => {
+                write!(f, "image too small to contain text ({width}x{height})")
+            }
+            Self::TooLarge { width, height } => write!(
+                f,
+                "image too large: {width}x{height} exceeds the {} MP budget",
+                DECODE_MAX_PIXELS / 1_000_000
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "image-decode")]
+impl std::error::Error for ImageDecodeError {}
+
+/// Largest single decoded dimension (guards a degenerate `1 × 400_000_000`).
+#[cfg(feature = "image-decode")]
+const DECODE_MAX_DIM: u32 = 20_000;
+/// Decoded pixel budget (width × height) — 40 MP covers a 300 dpi A3 scan.
+#[cfg(feature = "image-decode")]
+const DECODE_MAX_PIXELS: u64 = 40_000_000;
+/// Cap the decoder's own intermediate allocation (a compressed bomb inflates
+/// far past its byte size).
+#[cfg(feature = "image-decode")]
+const DECODE_MAX_ALLOC: u64 = 256 * 1024 * 1024;
+
+/// Decode an encoded image container (PNG / JPEG / WebP / TIFF / GIF / BMP /
+/// PNM) to an 8-bit grey buffer `(grey, width, height)`, row-major,
+/// `len == width·height` — ready for the OGAR OCR executor or
+/// [`from_grey_pix`]. Decode is **pure-Rust** (the `image` crate); no
+/// leptonica, no C. This is the one call a consumer needs to hand the executor
+/// container bytes without wiring `image` itself.
+///
+/// Format is sniffed from the bytes. Decode runs under explicit limits (the
+/// `image` defaults set NO dimension cap, so a tiny compressed file can decode
+/// to a gigapixel raster): dimensions ≤ [`DECODE_MAX_DIM`], pixel count ≤
+/// [`DECODE_MAX_PIXELS`] (checked BEFORE `to_luma8` allocates the second
+/// full-resolution buffer), decoder alloc ≤ 256 MiB.
+///
+/// Available with the `image-decode` feature.
+///
+/// # Errors
+/// [`ImageDecodeError`] on unreadable/undecodable bytes, or a decoded image
+/// below the 3px floor or above the pixel budget.
+///
+/// [`from_grey_pix`]: tesseract_recognizer::from_grey_pix
+#[cfg(feature = "image-decode")]
+pub fn decode_image(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), ImageDecodeError> {
+    use image::{ImageReader, Limits};
+    use std::io::Cursor;
+
+    let mut reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| ImageDecodeError::Read(e.to_string()))?;
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(DECODE_MAX_DIM);
+    limits.max_image_height = Some(DECODE_MAX_DIM);
+    limits.max_alloc = Some(DECODE_MAX_ALLOC);
+    reader.limits(limits);
+
+    let dynimg = reader
+        .decode()
+        .map_err(|e| ImageDecodeError::Decode(e.to_string()))?;
+    let (w, h) = (dynimg.width() as usize, dynimg.height() as usize);
+    if w < 3 || h < 3 {
+        return Err(ImageDecodeError::TooSmall {
+            width: w,
+            height: h,
+        });
+    }
+    if (w as u64) * (h as u64) > DECODE_MAX_PIXELS {
+        return Err(ImageDecodeError::TooLarge {
+            width: w,
+            height: h,
+        });
+    }
+    let grey = dynimg.to_luma8();
+    Ok((grey.into_raw(), w, h))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,5 +785,36 @@ mod tests {
     fn rgb_to_gray_rejects_negative_weight() {
         let rgb: Vec<u8> = vec![1, 2, 3];
         let _ = rgb_to_gray(&rgb, 1, 1, -0.1, 0.5, 0.6);
+    }
+
+    #[cfg(feature = "image-decode")]
+    #[test]
+    fn decode_image_png_roundtrips_and_guards() {
+        use image::{DynamicImage, GrayImage, ImageFormat};
+        use std::io::Cursor;
+
+        // A 4×3 grey image → PNG → decode_image → same grey bytes.
+        let (w, h) = (4usize, 3usize);
+        let src: Vec<u8> = (0..(w * h) as u8).map(|i| i.wrapping_mul(20)).collect();
+        let mut png = Vec::new();
+        DynamicImage::ImageLuma8(GrayImage::from_raw(w as u32, h as u32, src.clone()).unwrap())
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .unwrap();
+        let (grey, dw, dh) = decode_image(&png).expect("decode the png");
+        assert_eq!((dw, dh), (w, h));
+        assert_eq!(grey, src, "grey round-trips byte-for-byte through PNG");
+
+        // A 2×2 image is below the 3px floor.
+        let mut tiny = Vec::new();
+        DynamicImage::ImageLuma8(GrayImage::from_raw(2, 2, vec![0u8; 4]).unwrap())
+            .write_to(&mut Cursor::new(&mut tiny), ImageFormat::Png)
+            .unwrap();
+        assert!(matches!(
+            decode_image(&tiny),
+            Err(ImageDecodeError::TooSmall { .. })
+        ));
+
+        // Garbage bytes are rejected, not panicked on.
+        assert!(decode_image(&[0xde, 0xad, 0xbe, 0xef]).is_err());
     }
 }

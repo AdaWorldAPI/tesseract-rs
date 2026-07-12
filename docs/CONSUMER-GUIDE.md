@@ -124,15 +124,28 @@ None of this is tesseract-rs's concern — it hands you the seed and stops.
 nothing that violates the customer-binary firewall. You can drive OCR from a
 lean customer binary.
 
-## Input formats
+## Input — encoded images, one pure-Rust call
 
-Today the executor takes **8-bit grey** pixels (row-major) — from a P5 PGM
-(`tesseract_ocr::image_input::parse_pgm`) or from RGB via
-`tesseract_ocr::image_input::rgb_to_gray`. Decoding PNG/JPEG/TIFF containers is
-**not** yet inside the executor; a consumer decodes to grey first (the
-`tesseract-ocr-web` crate shows the pure-Rust `image`-crate pattern). An
-encoded-image intake on the executor (hand it a PNG + classid, decode inside,
-pure-Rust) is the next planned ergonomic — until then, decode-then-execute.
+The executor takes **8-bit grey** pixels (row-major). Get them one of three
+pure-Rust ways, all through the tesseract crates — you never wire `image`
+yourself:
+
+- **Encoded containers** (PNG / JPEG / WebP / TIFF / GIF / BMP / PNM) —
+  `tesseract_ogar::decode_image(bytes)` → `(grey, width, height)`, behind the
+  `image-decode` feature (bounded against decode bombs: dimension / pixel /
+  alloc caps). Enable it: `tesseract-ogar = { …, features = ["image-decode"] }`.
+- **P5 PGM** — `tesseract_ocr::image_input::parse_pgm` (lossless, no extra deps).
+- **Raw RGB** — `tesseract_ocr::image_input::rgb_to_gray`.
+
+So a consumer's ingest is two pure-Rust calls — decode, execute — touching only
+the tesseract crates:
+
+```rust
+let (grey, width, height) = tesseract_ogar::decode_image(png_or_jpeg_bytes)?;
+let resp = exec.execute(OcrRequest::RecognizeDocument {
+    grey: &grey, width, height, with_dict: false, harvest_profile: None,
+})?;
+```
 
 ## Runnable reference
 
