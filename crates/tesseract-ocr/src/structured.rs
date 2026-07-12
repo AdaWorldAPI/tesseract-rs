@@ -336,11 +336,16 @@ fn union_bbox(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, i3
 
 /// Reconstruct a [`TableGrid`] from a table region's `lines` — the delicate
 /// feature that makes doc.v1 a good seed. Rows ARE the recognized lines;
-/// columns come from the vertical whitespace gaps across all the region's
-/// words (a gap ≥ one median word-height separates columns). Each word joins
-/// the column band its x-center lands in; a cell is one line's words in one
-/// column. Pragmatic synthesis over the proven word surface — no rule-mask or
-/// C-transcode dependency, so it handles ruled and borderless tables alike.
+/// columns come from vertical whitespace **rivers**: a separator must be
+/// whitespace agreed by a MAJORITY of rows AND at least 2× a word-height wide
+/// (a within-cell word space in a single row is neither, so a multi-word
+/// description stays ONE cell — codex #41 P2). Each word joins the column band
+/// its x-center lands in; a cell is one line's words in one column. Pragmatic
+/// synthesis over the proven word surface — no rule-mask or C-transcode
+/// dependency, so it handles ruled and borderless tables alike. (Residual: a
+/// sparse table whose single within-cell gap is both wide AND uncovered by
+/// every other row stays ambiguous; a ruled table's vertical rule mask would
+/// settle it — future, this is word-only today.)
 #[must_use]
 pub fn extract_table_grid(lines: &[&DocLine]) -> TableGrid {
     let all: Vec<&DocWord> = lines.iter().flat_map(|l| l.words.iter()).collect();
@@ -352,28 +357,43 @@ pub fn extract_table_grid(lines: &[&DocLine]) -> TableGrid {
         };
     }
 
-    // Column cut positions from the x-whitespace gaps.
     let x0 = all.iter().map(|w| w.bbox.0).min().unwrap();
     let x1 = all.iter().map(|w| w.bbox.2).max().unwrap();
     let mut heights: Vec<i32> = all.iter().map(|w| (w.bbox.3 - w.bbox.1).max(1)).collect();
     heights.sort_unstable();
-    let gap_min = heights[heights.len() / 2].max(1) as usize;
-
+    let med_h = heights[heights.len() / 2].max(1) as usize;
+    // A column separator must be WIDE (≥ 2× a word-height — within-cell word
+    // spaces are ~1×) AND agreed by a MAJORITY of rows. Both guards keep a
+    // multi-word description cell's internal gap from becoming a column (#41 P2).
+    let gap_min = 2 * med_h;
     let width = (x1 - x0).max(1) as usize;
-    let mut covered = vec![false; width];
-    for w in &all {
-        let a = (w.bbox.0 - x0).clamp(0, x1 - x0) as usize;
-        let b = (w.bbox.2 - x0).clamp(0, x1 - x0) as usize;
-        for c in covered.iter_mut().take(b).skip(a) {
-            *c = true;
+
+    // Per-x count of rows that are WHITESPACE there (no word of that row covers x).
+    let mut gap_rows = vec![0u32; width];
+    for line in lines {
+        let mut row_covered = vec![false; width];
+        for w in &line.words {
+            let a = (w.bbox.0 - x0).clamp(0, x1 - x0) as usize;
+            let b = (w.bbox.2 - x0).clamp(0, x1 - x0) as usize;
+            for c in row_covered.iter_mut().take(b).skip(a) {
+                *c = true;
+            }
+        }
+        for (x, &cov) in row_covered.iter().enumerate() {
+            if !cov {
+                gap_rows[x] += 1;
+            }
         }
     }
-    // Cuts at the midpoint of every whitespace gap wide enough to be a column
-    // separator; the outer edges 0 and width bound the first/last columns.
+    let n_rows = lines.len() as u32;
+    let support = if n_rows <= 1 { 1 } else { n_rows / 2 + 1 };
+
+    // Cuts at the midpoint of every cross-row whitespace river wide enough to be
+    // a column separator; the outer edges 0 and width bound the first/last cols.
     let mut cuts: Vec<usize> = vec![0];
     let mut gap_start: Option<usize> = None;
-    for (x, &cov) in covered.iter().enumerate() {
-        if cov {
+    for (x, &g) in gap_rows.iter().enumerate() {
+        if g < support {
             if let Some(s) = gap_start.take() {
                 if x - s >= gap_min {
                     cuts.push((s + x) / 2);
@@ -1671,6 +1691,42 @@ mod tests {
         assert!(json.contains("\"rows\":2"));
         assert!(json.contains("\"text\":\"5,00\""), "cell text emitted");
         assert!(json.contains("\"header\":true"), "row 0 flagged header");
+    }
+
+    #[test]
+    fn extract_table_grid_keeps_multiword_cell_intact() {
+        // codex #41 P2: a description cell "Kabel HDMI" with an internal word
+        // gap must NOT split into two columns just because no other row happens
+        // to cover that x-band. Two columns (description | price), not three.
+        let rows = vec![
+            dl(
+                (10, 10, 360, 30),
+                vec![
+                    dw("Pos", (10, 10, 40, 30), 99.0),
+                    dw("Preis", (300, 10, 360, 30), 99.0),
+                ],
+            ),
+            dl(
+                (10, 40, 350, 60),
+                vec![
+                    dw("Kabel", (10, 40, 60, 60), 99.0),
+                    dw("HDMI", (90, 40, 140, 60), 99.0), // internal gap [60,90]=30 < 2×height(40)
+                    dw("5,00", (300, 40, 350, 60), 99.0),
+                ],
+            ),
+        ];
+        let line_refs: Vec<&DocLine> = rows.iter().collect();
+        let grid = extract_table_grid(&line_refs);
+        assert_eq!(
+            grid.cols, 2,
+            "the Kabel/HDMI internal gap must NOT become a column"
+        );
+        let desc = grid
+            .cells
+            .iter()
+            .find(|c| c.row == 1 && c.col == 0)
+            .unwrap();
+        assert_eq!(desc.text, "Kabel HDMI", "the description cell stays whole");
     }
 
     // --- from_line_words ---------------------------------------------------
