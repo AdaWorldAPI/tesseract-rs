@@ -728,16 +728,22 @@ impl LstmRecognizer {
                 .into_iter()
                 .map(|r| (r.left as i32, r.top as i32, r.right as i32, r.bottom as i32))
                 .collect();
-        let figures = Self::region_figures(grey, w, h);
-        let mut regions = crate::structured::build_regions(
+        let binary = Self::binarize_page(grey, w, h);
+        let figures = Self::region_figures(&binary, w, h);
+        // A block is a TABLE when its FULL bbox (rules + column corridors, not
+        // just the text-line union the region carries) clears decide_if_table.
+        let table_blocks: Vec<bool> = blocks
+            .iter()
+            .map(|&blk| Self::block_is_table(&binary, w, h, blk))
+            .collect();
+        let regions = crate::structured::build_regions(
             &page,
             &furniture.header_lines,
             &furniture.footer_lines,
             &blocks,
+            &table_blocks,
             &figures,
         );
-        // Reclassify text blocks that are tables (leptonica decide_if_table).
-        Self::mark_table_regions(&mut regions, grey, w, h);
         let json = crate::structured::render_json_with_regions(&page, &regions, &fields);
         let word_count = page.lines.iter().map(|l| l.words.len()).sum();
         let line_count = page.lines.len();
@@ -769,12 +775,14 @@ impl LstmRecognizer {
     /// [`xy_cut`](crate::xy_cut::xy_cut); the textblock mask
     /// ([`Regions::textblock`](crate::pageseg::Regions::textblock)) is the
     /// pixel-level text-region witness the same composition also yields.
-    fn region_figures(grey: &[u8], w: usize, h: usize) -> Vec<(i32, i32, i32, i32)> {
+    ///
+    /// Takes the already-binarized page ([`Self::binarize_page`]) — the caller
+    /// binarizes once and shares it with the table pass.
+    fn region_figures(binary: &[u8], w: usize, h: usize) -> Vec<(i32, i32, i32, i32)> {
         if w < crate::pageseg::MIN_WIDTH || h < crate::pageseg::MIN_HEIGHT {
             return Vec::new();
         }
-        let binary = Self::binarize_page(grey, w, h);
-        let Some(regions) = crate::pageseg::get_regions_binary(&binary, w, h) else {
+        let Some(regions) = crate::pageseg::get_regions_binary(binary, w, h) else {
             return Vec::new();
         };
         if !regions.halftone.contains(&0) {
@@ -789,7 +797,7 @@ impl LstmRecognizer {
     /// Otsu binarization (with the fixed-128 fallback the library segmenters
     /// use when Otsu declines) → this crate's 1bpp `0` = ON. Shared by the
     /// region classifier's figure ([`Self::region_figures`]) and table
-    /// ([`Self::mark_table_regions`]) paths.
+    /// ([`Self::block_is_table`]) paths — the caller binarizes once.
     fn binarize_page(grey: &[u8], w: usize, h: usize) -> Vec<u8> {
         let otsu = crate::threshold::otsu_threshold_gray(grey, w, 0, 0, w, h);
         if otsu.hi_value == -1 {
@@ -801,51 +809,44 @@ impl LstmRecognizer {
         }
     }
 
-    /// Reclassify text regions that are TABLES — the byte-parity leptonica
-    /// `decide_if_table` ([`crate::pageseg::decide_if_table`]). For each
-    /// [`RegionKind::Text`](crate::structured::RegionKind::Text) region, crop
-    /// the binarized page to its bbox and run the table decision; a score ≥
-    /// [`TABLE_SCORE_THRESHOLD`](crate::pageseg::TABLE_SCORE_THRESHOLD) flips it
-    /// to [`RegionKind::Table`](crate::structured::RegionKind::Table).
+    /// Whether an XY-cut layout `block` is a TABLE — the byte-parity leptonica
+    /// `decide_if_table` ([`crate::pageseg::decide_if_table`]) over the block's
+    /// FULL bbox, cropped from the binarized page. A score ≥
+    /// [`TABLE_SCORE_THRESHOLD`](crate::pageseg::TABLE_SCORE_THRESHOLD) marks a
+    /// table.
+    ///
+    /// **Cropping the block, not the emitted text-region bbox, is the point.**
+    /// The region bbox `build_regions` produces is the union of the OCR line
+    /// boxes; it excludes the rules, borders, and empty column corridors that
+    /// live *between/around* the text — exactly the structure
+    /// `decide_if_table` counts. Feeding it the text-line union would strip that
+    /// signal and miss ruled tables (per the #39 review). The block bbox keeps
+    /// the whole layout region intact.
     ///
     /// **Scope note:** `decide_if_table`'s brick sizes target leptonica's
     /// ~75-300 ppi structural-line scale; the `pixPrepare1bpp` ppi-normalization
     /// plus `pixDeskewBoth` front-end is deferred to the deskew wave, so this
-    /// runs on the region crop at the page's own resolution — robust for typical
+    /// runs on the block crop at the page's own resolution — robust for typical
     /// document scales (table rules span whole columns, text words are short),
-    /// but not yet ppi-exact. Crops under 100 px in either dimension can hold no
-    /// `o100` structural line, so they score 0 and are skipped.
-    fn mark_table_regions(
-        regions: &mut [crate::structured::DocRegion],
-        grey: &[u8],
-        w: usize,
-        h: usize,
-    ) {
-        let binary = Self::binarize_page(grey, w, h);
-        for region in regions.iter_mut() {
-            if region.kind != crate::structured::RegionKind::Text {
-                continue;
-            }
-            let (l, t, r, b) = region.bbox;
-            let l = l.max(0) as usize;
-            let t = t.max(0) as usize;
-            let r = (r.max(0) as usize).min(w);
-            let b = (b.max(0) as usize).min(h);
-            let (cw, ch) = (r.saturating_sub(l), b.saturating_sub(t));
-            if cw < 100 || ch < 100 {
-                continue;
-            }
-            let mut crop = vec![255u8; cw * ch];
-            for y in 0..ch {
-                let row = (t + y) * w + l;
-                crop[y * cw..(y + 1) * cw].copy_from_slice(&binary[row..row + cw]);
-            }
-            if crate::pageseg::decide_if_table(&crop, cw, ch).score
-                >= crate::pageseg::TABLE_SCORE_THRESHOLD
-            {
-                region.kind = crate::structured::RegionKind::Table;
-            }
+    /// but not yet ppi-exact. Blocks under 100 px in either dimension can hold
+    /// no `o100` structural line, so they score 0 and are skipped.
+    fn block_is_table(binary: &[u8], w: usize, h: usize, block: (i32, i32, i32, i32)) -> bool {
+        let (l, t, r, b) = block;
+        let l = l.max(0) as usize;
+        let t = t.max(0) as usize;
+        let r = (r.max(0) as usize).min(w);
+        let b = (b.max(0) as usize).min(h);
+        let (cw, ch) = (r.saturating_sub(l), b.saturating_sub(t));
+        if cw < 100 || ch < 100 {
+            return false;
         }
+        let mut crop = vec![255u8; cw * ch];
+        for y in 0..ch {
+            let row = (t + y) * w + l;
+            crop[y * cw..(y + 1) * cw].copy_from_slice(&binary[row..row + cw]);
+        }
+        crate::pageseg::decide_if_table(&crop, cw, ch).score
+            >= crate::pageseg::TABLE_SCORE_THRESHOLD
     }
 
     /// `LSTMRecognizer::SetRandomSeed` (`lstmrecognizer.h:287-291`): the exact
@@ -1370,15 +1371,17 @@ mod makerow_page_tests {
         );
     }
 
-    /// The table reclassification (`mark_table_regions`) is corpus-free: a grey
-    /// page with a ruled grid in one region and a plain paragraph in another
-    /// must flip the grid region to [`RegionKind::Table`] (via the byte-parity
-    /// `decide_if_table`) while the paragraph stays [`RegionKind::Text`].
+    /// Table classification (`block_is_table`) is corpus-free and decides on
+    /// the BLOCK bbox: a ruled grid block flips to a table (via the byte-parity
+    /// `decide_if_table`) while a plain-paragraph block does not, and a block
+    /// under the 100 px structural-scale floor is skipped. Cropping the block —
+    /// not the text-line union — is what keeps the rules and column corridors
+    /// the decision keys on (the #39 fix).
     #[test]
-    fn mark_table_regions_flips_grid_keeps_paragraph() {
+    fn block_is_table_detects_grid_not_paragraph() {
         let (w, h) = (480usize, 280usize);
         let mut grey = vec![255u8; w * h];
-        // Ruled grid (left): 4 horizontal + 4 vertical black lines.
+        // Ruled grid (left block): 4 horizontal + 4 vertical black lines.
         for &r in &[20usize, 90, 160, 230] {
             for y in r..r + 2 {
                 for x in 20..220 {
@@ -1393,7 +1396,7 @@ mod makerow_page_tests {
                 }
             }
         }
-        // Plain paragraph (right): char stripes, no rules.
+        // Plain paragraph (right block): char stripes, no rules.
         let mut yb = 20;
         while yb + 5 <= 260 {
             for y in yb..yb + 5 {
@@ -1406,28 +1409,18 @@ mod makerow_page_tests {
             yb += 14;
         }
 
-        let mut regions = vec![
-            crate::structured::DocRegion {
-                kind: crate::structured::RegionKind::Text,
-                bbox: (18, 18, 224, 236),
-                line_indices: Vec::new(),
-            },
-            crate::structured::DocRegion {
-                kind: crate::structured::RegionKind::Text,
-                bbox: (258, 18, 462, 262),
-                line_indices: Vec::new(),
-            },
-        ];
-        LstmRecognizer::mark_table_regions(&mut regions, &grey, w, h);
-        assert_eq!(
-            regions[0].kind,
-            crate::structured::RegionKind::Table,
-            "ruled grid → table"
+        let binary = LstmRecognizer::binarize_page(&grey, w, h);
+        assert!(
+            LstmRecognizer::block_is_table(&binary, w, h, (18, 18, 224, 236)),
+            "ruled grid block → table"
         );
-        assert_eq!(
-            regions[1].kind,
-            crate::structured::RegionKind::Text,
-            "paragraph stays text"
+        assert!(
+            !LstmRecognizer::block_is_table(&binary, w, h, (258, 18, 462, 262)),
+            "paragraph block → not table"
+        );
+        assert!(
+            !LstmRecognizer::block_is_table(&binary, w, h, (18, 18, 70, 70)),
+            "block under 100 px is skipped"
         );
     }
 }
