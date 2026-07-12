@@ -38,8 +38,8 @@ let resp = exec.execute(OcrRequest::RecognizeDocument {
     grey: &pixels,          // 8-bit grey, row-major (see "Input" below)
     width,
     height,
-    dict: None,             // optional language-model dict
-    harvest: None,          // optional typed-field profile (e.g. German invoice)
+    with_dict: false,       // true → run the language-model dict beam
+    harvest_profile: None,  // e.g. Some("german_invoice") → typed field harvest
 })?;
 
 let OcrResponse::DocumentOut { doc_json, fields } = resp else { /* … */ };
