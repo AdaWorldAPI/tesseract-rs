@@ -294,9 +294,31 @@ regions now come from this leaf (`region_figures`), REPLACING the old full-res
 fill-back; text-block reading order stays with `xy_cut`. Live-verified: page_01
 (text page) → figures empty, all `type:"text"`, `mean_conf` 99.47 unchanged;
 `region_figures_boxes_the_image_block` proves an image page yields exactly one
-figure. **Table detection (`pixDecideIfTable`) is the one region leaf still open**
-— NOT in the `pixGetRegionsBinary` path (line-grid via morph bricks is the
-interim); a separate follow-up. No Core change (pageseg is tesseract-ocr-local) →
+figure. No Core change (pageseg is tesseract-ocr-local) → this file + the commit
+are the record.
+
+**★ Table detection (`pixDecideIfTable`) DECISION CORE is CLOSED — byte-parity,
+wired as `RegionKind::Table`.** `pageseg::decide_if_table` transcodes the
+falsifiable scoring core (`pageseg.c`, steps 5-9): horizontal black lines
+(`o100.1 + c1.4`, count `nhb`), vertical black lines (`o1.100 + c4.1`, `nvb`),
+lines seedfilled-back + OR'd + removed → noise-cleaned (`c4.1 + o8.1`) → inverted
+→ `r1 + o1.100` → width ≥ 5 vertical whitespace (`nvw`), and the 4-condition
+score (`nhb>1`, `nvb>2`, `nvw>3`, `nvw>6`; ≥ 2 == table). Every op is an
+already-parity-proven brick (`morph_sequence` incl. the `r` rank-reduce op,
+`seedfill_binary`, `select_by_size`, conn-comp). **Byte-identical vs the REAL
+`pixDecideIfTable` steps 5-9** on a 240×280 grid fixture (score 2: `nhb=4`,
+`nvb=4`) and a text-paragraph fixture (score 0) — scalars `nhb/nvb/nvw/score`
+plus the h-line / v-line / v-whitespace masks — via a `-llept` 1.82.0 oracle
+(`.claude/harvest/oracles/decide_if_table_oracle.*`). Wired into
+`recognize_document` (`mark_table_regions`): each `Text` region is cropped from
+the binarized page and reclassified `Table` when the score clears the threshold;
+live-verified page_01 stays all-`text`, `mark_table_regions_flips_grid_keeps_paragraph`
+proves a ruled grid flips to `table`. **DEFERRED (honest boundary):** the
+`pixPrepare1bpp` (ppi-normalize) + `pixDeskewBoth` FRONT-END — steps 1-4 — is the
+separate **deskew wave** (skew detection `pixFindSkew` sweep+search + arbitrary-
+angle `pixRotate`, not yet scoped); the core runs on the region crop at the
+page's own resolution (robust for typical document scales, not yet ppi-exact).
+That deskew wave is now the one remaining region-classifier gap. No Core change →
 this file + the commit are the record.
 
 ## Web demo (`crates/tesseract-ocr-web`)

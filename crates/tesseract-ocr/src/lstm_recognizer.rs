@@ -729,13 +729,15 @@ impl LstmRecognizer {
                 .map(|r| (r.left as i32, r.top as i32, r.right as i32, r.bottom as i32))
                 .collect();
         let figures = Self::region_figures(grey, w, h);
-        let regions = crate::structured::build_regions(
+        let mut regions = crate::structured::build_regions(
             &page,
             &furniture.header_lines,
             &furniture.footer_lines,
             &blocks,
             &figures,
         );
+        // Reclassify text blocks that are tables (leptonica decide_if_table).
+        Self::mark_table_regions(&mut regions, grey, w, h);
         let json = crate::structured::render_json_with_regions(&page, &regions, &fields);
         let word_count = page.lines.iter().map(|l| l.words.len()).sum();
         let line_count = page.lines.len();
@@ -771,14 +773,7 @@ impl LstmRecognizer {
         if w < crate::pageseg::MIN_WIDTH || h < crate::pageseg::MIN_HEIGHT {
             return Vec::new();
         }
-        let otsu = crate::threshold::otsu_threshold_gray(grey, w, 0, 0, w, h);
-        let binary: Vec<u8> = if otsu.hi_value == -1 {
-            grey.iter()
-                .map(|&p| if p < 128 { 0 } else { 255 })
-                .collect()
-        } else {
-            crate::threshold::threshold_rect_to_binary(grey, w, 0, 0, w, h, otsu)
-        };
+        let binary = Self::binarize_page(grey, w, h);
         let Some(regions) = crate::pageseg::get_regions_binary(&binary, w, h) else {
             return Vec::new();
         };
@@ -789,6 +784,68 @@ impl LstmRecognizer {
             .into_iter()
             .map(|b| (b.x, b.y, b.x + b.w, b.y + b.h))
             .collect()
+    }
+
+    /// Otsu binarization (with the fixed-128 fallback the library segmenters
+    /// use when Otsu declines) → this crate's 1bpp `0` = ON. Shared by the
+    /// region classifier's figure ([`Self::region_figures`]) and table
+    /// ([`Self::mark_table_regions`]) paths.
+    fn binarize_page(grey: &[u8], w: usize, h: usize) -> Vec<u8> {
+        let otsu = crate::threshold::otsu_threshold_gray(grey, w, 0, 0, w, h);
+        if otsu.hi_value == -1 {
+            grey.iter()
+                .map(|&p| if p < 128 { 0 } else { 255 })
+                .collect()
+        } else {
+            crate::threshold::threshold_rect_to_binary(grey, w, 0, 0, w, h, otsu)
+        }
+    }
+
+    /// Reclassify text regions that are TABLES — the byte-parity leptonica
+    /// `decide_if_table` ([`crate::pageseg::decide_if_table`]). For each
+    /// [`RegionKind::Text`](crate::structured::RegionKind::Text) region, crop
+    /// the binarized page to its bbox and run the table decision; a score ≥
+    /// [`TABLE_SCORE_THRESHOLD`](crate::pageseg::TABLE_SCORE_THRESHOLD) flips it
+    /// to [`RegionKind::Table`](crate::structured::RegionKind::Table).
+    ///
+    /// **Scope note:** `decide_if_table`'s brick sizes target leptonica's
+    /// ~75-300 ppi structural-line scale; the `pixPrepare1bpp` ppi-normalization
+    /// plus `pixDeskewBoth` front-end is deferred to the deskew wave, so this
+    /// runs on the region crop at the page's own resolution — robust for typical
+    /// document scales (table rules span whole columns, text words are short),
+    /// but not yet ppi-exact. Crops under 100 px in either dimension can hold no
+    /// `o100` structural line, so they score 0 and are skipped.
+    fn mark_table_regions(
+        regions: &mut [crate::structured::DocRegion],
+        grey: &[u8],
+        w: usize,
+        h: usize,
+    ) {
+        let binary = Self::binarize_page(grey, w, h);
+        for region in regions.iter_mut() {
+            if region.kind != crate::structured::RegionKind::Text {
+                continue;
+            }
+            let (l, t, r, b) = region.bbox;
+            let l = l.max(0) as usize;
+            let t = t.max(0) as usize;
+            let r = (r.max(0) as usize).min(w);
+            let b = (b.max(0) as usize).min(h);
+            let (cw, ch) = (r.saturating_sub(l), b.saturating_sub(t));
+            if cw < 100 || ch < 100 {
+                continue;
+            }
+            let mut crop = vec![255u8; cw * ch];
+            for y in 0..ch {
+                let row = (t + y) * w + l;
+                crop[y * cw..(y + 1) * cw].copy_from_slice(&binary[row..row + cw]);
+            }
+            if crate::pageseg::decide_if_table(&crop, cw, ch).score
+                >= crate::pageseg::TABLE_SCORE_THRESHOLD
+            {
+                region.kind = crate::structured::RegionKind::Table;
+            }
+        }
     }
 
     /// `LSTMRecognizer::SetRandomSeed` (`lstmrecognizer.h:287-291`): the exact
@@ -1310,6 +1367,67 @@ mod makerow_page_tests {
         assert!(
             (128..=132).contains(&r) && (108..=112).contains(&b),
             "extent {r},{b}"
+        );
+    }
+
+    /// The table reclassification (`mark_table_regions`) is corpus-free: a grey
+    /// page with a ruled grid in one region and a plain paragraph in another
+    /// must flip the grid region to [`RegionKind::Table`] (via the byte-parity
+    /// `decide_if_table`) while the paragraph stays [`RegionKind::Text`].
+    #[test]
+    fn mark_table_regions_flips_grid_keeps_paragraph() {
+        let (w, h) = (480usize, 280usize);
+        let mut grey = vec![255u8; w * h];
+        // Ruled grid (left): 4 horizontal + 4 vertical black lines.
+        for &r in &[20usize, 90, 160, 230] {
+            for y in r..r + 2 {
+                for x in 20..220 {
+                    grey[y * w + x] = 0;
+                }
+            }
+        }
+        for &c in &[20usize, 90, 160, 220] {
+            for x in c..c + 2 {
+                for y in 20..232 {
+                    grey[y * w + x] = 0;
+                }
+            }
+        }
+        // Plain paragraph (right): char stripes, no rules.
+        let mut yb = 20;
+        while yb + 5 <= 260 {
+            for y in yb..yb + 5 {
+                for x in 260..460 {
+                    if (x - 260) % 24 < 18 {
+                        grey[y * w + x] = 0;
+                    }
+                }
+            }
+            yb += 14;
+        }
+
+        let mut regions = vec![
+            crate::structured::DocRegion {
+                kind: crate::structured::RegionKind::Text,
+                bbox: (18, 18, 224, 236),
+                line_indices: Vec::new(),
+            },
+            crate::structured::DocRegion {
+                kind: crate::structured::RegionKind::Text,
+                bbox: (258, 18, 462, 262),
+                line_indices: Vec::new(),
+            },
+        ];
+        LstmRecognizer::mark_table_regions(&mut regions, &grey, w, h);
+        assert_eq!(
+            regions[0].kind,
+            crate::structured::RegionKind::Table,
+            "ruled grid → table"
+        );
+        assert_eq!(
+            regions[1].kind,
+            crate::structured::RegionKind::Text,
+            "paragraph stays text"
         );
     }
 }

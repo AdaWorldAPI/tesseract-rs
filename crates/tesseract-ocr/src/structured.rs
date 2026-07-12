@@ -245,6 +245,10 @@ pub fn render_json(page: &DocPage, fields: &[HarvestedField]) -> String {
 pub enum RegionKind {
     /// Body text (an XY-cut block's lines).
     Text,
+    /// A tabular region — a [`Text`](RegionKind::Text) block whose leptonica
+    /// `pixDecideIfTable` score cleared the table threshold (ruled lines /
+    /// column corridors). Carries its lines like a text block.
+    Table,
     /// An image / halftone region (from the halftone mask; carries no lines).
     Figure,
     /// Page-furniture header lines.
@@ -259,6 +263,7 @@ impl RegionKind {
     pub fn as_str(self) -> &'static str {
         match self {
             RegionKind::Text => "text",
+            RegionKind::Table => "table",
             RegionKind::Figure => "figure",
             RegionKind::Header => "header",
             RegionKind::Footer => "footer",

@@ -53,6 +53,7 @@
 //! [`crate::threshold`]), assumed 150–200 ppi per the C's header comment.
 
 use crate::binreduce::{expand_replicate, reduce_rank_binary_cascade};
+use crate::conncomp::conn_comp_bb;
 use crate::morph::{close_safe_brick, dilate_brick, morph_sequence, open_brick};
 use crate::morphapp::{
     morph_sequence_by_component, select_by_size, SelectRelation, SelectType, SizeFilter,
@@ -383,6 +384,123 @@ pub fn get_regions_binary(binary: &[u8], w: usize, h: usize) -> Option<Regions> 
     })
 }
 
+/// The table decision of [`decide_if_table`] — leptonica's 0-4 table score
+/// plus the three counts it is built from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableDecision {
+    /// `nhb` — horizontal black lines (`o100.1 + c1.4` components).
+    pub nhb: usize,
+    /// `nvb` — vertical black lines (`o1.100 + c4.1` components).
+    pub nvb: usize,
+    /// `nvw` — long vertical whitespace corridors (width ≥ 5 after `r1 + o1.100`).
+    pub nvw: usize,
+    /// Table score 0-4: `+1` each for `nhb>1`, `nvb>2`, `nvw>3`, `nvw>6`.
+    /// leptonica classifies `score >= 2` as a table.
+    pub score: i32,
+}
+
+/// The table-classification threshold — leptonica requires 2 of the 4
+/// conditions (`pageseg.c`, `pixDecideIfTable`).
+pub const TABLE_SCORE_THRESHOLD: i32 = 2;
+
+/// Decide whether an upright 1bpp region is a table — the DECISION CORE of
+/// `pixDecideIfTable` (`pageseg.c`, steps 5-9). `binary` is the region at
+/// ~75 ppi, ALREADY deskewed + dilated (this crate's `0` = ON convention).
+///
+/// **Scope:** this transcodes the falsifiable decision logic — the line /
+/// whitespace count + 4-condition score, where the table decision actually
+/// happens. The `pixPrepare1bpp` (crop → background-normalize → threshold →
+/// scale-to-ppi) and `pixDeskewBoth` front-end (steps 1-4) is the separate
+/// **deskew wave** (skew detection + arbitrary-angle rotation, not yet scoped)
+/// and is the caller's responsibility; [`crate::LstmRecognizer::recognize_document`]
+/// feeds pre-scaled upright pages, so deskew is ~identity there. The score is
+/// byte-parity-proven against the REAL `pixDecideIfTable` steps 5-9 (both sides
+/// fed the same upright region) — see the `decide_if_table_*` tests.
+///
+/// The counts:
+/// - `nhb` — horizontal black lines: `o100.1 + c1.4` opened, 8-conn components.
+/// - `nvb` — vertical black lines: `o1.100 + c4.1` opened, 8-conn components.
+/// - `nvw` — long vertical whitespace: lines seedfilled back + OR'd + removed,
+///   noise-cleaned (`c4.1 + o8.1`), inverted, `r1 + o1.100` (2×-reduce then
+///   vertical open), kept if width ≥ 5, 8-conn components.
+///
+/// # Panics
+/// Panics if `binary.len() != w * h`.
+#[must_use]
+pub fn decide_if_table(binary: &[u8], w: usize, h: usize) -> TableDecision {
+    assert_eq!(binary.len(), w * h, "binary buffer length must be w * h");
+    let empty = TableDecision {
+        nhb: 0,
+        nvb: 0,
+        nvw: 0,
+        score: 0,
+    };
+
+    // Horizontal + vertical black lines (dims preserved — no reduce/expand op).
+    let (Some((pix2, _, _)), Some((pix4, _, _))) = (
+        morph_sequence(binary, w, h, "o100.1 + c1.4"),
+        morph_sequence(binary, w, h, "o1.100 + c4.1"),
+    ) else {
+        return empty;
+    };
+    let nhb = conn_comp_bb(&pix2, w, h, 8).len();
+    let nvb = conn_comp_bb(&pix4, w, h, 8).len();
+
+    // Seedfill each line mask back through the region, OR, and subtract to
+    // remove the lines (pix3 | pix5 = pix6; pix1 -= pix6).
+    let (Some(pix3), Some(pix5)) = (
+        seedfill_binary(&pix2, w, h, binary, w, h, 8),
+        seedfill_binary(&pix4, w, h, binary, w, h, 8),
+    ) else {
+        return empty;
+    };
+    let delined = subtract(binary, &or(&pix3, &pix5));
+
+    // Remove noise, invert, find long vertical whitespace corridors.
+    let Some((pix7, _, _)) = morph_sequence(&delined, w, h, "c4.1 + o8.1") else {
+        return empty;
+    };
+    let inv = invert(&pix7);
+    // "r1 + o1.100": rank-1 2× reduce THEN vertical open — CHANGES dims.
+    let Some((pix8, rw, rh)) = morph_sequence(&inv, w, h, "r1 + o1.100") else {
+        return empty;
+    };
+    let nvw = select_by_size(
+        &pix8,
+        rw,
+        rh,
+        8,
+        SizeFilter {
+            width: 5,
+            height: 0,
+            select_type: SelectType::Width,
+            relation: SelectRelation::Gte,
+        },
+    )
+    .map_or(0, |pix9| conn_comp_bb(&pix9, rw, rh, 8).len());
+
+    // Two of four conditions → table.
+    let mut score = 0;
+    if nhb > 1 {
+        score += 1;
+    }
+    if nvb > 2 {
+        score += 1;
+    }
+    if nvw > 3 {
+        score += 1;
+    }
+    if nvw > 6 {
+        score += 1;
+    }
+    TableDecision {
+        nhb,
+        nvb,
+        nvw,
+        score,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +549,56 @@ mod tests {
         parse_dump(include_str!(
             "../../../.claude/harvest/oracles/pageseg_regions_oracle_out.txt"
         ))
+    }
+
+    fn oracle4() -> HashMap<String, (usize, usize, Vec<u8>)> {
+        parse_dump(include_str!(
+            "../../../.claude/harvest/oracles/decide_if_table_oracle_out.txt"
+        ))
+    }
+
+    /// The 240×280 table fixture — a 4×4 grid of black lines. MUST match the
+    /// `decide_if_table_oracle`'s `table_ink` byte-for-byte.
+    fn table_fixture() -> (Vec<u8>, usize, usize) {
+        let (w, h) = (240usize, 280usize);
+        let mut buf = vec![255u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let hline = [20usize, 90, 160, 230]
+                    .iter()
+                    .any(|&r| y >= r && y < r + 2 && (20..220).contains(&x));
+                let vline = [20usize, 90, 160, 220]
+                    .iter()
+                    .any(|&c| x >= c && x < c + 2 && (20..232).contains(&y));
+                if hline || vline {
+                    buf[y * w + x] = 0;
+                }
+            }
+        }
+        (buf, w, h)
+    }
+
+    /// The 240×280 text-paragraph fixture — horizontal char stripes, no lines.
+    /// MUST match the `decide_if_table_oracle`'s `text_ink` byte-for-byte.
+    fn text_para_fixture() -> (Vec<u8>, usize, usize) {
+        let (w, h) = (240usize, 280usize);
+        let mut buf = vec![255u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let mut ink = false;
+                let mut yb = 20;
+                while yb + 5 <= 260 {
+                    if y >= yb && y < yb + 5 && (20..220).contains(&x) && (x - 20) % 24 < 18 {
+                        ink = true;
+                    }
+                    yb += 14;
+                }
+                if ink {
+                    buf[y * w + x] = 0;
+                }
+            }
+        }
+        (buf, w, h)
     }
 
     /// The 320×280 region-classifier fixture — a solid 100×80 image block plus
@@ -594,6 +762,67 @@ mod tests {
         assert!(get_regions_binary(&buf, 99, 200).is_none());
         let buf = vec![255u8; 200 * 99];
         assert!(get_regions_binary(&buf, 200, 99).is_none());
+    }
+
+    #[test]
+    fn decide_if_table_matches_liblept() {
+        let o = oracle4();
+        let (tab, w, h) = table_fixture();
+        let (txt, _, _) = text_para_fixture();
+        assert_eq!(o["tab_src"], (w, h, tab.clone()), "table fixture == oracle");
+        assert_eq!(o["txt_src"], (w, h, txt.clone()), "text fixture == oracle");
+
+        // Scalar parity — the leaf's OUTPUT (nhb/nvb/nvw/score) on both arms.
+        let dt = decide_if_table(&tab, w, h);
+        assert_eq!(dt.nhb, o["tab_nhb_flag"].0, "table nhb");
+        assert_eq!(dt.nvb, o["tab_nvb_flag"].0, "table nvb");
+        assert_eq!(dt.nvw, o["tab_nvw_flag"].0, "table nvw");
+        assert_eq!(dt.score, o["tab_score_flag"].0 as i32, "table score");
+        assert!(
+            dt.score >= TABLE_SCORE_THRESHOLD,
+            "grid classified as table"
+        );
+
+        let dx = decide_if_table(&txt, w, h);
+        assert_eq!(dx.nhb, o["txt_nhb_flag"].0, "text nhb");
+        assert_eq!(dx.nvb, o["txt_nvb_flag"].0, "text nvb");
+        assert_eq!(dx.nvw, o["txt_nvw_flag"].0, "text nvw");
+        assert_eq!(dx.score, o["txt_score_flag"].0 as i32, "text score");
+        assert!(
+            dx.score < TABLE_SCORE_THRESHOLD,
+            "paragraph classified as text"
+        );
+
+        // Mask parity — pin the composition's intermediates on the table arm.
+        let (hlines, _, _) = morph_sequence(&tab, w, h, "o100.1 + c1.4").unwrap();
+        assert_eq!(&hlines, &o["tab_hlines"].2, "horizontal-line mask");
+        let (vlines, _, _) = morph_sequence(&tab, w, h, "o1.100 + c4.1").unwrap();
+        assert_eq!(&vlines, &o["tab_vlines"].2, "vertical-line mask");
+        let pix3 = seedfill_binary(&hlines, w, h, &tab, w, h, 8).unwrap();
+        let pix5 = seedfill_binary(&vlines, w, h, &tab, w, h, 8).unwrap();
+        let delined = subtract(&tab, &or(&pix3, &pix5));
+        let (pix7, _, _) = morph_sequence(&delined, w, h, "c4.1 + o8.1").unwrap();
+        let inv = invert(&pix7);
+        let (pix8, rw, rh) = morph_sequence(&inv, w, h, "r1 + o1.100").unwrap();
+        let pix9 = select_by_size(
+            &pix8,
+            rw,
+            rh,
+            8,
+            SizeFilter {
+                width: 5,
+                height: 0,
+                select_type: SelectType::Width,
+                relation: SelectRelation::Gte,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (rw, rh),
+            (o["tab_vwhite"].0, o["tab_vwhite"].1),
+            "vwhite dims"
+        );
+        assert_eq!(&pix9, &o["tab_vwhite"].2, "vertical-whitespace mask");
     }
 
     /// The 97×61 close-safe fixture — the binreduce oracle's formula.
