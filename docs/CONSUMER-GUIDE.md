@@ -26,10 +26,15 @@ but that layer is **OGAR-side**, and tesseract-rs stays a pure **producer**. A
 composed document does not paste your regions; it **references a `doc.v1`
 awareness subtree through an `ObjectSlot`** (a typed projection portal:
 `ObjectRef` + `ClassView` + `WideFieldMask` + `ResolutionMode`). The
-`@sha256:` resolution arm is exactly the `content_sha256` this crate already
-stamps — an imported scan appears in a report as a live, revision-pinnable
-portal, not a decaying copy. So the boundary is unchanged: you emit `doc.v1`;
-OGAR composes it. Nothing new is required of tesseract-rs.
+`@sha256:` resolution arm resolves against the content hash of the **original
+input bytes** — the `ogar-doc-ir::DocIr.content_sha256` convergence key,
+computed **OGAR-side at ingestion** over the bytes you fed in. **This crate's
+`doc.v1` does NOT stamp a hash:** `structured.rs` emits `schema` / page metadata
+/ `quality` / `regions` / `fields` only, so `@sha256:` is an OGAR-side concern,
+not a field you read out of `doc_json`. With that hash in hand, an imported scan
+appears in a report as a live, revision-pinnable portal, not a decaying copy. So
+the boundary is unchanged: you emit `doc.v1`; OGAR composes it. Nothing new is
+required of tesseract-rs.
 
 ## The path — classid → executor → `doc.v1`
 
