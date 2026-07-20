@@ -18,6 +18,19 @@ Three layers, one seam. Know which is yours.
 storage, graph, comprehension, PDF-from-data — is your call. tesseract-rs knows
 nothing about any of it.
 
+**`doc.v1` is the OBSERVATION retina, and the DocIr composition layer does not
+change that.** Under the DocIr composition grounding (OGAR
+`docs/DOCIR-COMPOSITION-LAYER.md` #217 / `docs/DOCIR-COMPOSITION-GROUNDING.md`
+#218), *DocIr* also names a **composition layer** over the OGAR object graph —
+but that layer is **OGAR-side**, and tesseract-rs stays a pure **producer**. A
+composed document does not paste your regions; it **references a `doc.v1`
+awareness subtree through an `ObjectSlot`** (a typed projection portal:
+`ObjectRef` + `ClassView` + `WideFieldMask` + `ResolutionMode`). The
+`@sha256:` resolution arm is exactly the `content_sha256` this crate already
+stamps — an imported scan appears in a report as a live, revision-pinnable
+portal, not a decaying copy. So the boundary is unchanged: you emit `doc.v1`;
+OGAR composes it. Nothing new is required of tesseract-rs.
+
 ## The path — classid → executor → `doc.v1`
 
 ```rust
