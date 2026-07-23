@@ -543,6 +543,21 @@ fn grey_to_data_uri(image: &GreyImage) -> Option<String> {
     ))
 }
 
+/// Encode a grey raster as a `data:image/png;base64,...` URI (pure-Rust PNG —
+/// the same encoder [`render_preview_html`] embeds), or `None` when the image
+/// is empty / its data is shorter than `w * h`.
+///
+/// Exposed for consumers that overlay their OWN annotations on the page raster
+/// — e.g. a debug preview drawing colour-coded `doc.v1` region rectangles over
+/// the scan — and therefore need a browser-renderable background image without
+/// re-implementing a PNG encoder. PNG is used deliberately: an uploaded PGM /
+/// TIFF scan does not render in an `<img>`, but the grey → PNG transcode always
+/// does.
+#[must_use]
+pub fn grey_png_data_uri(image: &GreyImage) -> Option<String> {
+    grey_to_data_uri(image)
+}
+
 /// Render a [`LayoutDoc`] as a standalone HTML preview. Each page is a
 /// `position:relative` box sized in image pixels; every block is one
 /// absolutely-positioned child at the SAME px bbox as the PDF projection — the

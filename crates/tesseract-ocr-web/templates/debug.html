@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debug preview (A vs B) — tesseract-rs</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    line-height: 1.5; margin: 0; padding: 2rem 1rem;
+    background: Canvas; color: CanvasText;
+  }
+  main { max-width: 74rem; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.05rem; margin: 1.75rem 0 .6rem; }
+  .tag { color: color-mix(in srgb, CanvasText 60%, Canvas); font-size: .9rem; margin: 0 0 1.25rem; }
+  a { color: #2563eb; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
+  .card {
+    border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
+    border-radius: 12px; padding: 1.1rem 1.25rem; margin-bottom: 1rem;
+  }
+  label { display: block; font-weight: 600; margin-bottom: .35rem; }
+  input[type=file], input[type=url] {
+    width: 100%; padding: .55rem; border-radius: 8px;
+    border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
+    background: Canvas; color: CanvasText; font-size: 1rem;
+  }
+  .or { text-align: center; color: color-mix(in srgb, CanvasText 50%, Canvas);
+        margin: .8rem 0; font-size: .8rem; letter-spacing: .05em; }
+  .btns { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: 1rem; }
+  button {
+    padding: .6rem 1rem; font-size: .95rem; font-weight: 600; border: 0;
+    border-radius: 8px; cursor: pointer; background: #2563eb; color: #fff;
+  }
+  button.secondary {
+    background: Canvas; color: CanvasText;
+    border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
+  }
+  button:hover { filter: brightness(1.08); }
+  .error {
+    border: 1px solid #ef4444; background: color-mix(in srgb, #ef4444 12%, Canvas);
+    color: color-mix(in srgb, #ef4444 85%, CanvasText);
+    padding: .75rem 1rem; border-radius: 8px; margin-bottom: 1rem;
+  }
+  .warn {
+    border: 1px solid #f59e0b; background: color-mix(in srgb, #f59e0b 12%, Canvas);
+    color: color-mix(in srgb, #b45309 88%, CanvasText);
+    padding: .75rem 1rem; border-radius: 8px; margin: 0 0 1rem; font-size: .9rem;
+  }
+  .note { font-size: .82rem; color: color-mix(in srgb, CanvasText 55%, Canvas); }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 60rem) { .grid2 { grid-template-columns: 1fr; } }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: .75rem; margin: 0; padding: 0; list-style: none; }
+  .stats li { border: 1px solid color-mix(in srgb, CanvasText 15%, Canvas); border-radius: 8px; padding: .55rem .7rem; }
+  .stats .k { font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; color: color-mix(in srgb, CanvasText 55%, Canvas); }
+  .stats .v { font-size: 1.05rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .spec { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; word-break: break-all; }
+
+  ol.algo { margin: 0; padding-left: 1.2rem; }
+  ol.algo li { margin-bottom: .35rem; font-size: .9rem; }
+  ol.algo .n { font-weight: 600; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: .5rem; margin: 0 0 .75rem; padding: 0; list-style: none; }
+  .chip { display: inline-flex; align-items: center; gap: .35rem; font-size: .8rem;
+          border: 1px solid; border-radius: 999px; padding: .15rem .6rem; }
+  .chip .sw { width: .7rem; height: .7rem; border-radius: 2px; display: inline-block; }
+
+  .regionmap {
+    position: relative; width: 100%; max-width: 720px; margin: 0 auto;
+    border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas); border-radius: 6px; overflow: hidden;
+  }
+  .regionmap img { display: block; width: 100%; height: 100%; }
+  .rbox { position: absolute; border: 2px solid; box-sizing: border-box; }
+  .rbox .rlabel { position: absolute; top: 0; left: 0; font-size: .6rem; line-height: 1;
+                  color: #fff; padding: 1px 3px; border-radius: 0 0 3px 0; white-space: nowrap; }
+
+  .kv { margin: 0; font-size: .85rem; }
+  .kv div { padding: .15rem 0; border-bottom: 1px solid color-mix(in srgb, CanvasText 10%, Canvas); }
+  .kv .lab { color: color-mix(in srgb, CanvasText 55%, Canvas); }
+
+  .panel h3 { font-size: .95rem; margin: 0 0 .4rem; }
+  .panel .sub { font-size: .78rem; color: color-mix(in srgb, CanvasText 55%, Canvas); margin: 0 0 .5rem; }
+  iframe.preview {
+    width: 100%; height: 72vh; border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
+    border-radius: 8px; background: #fff;
+  }
+  footer { margin-top: 2rem; font-size: .8rem; color: color-mix(in srgb, CanvasText 50%, Canvas); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Debug preview — A vs B</h1>
+  <p class="tag">Pure-Rust OCR. <strong>A</strong> = searchable facsimile (the scan with an invisible/searchable text layer). <strong>B</strong> = the <code>doc.v1</code> structural reconstruction. Both are rendered from ONE recognition pass, in the same pixel coordinate space, so they line up.</p>
+
+  {% if let Some(msg) = error %}
+  <div class="error">{{ msg }}</div>
+  {% endif %}
+
+  <form class="card" action="/debug" method="post" enctype="multipart/form-data">
+    <label for="file">Upload an image</label>
+    <input id="file" type="file" name="file" accept="image/png,image/jpeg,image/webp,image/tiff,image/gif,image/bmp,image/x-portable-graymap,image/*">
+    <div class="or">— OR —</div>
+    <label for="url">Scan an image URL</label>
+    <input id="url" type="url" name="url" placeholder="https://example.com/scan.png">
+    <p class="note">Private, loopback, and link-local addresses are refused (SSRF guard); 10&nbsp;MB / 10&nbsp;s cap.</p>
+    <div class="btns">
+      <button type="submit" formaction="/debug">Debug preview (A vs B)</button>
+      <button type="submit" class="secondary" formaction="/pdf">Download A · searchable PDF</button>
+      <button type="submit" class="secondary" formaction="/pdf?mode=structured">Download B · structured PDF</button>
+      <button type="submit" class="secondary" formaction="/ocr">Plain OCR</button>
+      <button type="submit" class="secondary" formaction="/">Home</button>
+    </div>
+  </form>
+
+  {% if let Some(r) = result %}
+
+  {% if r.low_confidence %}
+  <div class="warn"><strong>Low recognition confidence.</strong> The bundled <code>eng</code> model is print-trained; handwriting / low-resolution input produces confident-looking but wrong output. The previews below are likely unreliable.</div>
+  {% endif %}
+
+  <h2>Statistics</h2>
+  <ul class="stats">
+    <li><div class="k">Image</div><div class="v">{{ r.width }}&times;{{ r.height }} px</div></li>
+    <li><div class="k">Words</div><div class="v">{{ r.word_count }}</div></li>
+    <li><div class="k">Lines</div><div class="v">{{ r.line_count }}</div></li>
+    <li><div class="k">Mean confidence</div><div class="v">{{ r.mean_conf }}/100</div></li>
+    <li><div class="k">Low confidence</div><div class="v">{% if r.low_confidence %}yes{% else %}no{% endif %}</div></li>
+    <li><div class="k">Recognition</div><div class="v">{{ r.elapsed_ms }} ms</div></li>
+    <li><div class="k">Model</div><div class="v">{{ r.model }}</div></li>
+    <li><div class="k">Language</div><div class="v">{{ r.lang }}</div></li>
+    <li><div class="k">Dict beam</div><div class="v">{% if r.dict_on %}on{% else %}off{% endif %}</div></li>
+    <li><div class="k">Null char</div><div class="v">{{ r.null_char }}</div></li>
+  </ul>
+  <p class="note" style="margin-top:.6rem">Network spec: <span class="spec">{{ r.network_spec }}</span></p>
+  <p class="note">No script/orientation detection (OSD) is transcoded, so there is <strong>no language-confidence score</strong> — the loaded model plus the mean confidence above are the honest proxy.</p>
+
+  <h2>Regions</h2>
+  <div class="grid2">
+    <div>
+      <ul class="legend">
+        {% for l in r.legend %}
+        <li class="chip" style="border-color:{{ l.color }}"><span class="sw" style="background:{{ l.color }}"></span>{{ l.kind }}</li>
+        {% endfor %}
+      </ul>
+      <div class="regionmap" style="aspect-ratio:{{ r.width }}/{{ r.height }}">
+        {% if r.overlay_bg.is_empty() %}{% else %}<img src="{{ r.overlay_bg }}" alt="page scan">{% endif %}
+        {% for o in r.overlays %}
+        <div class="rbox" style="{{ o.css }};border-color:{{ o.color }};background:{{ o.color }}22"><span class="rlabel" style="background:{{ o.color }}">{{ o.kind }}</span></div>
+        {% endfor %}
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-top:0">
+        <strong style="font-size:.9rem">Region counts</strong>
+        <div class="kv" style="margin-top:.4rem">
+          {% for c in r.region_counts %}
+          <div><span class="lab">{{ c.kind }}</span> &middot; <b>{{ c.count }}</b></div>
+          {% endfor %}
+          {% if r.region_counts.is_empty() %}<div class="note">no regions classified</div>{% endif %}
+        </div>
+      </div>
+      <div class="card">
+        <strong style="font-size:.9rem">Table &amp; figure positions</strong>
+        <div class="kv" style="margin-top:.4rem">
+          {% for p in r.placed %}
+          <div><span class="lab">{{ p.kind }}</span> &middot; <code>{{ p.bbox }}</code></div>
+          {% endfor %}
+          {% if r.placed.is_empty() %}<div class="note">none on this page</div>{% endif %}
+        </div>
+      </div>
+      {% if r.fields.is_empty() %}{% else %}
+      <div class="card">
+        <strong style="font-size:.9rem">Harvested fields</strong>
+        <div class="kv" style="margin-top:.4rem">
+          {% for f in r.fields %}
+          <div><span class="lab">{{ f.key }}</span> &middot; <b>{{ f.value }}</b> &middot; <code>{{ f.bbox }}</code></div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <h2>Algorithms used</h2>
+  <div class="card">
+    <ol class="algo">
+      {% for a in r.algorithms %}
+      <li><span class="n">{{ a.name }}</span> &mdash; {{ a.detail }}</li>
+      {% endfor %}
+    </ol>
+  </div>
+
+  <h2>A vs B</h2>
+  <div class="grid2">
+    <div class="panel" id="panel-a">
+      <h3>A &middot; Searchable facsimile</h3>
+      <p class="sub">The original scan with an invisible, searchable text layer over each recognized word.</p>
+      <iframe class="preview" title="A — searchable facsimile" srcdoc="{{ r.preview_a }}"></iframe>
+    </div>
+    <div class="panel" id="panel-b">
+      <h3>B &middot; Structured reconstruction (<code>?mode=structured</code>)</h3>
+      <p class="sub">The <code>doc.v1</code> reconstruction: re-typeset text, cropped figures, ruled tables — no scan underneath.</p>
+      <iframe class="preview" title="B — structured reconstruction" srcdoc="{{ r.preview_b }}"></iframe>
+    </div>
+  </div>
+
+  {% endif %}
+
+  <footer>A and B share one <code>doc.v1</code> + one grey raster (Klickwege parity). <a href="/">Home</a></footer>
+</main>
+</body>
+</html>

@@ -31,6 +31,16 @@ futures-util = { version = "0.3", default-features = false }
 # The pure-Rust OCR.
 tesseract-ocr = { path = "../tesseract-ocr" }
 tesseract-core = { path = "../tesseract-core" }
+# The pure-Rust PDF + layout front-end (searchable-PDF "A" + doc.v1-reconstruction
+# "B", plus the HTML preview projection). `default-features = false` drops the
+# `parallel`/rayon feature — the web demo renders one page at a time, so it needs
+# only the layout/render surface (lopdf + flate2 + serde_json, all pure Rust,
+# BBB-clean: no OGAR, no lance-graph engine).
+tesseract-ocr-pdf = { path = "../tesseract-ocr-pdf", default-features = false }
+# doc.v1 JSON parse for the debug/overlay/searchable-word surface (pure Rust,
+# already in the workspace lockfile via tesseract-ocr-pdf).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] } # ServiceExt::oneshot for router tests
