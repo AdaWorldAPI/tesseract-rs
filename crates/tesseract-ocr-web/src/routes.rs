@@ -67,6 +67,11 @@ fn confidence_str(mean_conf: f32) -> String {
 /// `RequestBodyLimitLayer` caps the raw body; the smaller of the two wins, so
 /// both are raised together. The URL-fetch arm has its own 10 MB cap in
 /// [`fetch_image_url`].
+///
+/// Merges in [`crate::api::router`] — the machine-facing `/api/v1/*` +
+/// `/openapi.json` surface (Power Platform custom connector) — BEFORE the
+/// upload-size layers, so those same limits (and not a separate/looser cap)
+/// bound the API routes too.
 pub fn router(state: Arc<AppState>) -> Router {
     const MAX_UPLOAD: usize = 12 * 1024 * 1024;
     Router::new()
@@ -78,6 +83,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Verbose debug preview: A and B side by side + region overlays + stats
         // + an honest algorithms-used trace.
         .route("/debug", get(debug_get).post(debug_post))
+        .merge(crate::api::router())
         .layer(DefaultBodyLimit::max(MAX_UPLOAD))
         .layer(RequestBodyLimitLayer::new(MAX_UPLOAD))
         .with_state(state)
@@ -206,14 +212,17 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
 /// The `?mode=` selector for [`pdf`]. `"structured"` → reconstruction "B"
 /// ([`doc_v1_layout`] + [`render_pdf`]); anything else — `"searchable"`, an
 /// unknown value, or an absent field — → the searchable facsimile "A".
+///
+/// `pub(crate)`: also used by [`crate::api`] so `POST /api/v1/pdf` accepts
+/// the exact same `?mode=` contract as the HTML `/pdf` route.
 #[derive(Debug, Default, serde::Deserialize)]
-struct PdfQuery {
+pub(crate) struct PdfQuery {
     #[serde(default)]
     mode: Option<String>,
 }
 
 impl PdfQuery {
-    fn is_structured(&self) -> bool {
+    pub(crate) fn is_structured(&self) -> bool {
         matches!(self.mode.as_deref(), Some("structured"))
     }
 }
@@ -588,7 +597,11 @@ fn build_debug_view(state: &AppState, bytes: &[u8]) -> Result<DebugView, String>
 /// two exports share the searchable/reconstruction geometry. Returns the PDF
 /// bytes + a download filename. Heavy synchronous work — run via
 /// `spawn_blocking`.
-fn build_pdf(
+///
+/// `pub(crate)`: also used by [`crate::api`] (the `SearchablePdf`/
+/// `StructuredPdf` connector actions) — one PDF-building path for both the
+/// HTML demo and the machine API.
+pub(crate) fn build_pdf(
     state: &AppState,
     bytes: &[u8],
     structured: bool,
@@ -660,7 +673,10 @@ async fn read_image_upload(mut multipart: Multipart) -> Result<Vec<u8>, String> 
 /// hand (rather than a header tuple) because `Vec<u8>::into_response()` sets
 /// `content-type: application/octet-stream`, which must be REPLACED — not
 /// appended — with `application/pdf`.
-fn pdf_response(bytes: Vec<u8>, filename: &str) -> Response {
+///
+/// `pub(crate)`: also used by [`crate::api`] so the JSON/binary API's PDF
+/// actions return byte-identical responses to the HTML `/pdf` route.
+pub(crate) fn pdf_response(bytes: Vec<u8>, filename: &str) -> Response {
     use axum::http::{header, HeaderValue};
     let mut resp = bytes.into_response();
     let headers = resp.headers_mut();

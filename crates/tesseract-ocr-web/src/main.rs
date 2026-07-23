@@ -8,6 +8,7 @@
 //! process to bind `0.0.0.0:$PORT` — so we read `PORT` at runtime and only fall
 //! back to 8080 for local `cargo run`. Do NOT hardcode the port.
 
+mod api;
 mod fetch;
 mod ocr;
 mod routes;

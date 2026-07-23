@@ -41,6 +41,11 @@ tesseract-ocr-pdf = { path = "../tesseract-ocr-pdf", default-features = false }
 # already in the workspace lockfile via tesseract-ocr-pdf).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Power Platform connector surface (`src/api.rs`): decodes the `content_base64`
+# field of the `{content_base64, lang}` JSON request-body alternative to a raw
+# binary body. Already resolved to 0.22.1 elsewhere in the workspace lockfile
+# (transitive), so this adds no new version to reconcile.
+base64 = "0.22"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] } # ServiceExt::oneshot for router tests
