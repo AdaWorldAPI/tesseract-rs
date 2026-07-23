@@ -357,6 +357,44 @@ PGM/grey-only executor. This is the operator's "make the implementation debt to
 get used to the OGAR adapters small" delivered. No Core change → this file + the
 commit are the record.
 
+**★ Sauvola adaptive binarization — NEW leaf, byte-parity green (2026-07-23).**
+`crates/tesseract-ocr/src/binarize.rs` transcodes the full `pixSauvolaBinarize`
+chain from the `AdaWorldAPI/leptonica` fork (`src/{binarize.c,convolve.c,pix2.c}`):
+`pixAddMirroredBorder(whsize+1)` → `pixWindowedMean` (u32 wrapping integral,
+`blockconvAccumLow`) + `pixWindowedMeanSquare` (f64 integral, `pixMeanSquareAccum`)
+→ `pixSauvolaGetThreshold` (`t = m·(1 - k·(1 - s/128))`, `s = sqrt(ms - m²)`, sqrt
+LUT when `w·h > 100000`) → `pixApplyLocalThreshold` (`grey < t` → ON/black).
+**Byte-identical vs liblept 1.82.0** (`.claude/harvest/oracles/sauvola_oracle.cpp`,
+`pixGetPixel` of `pixth`+`pixd`) on **5/5** configs: 128×96 usetab=0, 400×300
+usetab=1 (LUT path), whsize 4/8/10/15, k 0.2/0.34/0.5, and a real 512×720 page
+(368640 px). Fidelity pins: the u32 accumulator is **wrapping** (`l_uint32`; the
+4-corner window diff recovers the true sum mod 2³²); the mean-square accumulator
+is `f64` (exact integers < 2⁵²); `mean`=`(f32 norm·sum) as u8` (trunc),
+`mean_square`=`(f64 norm·sum + 0.5) as u32` (round), threshold = `f64` expr `as
+i32` low-8-bits. Example `sauvola_dump`; 3 unit tests; clippy-clean (toolchain
+1.95). Tesseract-ocr-local (no Core change) → this file + the commit are the
+record. Available for the segmentation path (`xy_cut::binarize_page` is global
+Otsu today); the adaptive alternative that survives the uneven-lit scans global
+thresholding destroys (the ImproveQuality lesson). Not wired as the default —
+that is a behavioural change needing its own re-pin.
+
+**★ eng + deu byte-parity across ALL model leaves — the transcode is
+model-agnostic (2026-07-23).** Step-1 oracle installed in-container (tesseract
+5.3.4 + leptonica 1.82.0 via apt; matching 5.3.4 source cloned for headers →
+**zero ABI skew**, retiring the 5.5.0/5.3.4 skew the older method fought). deu
+components via `combine_tessdata -u deu.traineddata corpus/model/deu.`. Every leaf
+proven on eng is now byte-identical on **deu** too: UNICHARSET 6/6 (116 entries,
+multibyte Ä Ö Ü ä ö ü ß), UNICHAR utf8 (model-indep), recoder encode/decode/beam
+(code_range 115), network forward (nw=400979, a *different architecture* than eng
+385807), and the **image→text end-to-end capstone** (deu null_char=114 vs eng 110;
+the German model self-derives different constants and the Rust reproduces all of
+them — a real falsifier, not eng-overfit). Oracles banked in `.claude/harvest/
+oracles/` (`unicharset`/`unichar`/`recoder`/`network_forward`/`image_text_agnostic`
+/`sauvola`); status tracker `.claude/harvest/PARITY-ENG-DEU-STATUS.md`; harness
+`run_unicharset_parity.sh`. The Core-side finding (lance-graph-contract's
+UniCharSet/UnicharCompress/Network loaders are model-agnostic) is recorded on the
+lance-graph board (extends E-CPP-PARITY-1..7 + E-OCR-*).
+
 ## Web demo (`crates/tesseract-ocr-web`)
 
 A single-binary **consumer** demo (axum + askama + tokio) proving the pipeline

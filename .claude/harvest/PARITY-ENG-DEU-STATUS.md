@@ -45,3 +45,27 @@ just pixels, so they need no per-language re-run (re-confirm as regression only)
   ids all byte-identical).
 
 Harness: `run_unicharset_parity.sh <unicharset> <label>`.
+
+## IN-CONTAINER RESULTS — 2026-07-23 (all green so far)
+
+| Feature | eng | deu | Falsifier that proves it is real |
+|---|---|---|---|
+| UNICHARSET (bijection + 5 fields) | ✅ 6/6 (112) | ✅ 6/6 (116) | multibyte Ä Ö Ü ä ö ü ß ids byte-identical |
+| UNICHAR utf8 codec | ✅ 268 | ✅ 268 (model-indep) | overlong-NUL→0, 4 illegal leads→ILLEGAL |
+| recoder encode/decode/beam | ✅ 112/113/114 | ✅ 116/117/118 | code_range 111 vs 115; shared-code id 1→2; id-ordered beam final list |
+| network forward (softmax) | ✅ 8/8 | ✅ 8/8 | deu nw=400979 vs eng 385807 (different arch), both agree |
+| image → text (end-to-end capstone) | ✅ 6/6 | ✅ 6/6 | deu null_char=114 vs eng 110, sample_iteration differ; both agree |
+| **Sauvola adaptive binarize** (NEW) | ✅ 5/5 configs | ✅ (model-indep) | 368640-px real page + usetab=1 LUT + whsize 4–15 all byte-identical |
+| beam decode (standalone) | ⏳ | ⏳ | (in flight) |
+| dict / dawg walk | ⏳ | ⏳ | (in flight) |
+
+**Sauvola** transcoded from `AdaWorldAPI/leptonica` `src/{binarize.c,convolve.c,pix2.c}`
+into `crates/tesseract-ocr/src/binarize.rs`; byte-parity vs liblept 1.82.0
+(`sauvola_oracle.cpp`). The full `pixSauvolaBinarize` chain (mirror border →
+u32/f64 integral windowed mean+mean-square → threshold `m(1-k(1-s/128))` → apply)
+is byte-identical; 3 unit tests, clippy-clean.
+
+Headline: **the transcode is model-agnostic.** Every core leaf proven on eng is
+byte-identical on deu too — the German model self-derives different constants
+(charset 116, code_range 115, null_char 114, nw 400979) and the Rust reproduces
+all of them. Nothing was eng-overfit.

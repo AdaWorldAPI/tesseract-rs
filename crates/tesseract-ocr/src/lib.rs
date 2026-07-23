@@ -13,6 +13,7 @@
 //! `ruff_cpp_spo` C++ SPO harvest); the compute **payloads** come from the
 //! recognizer's proven leaves. See `.claude/plans/recognizer-image-to-text-v2.md`.
 
+pub mod binarize;
 pub mod binreduce;
 pub mod blob_filter;
 pub mod conncomp;
