@@ -196,6 +196,32 @@ fn push_rect_stroke(
     }
 }
 
+/// Shrink factor from a text block's reported bbox height down to a rendered
+/// font size. The bbox height is an "at least" ascender-to-descender band —
+/// `tesseract-ocr`'s `makerow_row_crops` deliberately EXTENDS a row's box to
+/// cover ascenders/descenders generously (recognition robustness), not a
+/// tight visual line-height — so using it verbatim as `Tf`'s nominal size
+/// overshoots.
+///
+/// The transcoded typographic-band math (`textline.rs`'s
+/// `K_XHEIGHT_FRACTION`/`K_ASCENDER_FRACTION`/`K_DESCENDER_FRACTION` =
+/// `0.5`/`0.25`/`0.25`) sizes a well-behaved single line's band at
+/// `xheight + ascrise + |descdrop|` ≈ `1.0 × line_size` — the box height is
+/// *expected* to be roughly one line's baseline-to-baseline pitch already.
+/// Real scans routinely exceed that (dense/antique typesetting, diacritics,
+/// row-fitting slack): measured on a real multi-paragraph page, consecutive
+/// `Tm` baselines landed ~15pt apart while `fontsize_pt = box_h_pt` chose
+/// ~30-31pt — roughly double the real pitch, so every line's glyphs bled a
+/// half-line into both neighbours (the reported bug). `0.5` maps that
+/// measured case back onto its real pitch while leaving a well-behaved
+/// (~1.0×) band comfortably smaller than its own box — a safe direction to
+/// be wrong in, since an undersized font stays legible where an oversized
+/// one collides. Shared by [`emit_text_run`] (the PDF projection) and
+/// [`text_font_size_px`] (the HTML projection), so both size text the same
+/// way — the Klickwege-parity invariant applied to text SIZE, not just
+/// position.
+const TEXT_HEIGHT_TO_FONTSIZE: f64 = 0.5;
+
 /// Emit the `Tm`/`Tf`/`Tz`/`Tj` run for one text bbox (baseline = box bottom,
 /// `Tz`-fitted to the box width). Returns the WinAnsi `'?'`-substitution count.
 /// A degenerate box emits nothing and counts nothing; a positive box counts
@@ -222,7 +248,7 @@ fn emit_text_run(
     let x_pt = px_to_pt(f64::from(left), dpi);
     // Baseline = box bottom (APPROX); PDF y is bottom-up.
     let y_pt = page_h_pt - px_to_pt(f64::from(bottom), dpi);
-    let fontsize_pt = box_h_pt;
+    let fontsize_pt = box_h_pt * TEXT_HEIGHT_TO_FONTSIZE;
     let natural_width_pt = fontsize_pt * f64::from(natural_width_1000em) / 1000.0;
     let tz = 100.0 * box_w_pt / natural_width_pt;
 
@@ -515,6 +541,17 @@ fn css_box(bbox: (u32, u32, u32, u32)) -> String {
     format!("left:{l}px;top:{t}px;width:{w}px;height:{h}px")
 }
 
+/// The HTML preview's font-size (px) for a text bbox — mirrors
+/// [`emit_text_run`]'s `fontsize_pt = box_h_pt * TEXT_HEIGHT_TO_FONTSIZE`
+/// (same shrink, same source height) so the debug preview shows what the
+/// PDF's painted/invisible text actually looks like, not an unrelated fixed
+/// size. Clamped to at least `1.0` so a degenerate/thin box never emits
+/// `font-size:0px`.
+fn text_font_size_px(bbox: (u32, u32, u32, u32)) -> f64 {
+    let (_, top, _, bottom) = bbox;
+    (f64::from(bottom.saturating_sub(top)) * TEXT_HEIGHT_TO_FONTSIZE).max(1.0)
+}
+
 /// Minimal HTML text escaping for element content / attribute values.
 fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -573,10 +610,10 @@ pub fn render_preview_html(doc: &LayoutDoc) -> String {
     html.push_str(".page{position:relative;margin:8px auto;background:#fff;overflow:hidden;");
     html.push_str("box-shadow:0 0 4px rgba(0,0,0,.4)}\n");
     html.push_str(".page>*{position:absolute;box-sizing:border-box}\n");
-    html.push_str(".text{font:12px/1 sans-serif;white-space:pre;color:#000}\n");
+    html.push_str(".text{font-family:sans-serif;white-space:pre;color:#000}\n");
     html.push_str(".table{border:1px solid #333}\n");
     html.push_str(".table .cell{position:absolute;box-sizing:border-box;");
-    html.push_str("font:11px/1 sans-serif;border:1px solid #999;overflow:hidden;padding:1px}\n");
+    html.push_str("font-family:sans-serif;border:1px solid #999;overflow:hidden;padding:1px}\n");
     html.push_str(".figure{outline:1px dashed #666}\n");
     html.push_str("</style>\n</head>\n<body>\n");
 
@@ -602,8 +639,9 @@ pub fn render_preview_html(doc: &LayoutDoc) -> String {
         for block in &page.blocks {
             match block {
                 Block::Text(t) => {
+                    let font_px = text_font_size_px(t.bbox);
                     html.push_str(&format!(
-                        "  <div class=\"text\" style=\"{}\">{}</div>\n",
+                        "  <div class=\"text\" style=\"{};font-size:{font_px}px;line-height:1\">{}</div>\n",
                         css_box(t.bbox),
                         html_escape(&t.text)
                     ));
@@ -630,9 +668,10 @@ pub fn render_preview_html(doc: &LayoutDoc) -> String {
                         // parity anchor is the table's own bbox on the div above.
                         let (l, top) = (cl.saturating_sub(tl), ct.saturating_sub(tt));
                         let (w, h) = (cr.saturating_sub(cl), cb.saturating_sub(ct));
+                        let font_px = text_font_size_px(cell.bbox);
                         html.push_str(&format!(
                             "    <div class=\"cell\" style=\"left:{l}px;top:{top}px;\
-                             width:{w}px;height:{h}px\">{}</div>\n",
+                             width:{w}px;height:{h}px;font-size:{font_px}px;line-height:1\">{}</div>\n",
                             html_escape(&cell.text)
                         ));
                     }
@@ -1285,6 +1324,56 @@ mod tests {
         let tr = ops(&content, "Tr");
         assert!(tr.iter().any(|o| num(o, 0) == 0.0), "fill mode 0 present");
         assert!(!tr.iter().any(|o| num(o, 0) == 3.0), "no invisible group");
+    }
+
+    /// Regression for the reported overlap bug: two consecutive lines whose
+    /// bbox height (30) is double their baseline-to-baseline pitch (15) —
+    /// exactly the shape measured on a real multi-paragraph page, where the
+    /// naive `fontsize_pt = box_h_pt` chose a font twice the real line pitch
+    /// and every line's glyphs bled into both neighbours. After the fix, the
+    /// rendered font size must not exceed the real pitch between baselines,
+    /// in EITHER projection (PDF `Tf` and the HTML preview's `font-size`).
+    #[test]
+    fn visible_text_font_size_does_not_exceed_line_pitch() {
+        let doc = LayoutDoc {
+            dpi: 72,
+            pages: vec![LayoutPage {
+                width: 100,
+                height: 100,
+                background: None,
+                blocks: vec![
+                    Block::Text(TextBlock {
+                        bbox: (0, 0, 100, 30),
+                        text: "Line one".to_string(),
+                        visible: true,
+                    }),
+                    Block::Text(TextBlock {
+                        bbox: (0, 15, 100, 45),
+                        text: "Line two".to_string(),
+                        visible: true,
+                    }),
+                ],
+            }],
+        };
+        // Baseline-to-baseline pitch = the boxes' bottom-to-bottom delta (45-30=15),
+        // matching the box-height (30) being double the real pitch — the bug shape.
+        let pitch_pt = 15.0;
+
+        let (pdf, _r) = render_pdf(&doc).expect("render");
+        let content = page_content(&pdf);
+        for tf in ops(&content, "Tf") {
+            let size = num(tf, 1);
+            assert!(
+                size <= pitch_pt + 1e-6,
+                "PDF font size {size} must not exceed the {pitch_pt}pt line pitch"
+            );
+        }
+
+        let html = render_preview_html(&doc);
+        assert!(
+            html.contains("font-size:15px"),
+            "HTML font-size must shrink with the box height (30px * 0.5 = 15px), got: {html}"
+        );
     }
 
     // --- Builder B: doc.v1 reconstruction -----------------------------------

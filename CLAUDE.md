@@ -409,9 +409,32 @@ http/https-only, non-public-IP reject incl. `169.254.169.254`, redirects off,
 local fallback — `PORT` is NOT hardcoded/pinned; Railway injects it). The
 `Dockerfile` clones the `lance-graph` + `ndarray` siblings at build via a
 `GH_TOKEN`/`GITHUB_TOKEN` secret/arg (the token Railway's GitHub login already
-grants — set it as a build variable) and trims `tesseract-ogar` from the
-workspace (web tree is OGAR-free) → one binary. 5 inline tests (bin-only crate) + CI `-p tesseract-ocr-web`. No Core
+grants — set it as a build variable) and trims `tesseract-ogar` **and**
+`tesseract-ocr-python` from the workspace (the web tree is OGAR-free; the
+Python wheel crate path-deps `tesseract-ogar` → OGAR too, so it must be
+trimmed for the exact same reason or the build fails looking for an uncloned
+`/src/OGAR`) → one binary. 5 inline tests (bin-only crate) + CI `-p tesseract-ocr-web`. No Core
 change → no lance-graph board entry; this crate + this note are the record.
+
+**★ Text-line overlap bug — FIXED (2026-07-23).** `crates/tesseract-ocr-pdf/
+src/layout.rs`'s `emit_text_run` set the PDF `Tf` (font size) directly to a
+text block's bbox HEIGHT — `makerow_row_crops`'s "at least" ascender-to-
+descender OCR recognition band (generous by design, for recognizer
+robustness), not a tight visual line-height. Confirmed by extracting the raw
+content stream from a real multi-paragraph repro: consecutive `Tm` baselines
+landed ~15pt apart while `Tf` chose ~30-31pt (~2x the real pitch) — every
+line's glyphs bled a half-line into both neighbours, in both the structured
+PDF (visible `0 Tr` text) and the debug HTML preview (which shows the
+searchable PDF's normally-invisible per-word text visibly, for inspection).
+Fix: `TEXT_HEIGHT_TO_FONTSIZE = 0.5`, grounded in the transcoded
+`K_XHEIGHT_FRACTION`/`K_ASCENDER_FRACTION`/`K_DESCENDER_FRACTION` band math
+(`textline.rs`: a well-behaved single line's band is ~1.0× its own pitch, so
+0.5× leaves safe headroom; an oversized/anomalous band lands back near its
+real pitch instead of doubling it) — applied identically in `emit_text_run`
+(PDF) and the new `text_font_size_px` (HTML preview, replacing the
+previously fixed/disconnected 12px/11px CSS), preserving Klickwege parity.
+tesseract-ocr-pdf-local (no Core change) → this file + the commit are the
+record.
 
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
