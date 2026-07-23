@@ -30,6 +30,10 @@
 //!    region's binarization can never drift from its parent's. If Otsu returns
 //!    `hi_value == -1` ("no opinion", only reachable on a degenerate page) we
 //!    fall back to a fixed `pixel < 128` split, same as `line_segment.rs`.
+//!    [`binarize_page_with`] exposes this same step under an explicit
+//!    [`BinarizeMode`] — `Otsu` (the default, byte-identical to
+//!    [`binarize_page`]) or the opt-in adaptive `Sauvola` — but [`xy_cut`]
+//!    itself always calls [`binarize_page`], i.e. always `Otsu`.
 //!
 //! 2. **Both profiles, every level.** For the current rect we compute BOTH the
 //!    vertical (per-column) and horizontal (per-row) ink profiles. A profile bin
@@ -77,6 +81,7 @@
     reason = "raster coordinates and pixel counts stay well within f32/usize range; the gap-threshold arithmetic is deliberately low-precision"
 )]
 
+use crate::binarize::sauvola_binarize;
 use crate::threshold::{otsu_threshold_gray, threshold_rect_to_binary};
 
 /// An axis-aligned region in raster space: **top-down** image coordinates with
@@ -174,18 +179,99 @@ pub fn xy_cut(grey: &[u8], w: usize, h: usize, params: &XyCutParams) -> Vec<Page
     out
 }
 
+/// Segmentation binarization mode for [`binarize_page_with`]. The crate-wide
+/// default is [`BinarizeMode::Otsu`] — a single global threshold — and
+/// [`binarize_page`] (the helper [`xy_cut`] itself calls) is pinned to
+/// exactly that default, byte-for-byte, so this opt-in surface never changes
+/// existing behaviour on its own. [`BinarizeMode::Sauvola`] is the adaptive
+/// alternative (see [`sauvola_binarize`]): a per-pixel threshold from the
+/// local mean/stddev that survives unevenly-lit or aged scans a single
+/// global Otsu split washes out. Nothing in this crate selects `Sauvola`
+/// implicitly — a caller must construct it explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum BinarizeMode {
+    /// Global Otsu threshold ([`otsu_threshold_gray`]), with the fixed
+    /// `pixel < 128` fallback when Otsu declines to threshold
+    /// (`hi_value == -1`; only reachable on a degenerate page). This is the
+    /// crate-wide segmentation default.
+    #[default]
+    Otsu,
+    /// Adaptive Sauvola threshold ([`sauvola_binarize`]): a per-pixel
+    /// threshold from the local mean and standard deviation over a
+    /// `(2·whsize+1)²` window, robust against uneven lighting that defeats a
+    /// single global Otsu split. Falls back to [`BinarizeMode::Otsu`] when
+    /// the page is too small for the requested window (mirroring the guard
+    /// [`sauvola_binarize`] itself asserts on: `whsize >= 2` and
+    /// `w, h >= 2·whsize + 3`), so this mode never panics regardless of page
+    /// size.
+    Sauvola {
+        /// Window half-size. Must be `>= 2`, and the page must be at least
+        /// `2·whsize + 3` on each side, or this mode falls back to `Otsu`.
+        whsize: usize,
+        /// Sauvola sensitivity factor `k` (typically `0.34`).
+        k: f32,
+    },
+}
+
 /// Binarize the full page once into this crate's `0` = ink / `255` = background
-/// convention. Uses the page's own Otsu decision, falling back to a fixed
-/// `pixel < 128` split when Otsu declines to threshold (`hi_value == -1`; only
-/// reachable on a degenerate page — see `line_segment::row_ink_counts`).
+/// convention, using the crate-wide default ([`BinarizeMode::default`], i.e.
+/// [`BinarizeMode::Otsu`]) — byte-identical to this function's behaviour
+/// before [`BinarizeMode`] existed. Uses the page's own Otsu decision,
+/// falling back to a fixed `pixel < 128` split when Otsu declines to
+/// threshold (`hi_value == -1`; only reachable on a degenerate page — see
+/// `line_segment::row_ink_counts`).
 fn binarize_page(grey: &[u8], w: usize, h: usize) -> Vec<u8> {
-    let otsu = otsu_threshold_gray(grey, w, 0, 0, w, h);
-    if otsu.hi_value == -1 {
-        grey.iter()
-            .map(|&p| if p < 128 { 0 } else { 255 })
-            .collect()
-    } else {
-        threshold_rect_to_binary(grey, w, 0, 0, w, h, otsu)
+    binarize_page_with(grey, w, h, BinarizeMode::default())
+}
+
+/// Binarize the full page once into this crate's `0` = ink / `255` = background
+/// convention, under an explicit, opt-in [`BinarizeMode`].
+///
+/// [`BinarizeMode::Otsu`] is exactly [`binarize_page`]'s pre-existing body —
+/// global [`otsu_threshold_gray`] + [`threshold_rect_to_binary`], with the
+/// same `hi_value == -1` fixed-128 fallback — so selecting it, or the
+/// default, reproduces [`binarize_page`] byte-for-byte.
+///
+/// [`BinarizeMode::Sauvola`] runs [`sauvola_binarize`] and converts its own
+/// per-pixel foreground convention (`1` = black text, `0` = background) into
+/// this crate's `{0, 255}` convention (`0` = ink, `255` = background) — the
+/// inverse byte value, same semantic split. When the page is too small for
+/// the requested window, this falls back to [`BinarizeMode::Otsu`] instead
+/// of panicking (mirroring the guard [`sauvola_binarize`] itself asserts
+/// on).
+///
+/// This is the opt-in segmentation entry point: [`xy_cut`] and
+/// [`binarize_page`] are untouched and keep calling the `Otsu` path
+/// unconditionally. Threading this mode up to a document-level API (e.g.
+/// `LstmRecognizer::recognize_document`) is a deliberate follow-up, not done
+/// here.
+#[must_use]
+pub fn binarize_page_with(grey: &[u8], w: usize, h: usize, mode: BinarizeMode) -> Vec<u8> {
+    match mode {
+        BinarizeMode::Otsu => {
+            let otsu = otsu_threshold_gray(grey, w, 0, 0, w, h);
+            if otsu.hi_value == -1 {
+                grey.iter()
+                    .map(|&p| if p < 128 { 0 } else { 255 })
+                    .collect()
+            } else {
+                threshold_rect_to_binary(grey, w, 0, 0, w, h, otsu)
+            }
+        }
+        BinarizeMode::Sauvola { whsize, k: factor } => {
+            let window_ok = whsize >= 2 && w >= 2 * whsize + 3 && h >= 2 * whsize + 3;
+            if !window_ok {
+                // Too small for the requested window — fall back to Otsu
+                // rather than reaching sauvola_binarize's own panic guard.
+                return binarize_page_with(grey, w, h, BinarizeMode::Otsu);
+            }
+            let sauvola = sauvola_binarize(grey, w, h, whsize, factor);
+            sauvola
+                .binary
+                .iter()
+                .map(|&fg| if fg == 1 { 0 } else { 255 })
+                .collect()
+        }
     }
 }
 
@@ -683,6 +769,101 @@ mod tests {
                 right: 290,
                 bottom: 60
             }
+        );
+    }
+
+    #[test]
+    fn binarize_page_matches_binarize_page_with_otsu_default() {
+        // binarize_page (the private helper `xy_cut` itself calls) must stay
+        // byte-identical to binarize_page_with's Otsu arm, and Otsu must stay
+        // BinarizeMode's default — the whole point of this opt-in wiring is
+        // that the pre-existing default path is untouched.
+        let (w, h) = (100, 60);
+        let mut g = page(w, h);
+        fill(&mut g, w, 30, 70, 20, 40);
+        let via_private = binarize_page(&g, w, h);
+        let via_otsu = binarize_page_with(&g, w, h, BinarizeMode::Otsu);
+        let via_default = binarize_page_with(&g, w, h, BinarizeMode::default());
+        assert_eq!(
+            via_private, via_otsu,
+            "binarize_page must equal binarize_page_with(.., BinarizeMode::Otsu)"
+        );
+        assert_eq!(
+            via_otsu, via_default,
+            "BinarizeMode::default() must be Otsu"
+        );
+    }
+
+    #[test]
+    fn binarize_page_with_sauvola_differs_from_otsu_and_matches_direct_call() {
+        // Two horizontal bands at very different overall brightness (an
+        // unevenly-lit page): a dim top band (bg=60) and a bright bottom band
+        // (bg=200), each with a small "text" patch ~20 levels darker than its
+        // OWN local background. A single global Otsu threshold can only split
+        // BETWEEN the two bands, not WITHIN either — so it misclassifies the
+        // bulk of the bright band as foreground (both text patches land on
+        // the wrong side too). Sauvola's local mean/std tracks each band's
+        // own level, so it must disagree with Otsu on, at minimum, the bulk
+        // bottom-band background pixels.
+        let (w, h) = (40usize, 40usize);
+        let mut grey = vec![60u8; w * h];
+        for y in 20..40 {
+            for x in 0..40 {
+                grey[y * w + x] = 200;
+            }
+        }
+        // Top-band text patch: darker than the local 60 background.
+        for y in 5..11 {
+            for x in 5..11 {
+                grey[y * w + x] = 40;
+            }
+        }
+        // Bottom-band text patch: darker than the local 200 background, same
+        // 20-level relative dip as the top patch.
+        for y in 25..31 {
+            for x in 25..31 {
+                grey[y * w + x] = 180;
+            }
+        }
+
+        let otsu = binarize_page_with(&grey, w, h, BinarizeMode::Otsu);
+        let sauvola_mode =
+            binarize_page_with(&grey, w, h, BinarizeMode::Sauvola { whsize: 8, k: 0.34 });
+
+        assert_ne!(
+            otsu, sauvola_mode,
+            "Sauvola must disagree with a single global Otsu threshold on an unevenly-lit page"
+        );
+
+        // Independently reproduce the {0,255} conversion binarize_page_with
+        // applies to Sauvola's own {0,1} foreground convention, and confirm
+        // it matches exactly.
+        let direct = sauvola_binarize(&grey, w, h, 8, 0.34);
+        let expected: Vec<u8> = direct
+            .binary
+            .iter()
+            .map(|&fg| if fg == 1 { 0 } else { 255 })
+            .collect();
+        assert_eq!(
+            sauvola_mode, expected,
+            "binarize_page_with(Sauvola) must match a direct sauvola_binarize call under the same {{0,255}} conversion"
+        );
+    }
+
+    #[test]
+    fn binarize_page_with_sauvola_falls_back_to_otsu_on_tiny_image() {
+        // whsize=8 requires w,h >= 19 (sauvola_binarize's own guard); a 10x10
+        // image is too small, so the Sauvola arm must fall back to Otsu
+        // rather than calling sauvola_binarize (which would otherwise panic).
+        let (w, h) = (10usize, 10usize);
+        let mut g = page(w, h);
+        fill(&mut g, w, 2, 8, 2, 8);
+        let otsu = binarize_page_with(&g, w, h, BinarizeMode::Otsu);
+        let sauvola_fallback =
+            binarize_page_with(&g, w, h, BinarizeMode::Sauvola { whsize: 8, k: 0.34 });
+        assert_eq!(
+            otsu, sauvola_fallback,
+            "a too-small-for-window Sauvola request must fall back to Otsu byte-for-byte"
         );
     }
 }

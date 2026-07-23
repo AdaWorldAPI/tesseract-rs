@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "tesseract-rs"
+description = "Pure-Rust, byte-parity Tesseract OCR (eng + deu) -- no libtesseract, no leptonica, no C at runtime."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+]
+dynamic = ["version"]
+
+[tool.maturin]
+# `[lib] name = "tesseract_rs"` in Cargo.toml already matches this project's
+# desired import name (`import tesseract_rs`), so no `module-name` override
+# is needed here -- maturin defaults the wheel's importable module to the
+# cdylib's `[lib] name`.
+features = ["pyo3/extension-module"]

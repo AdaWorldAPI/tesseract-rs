@@ -1,0 +1,23 @@
+{
+  "properties": {
+    "connectionParameters": {
+      "api_key": {
+        "type": "securestring",
+        "uiDefinition": {
+          "displayName": "API Key",
+          "description": "The x-api-key value your tesseract-rs deployment expects (the TESSERACT_API_KEY environment variable). If your deployment has no key configured, enter any placeholder value here - TESSERACT_API_KEY unset means the server accepts every request regardless of this header.",
+          "tooltip": "Provide your tesseract-rs API key",
+          "constraints": {
+            "tabIndex": 2,
+            "clearText": false,
+            "required": "false"
+          }
+        }
+      }
+    },
+    "iconBrandColor": "#2D2D2D",
+    "capabilities": [],
+    "publisher": "tesseract-rs",
+    "stackOwner": "tesseract-rs"
+  }
+}
