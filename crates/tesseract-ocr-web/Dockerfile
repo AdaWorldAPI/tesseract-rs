@@ -53,14 +53,17 @@ RUN set -eu; \
     clone ndarray "$NDARRAY_REF"
 
 WORKDIR /src/tesseract-rs
-# Trim the one workspace member that path-deps the OGAR sibling (the web binary
-# needs neither tesseract-ogar nor OGAR), so cargo can resolve without it. The
-# guard makes a silent no-op (e.g. if the members line is ever reformatted
-# one-entry-per-line) a hard build failure instead of a confusing later
-# "failed to load OGAR/Cargo.toml".
-RUN sed -i 's#, "crates/tesseract-ogar"##' Cargo.toml; \
-    if grep -q '"crates/tesseract-ogar"' Cargo.toml; then \
-      echo "FATAL: failed to trim tesseract-ogar from workspace members (Cargo.toml reformatted?)" >&2; \
+# Trim the workspace members that path-dep the OGAR sibling (the web binary
+# needs neither tesseract-ogar nor tesseract-ocr-python nor OGAR), so cargo can
+# resolve without it. Cargo loads every workspace member's manifest (and its
+# path deps) even when building a single `-p` package, so `tesseract-ocr-python`
+# — which path-deps `tesseract-ogar` → OGAR — must be trimmed too, or the build
+# fails looking for the uncloned `/src/OGAR` sibling. The guard makes a silent
+# no-op (e.g. if the members line is ever reformatted one-entry-per-line) a hard
+# build failure instead of a confusing later "failed to load OGAR/Cargo.toml".
+RUN sed -i 's#, "crates/tesseract-ogar"##; s#, "crates/tesseract-ocr-python"##' Cargo.toml; \
+    if grep -q '"crates/tesseract-ogar"' Cargo.toml || grep -q '"crates/tesseract-ocr-python"' Cargo.toml; then \
+      echo "FATAL: failed to trim tesseract-ogar/tesseract-ocr-python from workspace members (Cargo.toml reformatted?)" >&2; \
       exit 1; \
     fi
 
