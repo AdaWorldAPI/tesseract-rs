@@ -40,6 +40,11 @@ flate2 = "1.1"
 # is single-threaded by design, so there is no nested-parallelism hazard to guard
 # against inside a job — rayon owns ALL the CPU parallelism in this crate.
 rayon = { version = "1", optional = true }
+# doc.v1 JSON parsing for the layout reconstruction builder
+# (`layout::doc_v1_layout`). Pure Rust, standalone-safe (no OGAR / lance-graph);
+# already in the workspace lockfile, so this adds no new dependency version.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [features]
 default = ["parallel"]

@@ -212,6 +212,68 @@ pub fn ocr_image_bytes_json(state: &AppState, bytes: &[u8]) -> Result<OcrJsonOut
     })
 }
 
+/// Everything the `/debug` and `/pdf` routes need from ONE recognition pass:
+/// the `doc.v1` JSON (the canonical structured output), the decoded grey raster
+/// (needed to build the searchable-PDF "A" background and to crop `doc.v1`
+/// figure regions for "B"), the page dimensions, and the same honesty stats the
+/// other modes report. A and B are BOTH derived from this single pass, so the
+/// two panels cannot drift.
+pub struct OcrDebugOutcome {
+    /// Decoded image width in pixels.
+    pub width: usize,
+    /// Decoded image height in pixels.
+    pub height: usize,
+    /// The decoded 8-bit grey raster, row-major, `width * height` bytes.
+    pub grey: Vec<u8>,
+    /// The rendered `tesseract-rs/doc.v1` JSON document.
+    pub doc_json: String,
+    /// Total recognized words across all lines.
+    pub word_count: usize,
+    /// Number of non-empty recognized lines.
+    pub line_count: usize,
+    /// Mean word confidence 0–100 (`-1` sentinel when no words).
+    pub mean_conf: f32,
+    /// `true` when the recognizer is not confident (likely handwriting /
+    /// low-resolution / non-printed input).
+    pub low_confidence: bool,
+    /// Wall-clock recognition time in milliseconds (decode excluded).
+    pub elapsed_ms: f64,
+    /// `true` when the production dict beam was used (DAWGs loaded).
+    pub dict_on: bool,
+}
+
+/// Decode `bytes` to grey and run the canonical one-shot structured-document
+/// path ([`LstmRecognizer::recognize_document`]) with the German-invoice field
+/// harvest — the SAME composition [`ocr_image_bytes_json`] uses — but ALSO
+/// return the grey raster so the caller can build the searchable-PDF "A"
+/// facsimile (scan + invisible word layer) and the `doc.v1` reconstruction "B"
+/// from one recognition. Same off-runtime contract as the other entry points —
+/// heavy synchronous CPU work, callers MUST run it via `spawn_blocking`.
+pub fn ocr_image_bytes_debug(state: &AppState, bytes: &[u8]) -> Result<OcrDebugOutcome, String> {
+    let (raw, w, h) = decode_grey(bytes)?;
+
+    let t0 = Instant::now();
+    let specs = german_invoice_fields();
+    let doc = state
+        .recognizer
+        .recognize_document(&raw, w, h, state.dict.as_ref(), Some(&specs))
+        .map_err(|e| format!("recognition failed: {e}"))?;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    Ok(OcrDebugOutcome {
+        width: w,
+        height: h,
+        grey: raw,
+        doc_json: doc.json,
+        word_count: doc.word_count,
+        line_count: doc.line_count,
+        mean_conf: doc.mean_confidence.unwrap_or(-1.0),
+        low_confidence: doc.low_confidence,
+        elapsed_ms,
+        dict_on: state.dict.is_some(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

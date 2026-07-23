@@ -27,12 +27,17 @@
   }
   .or { text-align: center; color: color-mix(in srgb, CanvasText 50%, Canvas);
         margin: .9rem 0; font-size: .85rem; letter-spacing: .05em; }
+  .btns { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: 1rem; }
   button {
-    margin-top: 1rem; width: 100%; padding: .7rem 1rem; font-size: 1rem;
+    flex: 1 1 auto; padding: .7rem 1rem; font-size: 1rem;
     font-weight: 600; border: 0; border-radius: 8px; cursor: pointer;
     background: #2563eb; color: #fff;
   }
-  button:hover { background: #1d4ed8; }
+  button.secondary {
+    background: Canvas; color: CanvasText;
+    border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
+  }
+  button:hover { filter: brightness(1.08); }
   .error {
     border: 1px solid #ef4444; background: color-mix(in srgb, #ef4444 12%, Canvas);
     color: color-mix(in srgb, #ef4444 85%, CanvasText);
@@ -70,8 +75,17 @@
       <label><input type="radio" name="format" value="json"> JSON (Struktur + Felder)</label>
     </div>
 
-    <button type="submit">Run OCR</button>
+    <div class="btns">
+      <button type="submit" formaction="/ocr">Run OCR</button>
+      <button type="submit" class="secondary" formaction="/debug">Debug preview (A vs B)</button>
+    </div>
+    <div class="btns">
+      <button type="submit" class="secondary" formaction="/pdf">Searchable PDF (A)</button>
+      <button type="submit" class="secondary" formaction="/pdf?mode=structured">Structured PDF (B)</button>
+    </div>
   </form>
+
+  <p class="note"><a href="/debug">Open the verbose debug preview</a> to see the searchable facsimile (A) and the structured <code>doc.v1</code> reconstruction (B) side by side, with region overlays, stats, and an algorithms trace.</p>
 
   <p class="note">Best on single text-line images at the model height (36&nbsp;px); larger pages are line-found and recognized top-to-bottom. PNG, JPEG, WebP, TIFF, GIF, BMP, and PNM (PGM/PPM) are accepted.</p>
   <p class="note"><strong>Printed text only.</strong> The bundled <code>eng</code> model is trained on printed fonts &mdash; handwriting is not supported and produces garbled output. Every result now shows a <em>confidence</em> score, and a low score is flagged, so unreadable input (handwriting, low resolution) is called out rather than returned silently.</p>

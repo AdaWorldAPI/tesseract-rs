@@ -60,6 +60,14 @@ pub use searchable_pdf::{
     render_searchable_pdf, PageOcr, PlacedWord, RenderReport, SearchablePdfError,
 };
 
+/// Resolution-independent page layout model + the PDF ([`layout::render_pdf`])
+/// and HTML ([`layout::render_preview_html`]) projections that place every
+/// block at the SAME image-pixel bbox (the "Klickwege parity"). Also the two
+/// builders: [`layout::searchable_layout`] (scan + invisible text — what
+/// [`render_searchable_pdf`] wraps) and [`layout::doc_v1_layout`] (reconstruct
+/// a page from a `doc.v1` JSON document + its rasters).
+pub mod layout;
+
 #[cfg(feature = "parallel")]
 mod parallel;
 #[cfg(feature = "parallel")]

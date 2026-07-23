@@ -111,8 +111,7 @@ use std::io::Write as _;
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use lopdf::content::{Content, Operation};
-use lopdf::{dictionary, Document, Object, ObjectId, Stream};
+use lopdf::{dictionary, Document, ObjectId, Stream};
 
 use crate::GreyImage;
 
@@ -271,7 +270,7 @@ fn winansi_encode(ch: char) -> (u8, bool) {
 
 /// Encode `text` to WinAnsi bytes, returning the bytes and the number of
 /// lossy `'?'` substitutions (see [`winansi_encode`]).
-fn winansi_encode_str(text: &str) -> (Vec<u8>, usize) {
+pub(crate) fn winansi_encode_str(text: &str) -> (Vec<u8>, usize) {
     let mut bytes = Vec::with_capacity(text.len());
     let mut substitutions = 0usize;
     for ch in text.chars() {
@@ -285,7 +284,7 @@ fn winansi_encode_str(text: &str) -> (Vec<u8>, usize) {
 }
 
 /// Sum of Helvetica AFM advance widths for `bytes`, in `1/1000 em` units.
-fn advance_width_1000em(bytes: &[u8]) -> u32 {
+pub(crate) fn advance_width_1000em(bytes: &[u8]) -> u32 {
     bytes
         .iter()
         .map(|&b| u32::from(HELVETICA_WINANSI_WIDTHS[b as usize]))
@@ -297,7 +296,7 @@ fn advance_width_1000em(bytes: &[u8]) -> u32 {
 /// backslash-escaped; every other byte (including all of `0x80..=0xFF`,
 /// which is exactly a WinAnsi-encoded byte, not UTF-8) passes through
 /// verbatim.
-fn escape_pdf_literal(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn escape_pdf_literal(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + 2);
     for &b in bytes {
         match b {
@@ -312,7 +311,7 @@ fn escape_pdf_literal(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// `px * 72.0 / dpi` — image pixels to PDF points at the given resolution.
-fn px_to_pt(px: f64, dpi: u32) -> f64 {
+pub(crate) fn px_to_pt(px: f64, dpi: u32) -> f64 {
     px * 72.0 / f64::from(dpi)
 }
 
@@ -320,14 +319,14 @@ fn px_to_pt(px: f64, dpi: u32) -> f64 {
 /// `pdfrenderer.cpp`'s own `prec()`, which exists for the same reason: avoid
 /// scientific notation and keep the file diffable/small — PDF 32000-1:2008
 /// places no precision requirement on real numbers).
-fn prec(x: f64) -> f64 {
+pub(crate) fn prec(x: f64) -> f64 {
     (x * 1000.0).round() / 1000.0
 }
 
 /// Embed one 8-bit `DeviceGray` image as a `FlateDecode` XObject — mirrors
 /// `examples/make_scanned_pdf.rs`'s image-embedding shape (same filter,
 /// colour space, bit depth), factored out here so both call sites share it.
-fn embed_grey_image(doc: &mut Document, grey: &GreyImage) -> ObjectId {
+pub(crate) fn embed_grey_image(doc: &mut Document, grey: &GreyImage) -> ObjectId {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder
         .write_all(&grey.data)
@@ -348,102 +347,19 @@ fn embed_grey_image(doc: &mut Document, grey: &GreyImage) -> ObjectId {
     doc.add_object(Stream::new(image_dict, compressed))
 }
 
-/// Build the per-page content stream: paint the image full-page, then an
-/// invisible (`3 Tr`) text object with one `Tm`/`Tf`/`Tz`/`Tj` run per word.
-/// Returns the encoded content-stream bytes plus this page's substitution
-/// count (see [`RenderReport`]).
-fn build_page_content(page: &PageOcr, dpi: u32) -> (Vec<u8>, usize) {
-    let page_w_pt = px_to_pt(page.grey.w as f64, dpi);
-    let page_h_pt = px_to_pt(page.grey.h as f64, dpi);
-
-    let mut operations = vec![
-        Operation::new("q", vec![]),
-        Operation::new(
-            "cm",
-            vec![
-                (prec(page_w_pt) as f32).into(),
-                0.into(),
-                0.into(),
-                (prec(page_h_pt) as f32).into(),
-                0.into(),
-                0.into(),
-            ],
-        ),
-        Operation::new("Do", vec!["Im0".into()]),
-        Operation::new("Q", vec![]),
-        Operation::new("BT", vec![]),
-        Operation::new("Tr", vec![3.into()]),
-    ];
-
-    let mut page_substitutions = 0usize;
-
-    for word in &page.words {
-        let (left, top, right, bottom) = word.box_;
-        if right <= left || bottom <= top {
-            // A degenerate (zero-area) box has no meaningful placement or
-            // font size; skip it rather than emitting a Tz divide-by-zero
-            // or an invisible-but-nonsensical Tm.
-            continue;
-        }
-        let (bytes, substitutions) = winansi_encode_str(&word.text);
-        page_substitutions += substitutions;
-        let natural_width_1000em = advance_width_1000em(&bytes);
-        if natural_width_1000em == 0 {
-            // Every character in this word is zero-width in the AFM table
-            // (only control codes are 0, and winansi_encode never emits
-            // one) — kept as a total guard, never hit on real input.
-            continue;
-        }
-
-        let box_w_pt = px_to_pt(f64::from(right - left), dpi);
-        let box_h_pt = px_to_pt(f64::from(bottom - top), dpi);
-        let x_pt = px_to_pt(f64::from(left), dpi);
-        // Baseline = box bottom (APPROX, see module docs); PDF y is
-        // bottom-up, page_h_pt is the page's top in PDF space.
-        let y_pt = page_h_pt - px_to_pt(f64::from(bottom), dpi);
-        let fontsize_pt = box_h_pt;
-
-        let natural_width_pt = fontsize_pt * f64::from(natural_width_1000em) / 1000.0;
-        let tz = 100.0 * box_w_pt / natural_width_pt;
-
-        operations.push(Operation::new(
-            "Tm",
-            vec![
-                1.into(),
-                0.into(),
-                0.into(),
-                1.into(),
-                (prec(x_pt) as f32).into(),
-                (prec(y_pt) as f32).into(),
-            ],
-        ));
-        operations.push(Operation::new(
-            "Tf",
-            vec!["F1".into(), (prec(fontsize_pt) as f32).into()],
-        ));
-        operations.push(Operation::new("Tz", vec![(prec(tz) as f32).into()]));
-        operations.push(Operation::new(
-            "Tj",
-            vec![Object::String(
-                escape_pdf_literal(&bytes),
-                lopdf::StringFormat::Literal,
-            )],
-        ));
-    }
-
-    operations.push(Operation::new("ET", vec![]));
-
-    let content = Content { operations };
-    (
-        content.encode().expect("encode content stream"),
-        page_substitutions,
-    )
-}
-
 /// Render one or more OCR'd pages into a single searchable PDF: each page
 /// shows its original scanned image with an invisible, `Tz`-fitted text
 /// layer positioned per word box. See the module docs for the full
 /// coordinate/`Tz` model and the WinAnsi lossy-mapping policy.
+///
+/// This is a thin wrapper over the general [`crate::layout`] renderer:
+/// [`crate::layout::searchable_layout`] turns the `(image, words)` pages into a
+/// [`crate::layout::LayoutDoc`] (full-page background + one invisible text
+/// block per word) and [`crate::layout::render_pdf`] emits the PDF. The exact
+/// `px→pt` / `Tz`-fit / WinAnsi / `prec` math — and the per-word ordering — is
+/// unchanged (the same shared helpers in this module do the work), so this
+/// function's output and behaviour are identical to the pre-generalization
+/// renderer.
 ///
 /// # Errors
 ///
@@ -454,81 +370,9 @@ pub fn render_searchable_pdf(
     pages: &[PageOcr],
     dpi: u32,
 ) -> Result<(Vec<u8>, RenderReport), SearchablePdfError> {
-    for (i, page) in pages.iter().enumerate() {
-        let expected = page.grey.w * page.grey.h;
-        if page.grey.data.len() != expected {
-            return Err(SearchablePdfError::ImageSizeMismatch {
-                page: i,
-                expected,
-                got: page.grey.data.len(),
-            });
-        }
-    }
-
-    let mut doc = Document::with_version("1.5");
-    let pages_id = doc.new_object_id();
-
-    let font_id = doc.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => "Type1",
-        "BaseFont" => "Helvetica",
-        "Encoding" => "WinAnsiEncoding",
-    });
-
-    let mut kids = Vec::with_capacity(pages.len());
-    let mut report = RenderReport {
-        pages: Vec::with_capacity(pages.len()),
-    };
-
-    for page in pages {
-        let image_id = embed_grey_image(&mut doc, &page.grey);
-        let (content_bytes, substitutions) = build_page_content(page, dpi);
-        report.pages.push(substitutions);
-
-        let resources_id = doc.add_object(dictionary! {
-            "XObject" => dictionary! {
-                "Im0" => image_id,
-            },
-            "Font" => dictionary! {
-                "F1" => font_id,
-            },
-        });
-        let content_id = doc.add_object(Stream::new(dictionary! {}, content_bytes));
-
-        let page_w_pt = px_to_pt(page.grey.w as f64, dpi);
-        let page_h_pt = px_to_pt(page.grey.h as f64, dpi);
-        let page_id = doc.add_object(dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "Contents" => content_id,
-            "Resources" => resources_id,
-            "MediaBox" => vec![
-                0.into(),
-                0.into(),
-                (prec(page_w_pt) as f32).into(),
-                (prec(page_h_pt) as f32).into(),
-            ],
-        });
-        kids.push(page_id.into());
-    }
-
-    let kids_count = i64::try_from(kids.len()).unwrap_or(i64::MAX);
-    let pages_dict = dictionary! {
-        "Type" => "Pages",
-        "Kids" => kids,
-        "Count" => kids_count,
-    };
-    doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
-
-    let catalog_id = doc.add_object(dictionary! {
-        "Type" => "Catalog",
-        "Pages" => pages_id,
-    });
-    doc.trailer.set("Root", catalog_id);
-
-    let mut bytes = Vec::new();
-    doc.save_to(&mut bytes).map_err(SearchablePdfError::Save)?;
-    Ok((bytes, report))
+    let mut layout = crate::layout::searchable_layout(pages.to_vec());
+    layout.dpi = dpi;
+    crate::layout::render_pdf(&layout)
 }
 
 #[cfg(test)]

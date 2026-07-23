@@ -3,14 +3,22 @@
 use std::sync::Arc;
 
 use askama::Template;
-use axum::extract::{DefaultBodyLimit, Multipart, State};
-use axum::response::Html;
+use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use tower_http::limit::RequestBodyLimitLayer;
 
+use tesseract_ocr_pdf::layout::{
+    doc_v1_layout, grey_png_data_uri, render_pdf, render_preview_html, searchable_layout,
+};
+use tesseract_ocr_pdf::{render_searchable_pdf, GreyImage, PageOcr, PlacedWord};
+
 use crate::fetch::fetch_image_url;
-use crate::ocr::{ocr_image_bytes, ocr_image_bytes_json, OcrJsonOutcome, OcrOutcome, OutputFormat};
+use crate::ocr::{
+    ocr_image_bytes, ocr_image_bytes_debug, ocr_image_bytes_json, OcrDebugOutcome, OcrJsonOutcome,
+    OcrOutcome, OutputFormat,
+};
 use crate::state::AppState;
 
 #[derive(Template)]
@@ -64,6 +72,12 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/ocr", post(ocr))
+        // Searchable-PDF export. `?mode=structured` selects reconstruction "B";
+        // default / `?mode=searchable` selects the scan+text facsimile "A".
+        .route("/pdf", post(pdf))
+        // Verbose debug preview: A and B side by side + region overlays + stats
+        // + an honest algorithms-used trace.
+        .route("/debug", get(debug_get).post(debug_post))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD))
         .layer(RequestBodyLimitLayer::new(MAX_UPLOAD))
         .with_state(state)
@@ -181,6 +195,571 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
                     err_page("recognition failed unexpectedly")
                 }
             }
+        }
+    }
+}
+
+// ===========================================================================
+// PDF export (A / B) + verbose debug preview (A vs B side by side)
+// ===========================================================================
+
+/// The `?mode=` selector for [`pdf`]. `"structured"` → reconstruction "B"
+/// ([`doc_v1_layout`] + [`render_pdf`]); anything else — `"searchable"`, an
+/// unknown value, or an absent field — → the searchable facsimile "A".
+#[derive(Debug, Default, serde::Deserialize)]
+struct PdfQuery {
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+impl PdfQuery {
+    fn is_structured(&self) -> bool {
+        matches!(self.mode.as_deref(), Some("structured"))
+    }
+}
+
+/// A minimal `tesseract-rs/doc.v1` deserialize — only the fields the debug
+/// preview + the searchable-word layer read. The canonical emitter is
+/// `tesseract_ocr::structured::render_json_with_regions`; this consumer-side
+/// subset mirrors just its `pages[].{width,height,quality,regions,fields}`
+/// shape (a demo consumer parsing the documented seam — see
+/// `docs/CONSUMER-GUIDE.md` "The doc.v1 seed shape").
+mod docv1 {
+    use serde::Deserialize;
+
+    #[derive(Debug, Default, Deserialize)]
+    pub struct Doc {
+        #[serde(default)]
+        pub pages: Vec<Page>,
+    }
+
+    // Only the fields the debug preview reads. serde ignores the rest of the
+    // `doc.v1` page (`width` / `height` / `quality` / ...) — those stats come
+    // from the recognition pass (`OcrDebugOutcome`) directly, so re-reading them
+    // from the JSON would be redundant.
+    #[derive(Debug, Default, Deserialize)]
+    pub struct Page {
+        #[serde(default)]
+        pub regions: Vec<Region>,
+        #[serde(default)]
+        pub fields: Vec<Field>,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    pub struct Region {
+        #[serde(rename = "type", default)]
+        pub kind: String,
+        #[serde(default)]
+        pub bbox: [i64; 4],
+        #[serde(default)]
+        pub lines: Vec<Line>,
+        #[serde(default)]
+        pub rows: usize,
+        #[serde(default)]
+        pub cols: usize,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    pub struct Line {
+        #[serde(default)]
+        pub words: Vec<Word>,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    pub struct Word {
+        #[serde(default)]
+        pub text: String,
+        #[serde(default)]
+        pub bbox: [i64; 4],
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    pub struct Field {
+        #[serde(default)]
+        pub key: String,
+        #[serde(default)]
+        pub value: String,
+        #[serde(default)]
+        pub bbox: [i64; 4],
+    }
+}
+
+/// Clamp a signed `[l,t,r,b]` JSON bbox to a `u32` top-down tuple.
+fn to_u32_bbox(b: [i64; 4]) -> (u32, u32, u32, u32) {
+    let c = |v: i64| -> u32 { v.clamp(0, i64::from(u32::MAX)) as u32 };
+    (c(b[0]), c(b[1]), c(b[2]), c(b[3]))
+}
+
+fn bbox_str(bbox: (u32, u32, u32, u32)) -> String {
+    let (l, t, r, b) = bbox;
+    format!("[{l}, {t}, {r}, {b}]")
+}
+
+/// Every recognized word (text + top-down image-pixel bbox) across every region
+/// — the searchable-PDF "A" word layer, taken from the SAME `doc.v1` that drives
+/// "B" so the two projections share one coordinate space.
+fn placed_words_from_doc(doc: &docv1::Doc) -> Vec<PlacedWord> {
+    let mut words = Vec::new();
+    if let Some(page) = doc.pages.first() {
+        for region in &page.regions {
+            for line in &region.lines {
+                for w in &line.words {
+                    words.push(PlacedWord {
+                        text: w.text.clone(),
+                        box_: to_u32_bbox(w.bbox),
+                    });
+                }
+            }
+        }
+    }
+    words
+}
+
+/// Overlay/legend colour for a `doc.v1` region type (the types are additive —
+/// an unknown kind renders grey rather than being dropped).
+fn region_color(kind: &str) -> &'static str {
+    match kind {
+        "text" | "paragraph" => "#2563eb", // blue
+        "header" => "#7c3aed",             // violet
+        "footer" => "#0891b2",             // cyan
+        "table" => "#16a34a",              // green
+        "figure" => "#dc2626",             // red
+        _ => "#6b7280",                    // grey
+    }
+}
+
+/// CSS `left/top/width/height` in PER-CENT of the page box for a top-down bbox,
+/// or `None` for a degenerate/zero-area box. Percentages make the overlay
+/// scale-independent — it lines up at whatever width the page container renders.
+fn pct_css(bbox: (u32, u32, u32, u32), w: usize, h: usize) -> Option<String> {
+    let (l, t, r, b) = bbox;
+    if r <= l || b <= t || w == 0 || h == 0 {
+        return None;
+    }
+    let (wf, hf) = (w as f64, h as f64);
+    Some(format!(
+        "left:{:.3}%;top:{:.3}%;width:{:.3}%;height:{:.3}%",
+        f64::from(l) / wf * 100.0,
+        f64::from(t) / hf * 100.0,
+        f64::from(r - l) / wf * 100.0,
+        f64::from(b - t) / hf * 100.0,
+    ))
+}
+
+/// One colour-coded region rectangle in the overlay (position as CSS %).
+struct RegionOverlay {
+    kind: String,
+    color: &'static str,
+    css: String,
+}
+
+/// One legend chip (a region type present on the page + its colour).
+struct LegendItem {
+    kind: String,
+    color: &'static str,
+}
+
+/// A region-type tally (`text: 12`, `table: 1`, ...).
+struct KindCount {
+    kind: String,
+    count: usize,
+}
+
+/// A located table/figure region, for the stats panel.
+struct RegionPos {
+    kind: String,
+    bbox: String,
+}
+
+/// A harvested typed field row (key/value + where it was found).
+struct FieldRow {
+    key: String,
+    value: String,
+    bbox: String,
+}
+
+/// One line of the honest algorithms-used trace.
+struct AlgoStep {
+    name: String,
+    detail: String,
+}
+
+/// Everything the `debug.html` template renders for one uploaded page: the
+/// stats, the region overlay, the algorithms trace, and the two rendered
+/// previews (A + B) that go into side-by-side `<iframe srcdoc>` panels.
+struct DebugView {
+    width: usize,
+    height: usize,
+    model: &'static str,
+    lang: &'static str,
+    network_spec: String,
+    null_char: i32,
+    dict_on: bool,
+    mean_conf: String,
+    low_confidence: bool,
+    word_count: usize,
+    line_count: usize,
+    elapsed_ms: String,
+    region_counts: Vec<KindCount>,
+    overlay_bg: String,
+    overlays: Vec<RegionOverlay>,
+    legend: Vec<LegendItem>,
+    placed: Vec<RegionPos>,
+    fields: Vec<FieldRow>,
+    algorithms: Vec<AlgoStep>,
+    /// The rendered "A" preview HTML (scan + invisible/searchable word layer),
+    /// embedded verbatim into an `<iframe srcdoc>` (Askama escapes it for the
+    /// attribute; the browser un-escapes and renders the document).
+    preview_a: String,
+    /// The rendered "B" preview HTML (the `doc.v1` structural reconstruction).
+    preview_b: String,
+}
+
+#[derive(Template)]
+#[template(path = "debug.html")]
+struct DebugTemplate {
+    error: Option<String>,
+    result: Option<DebugView>,
+}
+
+/// The honest "what actually ran" trace — reflects whether the dict beam was
+/// active. NO language/script confidence is claimed (OSD is not transcoded);
+/// the model + mean confidence are the honest proxy (surfaced in the stats).
+fn algorithms_trace(dbg: &OcrDebugOutcome) -> Vec<AlgoStep> {
+    let decode = if dbg.dict_on {
+        "CTC beam decode with the production dict beam (dict_ratio 2.25, cert_offset \u{2212}0.085, worst_dict_cert \u{2212}25) over the word / punc / number DAWGs."
+    } else {
+        "CTC beam decode, plain \u{2014} no dictionary loaded (dict_ratio 1.0, cert_offset 0.0)."
+    };
+    vec![
+        AlgoStep {
+            name: "1. Image decode".into(),
+            detail: "pure-Rust `image` crate (PNG / JPEG / WebP / TIFF / GIF / BMP / PNM) \u{2192} 8-bit grey. Zero C libraries.".into(),
+        },
+        AlgoStep {
+            name: "2. Line segmentation".into(),
+            detail: "make-row row crops (seg-approx): the page is split into text-line bands, recognized top-to-bottom.".into(),
+        },
+        AlgoStep {
+            name: "3. Binarization".into(),
+            detail: "global Otsu (fixed-128 fallback) for the region / table classifier. Sauvola adaptive binarization is transcoded and available, but is NOT the segmentation default.".into(),
+        },
+        AlgoStep {
+            name: "4. LSTM forward".into(),
+            detail: "int8 network forward \u{2014} byte-parity transcode of libtesseract (no leptonica / OpenCV at runtime).".into(),
+        },
+        AlgoStep {
+            name: "5. Decode".into(),
+            detail: decode.into(),
+        },
+        AlgoStep {
+            name: "6. Region classification".into(),
+            detail: "page furniture (header / footer), XY-cut layout blocks (reading order), `pixGetRegionsBinary` halftone figures, `pixDecideIfTable` table detection \u{2014} all byte-parity leptonica leaves.".into(),
+        },
+        AlgoStep {
+            name: "7. Table structure".into(),
+            detail: "whitespace-column cell-grid reconstruction over the recognized words (a doc.v1 output surface, not a TableFinder transcode).".into(),
+        },
+        AlgoStep {
+            name: "8. Field harvest".into(),
+            detail: "German-invoice typed fields (IBAN mod-97, amount \u{2192} cents, GUID shape).".into(),
+        },
+    ]
+}
+
+/// Build the full debug view from one recognition pass. A (searchable
+/// facsimile) and B (doc.v1 reconstruction) are BOTH derived from the same
+/// `OcrDebugOutcome` (one `doc.v1` + one grey raster), so the two previews share
+/// one coordinate space and line up side by side. Heavy synchronous work — run
+/// via `spawn_blocking`.
+fn build_debug_view(state: &AppState, bytes: &[u8]) -> Result<DebugView, String> {
+    let dbg = ocr_image_bytes_debug(state, bytes)?;
+    let doc: docv1::Doc =
+        serde_json::from_str(&dbg.doc_json).map_err(|e| format!("parsing doc.v1: {e}"))?;
+    let (w, h) = (dbg.width, dbg.height);
+
+    // The honest algorithms trace — computed before the grey raster is moved out
+    // of `dbg` (it only needs `dbg.dict_on`; the remaining stats read below are
+    // all `Copy`, so a later partial move of `dbg.grey` leaves them accessible).
+    let algorithms = algorithms_trace(&dbg);
+
+    // ONE grey raster feeds both the "B" figure crops and the "A" background.
+    let grey = GreyImage {
+        data: dbg.grey,
+        w,
+        h,
+    };
+
+    // B — the doc.v1 structural reconstruction (borrows the raster for figures).
+    let mut layout_b = doc_v1_layout(&dbg.doc_json, std::slice::from_ref(&grey))
+        .map_err(|e| format!("reconstructing layout: {e}"))?;
+    layout_b.dpi = 72;
+    let preview_b = render_preview_html(&layout_b);
+
+    // The overlay panel's browser-safe scan background (grey \u{2192} PNG data URI).
+    let overlay_bg = grey_png_data_uri(&grey).unwrap_or_default();
+
+    // Region overlays + counts + legend + table/figure positions, from doc.v1.
+    let mut overlays: Vec<RegionOverlay> = Vec::new();
+    let mut region_counts: Vec<KindCount> = Vec::new();
+    let mut legend: Vec<LegendItem> = Vec::new();
+    let mut placed: Vec<RegionPos> = Vec::new();
+    let mut fields: Vec<FieldRow> = Vec::new();
+    if let Some(page) = doc.pages.first() {
+        for region in &page.regions {
+            let color = region_color(&region.kind);
+            let bb = to_u32_bbox(region.bbox);
+            if let Some(css) = pct_css(bb, w, h) {
+                overlays.push(RegionOverlay {
+                    kind: region.kind.clone(),
+                    color,
+                    css,
+                });
+            }
+            match region_counts.iter_mut().find(|c| c.kind == region.kind) {
+                Some(c) => c.count += 1,
+                None => region_counts.push(KindCount {
+                    kind: region.kind.clone(),
+                    count: 1,
+                }),
+            }
+            if !legend.iter().any(|l| l.kind == region.kind) {
+                legend.push(LegendItem {
+                    kind: region.kind.clone(),
+                    color,
+                });
+            }
+            if region.kind == "table" || region.kind == "figure" {
+                let label = if region.kind == "table" && (region.rows > 0 || region.cols > 0) {
+                    format!("table {}\u{00d7}{}", region.rows, region.cols)
+                } else {
+                    region.kind.clone()
+                };
+                placed.push(RegionPos {
+                    kind: label,
+                    bbox: bbox_str(bb),
+                });
+            }
+        }
+        for f in &page.fields {
+            fields.push(FieldRow {
+                key: f.key.clone(),
+                value: f.value.clone(),
+                bbox: bbox_str(to_u32_bbox(f.bbox)),
+            });
+        }
+    }
+
+    // A — the searchable facsimile (moves the raster in as the background).
+    let words = placed_words_from_doc(&doc);
+    let page_ocr = PageOcr { grey, words };
+    let mut layout_a = searchable_layout(vec![page_ocr]);
+    layout_a.dpi = 72;
+    let preview_a = render_preview_html(&layout_a);
+
+    Ok(DebugView {
+        width: w,
+        height: h,
+        model: "eng.lstm",
+        lang: "English (eng)",
+        network_spec: state.recognizer.network_str.clone(),
+        null_char: state.recognizer.null_char,
+        dict_on: dbg.dict_on,
+        mean_conf: confidence_str(dbg.mean_conf),
+        low_confidence: dbg.low_confidence,
+        word_count: dbg.word_count,
+        line_count: dbg.line_count,
+        elapsed_ms: format!("{:.1}", dbg.elapsed_ms),
+        region_counts,
+        overlay_bg,
+        overlays,
+        legend,
+        placed,
+        fields,
+        algorithms,
+        preview_a,
+        preview_b,
+    })
+}
+
+/// Build one exported PDF: `structured` → reconstruction "B"
+/// ([`doc_v1_layout`] + [`render_pdf`]); otherwise the searchable facsimile "A"
+/// ([`render_searchable_pdf`]). Both are laid out at 72 dpi (1 px = 1 pt) so the
+/// two exports share the searchable/reconstruction geometry. Returns the PDF
+/// bytes + a download filename. Heavy synchronous work — run via
+/// `spawn_blocking`.
+fn build_pdf(
+    state: &AppState,
+    bytes: &[u8],
+    structured: bool,
+) -> Result<(Vec<u8>, &'static str), String> {
+    let dbg = ocr_image_bytes_debug(state, bytes)?;
+    let grey = GreyImage {
+        data: dbg.grey,
+        w: dbg.width,
+        h: dbg.height,
+    };
+    if structured {
+        let mut layout = doc_v1_layout(&dbg.doc_json, std::slice::from_ref(&grey))
+            .map_err(|e| format!("reconstructing layout: {e}"))?;
+        layout.dpi = 72;
+        let (pdf, _report) = render_pdf(&layout).map_err(|e| format!("rendering PDF: {e}"))?;
+        Ok((pdf, "structured.pdf"))
+    } else {
+        let doc: docv1::Doc =
+            serde_json::from_str(&dbg.doc_json).map_err(|e| format!("parsing doc.v1: {e}"))?;
+        let words = placed_words_from_doc(&doc);
+        let page = PageOcr { grey, words };
+        let (pdf, _report) =
+            render_searchable_pdf(&[page], 72).map_err(|e| format!("rendering PDF: {e}"))?;
+        Ok((pdf, "searchable.pdf"))
+    }
+}
+
+/// Read the `file`/`url` fields from a multipart upload (File wins over URL) and
+/// return the raw image bytes, or a user-safe error string. Shared by [`pdf`]
+/// and [`debug_post`]; the URL arm goes through the same SSRF guard as `/ocr`.
+async fn read_image_upload(mut multipart: Multipart) -> Result<Vec<u8>, String> {
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut url: Option<String> = None;
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                let name = field.name().unwrap_or_default().to_string();
+                match name.as_str() {
+                    "file" => match field.bytes().await {
+                        Ok(b) if !b.is_empty() => file_bytes = Some(b.to_vec()),
+                        Ok(_) => {}
+                        Err(e) => return Err(format!("upload read error: {e}")),
+                    },
+                    "url" => {
+                        if let Ok(t) = field.text().await {
+                            if !t.trim().is_empty() {
+                                url = Some(t.trim().to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("malformed upload: {e}")),
+        }
+    }
+
+    if let Some(b) = file_bytes {
+        Ok(b)
+    } else if let Some(u) = url {
+        fetch_image_url(&u).await
+    } else {
+        Err("please choose an image file or paste an image URL".to_string())
+    }
+}
+
+/// `application/pdf` attachment response with a download filename. Built by
+/// hand (rather than a header tuple) because `Vec<u8>::into_response()` sets
+/// `content-type: application/octet-stream`, which must be REPLACED — not
+/// appended — with `application/pdf`.
+fn pdf_response(bytes: Vec<u8>, filename: &str) -> Response {
+    use axum::http::{header, HeaderValue};
+    let mut resp = bytes.into_response();
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/pdf"),
+    );
+    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+        headers.insert(header::CONTENT_DISPOSITION, v);
+    }
+    resp
+}
+
+/// `POST /pdf` — multipart image → a searchable ("A", default) or structured
+/// ("B", `?mode=structured`) PDF download. Same permit + `spawn_blocking`
+/// discipline as `/ocr`.
+async fn pdf(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<PdfQuery>,
+    multipart: Multipart,
+) -> Response {
+    let bytes = match read_image_upload(multipart).await {
+        Ok(b) => b,
+        Err(e) => return err_page(e).into_response(),
+    };
+    let structured = q.is_structured();
+
+    let permit = match state.recognize_permits.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => return err_page("server is shutting down").into_response(),
+    };
+    let st = state.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        build_pdf(&st, &bytes, structured)
+    })
+    .await;
+    match outcome {
+        Ok(Ok((pdf_bytes, filename))) => pdf_response(pdf_bytes, filename),
+        Ok(Err(e)) => err_page(e).into_response(),
+        Err(e) => {
+            eprintln!("pdf: recognition task failed: {e}");
+            err_page("recognition failed unexpectedly").into_response()
+        }
+    }
+}
+
+/// `GET /debug` — the upload form for the verbose A-vs-B preview.
+async fn debug_get() -> Html<String> {
+    render(&DebugTemplate {
+        error: None,
+        result: None,
+    })
+}
+
+/// `POST /debug` — multipart image → the verbose preview (A + B side by side,
+/// region overlays, stats, algorithms trace). Same permit + `spawn_blocking`
+/// discipline as `/ocr`.
+async fn debug_post(State(state): State<Arc<AppState>>, multipart: Multipart) -> Html<String> {
+    let bytes = match read_image_upload(multipart).await {
+        Ok(b) => b,
+        Err(e) => {
+            return render(&DebugTemplate {
+                error: Some(e),
+                result: None,
+            })
+        }
+    };
+
+    let permit = match state.recognize_permits.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => {
+            return render(&DebugTemplate {
+                error: Some("server is shutting down".to_string()),
+                result: None,
+            })
+        }
+    };
+    let st = state.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        build_debug_view(&st, &bytes)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(view)) => render(&DebugTemplate {
+            error: None,
+            result: Some(view),
+        }),
+        Ok(Err(e)) => render(&DebugTemplate {
+            error: Some(e),
+            result: None,
+        }),
+        Err(e) => {
+            eprintln!("debug: recognition task failed: {e}");
+            render(&DebugTemplate {
+                error: Some("recognition failed unexpectedly".to_string()),
+                result: None,
+            })
         }
     }
 }
@@ -389,5 +968,169 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Build a minimal `multipart/form-data` body with a single `file` field.
+    /// Returns `(content_type_header, body_bytes)`.
+    fn multipart_file(bytes: &[u8]) -> (String, Vec<u8>) {
+        const B: &str = "TESSBOUNDARY9f8e7d6c";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{B}\r\nContent-Disposition: form-data; name=\"file\"; \
+                 filename=\"page.pgm\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{B}--\r\n").as_bytes());
+        (format!("multipart/form-data; boundary={B}"), body)
+    }
+
+    fn page_01_bytes() -> Vec<u8> {
+        let page = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pages/page_01.pgm");
+        std::fs::read(&page).expect("read page_01.pgm")
+    }
+
+    #[tokio::test]
+    async fn get_debug_returns_200() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = model_dir();
+        if !dir.join("eng.lstm").exists() {
+            eprintln!("skipping: corpus model absent");
+            return;
+        }
+        let state = Arc::new(AppState::load(&dir).expect("load model"));
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_pdf_returns_pdf_bytes() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = model_dir();
+        if !dir.join("eng.lstm").exists() {
+            eprintln!("skipping: corpus model absent");
+            return;
+        }
+        let state = Arc::new(AppState::load(&dir).expect("load model"));
+        let app = router(state);
+        let (ct, body) = multipart_file(&page_01_bytes());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pdf")
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .map(|v| v.to_str().unwrap()),
+            Some("application/pdf")
+        );
+        let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(out.starts_with(b"%PDF-"), "expected a PDF magic header");
+    }
+
+    #[tokio::test]
+    async fn post_pdf_structured_returns_pdf_bytes() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = model_dir();
+        if !dir.join("eng.lstm").exists() {
+            eprintln!("skipping: corpus model absent");
+            return;
+        }
+        let state = Arc::new(AppState::load(&dir).expect("load model"));
+        let app = router(state);
+        let (ct, body) = multipart_file(&page_01_bytes());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/pdf?mode=structured")
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .map(|v| v.to_str().unwrap()),
+            Some("application/pdf")
+        );
+        let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(out.starts_with(b"%PDF-"), "expected a PDF magic header");
+    }
+
+    #[tokio::test]
+    async fn post_debug_renders_a_and_b_panels() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = model_dir();
+        if !dir.join("eng.lstm").exists() {
+            eprintln!("skipping: corpus model absent");
+            return;
+        }
+        let state = Arc::new(AppState::load(&dir).expect("load model"));
+        let app = router(state);
+        let (ct, body) = multipart_file(&page_01_bytes());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/debug")
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8_lossy(&out);
+        // Both panels present, each embedding a rendered preview via srcdoc.
+        assert!(html.contains("id=\"panel-a\""), "A panel present");
+        assert!(html.contains("id=\"panel-b\""), "B panel present");
+        assert_eq!(
+            html.matches("iframe class=\"preview\"").count(),
+            2,
+            "two preview iframes (A + B)"
+        );
+        assert!(html.contains("srcdoc="), "previews embedded as srcdoc");
+        // The region overlay + algorithms trace rendered.
+        assert!(
+            html.contains("class=\"regionmap\""),
+            "region overlay present"
+        );
+        assert!(html.contains("Algorithms used"), "algorithms trace present");
     }
 }
