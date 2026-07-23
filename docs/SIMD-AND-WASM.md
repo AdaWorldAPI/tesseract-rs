@@ -1,99 +1,106 @@
-# SIMD integration & the WASM question
+# SIMD-Integration & die WASM-Frage
 
-> Do we need to wire ndarray's SIMD polyfill into the recognizer, and is the
-> WASM arm useful for the web demo? Short answer: **the integration already
-> exists**; the interesting frontier is a browser-side (wasm) build, which
-> works today but is **not** yet SIMD-accelerated on the int8 hot path.
+> Müssen wir ndarrays SIMD-Polyfill in den Recognizer einbinden, und ist der
+> WASM-Zweig für die Web-Demo nützlich? Kurz: **Die Integration existiert
+> bereits.** Das interessante Neuland ist ein Browser-seitiger (WASM-)Build —
+> der heute läuft, aber auf dem int8-Hotpfad **noch nicht** SIMD-beschleunigt ist.
 
-## 1. Verdict — the SIMD integration is already done
+## 1. Fazit — die SIMD-Integration ist bereits erledigt
 
-The recognizer's entire int8 hot path (every LSTM gate and fully-connected
-layer is an `int8 × int8 → i32` matrix-vector product) is a **single call** to
-ndarray's SIMD polyfill:
+Der gesamte int8-Hotpfad des Recognizers (jedes LSTM-Gate und jede
+Fully-Connected-Schicht ist ein `int8 × int8 → i32`-Matrix-Vektor-Produkt) ist
+ein **einziger Aufruf** von ndarrays SIMD-Polyfill:
 
 ```rust
 // crates/tesseract-recognizer/src/lib.rs:146
 ndarray::simd::matmul_i8_to_i32(w, u_col, out.view_mut())
 ```
 
-This is the `simd-savant` invariant ("all SIMD comes from `ndarray::simd`")
-already satisfied — the recognizer never writes an intrinsic itself, it consumes
-the one polyfilled kernel. **There is nothing to integrate.** Any speed we get
-(or don't) is decided inside ndarray, transparently to tesseract-rs.
+Damit ist die `simd-savant`-Invariante („alle SIMD kommen aus `ndarray::simd`")
+bereits erfüllt — der Recognizer schreibt nie selbst ein Intrinsic, er konsumiert
+den einen polyfill-Kernel. **Es gibt nichts zu integrieren.** Welche
+Geschwindigkeit wir bekommen (oder nicht), entscheidet sich innerhalb von
+ndarray, transparent für tesseract-rs.
 
-## 2. How the polyfill dispatches
+## 2. Wie das Polyfill dispatcht
 
-`ndarray/src/simd.rs` is the dispatch entry over per-arch backends
-(`simd_{amx,avx512,avx2,neon,neon_baseline,neon_bf16,neon_dotprod,scalar,wasm}.rs`),
-with `simd_caps.rs` as a `LazyLock<SimdCaps>` — detect the CPU **once**, dispatch
-forever.
+`ndarray/src/simd.rs` ist der Dispatch-Einstieg über die architektur-spezifischen
+Backends (`simd_{amx,avx512,avx2,neon,neon_baseline,neon_bf16,neon_dotprod,scalar,wasm}.rs`),
+mit `simd_caps.rs` als `LazyLock<SimdCaps>` — die CPU **einmal** erkennen, dann für
+immer dispatchen.
 
-`matmul_i8_to_i32` runtime-dispatches:
+`matmul_i8_to_i32` dispatcht zur Laufzeit:
 
 ```
-AMX TDPBUSD  →  AVX-512 VNNI (VPDPBUSD-zmm)  →  AVX2 VNNI (VPDPBUSD-ymm)  →  scalar
+AMX TDPBUSD  →  AVX-512 VNNI (VPDPBUSD-zmm)  →  AVX2 VNNI (VPDPBUSD-ymm)  →  Skalar
 ```
 
-| Target | Path the int8 GEMM takes |
+| Ziel | Pfad des int8-GEMM |
 |---|---|
-| x86-64 Sapphire Rapids+ (AMX) | AMX tile `TDPBUSD` |
-| x86-64 with AVX-512 VNNI | `VPDPBUSD` on zmm |
-| x86-64 with AVX2 VNNI | `VPDPBUSD` on ymm |
-| x86-64 baseline / aarch64 non-dotprod | scalar (or NEON dotprod where present) |
-| **wasm32** | **scalar** (see §4) |
+| x86-64 Sapphire Rapids+ (AMX) | AMX-Kachel `TDPBUSD` |
+| x86-64 mit AVX-512 VNNI | `VPDPBUSD` auf zmm |
+| x86-64 mit AVX2 VNNI | `VPDPBUSD` auf ymm |
+| x86-64 Baseline / aarch64 ohne dotprod | Skalar (bzw. NEON-dotprod, wo vorhanden) |
+| **wasm32** | **Skalar** (siehe §4) |
 
-x86/aarch64 use **runtime** detection (`is_x86_feature_detected!` etc.); the
-result is cached in the `LazyLock`.
+x86/aarch64 nutzen **Laufzeit**-Erkennung (`is_x86_feature_detected!` usw.); das
+Ergebnis wird im `LazyLock` zwischengespeichert.
 
-## 3. The server demo (Railway, x86-64) — already fast, nothing to do
+## 3. Die Server-Demo (Railway, x86-64) — bereits schnell, nichts zu tun
 
-The web demo binary runs on Railway's x86-64. The int8 GEMM is **already**
-runtime-dispatched to the best available VNNI/AMX path — no build flag or code
-change is required, because detection is at runtime. A host with AVX-512 VNNI
-gets `VPDPBUSD-zmm` automatically; a baseline host falls to scalar but still
-runs. **Recommendation: leave it — do not pin an exotic `target-cpu`** that
-would trade portability for a path the runtime dispatch already selects.
-(If you ever want to *force* a floor, `-C target-cpu=x86-64-v3` enables AVX2 as
-the compiled baseline while runtime detection still lifts to AVX-512/AMX.)
+Der Web-Demo-Binary läuft auf Railways x86-64. Der int8-GEMM wird **bereits** zur
+Laufzeit auf den besten verfügbaren VNNI/AMX-Pfad dispatcht — kein Build-Flag,
+keine Code-Änderung nötig, weil die Erkennung zur Laufzeit passiert. Ein Host mit
+AVX-512 VNNI bekommt automatisch `VPDPBUSD-zmm`; ein Baseline-Host fällt auf
+Skalar, läuft aber. **Empfehlung: so lassen — kein exotisches `target-cpu`
+festverdrahten**, das Portabilität gegen einen Pfad tauschen würde, den die
+Laufzeit-Dispatch ohnehin wählt. (Wer einen Boden erzwingen will:
+`-C target-cpu=x86-64-v3` aktiviert AVX2 als kompilierten Baseline, während die
+Laufzeit-Erkennung weiterhin auf AVX-512/AMX anhebt.)
 
-## 4. The WASM arm — real, but the int8 GEMM isn't wired to it (yet)
+## 4. Der WASM-Zweig — real, aber der int8-GEMM ist (noch) nicht daran gebunden
 
-ndarray **does** have a WASM backend — `simd_wasm.rs` plus full `wasm32` lane
-constants in `simd.rs` (`f32x4`, `f64x2`, `i16x8`, … the v128/SIMD128 shapes),
-selected at **compile time** (`target_feature = "simd128"`; WASM has no runtime
-feature detection, so it's a build-time gate, not the `simd_caps` runtime tier).
+ndarray **hat** ein WASM-Backend — `simd_wasm.rs` plus vollständige
+`wasm32`-Lane-Konstanten in `simd.rs` (`f32x4`, `f64x2`, `i16x8`, … die
+v128/SIMD128-Formen), zur **Kompilierzeit** ausgewählt
+(`target_feature = "simd128"`; WASM hat keine Laufzeit-Feature-Erkennung, es ist
+also ein Build-Gate, nicht die `simd_caps`-Laufzeit-Stufe).
 
-**But `matmul_i8_to_i32` has no wasm-v128 arm.** Its dispatch ladder is
-AMX → AVX-512 VNNI → AVX2 VNNI → **scalar**; on `wasm32` none of the first three
-apply, so the recognizer's hot path runs **scalar** in the browser. The v128
-backend accelerates the *generic* lane primitives, not this specific int8 GEMM.
+**Aber `matmul_i8_to_i32` hat keinen wasm-v128-Zweig.** Seine Dispatch-Leiter ist
+AMX → AVX-512 VNNI → AVX2 VNNI → **Skalar**; auf `wasm32` trifft keiner der ersten
+drei zu, der Hotpfad des Recognizers läuft im Browser also **skalar**. Das
+v128-Backend beschleunigt die *generischen* Lane-Primitive, nicht diesen
+spezifischen int8-GEMM.
 
-Consequences for a browser-side OCR demo:
+Folgen für eine Browser-seitige OCR-Demo:
 
-- **It works today.** Compiling the recognizer to `wasm32-unknown-unknown`
-  yields a correct, pure-Rust OCR that runs entirely client-side (offline,
-  private, no server round-trip) — but the int8 GEMM is **scalar**, so it's
-  slower than the server.
-- **To make it fast**, ndarray needs a `matmul_i8_to_i32` **wasm-v128 arm**.
-  WASM SIMD128 has no VNNI (`VPDPBUSD`) equivalent, so the kernel would widen
-  int8 → i16 and use `i32x4.dot_i16x8_s` (the `i16x8`-dot into `i32x4`) —
-  standard for int8 GEMM under SIMD128. That is an **ndarray** change (per the
-  `simd-savant` rule: add the arm in `ndarray/src/simd_*`, the recognizer
-  consumes it unchanged), not a tesseract-rs change.
-- **The browser demo is a different crate than `tesseract-ocr-web`.** That crate
-  is an axum/tokio/reqwest **server** — none of which target browser-wasm. A
-  client-side demo is a new thin `wasm-bindgen` crate exposing
-  `recognize_image(bytes) -> doc.v1` over the recognizer, built
-  `wasm32-unknown-unknown` with `-C target-feature=+simd128`.
+- **Sie läuft heute.** Ein Kompilat des Recognizers nach
+  `wasm32-unknown-unknown` ergibt eine korrekte, reine Rust-OCR, die komplett
+  Client-seitig läuft (offline, privat, ohne Server-Roundtrip) — aber der
+  int8-GEMM ist **skalar**, also langsamer als der Server.
+- **Um es schnell zu machen**, braucht ndarray einen `matmul_i8_to_i32`
+  **wasm-v128-Zweig**. WASM SIMD128 hat kein VNNI-(`VPDPBUSD`-)Äquivalent, der
+  Kernel würde int8 → i16 verbreitern und `i32x4.dot_i16x8_s` nutzen (den
+  `i16x8`-Dot in `i32x4`) — Standard für int8-GEMM unter SIMD128. Das ist eine
+  **ndarray**-Änderung (gemäß `simd-savant`-Regel: den Zweig in
+  `ndarray/src/simd_*` hinzufügen, der Recognizer konsumiert ihn unverändert),
+  keine tesseract-rs-Änderung.
+- **Die Browser-Demo ist ein anderer Crate als `tesseract-ocr-web`.** Dieser
+  Crate ist ein axum/tokio/reqwest-**Server** — nichts davon zielt auf
+  Browser-WASM. Eine Client-seitige Demo ist ein neuer dünner
+  `wasm-bindgen`-Crate, der `recognize_image(bytes) -> doc.v1` über den
+  Recognizer freigibt, gebaut als `wasm32-unknown-unknown` mit
+  `-C target-feature=+simd128`.
 
-## 5. Recommendation
+## 5. Empfehlung
 
-| Target | Action |
+| Ziel | Aktion |
 |---|---|
-| Server demo (x86 Railway) | **Nothing** — already SIMD-accelerated via runtime dispatch. |
-| Browser (wasm) demo | Feasible now (scalar); worth a thin `wasm-bindgen` crate. For speed, add the **`matmul_i8_to_i32` wasm-v128 arm in ndarray** first. |
+| Server-Demo (x86 Railway) | **Nichts** — bereits SIMD-beschleunigt via Laufzeit-Dispatch. |
+| Browser-(WASM-)Demo | Heute machbar (skalar); ein dünner `wasm-bindgen`-Crate lohnt sich. Für Tempo zuerst den **`matmul_i8_to_i32`-wasm-v128-Zweig in ndarray** ergänzen. |
 
-**Open probe (measure, don't assume):** once a wasm-v128 int8 GEMM exists,
-benchmark scalar-wasm vs v128-wasm vs the x86 server on the same page to
-quantify the browser speedup and confirm it clears the "usable in-browser"
-bar. Until then, the browser path is correctness-first, not speed-first.
+**Offene Probe (messen, nicht annehmen):** Sobald ein wasm-v128-int8-GEMM
+existiert, Skalar-WASM vs. v128-WASM vs. x86-Server auf derselben Seite
+benchmarken, um den Browser-Speedup zu quantifizieren und zu bestätigen, dass er
+die „im-Browser-benutzbar"-Schwelle nimmt. Bis dahin ist der Browser-Pfad
+korrektheits-first, nicht tempo-first.
