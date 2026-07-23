@@ -116,6 +116,7 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut url: Option<String> = None;
     let mut format = OutputFormat::Text;
+    let mut lang: Option<String> = None;
 
     loop {
         match multipart.next_field().await {
@@ -139,6 +140,15 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
                         // field just falls back to text (OutputFormat::from_field).
                         if let Ok(t) = field.text().await {
                             format = OutputFormat::from_field(Some(t.trim()));
+                        }
+                    }
+                    "lang" => {
+                        // Never a hard error: an unrecognized/absent lang field
+                        // just falls back to eng (AppState::model).
+                        if let Ok(t) = field.text().await {
+                            if !t.trim().is_empty() {
+                                lang = Some(t.trim().to_string());
+                            }
                         }
                     }
                     _ => {}
@@ -175,7 +185,7 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
         OutputFormat::Text => {
             let outcome = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                ocr_image_bytes(&st, &bytes)
+                ocr_image_bytes(&st, &bytes, lang.as_deref())
             })
             .await;
             match outcome {
@@ -190,7 +200,7 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
         OutputFormat::Json => {
             let outcome = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                ocr_image_bytes_json(&st, &bytes)
+                ocr_image_bytes_json(&st, &bytes, lang.as_deref())
             })
             .await;
             match outcome {
@@ -209,22 +219,38 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
 // PDF export (A / B) + verbose debug preview (A vs B side by side)
 // ===========================================================================
 
-/// The `?mode=` selector for [`pdf`]. `"structured"` → reconstruction "B"
-/// ([`doc_v1_layout`] + [`render_pdf`]); anything else — `"searchable"`, an
-/// unknown value, or an absent field — → the searchable facsimile "A".
+/// The `?mode=`/`?lang=` selectors for [`pdf`]. `mode="structured"` →
+/// reconstruction "B" ([`doc_v1_layout`] + [`render_pdf`]); anything else —
+/// `"searchable"`, an unknown value, or an absent field — → the searchable
+/// facsimile "A". `lang="deu"` → the German model; anything else → English
+/// (the pre-existing default) — see [`crate::state::AppState::model`].
 ///
 /// `pub(crate)`: also used by [`crate::api`] so `POST /api/v1/pdf` accepts
-/// the exact same `?mode=` contract as the HTML `/pdf` route.
+/// the exact same `?mode=`/`?lang=` contract as the HTML `/pdf` route (which
+/// reads `lang` from the multipart body instead, alongside `file`/`url`, and
+/// so ignores this struct's `lang` field).
 #[derive(Debug, Default, serde::Deserialize)]
 pub(crate) struct PdfQuery {
     #[serde(default)]
     mode: Option<String>,
+    #[serde(default)]
+    pub(crate) lang: Option<String>,
 }
 
 impl PdfQuery {
     pub(crate) fn is_structured(&self) -> bool {
         matches!(self.mode.as_deref(), Some("structured"))
     }
+}
+
+/// The `?lang=` selector for [`crate::api`] endpoints that have no `?mode=`
+/// concept of their own (`/api/v1/recognize`, `/api/v1/pdf/structured`).
+/// `"deu"` → the German model; anything else → English — see
+/// [`crate::state::AppState::model`].
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct LangQuery {
+    #[serde(default)]
+    pub(crate) lang: Option<String>,
 }
 
 /// A minimal `tesseract-rs/doc.v1` deserialize — only the fields the debug
@@ -476,13 +502,27 @@ fn algorithms_trace(dbg: &OcrDebugOutcome) -> Vec<AlgoStep> {
     ]
 }
 
+/// The `(model file, human label)` shown in the debug stats for a canonical
+/// language code (`"eng"` / `"deu"`, [`OcrDebugOutcome::lang`] — always one of
+/// those two, `AppState::model` never returns anything else).
+fn model_label(lang: &str) -> (&'static str, &'static str) {
+    match lang {
+        "deu" => ("deu.lstm", "German (deu)"),
+        _ => ("eng.lstm", "English (eng)"),
+    }
+}
+
 /// Build the full debug view from one recognition pass. A (searchable
 /// facsimile) and B (doc.v1 reconstruction) are BOTH derived from the same
 /// `OcrDebugOutcome` (one `doc.v1` + one grey raster), so the two previews share
 /// one coordinate space and line up side by side. Heavy synchronous work — run
 /// via `spawn_blocking`.
-fn build_debug_view(state: &AppState, bytes: &[u8]) -> Result<DebugView, String> {
-    let dbg = ocr_image_bytes_debug(state, bytes)?;
+fn build_debug_view(
+    state: &AppState,
+    bytes: &[u8],
+    lang: Option<&str>,
+) -> Result<DebugView, String> {
+    let dbg = ocr_image_bytes_debug(state, bytes, lang)?;
     let doc: docv1::Doc =
         serde_json::from_str(&dbg.doc_json).map_err(|e| format!("parsing doc.v1: {e}"))?;
     let (w, h) = (dbg.width, dbg.height);
@@ -566,13 +606,14 @@ fn build_debug_view(state: &AppState, bytes: &[u8]) -> Result<DebugView, String>
     layout_a.dpi = 72;
     let preview_a = render_preview_html(&layout_a);
 
+    let (model, lang) = model_label(dbg.lang);
     Ok(DebugView {
         width: w,
         height: h,
-        model: "eng.lstm",
-        lang: "English (eng)",
-        network_spec: state.recognizer.network_str.clone(),
-        null_char: state.recognizer.null_char,
+        model,
+        lang,
+        network_spec: dbg.network_spec,
+        null_char: dbg.null_char,
         dict_on: dbg.dict_on,
         mean_conf: confidence_str(dbg.mean_conf),
         low_confidence: dbg.low_confidence,
@@ -605,8 +646,9 @@ pub(crate) fn build_pdf(
     state: &AppState,
     bytes: &[u8],
     structured: bool,
+    lang: Option<&str>,
 ) -> Result<(Vec<u8>, &'static str), String> {
-    let dbg = ocr_image_bytes_debug(state, bytes)?;
+    let dbg = ocr_image_bytes_debug(state, bytes, lang)?;
     let grey = GreyImage {
         data: dbg.grey,
         w: dbg.width,
@@ -629,12 +671,22 @@ pub(crate) fn build_pdf(
     }
 }
 
-/// Read the `file`/`url` fields from a multipart upload (File wins over URL) and
-/// return the raw image bytes, or a user-safe error string. Shared by [`pdf`]
-/// and [`debug_post`]; the URL arm goes through the same SSRF guard as `/ocr`.
-async fn read_image_upload(mut multipart: Multipart) -> Result<Vec<u8>, String> {
+/// The result of [`read_image_upload`]: the raw image bytes plus the raw
+/// `lang` form field, unvalidated — [`AppState::model`] is where an
+/// unrecognized/absent value falls back to `eng`.
+struct UploadedImage {
+    bytes: Vec<u8>,
+    lang: Option<String>,
+}
+
+/// Read the `file`/`url`/`lang` fields from a multipart upload (File wins over
+/// URL) and return the raw image bytes + requested language, or a user-safe
+/// error string. Shared by [`pdf`] and [`debug_post`]; the URL arm goes
+/// through the same SSRF guard as `/ocr`.
+async fn read_image_upload(mut multipart: Multipart) -> Result<UploadedImage, String> {
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut url: Option<String> = None;
+    let mut lang: Option<String> = None;
     loop {
         match multipart.next_field().await {
             Ok(Some(field)) => {
@@ -652,6 +704,13 @@ async fn read_image_upload(mut multipart: Multipart) -> Result<Vec<u8>, String> 
                             }
                         }
                     }
+                    "lang" => {
+                        if let Ok(t) = field.text().await {
+                            if !t.trim().is_empty() {
+                                lang = Some(t.trim().to_string());
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -660,13 +719,14 @@ async fn read_image_upload(mut multipart: Multipart) -> Result<Vec<u8>, String> 
         }
     }
 
-    if let Some(b) = file_bytes {
-        Ok(b)
+    let bytes = if let Some(b) = file_bytes {
+        b
     } else if let Some(u) = url {
-        fetch_image_url(&u).await
+        fetch_image_url(&u).await?
     } else {
-        Err("please choose an image file or paste an image URL".to_string())
-    }
+        return Err("please choose an image file or paste an image URL".to_string());
+    };
+    Ok(UploadedImage { bytes, lang })
 }
 
 /// `application/pdf` attachment response with a download filename. Built by
@@ -698,8 +758,8 @@ async fn pdf(
     Query(q): Query<PdfQuery>,
     multipart: Multipart,
 ) -> Response {
-    let bytes = match read_image_upload(multipart).await {
-        Ok(b) => b,
+    let uploaded = match read_image_upload(multipart).await {
+        Ok(u) => u,
         Err(e) => return err_page(e).into_response(),
     };
     let structured = q.is_structured();
@@ -711,7 +771,7 @@ async fn pdf(
     let st = state.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        build_pdf(&st, &bytes, structured)
+        build_pdf(&st, &uploaded.bytes, structured, uploaded.lang.as_deref())
     })
     .await;
     match outcome {
@@ -736,8 +796,8 @@ async fn debug_get() -> Html<String> {
 /// region overlays, stats, algorithms trace). Same permit + `spawn_blocking`
 /// discipline as `/ocr`.
 async fn debug_post(State(state): State<Arc<AppState>>, multipart: Multipart) -> Html<String> {
-    let bytes = match read_image_upload(multipart).await {
-        Ok(b) => b,
+    let uploaded = match read_image_upload(multipart).await {
+        Ok(u) => u,
         Err(e) => {
             return render(&DebugTemplate {
                 error: Some(e),
@@ -758,7 +818,7 @@ async fn debug_post(State(state): State<Arc<AppState>>, multipart: Multipart) ->
     let st = state.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        build_debug_view(&st, &bytes)
+        build_debug_view(&st, &uploaded.bytes, uploaded.lang.as_deref())
     })
     .await;
     match outcome {
@@ -926,7 +986,7 @@ mod tests {
         let state = AppState::load(&dir).expect("load model");
         let page = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pages/page_01.pgm");
         let bytes = std::fs::read(&page).expect("read page_01.pgm");
-        let out = ocr_image_bytes(&state, &bytes).expect("ocr");
+        let out = ocr_image_bytes(&state, &bytes, None).expect("ocr");
         assert!(out.width > 0 && out.height > 0);
         assert!(
             out.line_count >= 2,
@@ -952,7 +1012,7 @@ mod tests {
         let state = AppState::load(&dir).expect("load model");
         let page = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pages/page_01.pgm");
         let bytes = std::fs::read(&page).expect("read page_01.pgm");
-        let out = ocr_image_bytes_json(&state, &bytes).expect("ocr json");
+        let out = ocr_image_bytes_json(&state, &bytes, None).expect("ocr json");
         assert!(out.width > 0 && out.height > 0);
         assert!(
             out.json.starts_with("{\"schema\":\"tesseract-rs/doc.v1\""),
@@ -1006,6 +1066,27 @@ mod tests {
     fn page_01_bytes() -> Vec<u8> {
         let page = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pages/page_01.pgm");
         std::fs::read(&page).expect("read page_01.pgm")
+    }
+
+    /// Same as [`multipart_file`] plus a `lang` field — for exercising the
+    /// language selector through the HTTP layer.
+    fn multipart_file_with_lang(bytes: &[u8], lang: &str) -> (String, Vec<u8>) {
+        const B: &str = "TESSBOUNDARYLANG1234";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{B}\r\nContent-Disposition: form-data; name=\"file\"; \
+                 filename=\"page.pgm\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(
+            format!("\r\n--{B}\r\nContent-Disposition: form-data; name=\"lang\"\r\n\r\n{lang}")
+                .as_bytes(),
+        );
+        body.extend_from_slice(format!("\r\n--{B}--\r\n").as_bytes());
+        (format!("multipart/form-data; boundary={B}"), body)
     }
 
     #[tokio::test]
@@ -1148,5 +1229,121 @@ mod tests {
             "region overlay present"
         );
         assert!(html.contains("Algorithms used"), "algorithms trace present");
+    }
+
+    /// A plain `/debug` request (no `lang` field) still reports the English
+    /// model — the pre-existing default is unchanged by adding language
+    /// selection. `page_01` is an English test page; `null_char` and
+    /// `network_str` differ per model (`E-OCR-DEU-PARITY-MODEL-AGNOSTIC-1`),
+    /// so asserting `110` (eng's null_char) here is a real behavioural check,
+    /// not just a string match on the label.
+    #[tokio::test]
+    async fn post_debug_default_lang_reports_english_model() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = model_dir();
+        if !dir.join("eng.lstm").exists() {
+            eprintln!("skipping: corpus model absent");
+            return;
+        }
+        let state = Arc::new(AppState::load(&dir).expect("load model"));
+        let app = router(state);
+        let (ct, body) = multipart_file(&page_01_bytes());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/debug")
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8_lossy(&out);
+        assert!(html.contains("eng.lstm"), "reports the eng model file");
+        assert!(html.contains("English (eng)"), "reports the eng label");
+        assert!(html.contains(">110<"), "reports eng's null_char (110)");
+    }
+
+    /// `lang=deu` selects the German model end-to-end through the HTTP layer
+    /// — the actual ask this test guards: requesting German must not
+    /// silently keep running `eng.lstm`. Gracefully skips if `deu.lstm` isn't
+    /// in the model dir (the same optional-language degrade `AppState::load`
+    /// itself uses), so this test is honest about what it actually proves
+    /// when the fixture is absent, rather than passing vacuously.
+    #[tokio::test]
+    async fn post_debug_with_lang_deu_reports_german_model() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = model_dir();
+        if !dir.join("eng.lstm").exists() {
+            eprintln!("skipping: corpus model absent");
+            return;
+        }
+        if !dir.join("deu.lstm").exists() {
+            eprintln!("skipping: deu model absent from corpus/model");
+            return;
+        }
+        let state = Arc::new(AppState::load(&dir).expect("load model"));
+        let app = router(state);
+        let (ct, body) = multipart_file_with_lang(&page_01_bytes(), "deu");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/debug")
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8_lossy(&out);
+        assert!(html.contains("deu.lstm"), "reports the deu model file");
+        assert!(html.contains("German (deu)"), "reports the deu label");
+        assert!(html.contains(">114<"), "reports deu's null_char (114)");
+    }
+
+    /// An unrecognized `lang` value (neither `"eng"` nor `"deu"`) falls back
+    /// to English rather than erroring — the same "forgiving field" rule
+    /// [`crate::ocr::OutputFormat::from_field`] already uses.
+    #[tokio::test]
+    async fn post_debug_with_unknown_lang_falls_back_to_english() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = model_dir();
+        if !dir.join("eng.lstm").exists() {
+            eprintln!("skipping: corpus model absent");
+            return;
+        }
+        let state = Arc::new(AppState::load(&dir).expect("load model"));
+        let app = router(state);
+        let (ct, body) = multipart_file_with_lang(&page_01_bytes(), "klingon");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/debug")
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8_lossy(&out);
+        assert!(html.contains("eng.lstm"), "unknown lang falls back to eng");
     }
 }

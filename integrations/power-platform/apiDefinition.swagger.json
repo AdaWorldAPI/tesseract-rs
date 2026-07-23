@@ -34,7 +34,7 @@
     "/api/v1/recognize": {
       "post": {
         "summary": "Recognize a document image",
-        "description": "Decodes an image (PNG/JPEG/WebP/TIFF/GIF/BMP/PNM) and returns the structured tesseract-rs/doc.v1 document: text/table/figure/header/footer regions, reconstructed table cell grids, per-word confidence, and a typed field harvest (amounts, IBANs, GUIDs). Primary input is the raw image bytes (application/octet-stream) - this matches Microsoft Graph's 'Get file content' output byte-for-byte, so a SharePoint/OneDrive/Outlook-attachment flow can pass the file content straight through with no conversion step. Alternatively, POST application/json with {\"content_base64\": \"<base64>\", \"lang\": \"eng\"}; lang is accepted for forward compatibility but is currently informational only - this deployment always recognizes with whichever single model it loaded at startup.",
+        "description": "Decodes an image (PNG/JPEG/WebP/TIFF/GIF/BMP/PNM) and returns the structured tesseract-rs/doc.v1 document: text/table/figure/header/footer regions, reconstructed table cell grids, per-word confidence, and a typed field harvest (amounts, IBANs, GUIDs). Primary input is the raw image bytes (application/octet-stream) - this matches Microsoft Graph's 'Get file content' output byte-for-byte, so a SharePoint/OneDrive/Outlook-attachment flow can pass the file content straight through with no conversion step. lang selects the recognition model: eng (default) or deu; an unrecognized value falls back to eng rather than erroring. For a binary body, pass lang via the ?lang= query parameter (there is no body field to carry it); for a JSON body, send {\"content_base64\": \"<base64>\", \"lang\": \"eng\"} instead (the JSON field wins if both are somehow present).",
         "operationId": "RecognizeDocument",
         "consumes": [
           "application/octet-stream",
@@ -44,6 +44,18 @@
           "application/json"
         ],
         "parameters": [
+          {
+            "name": "lang",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "enum": [
+              "eng",
+              "deu"
+            ],
+            "default": "eng",
+            "description": "Recognition model for a binary (application/octet-stream) body. Ignored when the body is application/json - use the JSON form's own lang field there instead."
+          },
           {
             "name": "body",
             "in": "body",
@@ -92,7 +104,7 @@
     "/api/v1/pdf": {
       "post": {
         "summary": "Export a searchable PDF",
-        "description": "Recognizes the input image and renders a PDF. Default: the original scan raster with an invisible, selectable text layer (mode=searchable). Pass ?mode=structured for the doc.v1-driven layout reconstruction instead - equivalent to calling the dedicated StructuredPdf action below. Same input shapes as RecognizeDocument (binary, or {content_base64, lang} JSON).",
+        "description": "Recognizes the input image and renders a PDF. Default: the original scan raster with an invisible, selectable text layer (mode=searchable). Pass ?mode=structured for the doc.v1-driven layout reconstruction instead - equivalent to calling the dedicated StructuredPdf action below. Same input shapes as RecognizeDocument (binary, or {content_base64, lang} JSON); lang selects eng (default) or deu the same way.",
         "operationId": "SearchablePdf",
         "consumes": [
           "application/octet-stream",
@@ -113,6 +125,18 @@
             ],
             "default": "searchable",
             "description": "PDF reconstruction mode. searchable (default): original raster + invisible text layer. structured: doc.v1 layout reconstruction (same as the StructuredPdf action)."
+          },
+          {
+            "name": "lang",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "enum": [
+              "eng",
+              "deu"
+            ],
+            "default": "eng",
+            "description": "Recognition model for a binary (application/octet-stream) body. Ignored when the body is application/json - use the JSON form's own lang field there instead."
           },
           {
             "name": "body",
@@ -162,7 +186,7 @@
     "/api/v1/pdf/structured": {
       "post": {
         "summary": "Export a structured (doc.v1-reconstructed) PDF",
-        "description": "A query-param-free alias for POST /api/v1/pdf?mode=structured, exposed as its own action so it is directly selectable in the Power Automate action picker. Renders the doc.v1 layout reconstruction ('B'): regions, tables, and figures laid out from the recognized structure rather than the original scan raster. Same input shapes as RecognizeDocument.",
+        "description": "A query-param-free-for-mode alias for POST /api/v1/pdf?mode=structured, exposed as its own action so it is directly selectable in the Power Automate action picker. Renders the doc.v1 layout reconstruction ('B'): regions, tables, and figures laid out from the recognized structure rather than the original scan raster. Same input shapes as RecognizeDocument; ?lang= is still accepted (there is no mode to select here, but the language switch is orthogonal).",
         "operationId": "StructuredPdf",
         "consumes": [
           "application/octet-stream",
@@ -172,6 +196,18 @@
           "application/pdf"
         ],
         "parameters": [
+          {
+            "name": "lang",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "enum": [
+              "eng",
+              "deu"
+            ],
+            "default": "eng",
+            "description": "Recognition model for a binary (application/octet-stream) body. Ignored when the body is application/json - use the JSON form's own lang field there instead."
+          },
           {
             "name": "body",
             "in": "body",
@@ -241,7 +277,12 @@
         "lang": {
           "type": "string",
           "example": "eng",
-          "description": "Advisory only in this deployment: the server always recognizes with whichever single model was loaded at startup (see MODEL_DIR). Reserved for a future multi-model deployment."
+          "enum": [
+            "eng",
+            "deu"
+          ],
+          "default": "eng",
+          "description": "Selects the recognition model: eng (default) or deu. An unrecognized value falls back to eng rather than erroring. deu is only available when the deployment's model directory has the deu.lstm* components; otherwise a deu request also falls back to eng."
         }
       }
     },

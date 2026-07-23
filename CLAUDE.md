@@ -436,6 +436,46 @@ previously fixed/disconnected 12px/11px CSS), preserving Klickwege parity.
 tesseract-ocr-pdf-local (no Core change) → this file + the commit are the
 record.
 
+**★ Web demo — `deu` model selection wired end-to-end (2026-07-23).** The
+same garbled-text repro that surfaced the overlap bug above was ALSO running
+German text through `eng.lstm` — `eng`'s 112-entry charset has no
+`ä`/`ö`/`ü`/`ß` at all (`deu` is 116), so every diacritic/`ß` came out as the
+nearest ASCII confusable (`daß`→`da8`, `weiß`→`weil`). The `deu.lstm*`
+components were already sitting in `corpus/model/` (unused) from the earlier
+eng/deu parity work. `crate::state::AppState` now holds `eng: LangModel`
+(required, as before) + `deu: Option<LangModel>` (optional — same
+graceful-degrade rule the dict DAWGs already used: absent/corrupt `deu.lstm*`
+just means `lang=deu` falls back to `eng`, never a startup failure) and a
+`model(lang: Option<&str>) -> (&'static str, &LangModel)` selector — a
+"forgiving field" (`None`/`"eng"`/anything unrecognized → `eng`, mirroring
+`OutputFormat::from_field`'s rule) that also returns the code it ACTUALLY
+selected, so callers report truth even on fallback. Threaded through every
+entry point: `ocr_image_bytes`/`_json`/`_debug` (`ocr.rs`) all take
+`lang: Option<&str>`; the HTML `/ocr`+`/pdf`+`/debug` routes read a `lang`
+multipart field (new `UploadedImage` struct carries it alongside the
+file/URL bytes) submitted from a `<select id="lang">` added to both
+`index.html` and `debug.html`; the machine API's `RecognizeJsonBody.lang`
+(previously accepted and merely LOGGED, per its own doc comment) is now
+real, and the binary-body routes gained a `?lang=` query param (`PdfQuery`
+gained a `lang` field; new `LangQuery` for `/api/v1/recognize` and
+`/api/v1/pdf/structured`, which had no query extractor at all before) —
+OpenAPI spec (`apiDefinition.swagger.json`) and the Power Platform
+`README.md` updated to match (dropped the "informational only" language).
+The debug stats' `model`/`lang`/`network_spec`/`null_char` fields were
+ALSO hardcoded to `"eng.lstm"`/`"English (eng)"` before this — now
+`OcrDebugOutcome` carries the actually-selected model's spec directly
+(avoiding a second `state.model()` lookup) so the stats panel can never
+report a different model than the one that actually ran. `corpus/model/`
+already ships both `eng.*` and `deu.*`, and the Dockerfile's
+`COPY .../corpus/model /app/model` copies the whole directory — so no
+Dockerfile change was needed for Railway to serve `deu` too. Tests: `state.rs`
+(`AppState::load` picks up both, `model()`'s fallback matrix, distinguished by
+the real `null_char` 110 vs 114 — `E-OCR-DEU-PARITY-MODEL-AGNOSTIC-1`) +
+`routes.rs` (`lang=deu` end-to-end through `/debug` reports `deu.lstm`/114;
+default and an unrecognized `lang` both still report `eng.lstm`/110).
+tesseract-ocr-web-local (no Core change) → this file + the commit are the
+record.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the

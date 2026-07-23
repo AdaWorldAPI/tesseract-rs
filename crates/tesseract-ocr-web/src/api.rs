@@ -39,7 +39,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::ocr::ocr_image_bytes_json;
-use crate::routes::{build_pdf, pdf_response, PdfQuery};
+use crate::routes::{build_pdf, pdf_response, LangQuery, PdfQuery};
 use crate::state::AppState;
 
 /// The compiled Swagger 2.0 document served at `GET /openapi.json` — the
@@ -109,8 +109,8 @@ async fn require_api_key(headers: HeaderMap, req: Request, next: Next) -> Respon
 // ===========================================================================
 
 /// The JSON alternate form's body shape (see `docs/SDK-PYTHON-AND-POWER-PLATFORM.md`
-/// §2). `lang` is accepted so a caller that sends it never gets a parse
-/// error, but it is currently INFORMATIONAL ONLY — see [`decode_request_body`].
+/// §2). `lang` selects the model via [`crate::state::AppState::model`]
+/// (`"deu"` → German, anything else → English) — see [`decode_request_body`].
 #[derive(Debug, Deserialize)]
 struct RecognizeJsonBody {
     content_base64: String,
@@ -135,33 +135,32 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// Decode `body` into raw image bytes for the recognizer, dispatched by
-/// content-type:
+/// Decode `body` into raw image bytes + the requested language (if any) for
+/// the recognizer, dispatched by content-type:
 /// - `application/json` — parsed as [`RecognizeJsonBody`]; `content_base64`
-///   is base64-decoded (standard or URL-safe alphabet, padded or not).
+///   is base64-decoded (standard or URL-safe alphabet, padded or not), and
+///   `lang` (if present) is returned alongside.
 /// - anything else (notably `application/octet-stream`, the shape Microsoft
 ///   Graph's "Get file content" produces) — the body IS the image bytes,
-///   verbatim.
+///   verbatim, with no `lang` of its own (a binary POST has no body field for
+///   it — callers pass `?lang=` instead; see each handler).
 ///
-/// `lang`, when present in the JSON form, is logged, not enforced — this
-/// server always recognizes with whichever single model [`AppState`] loaded
-/// at startup (`MODEL_DIR`; see `crate::state::AppState::load`). Wiring a
-/// per-request language switch would need a multi-model server; that is out
-/// of scope for this connector pass (see `integrations/power-platform/README.md`).
-fn decode_request_body(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, String> {
+/// `lang` selects the model via [`crate::state::AppState::model`] (`"deu"` →
+/// German, anything else → English, the pre-existing default) — never a hard
+/// error for an unrecognized value, same "forgiving field" rule the rest of
+/// this crate's request parsing uses.
+fn decode_request_body(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(Vec<u8>, Option<String>), String> {
     if is_json_content_type(headers) {
         let parsed: RecognizeJsonBody = serde_json::from_slice(body).map_err(|e| {
             format!(
                 "invalid JSON body (expected {{\"content_base64\": \"...\", \"lang\": \"eng\"}}): {e}"
             )
         })?;
-        if let Some(lang) = parsed.lang.as_deref() {
-            eprintln!(
-                "api: request declared lang={lang:?} (informational only — this \
-                 deployment always uses its single model loaded at startup via MODEL_DIR)"
-            );
-        }
-        decode_base64(parsed.content_base64.trim())
+        let bytes = decode_base64(parsed.content_base64.trim())?;
+        Ok((bytes, parsed.lang))
     } else if body.is_empty() {
         Err(
             "empty request body — send raw image bytes (application/octet-stream) or \
@@ -169,7 +168,7 @@ fn decode_request_body(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, Stri
                 .to_string(),
         )
     } else {
-        Ok(body.to_vec())
+        Ok((body.to_vec(), None))
     }
 }
 
@@ -224,15 +223,21 @@ fn doc_json_response(doc_json: String) -> Response {
 /// as the HTML `/ocr` route (recognition is heavy synchronous CPU work; the
 /// permit bounds concurrent recognitions, `spawn_blocking` keeps the async
 /// executor free while it runs).
+///
+/// `lang` comes from the JSON body's `lang` field when present; a binary POST
+/// (no body field for it) instead reads `?lang=` (`Query<LangQuery>`) — the
+/// JSON body wins if a caller somehow sends both.
 async fn recognize(
     State(state): State<Arc<AppState>>,
+    Query(q): Query<LangQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let bytes = match decode_request_body(&headers, &body) {
+    let (bytes, body_lang) = match decode_request_body(&headers, &body) {
         Ok(b) => b,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, e),
     };
+    let lang = body_lang.or(q.lang);
 
     let permit = match state.recognize_permits.clone().acquire_owned().await {
         Ok(p) => p,
@@ -241,7 +246,7 @@ async fn recognize(
     let st = state.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        ocr_image_bytes_json(&st, &bytes)
+        ocr_image_bytes_json(&st, &bytes, lang.as_deref())
     })
     .await;
     match outcome {
@@ -268,32 +273,40 @@ async fn pdf_searchable_or_query(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    pdf_impl(state, &headers, &body, q.is_structured()).await
+    pdf_impl(state, &headers, &body, q.is_structured(), q.lang).await
 }
 
 /// `POST /api/v1/pdf/structured` — `StructuredPdf` in the connector: a
-/// dedicated, query-param-free alias for the structured reconstruction, so
-/// Power Automate's action picker offers "Structured PDF" as its own action.
+/// dedicated, query-param-free-for-`mode` alias for the structured
+/// reconstruction, so Power Automate's action picker offers "Structured PDF"
+/// as its own action. `?lang=` is still accepted (there is no `mode` to
+/// select here, but the language switch is orthogonal).
 async fn pdf_structured(
     State(state): State<Arc<AppState>>,
+    Query(q): Query<LangQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    pdf_impl(state, &headers, &body, true).await
+    pdf_impl(state, &headers, &body, true, q.lang).await
 }
 
 /// Shared body for [`pdf_searchable_or_query`] / [`pdf_structured`] — decode,
 /// acquire a recognition permit, render off the async runtime, respond.
+/// `query_lang` is the `?lang=` value (if any); the JSON body's own `lang`
+/// field (when the request is `application/json`) wins over it — same
+/// precedence as [`recognize`].
 async fn pdf_impl(
     state: Arc<AppState>,
     headers: &HeaderMap,
     body: &[u8],
     structured: bool,
+    query_lang: Option<String>,
 ) -> Response {
-    let bytes = match decode_request_body(headers, body) {
+    let (bytes, body_lang) = match decode_request_body(headers, body) {
         Ok(b) => b,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, e),
     };
+    let lang = body_lang.or(query_lang);
 
     let permit = match state.recognize_permits.clone().acquire_owned().await {
         Ok(p) => p,
@@ -302,7 +315,7 @@ async fn pdf_impl(
     let st = state.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        build_pdf(&st, &bytes, structured)
+        build_pdf(&st, &bytes, structured, lang.as_deref())
     })
     .await;
     match outcome {
