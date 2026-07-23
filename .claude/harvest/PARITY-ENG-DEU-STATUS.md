@@ -56,8 +56,8 @@ Harness: `run_unicharset_parity.sh <unicharset> <label>`.
 | network forward (softmax) | ✅ 8/8 | ✅ 8/8 | deu nw=400979 vs eng 385807 (different arch), both agree |
 | image → text (end-to-end capstone) | ✅ 6/6 | ✅ 6/6 | deu null_char=114 vs eng 110, sample_iteration differ; both agree |
 | **Sauvola adaptive binarize** (NEW) | ✅ 5/5 configs | ✅ (model-indep) | 368640-px real page + usetab=1 LUT + whsize 4–15 all byte-identical |
-| beam decode (standalone) | ⏳ | ⏳ | (in flight) |
-| dict / dawg walk | ⏳ | ⏳ | (in flight) |
+| beam decode (standalone) | ✅ 2/2 modes | ✅ 2/2 modes | shared probs.bin, exact f32 bits; deu code_range 116/null 114 |
+| dict / dawg walk | ✅ 14/14 | ✅ 14/14 | German trie: über/schön/ß, numbers, back_to_punc dead-ends |
 
 **Sauvola** transcoded from `AdaWorldAPI/leptonica` `src/{binarize.c,convolve.c,pix2.c}`
 into `crates/tesseract-ocr/src/binarize.rs`; byte-parity vs liblept 1.82.0
