@@ -45,8 +45,22 @@ async fn main() {
         }
     };
     println!(
-        "tesseract-ocr-web: model loaded (dict beam: {})",
-        if state.dict.is_some() { "on" } else { "off" }
+        "tesseract-ocr-web: eng model loaded (dict beam: {}); deu model {}",
+        if state.eng.dict.is_some() {
+            "on"
+        } else {
+            "off"
+        },
+        match &state.deu {
+            Some(m) => {
+                if m.dict.is_some() {
+                    "loaded (dict beam: on)"
+                } else {
+                    "loaded (dict beam: off)"
+                }
+            }
+            None => "not found — lang=deu will fall back to eng",
+        }
     );
 
     // Railway injects $PORT and replaces the variable itself; 8080 is ONLY the

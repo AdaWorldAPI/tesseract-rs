@@ -150,22 +150,30 @@ fn decode_grey(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
 /// handwriting / low-resolution / non-printed input. Returns text + stats, or
 /// a user-safe error string.
 ///
+/// `lang` selects the model via [`AppState::model`] (`Some("deu")` → German,
+/// anything else → English, the pre-existing default).
+///
 /// This is heavy synchronous CPU work — callers MUST run it off the async
 /// runtime (via `spawn_blocking`); see [`crate::routes`].
-pub fn ocr_image_bytes(state: &AppState, bytes: &[u8]) -> Result<OcrOutcome, String> {
+pub fn ocr_image_bytes(
+    state: &AppState,
+    bytes: &[u8],
+    lang: Option<&str>,
+) -> Result<OcrOutcome, String> {
     let (raw, w, h) = decode_grey(bytes)?;
+    let (_lang, model) = state.model(lang);
 
     let t0 = Instant::now();
-    let lines = state
+    let lines = model
         .recognizer
-        .recognize_page_makerow_words(&raw, w, h, state.dict.as_ref())
+        .recognize_page_makerow_words(&raw, w, h, model.dict.as_ref())
         .map_err(|e| format!("recognition failed: {e}"))?;
-    let text = render_text(&lines, &state.recognizer.charset)
+    let text = render_text(&lines, &model.recognizer.charset)
         .trim_end()
         .to_string();
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    let page = DocPage::from_line_words(&lines, &state.recognizer.charset, w as u32, h as u32);
+    let page = DocPage::from_line_words(&lines, &model.recognizer.charset, w as u32, h as u32);
     let mean = mean_word_confidence(&page);
     let char_count = text.chars().count();
     let line_count = text.lines().filter(|l| !l.trim().is_empty()).count();
@@ -189,14 +197,24 @@ pub fn ocr_image_bytes(state: &AppState, bytes: &[u8]) -> Result<OcrOutcome, Str
 /// demo and the `tesseract-ogar` executor share ONE source of truth. Same
 /// off-runtime contract as [`ocr_image_bytes`] — heavy synchronous CPU work,
 /// callers MUST run it via `spawn_blocking`.
-pub fn ocr_image_bytes_json(state: &AppState, bytes: &[u8]) -> Result<OcrJsonOutcome, String> {
+///
+/// `lang` selects the model via [`AppState::model`] (`Some("deu")` → German,
+/// anything else → English, the pre-existing default). The German-invoice
+/// field harvest itself runs regardless of `lang` — its label keys/regexes
+/// are a fixed spec, not a language switch.
+pub fn ocr_image_bytes_json(
+    state: &AppState,
+    bytes: &[u8],
+    lang: Option<&str>,
+) -> Result<OcrJsonOutcome, String> {
     let (raw, w, h) = decode_grey(bytes)?;
+    let (_lang, model) = state.model(lang);
 
     let t0 = Instant::now();
     let specs = german_invoice_fields();
-    let doc = state
+    let doc = model
         .recognizer
-        .recognize_document(&raw, w, h, state.dict.as_ref(), Some(&specs))
+        .recognize_document(&raw, w, h, model.dict.as_ref(), Some(&specs))
         .map_err(|e| format!("recognition failed: {e}"))?;
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -240,6 +258,19 @@ pub struct OcrDebugOutcome {
     pub elapsed_ms: f64,
     /// `true` when the production dict beam was used (DAWGs loaded).
     pub dict_on: bool,
+    /// The model actually selected — `"eng"` or `"deu"` — from
+    /// [`AppState::model`]. Reflects reality even when the caller asked for a
+    /// language that isn't loaded (falls back to `"eng"`), so callers report
+    /// the truth rather than echoing the request.
+    pub lang: &'static str,
+    /// The selected model's network spec string (e.g.
+    /// `[1,36,0,1Ct3,3,16Mp3,3Lfys48Lfx96Lrx96Lfx192O1c1]`), for the debug
+    /// stats panel. Carried here (rather than re-selecting the model from
+    /// `state` again) so the caller can't accidentally report a DIFFERENT
+    /// model's spec than the one that actually ran.
+    pub network_spec: String,
+    /// The selected model's null/blank CTC label id, for the debug stats panel.
+    pub null_char: i32,
 }
 
 /// Decode `bytes` to grey and run the canonical one-shot structured-document
@@ -249,14 +280,22 @@ pub struct OcrDebugOutcome {
 /// facsimile (scan + invisible word layer) and the `doc.v1` reconstruction "B"
 /// from one recognition. Same off-runtime contract as the other entry points —
 /// heavy synchronous CPU work, callers MUST run it via `spawn_blocking`.
-pub fn ocr_image_bytes_debug(state: &AppState, bytes: &[u8]) -> Result<OcrDebugOutcome, String> {
+///
+/// `lang` selects the model via [`AppState::model`] (`Some("deu")` → German,
+/// anything else → English, the pre-existing default).
+pub fn ocr_image_bytes_debug(
+    state: &AppState,
+    bytes: &[u8],
+    lang: Option<&str>,
+) -> Result<OcrDebugOutcome, String> {
     let (raw, w, h) = decode_grey(bytes)?;
+    let (lang, model) = state.model(lang);
 
     let t0 = Instant::now();
     let specs = german_invoice_fields();
-    let doc = state
+    let doc = model
         .recognizer
-        .recognize_document(&raw, w, h, state.dict.as_ref(), Some(&specs))
+        .recognize_document(&raw, w, h, model.dict.as_ref(), Some(&specs))
         .map_err(|e| format!("recognition failed: {e}"))?;
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -270,7 +309,10 @@ pub fn ocr_image_bytes_debug(state: &AppState, bytes: &[u8]) -> Result<OcrDebugO
         mean_conf: doc.mean_confidence.unwrap_or(-1.0),
         low_confidence: doc.low_confidence,
         elapsed_ms,
-        dict_on: state.dict.is_some(),
+        dict_on: model.dict.is_some(),
+        lang,
+        network_spec: model.recognizer.network_str.clone(),
+        null_char: model.recognizer.null_char,
     })
 }
 

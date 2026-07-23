@@ -99,19 +99,22 @@ security scheme; this pass ships only the API-key gate.
 
 | operationId | Method + path | Input | Output |
 |---|---|---|---|
-| `RecognizeDocument` | `POST /api/v1/recognize` | binary image body (`application/octet-stream`) **or** `application/json` `{"content_base64": "...", "lang": "eng"}` | `tesseract-rs/doc.v1` JSON |
-| `SearchablePdf` | `POST /api/v1/pdf` (optional `?mode=searchable\|structured`, default `searchable`) | same as above | `application/pdf` |
-| `StructuredPdf` | `POST /api/v1/pdf/structured` | same as above | `application/pdf` (always the structured reconstruction) |
+| `RecognizeDocument` | `POST /api/v1/recognize` (optional `?lang=eng\|deu` for a binary body) | binary image body (`application/octet-stream`) **or** `application/json` `{"content_base64": "...", "lang": "eng"}` | `tesseract-rs/doc.v1` JSON |
+| `SearchablePdf` | `POST /api/v1/pdf` (optional `?mode=searchable\|structured`, `?lang=eng\|deu`) | same as above | `application/pdf` |
+| `StructuredPdf` | `POST /api/v1/pdf/structured` (optional `?lang=eng\|deu`) | same as above | `application/pdf` (always the structured reconstruction) |
 
 Notes:
 
-- **`lang` is accepted, not enforced.** This server loads exactly one model
-  at startup (`MODEL_DIR` — see the crate's own `README.md`/`CLAUDE.md`); the
-  field exists so a caller that sends it (mirroring the Python SDK's
-  `lang=` constructor argument) doesn't get a parse error. It currently has
-  no effect on which model recognizes the document — a per-request language
-  switch would need a multi-model server, which is out of scope for this
-  connector pass. A mismatch is logged server-side (stderr), not rejected.
+- **`lang` selects the model.** The server loads `eng` (required) and `deu`
+  (optional — present when `MODEL_DIR` has the `deu.lstm*` components; see
+  the crate's own `README.md`/`CLAUDE.md`) at startup and picks between them
+  per request. For a `application/json` body, send `lang` in the JSON
+  (mirrors the Python SDK's `lang=` constructor argument); for a binary body
+  there is no body field to carry it, so pass `?lang=` on the query string
+  instead (the JSON field wins if a request somehow carries both). Any value
+  other than `"deu"` — including an absent field, `"eng"`, or an unrecognized
+  string — falls back to English; requesting `deu` when the deployment never
+  loaded it also falls back to English (never a hard error).
 - **Upload size** is capped at 12 MB, shared with the HTML upload form's
   `DefaultBodyLimit`/`RequestBodyLimitLayer` — a larger body is rejected by
   the framework before any handler runs.

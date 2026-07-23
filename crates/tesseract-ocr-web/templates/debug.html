@@ -30,6 +30,13 @@
   }
   .or { text-align: center; color: color-mix(in srgb, CanvasText 50%, Canvas);
         margin: .8rem 0; font-size: .8rem; letter-spacing: .05em; }
+  select#lang {
+    padding: .55rem; border-radius: 8px;
+    border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
+    background: Canvas; color: CanvasText; font-size: 1rem;
+  }
+  .lang-row { display: flex; align-items: center; gap: .6rem; margin: 1rem 0 0; }
+  .lang-row label { margin: 0; font-weight: 400; }
   .btns { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: 1rem; }
   button {
     padding: .6rem 1rem; font-size: .95rem; font-weight: 600; border: 0;
@@ -108,6 +115,13 @@
     <label for="url">Scan an image URL</label>
     <input id="url" type="url" name="url" placeholder="https://example.com/scan.png">
     <p class="note">Private, loopback, and link-local addresses are refused (SSRF guard); 10&nbsp;MB / 10&nbsp;s cap.</p>
+    <div class="lang-row">
+      <label for="lang">Language</label>
+      <select id="lang" name="lang">
+        <option value="eng" selected>English (eng)</option>
+        <option value="deu">German (deu) &mdash; &auml; &ouml; &uuml; &szlig;</option>
+      </select>
+    </div>
     <div class="btns">
       <button type="submit" formaction="/debug">Debug preview (A vs B)</button>
       <button type="submit" class="secondary" formaction="/pdf">Download A · searchable PDF</button>
@@ -120,7 +134,7 @@
   {% if let Some(r) = result %}
 
   {% if r.low_confidence %}
-  <div class="warn"><strong>Low recognition confidence.</strong> The bundled <code>eng</code> model is print-trained; handwriting / low-resolution input produces confident-looking but wrong output. The previews below are likely unreliable.</div>
+  <div class="warn"><strong>Low recognition confidence.</strong> The <code>{{ r.model }}</code> model is print-trained; handwriting / low-resolution / wrong-language input produces confident-looking but wrong output. The previews below are likely unreliable.</div>
   {% endif %}
 
   <h2>Statistics</h2>

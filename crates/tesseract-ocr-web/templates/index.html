@@ -49,12 +49,19 @@
   .format-choice { display: flex; gap: 1.5rem; margin-bottom: 1rem; }
   .format-choice label { display: inline-flex; align-items: center; gap: .4rem; font-weight: 400; margin: 0; }
   .format-choice input[type=radio] { width: auto; }
+  select#lang {
+    padding: .55rem; border-radius: 8px;
+    border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
+    background: Canvas; color: CanvasText; font-size: 1rem;
+  }
+  .lang-row { display: flex; align-items: center; gap: .6rem; margin-bottom: 1rem; }
+  .lang-row label { margin: 0; font-weight: 400; }
 </style>
 </head>
 <body>
 <main>
   <h1>tesseract-rs</h1>
-  <p class="tag">Pure-Rust Tesseract OCR — no libtesseract, no leptonica, no OpenCV. Just the Rust recognizer and the <code>eng</code> model.</p>
+  <p class="tag">Pure-Rust Tesseract OCR — no libtesseract, no leptonica, no OpenCV. Just the Rust recognizer and the <code>eng</code>/<code>deu</code> models.</p>
 
   {% if let Some(msg) = error %}
   <div class="error">{{ msg }}</div>
@@ -75,6 +82,14 @@
       <label><input type="radio" name="format" value="json"> JSON (Struktur + Felder)</label>
     </div>
 
+    <div class="lang-row">
+      <label for="lang">Language</label>
+      <select id="lang" name="lang">
+        <option value="eng" selected>English (eng)</option>
+        <option value="deu">German (deu) &mdash; &auml; &ouml; &uuml; &szlig;</option>
+      </select>
+    </div>
+
     <div class="btns">
       <button type="submit" formaction="/ocr">Run OCR</button>
       <button type="submit" class="secondary" formaction="/debug">Debug preview (A vs B)</button>
@@ -88,7 +103,7 @@
   <p class="note"><a href="/debug">Open the verbose debug preview</a> to see the searchable facsimile (A) and the structured <code>doc.v1</code> reconstruction (B) side by side, with region overlays, stats, and an algorithms trace.</p>
 
   <p class="note">Best on single text-line images at the model height (36&nbsp;px); larger pages are line-found and recognized top-to-bottom. PNG, JPEG, WebP, TIFF, GIF, BMP, and PNM (PGM/PPM) are accepted.</p>
-  <p class="note"><strong>Printed text only.</strong> The bundled <code>eng</code> model is trained on printed fonts &mdash; handwriting is not supported and produces garbled output. Every result now shows a <em>confidence</em> score, and a low score is flagged, so unreadable input (handwriting, low resolution) is called out rather than returned silently.</p>
+  <p class="note"><strong>Printed text only.</strong> Both bundled models are trained on printed fonts &mdash; handwriting is not supported and produces garbled output. Pick the language that matches your input; running German text through the English model (or vice versa) will misread every character outside that model's charset (no <code>&auml;&ouml;&uuml;&szlig;</code> in <code>eng</code>, for instance). Every result now shows a <em>confidence</em> score, and a low score is flagged, so unreadable input (handwriting, low resolution, wrong language) is called out rather than returned silently.</p>
 
   <footer>Result is served back as text with a download link and recognition stats.</footer>
 </main>
