@@ -608,7 +608,7 @@ mod tests {
         let (w, h) = (320usize, 280usize);
         let mut buf = vec![255u8; w * h];
         let ink = |x: usize, y: usize| -> bool {
-            if x >= 30 && x < 130 && y >= 30 && y < 110 {
+            if (30..130).contains(&x) && (30..110).contains(&y) {
                 return true;
             }
             for c0 in [160usize, 250] {
@@ -839,9 +839,13 @@ mod tests {
         (buf, w, h)
     }
 
+    /// `(mask buffer, width, height)` + the seed-dot coordinates — the shape
+    /// [`sf_fixtures`] returns.
+    type SeedfillFixtures = ((Vec<u8>, usize, usize), Vec<(usize, usize)>);
+
     /// The 61×47 seedfill tile-checker mask (9×7 tiles — diagonal contact,
     /// the live 4-vs-8-connectivity discriminator) + the three seed dots.
-    fn sf_fixtures() -> ((Vec<u8>, usize, usize), Vec<(usize, usize)>) {
+    fn sf_fixtures() -> SeedfillFixtures {
         let (w, h) = (61usize, 47usize);
         let mut mask = vec![255u8; w * h];
         for y in 0..h {

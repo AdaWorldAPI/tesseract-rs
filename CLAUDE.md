@@ -476,6 +476,68 @@ default and an unrecognized `lang` both still report `eng.lstm`/110).
 tesseract-ocr-web-local (no Core change) → this file + the commit are the
 record.
 
+**★ Page rectification — NEW leaf, `crates/tesseract-ocr/src/rectify.rs`
+(2026-07-24).** Closes the OTHER half of the same repro: text near the right
+edge of wide lines was being truncated on a photographed page with
+"cushion and trapezoid" distortion (perspective/keystone — the camera wasn't
+square-on to the page — NOT the rotational skew `pixFindSkew`/`pixRotate`
+would fix; that "deskew wave" is a documented, still-unbuilt gap elsewhere in
+this file, and even finished it would not fix keystone — leptonica has no
+perspective correction at all). **Not a Tesseract transcode** (same footing
+as `structured.rs`'s `doc.v1`) — no oracle exists for this feature, validated
+instead by synthetic before/after fixtures.
+
+The idea: a row's fitted baseline slope varies with its height on a
+keystoned page (rows near the far edge tilt one way, near the near edge the
+other). This needed a NEW segmentation entry point,
+`crate::segment::segment_rows_independent` (sibling to the existing
+`segment_rows`, both factored out of `lstm_recognizer.rs`'s
+`makerow_row_crops` — a pure, zero-behaviour-change extraction, re-verified
+against the full 156-test pre-existing suite before anything new was added).
+**A real dead end hit mid-build, documented so it isn't re-discovered:**
+`segment_rows`'s rows all report the IDENTICAL `line_m()` — `make_rows` →
+`cleanup_rows_making` → `fit_parallel_rows(block, page_m)` deliberately
+forces every row in a block onto one shared page-wide gradient (real
+Tesseract's own assumption that a rotated-but-flat page's lines stay
+parallel) — a page-wide constant carries zero row-to-row variation, so it can
+only ever measure rotation, never a trapezoid's height-dependent tilt. Every
+synthetic trapezoid fixture measured `m1 = 0` exactly against `segment_rows`,
+until tracing `make_rows` → `cleanup_rows_making` → `fit_parallel_rows`
+source found the forcing. `segment_rows_independent` stops one step earlier,
+at `make_initial_textrows` (`makerow.cpp:254-289`), where each row still
+carries its OWN independent `fit_lms_line` result — genuinely real,
+already-computed-elsewhere data; no new detector invented.
+
+`fit_shear_ramp` (least-squares `slope(y) = m0 + m1·y` over the harvested
+per-row slopes) + `rectify_grey` (inverse-map vertical shear, nearest-
+neighbour, derivation + a hand-checked numeric sanity example in the doc
+comment) + `auto_rectify` (detect+fit+apply, up to 3 passes since one
+first-order pass only reduces — not zeroes — a large initial distortion;
+a safe no-op when nothing significant is detected, verified by a dedicated
+test). Test fixtures use hollow-rectangle "glyphs" (**a second real bug
+hit and fixed**: `filter_blobs`'s real density heuristic —
+`pixel_count >= height·width·0.7` → "too dense to be text" — rejected a
+first attempt at SOLID filled rectangles outright, 64/64 blobs, cascading
+the whole pool's line-size estimate to 0; hollow borders keep density
+~30-40%) and construct the "distorted" input by calling `rectify_grey`
+ITSELF with a negated ramp rather than hand-deriving a separate forward
+formula (a first attempt at that independent derivation had a sign/role
+bug — easy to get wrong twice, provably self-consistent once: same trusted
+implementation, negated input; exact algebraic cancellation for pure
+rotation, first-order for keystone). 7 tests, all passing, 0 regressions
+across the full 160-test crate suite.
+
+Wired opt-in (same "available, not yet the default" positioning
+`binarize::sauvola_binarize` already has) into `tesseract-ocr-web`: a
+`rectify` checkbox in `index.html`/`debug.html`, read as an HTML-checkbox
+multipart field (`UploadedImage.rectify`, mirroring `lang`'s wiring) through
+`/debug` and `/pdf` (NOT `/ocr` or the machine API yet — kept surgical for
+this pass). `OcrDebugOutcome.rectified` reports whether it actually changed
+anything (compares before/after — `auto_rectify`'s no-op guarantee means the
+checkbox being checked and the page actually being corrected are different
+facts), surfaced in the debug stats panel. `tesseract-ocr`/`tesseract-ocr-pdf`-
+local (no Core change) → this file + the commit are the record.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the

@@ -271,6 +271,12 @@ pub struct OcrDebugOutcome {
     pub network_spec: String,
     /// The selected model's null/blank CTC label id, for the debug stats panel.
     pub null_char: i32,
+    /// `true` when [`tesseract_ocr::rectify::auto_rectify`] actually changed
+    /// the page (it was requested AND the fitted ramp cleared
+    /// [`tesseract_ocr::rectify::ShearRamp::is_significant`]) — the debug
+    /// panel's honest "did rectification do anything" signal, since
+    /// `auto_rectify` is a safe no-op on an already-straight page.
+    pub rectified: bool,
 }
 
 /// Decode `bytes` to grey and run the canonical one-shot structured-document
@@ -282,13 +288,32 @@ pub struct OcrDebugOutcome {
 /// heavy synchronous CPU work, callers MUST run it via `spawn_blocking`.
 ///
 /// `lang` selects the model via [`AppState::model`] (`Some("deu")` → German,
-/// anything else → English, the pre-existing default).
+/// anything else → English, the pre-existing default). `rectify`, when
+/// `true`, runs [`tesseract_ocr::rectify::auto_rectify`] on the decoded grey
+/// page BEFORE recognition — a NEW, non-Tesseract preprocessing pass that
+/// corrects rotational skew and (a first-order approximation of) keystone/
+/// trapezoid distortion from a photographed page; see that module's docs.
+/// Opt-in (default `false` at every call site today) — same "available, not
+/// yet the default" positioning `binarize::sauvola_binarize` already has in
+/// this crate.
 pub fn ocr_image_bytes_debug(
     state: &AppState,
     bytes: &[u8],
     lang: Option<&str>,
+    rectify: bool,
 ) -> Result<OcrDebugOutcome, String> {
-    let (raw, w, h) = decode_grey(bytes)?;
+    let (decoded, w, h) = decode_grey(bytes)?;
+    // auto_rectify is a documented no-op (returns its input unchanged) when
+    // nothing significant was detected — comparing before/after is the
+    // honest way to report whether rectification actually did anything,
+    // rather than just echoing back the request flag.
+    let (raw, rectified) = if rectify {
+        let out = tesseract_ocr::rectify::auto_rectify(&decoded, w, h);
+        let changed = out != decoded;
+        (out, changed)
+    } else {
+        (decoded, false)
+    };
     let (lang, model) = state.model(lang);
 
     let t0 = Instant::now();
@@ -313,6 +338,7 @@ pub fn ocr_image_bytes_debug(
         lang,
         network_spec: model.recognizer.network_str.clone(),
         null_char: model.recognizer.null_char,
+        rectified,
     })
 }
 

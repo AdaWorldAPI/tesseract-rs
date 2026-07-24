@@ -122,6 +122,12 @@
         <option value="deu">German (deu) &mdash; &auml; &ouml; &uuml; &szlig;</option>
       </select>
     </div>
+    <div class="lang-row">
+      <label for="rectify" style="font-weight:400">
+        <input id="rectify" type="checkbox" name="rectify" style="width:auto">
+        Auto-rectify (correct rotational skew / keystone-trapezoid from a photographed page)
+      </label>
+    </div>
     <div class="btns">
       <button type="submit" formaction="/debug">Debug preview (A vs B)</button>
       <button type="submit" class="secondary" formaction="/pdf">Download A · searchable PDF</button>
@@ -149,6 +155,7 @@
     <li><div class="k">Language</div><div class="v">{{ r.lang }}</div></li>
     <li><div class="k">Dict beam</div><div class="v">{% if r.dict_on %}on{% else %}off{% endif %}</div></li>
     <li><div class="k">Null char</div><div class="v">{{ r.null_char }}</div></li>
+    <li><div class="k">Auto-rectify</div><div class="v">{% if r.rectified %}applied{% else %}no change{% endif %}</div></li>
   </ul>
   <p class="note" style="margin-top:.6rem">Network spec: <span class="spec">{{ r.network_spec }}</span></p>
   <p class="note">No script/orientation detection (OSD) is transcoded, so there is <strong>no language-confidence score</strong> — the loaded model plus the mean confidence above are the honest proxy.</p>
