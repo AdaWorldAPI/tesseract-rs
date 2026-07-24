@@ -315,7 +315,9 @@ async fn pdf_impl(
     let st = state.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        build_pdf(&st, &bytes, structured, lang.as_deref())
+        // rectify is not yet exposed on the machine API (HTML-demo-only for
+        // this pass — see tesseract_ocr::rectify's module docs).
+        build_pdf(&st, &bytes, structured, lang.as_deref(), false)
     })
     .await;
     match outcome {

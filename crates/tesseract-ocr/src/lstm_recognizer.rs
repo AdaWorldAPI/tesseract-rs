@@ -461,39 +461,13 @@ impl LstmRecognizer {
     /// [`make_rows`]: crate::textline::make_rows
     /// [`compute_block_xheight`]: crate::textline::compute_block_xheight
     fn makerow_row_crops(&self, grey: &[u8], w: usize, h: usize) -> Vec<MakerowRowCrop> {
-        use crate::blob_filter::filter_blobs;
-        use crate::conncomp::conn_comp_areas;
-        use crate::textline::{compute_block_xheight, make_rows, ToBlockCtx};
-        use crate::threshold::{otsu_threshold_gray, threshold_rect_to_binary};
-
-        // P2: binarize the whole page (foreground = 0 per the crate's
-        // grey-image convention).
-        let otsu = otsu_threshold_gray(grey, w, 0, 0, w, h);
-        let binary = threshold_rect_to_binary(grey, w, 0, 0, w, h, otsu);
-
-        // 3B + 3F₂ leaf 1: components with ink pixel counts (8-connectivity,
-        // matching the real pipeline's blob granularity most closely).
-        let mut components = conn_comp_areas(&binary, w, h, 8);
-        // Raster space → Tesseract y-UP page space for the makerow math.
-        for c in &mut components {
-            c.bb.y = h as i32 - (c.bb.y + c.bb.h);
-        }
-
-        // 3F₂ leaf 2: noise partition + the line-size seed.
-        let filtered = filter_blobs(&components);
-
-        // Waves 1-3: the real line finder.
-        let mut blocks = [ToBlockCtx {
-            blobs: filtered.blobs,
-            block_left: 0,
-            line_spacing: filtered.line_spacing,
-            line_size: filtered.line_size,
-            max_blob_size: filtered.max_blob_size,
-            ..Default::default()
-        }];
-        let page_m = make_rows(&mut blocks);
-        let [mut block] = blocks;
-        compute_block_xheight(&mut block, page_m, 0.0);
+        // The binarize→components→make_rows→xheight prefix is factored out
+        // as crate::segment::segment_rows (extracted verbatim from this
+        // function's original body; no behaviour change) — see that module's
+        // docs for why crate::rectify (a NEW, non-Tesseract preprocessing
+        // addition) needs a DIFFERENT sibling entry point
+        // (segment_rows_independent) rather than sharing this one.
+        let block = crate::segment::segment_rows(grey, w, h);
 
         // Rows (top-of-page first) → the TYPOGRAPHIC line box → the proven
         // line path. This is the real pipeline's feeding, not the expanded

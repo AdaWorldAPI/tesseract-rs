@@ -1602,7 +1602,7 @@ mod tests {
     #[test]
     fn extract_table_grid_splits_columns_by_whitespace() {
         // A 3-row × 4-column invoice-like table: Pos | Artikel | Menge | Preis.
-        let rows = vec![
+        let rows = [
             dl(
                 (10, 10, 470, 30),
                 vec![
@@ -1698,7 +1698,7 @@ mod tests {
         // codex #41 P2: a description cell "Kabel HDMI" with an internal word
         // gap must NOT split into two columns just because no other row happens
         // to cover that x-band. Two columns (description | price), not three.
-        let rows = vec![
+        let rows = [
             dl(
                 (10, 10, 360, 30),
                 vec![

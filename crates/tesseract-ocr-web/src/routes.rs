@@ -430,6 +430,10 @@ struct DebugView {
     network_spec: String,
     null_char: i32,
     dict_on: bool,
+    /// `true` when `?rectify` was requested AND actually changed the page
+    /// (`auto_rectify` is a no-op on an already-straight page — see
+    /// `tesseract_ocr::rectify`'s module docs).
+    rectified: bool,
     mean_conf: String,
     low_confidence: bool,
     word_count: usize,
@@ -521,8 +525,9 @@ fn build_debug_view(
     state: &AppState,
     bytes: &[u8],
     lang: Option<&str>,
+    rectify: bool,
 ) -> Result<DebugView, String> {
-    let dbg = ocr_image_bytes_debug(state, bytes, lang)?;
+    let dbg = ocr_image_bytes_debug(state, bytes, lang, rectify)?;
     let doc: docv1::Doc =
         serde_json::from_str(&dbg.doc_json).map_err(|e| format!("parsing doc.v1: {e}"))?;
     let (w, h) = (dbg.width, dbg.height);
@@ -615,6 +620,7 @@ fn build_debug_view(
         network_spec: dbg.network_spec,
         null_char: dbg.null_char,
         dict_on: dbg.dict_on,
+        rectified: dbg.rectified,
         mean_conf: confidence_str(dbg.mean_conf),
         low_confidence: dbg.low_confidence,
         word_count: dbg.word_count,
@@ -647,8 +653,9 @@ pub(crate) fn build_pdf(
     bytes: &[u8],
     structured: bool,
     lang: Option<&str>,
+    rectify: bool,
 ) -> Result<(Vec<u8>, &'static str), String> {
-    let dbg = ocr_image_bytes_debug(state, bytes, lang)?;
+    let dbg = ocr_image_bytes_debug(state, bytes, lang, rectify)?;
     let grey = GreyImage {
         data: dbg.grey,
         w: dbg.width,
@@ -673,20 +680,25 @@ pub(crate) fn build_pdf(
 
 /// The result of [`read_image_upload`]: the raw image bytes plus the raw
 /// `lang` form field, unvalidated — [`AppState::model`] is where an
-/// unrecognized/absent value falls back to `eng`.
+/// unrecognized/absent value falls back to `eng` — and whether the `rectify`
+/// checkbox was ticked.
 struct UploadedImage {
     bytes: Vec<u8>,
     lang: Option<String>,
+    rectify: bool,
 }
 
-/// Read the `file`/`url`/`lang` fields from a multipart upload (File wins over
-/// URL) and return the raw image bytes + requested language, or a user-safe
-/// error string. Shared by [`pdf`] and [`debug_post`]; the URL arm goes
-/// through the same SSRF guard as `/ocr`.
+/// Read the `file`/`url`/`lang`/`rectify` fields from a multipart upload
+/// (File wins over URL) and return the raw image bytes + requested language +
+/// rectify flag, or a user-safe error string. Shared by [`pdf`] and
+/// [`debug_post`]; the URL arm goes through the same SSRF guard as `/ocr`.
 async fn read_image_upload(mut multipart: Multipart) -> Result<UploadedImage, String> {
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut url: Option<String> = None;
     let mut lang: Option<String> = None;
+    // An HTML checkbox only sends its field AT ALL when checked (any value,
+    // conventionally "on") — its mere presence is the signal, not its text.
+    let mut rectify = false;
     loop {
         match multipart.next_field().await {
             Ok(Some(field)) => {
@@ -711,6 +723,13 @@ async fn read_image_upload(mut multipart: Multipart) -> Result<UploadedImage, St
                             }
                         }
                     }
+                    "rectify" => {
+                        // Discard the value (conventionally "on") — the
+                        // field's mere presence is the checkbox signal, same
+                        // consume-the-body discipline as every other field.
+                        let _ = field.text().await;
+                        rectify = true;
+                    }
                     _ => {}
                 }
             }
@@ -726,7 +745,11 @@ async fn read_image_upload(mut multipart: Multipart) -> Result<UploadedImage, St
     } else {
         return Err("please choose an image file or paste an image URL".to_string());
     };
-    Ok(UploadedImage { bytes, lang })
+    Ok(UploadedImage {
+        bytes,
+        lang,
+        rectify,
+    })
 }
 
 /// `application/pdf` attachment response with a download filename. Built by
@@ -771,7 +794,13 @@ async fn pdf(
     let st = state.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        build_pdf(&st, &uploaded.bytes, structured, uploaded.lang.as_deref())
+        build_pdf(
+            &st,
+            &uploaded.bytes,
+            structured,
+            uploaded.lang.as_deref(),
+            uploaded.rectify,
+        )
     })
     .await;
     match outcome {
@@ -818,7 +847,12 @@ async fn debug_post(State(state): State<Arc<AppState>>, multipart: Multipart) ->
     let st = state.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        build_debug_view(&st, &uploaded.bytes, uploaded.lang.as_deref())
+        build_debug_view(
+            &st,
+            &uploaded.bytes,
+            uploaded.lang.as_deref(),
+            uploaded.rectify,
+        )
     })
     .await;
     match outcome {
@@ -1089,6 +1123,26 @@ mod tests {
         (format!("multipart/form-data; boundary={B}"), body)
     }
 
+    /// Same as [`multipart_file`] plus a checked `rectify` checkbox field.
+    fn multipart_file_with_rectify(bytes: &[u8]) -> (String, Vec<u8>) {
+        const B: &str = "TESSBOUNDARYRECTIFY99";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{B}\r\nContent-Disposition: form-data; name=\"file\"; \
+                 filename=\"page.pgm\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(
+            format!("\r\n--{B}\r\nContent-Disposition: form-data; name=\"rectify\"\r\n\r\non")
+                .as_bytes(),
+        );
+        body.extend_from_slice(format!("\r\n--{B}--\r\n").as_bytes());
+        (format!("multipart/form-data; boundary={B}"), body)
+    }
+
     #[tokio::test]
     async fn get_debug_returns_200() {
         use axum::body::Body;
@@ -1345,5 +1399,50 @@ mod tests {
         let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8_lossy(&out);
         assert!(html.contains("eng.lstm"), "unknown lang falls back to eng");
+    }
+
+    /// `rectify` wires through the whole HTTP stack without erroring, and
+    /// `tesseract_ocr::rectify::auto_rectify`'s documented no-op guarantee
+    /// holds end-to-end: `page_01.pgm` is a clean digital render (no
+    /// rotation/keystone), so the stats panel must honestly report "no
+    /// change" rather than claiming a correction that didn't happen. The
+    /// correction algorithm itself (does it actually fix a distorted page)
+    /// is unit-tested exhaustively in `tesseract_ocr::rectify`'s own test
+    /// module — this test's job is only the wiring.
+    #[tokio::test]
+    async fn post_debug_with_rectify_is_a_no_op_on_a_clean_page() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = model_dir();
+        if !dir.join("eng.lstm").exists() {
+            eprintln!("skipping: corpus model absent");
+            return;
+        }
+        let state = Arc::new(AppState::load(&dir).expect("load model"));
+        let app = router(state);
+        let (ct, body) = multipart_file_with_rectify(&page_01_bytes());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/debug")
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8_lossy(&out);
+        assert!(
+            html.contains("no change"),
+            "a clean page must report no change from auto-rectify"
+        );
+        // Still recognizes correctly — rectify=true must not corrupt an
+        // already-good page.
+        assert!(html.contains("clock"), "recognition still works: {html}");
     }
 }
