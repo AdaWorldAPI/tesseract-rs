@@ -164,9 +164,12 @@ pub fn ocr_image_bytes(
     let (_lang, model) = state.model(lang);
 
     let t0 = Instant::now();
+    // Block-aware surface: multi-column pages read column-by-column in
+    // XY-cut order; a single-column page takes the identical whole-page
+    // path (see recognize_page_blocks_words' docs).
     let lines = model
         .recognizer
-        .recognize_page_makerow_words(&raw, w, h, model.dict.as_ref())
+        .recognize_page_blocks_words(&raw, w, h, model.dict.as_ref())
         .map_err(|e| format!("recognition failed: {e}"))?;
     let text = render_text(&lines, &model.recognizer.charset)
         .trim_end()

@@ -59,7 +59,7 @@ use crate::GreyImage;
 
 /// A whole document: its pages plus the resolution (`dpi`) at which
 /// image-pixel bboxes convert to PDF points (`px * 72 / dpi`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LayoutDoc {
     /// The pages, in order.
     pub pages: Vec<LayoutPage>,
@@ -70,7 +70,7 @@ pub struct LayoutDoc {
 
 /// One page: its pixel dimensions, an optional full-page background scan, and
 /// the placed blocks (top-down image-pixel coordinates throughout).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LayoutPage {
     /// Page width in image pixels.
     pub width: u32,
@@ -84,7 +84,7 @@ pub struct LayoutPage {
 }
 
 /// A single placed thing on a page — a text run, an image crop, or a table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     /// A placed text run (searchable or painted — see [`TextBlock::visible`]).
     Text(TextBlock),
@@ -103,16 +103,40 @@ pub enum Block {
 /// A placed text run. `visible = false` lays it down as an INVISIBLE searchable
 /// layer (PDF render mode `3 Tr`) — what you select but never see; `true`
 /// paints the glyphs (render mode `0 Tr`) — real, visible, selectable text.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextBlock {
-    /// Top-down image-pixel bbox `(left, top, right, bottom)`. The baseline is
-    /// the box bottom and the run is `Tz`-stretched to the box width, exactly
-    /// as [`crate::searchable_pdf`] documents.
+    /// Top-down image-pixel bbox `(left, top, right, bottom)`. Without
+    /// [`TextBlock::metrics`], the baseline is the box bottom and the font
+    /// size is derived from the box height ([`TEXT_HEIGHT_TO_FONTSIZE`]);
+    /// with metrics, both come from measurement instead. Either way the run
+    /// is `Tz`-stretched to the box width, exactly as
+    /// [`crate::searchable_pdf`] documents.
     pub bbox: (u32, u32, u32, u32),
     /// The run's text.
     pub text: String,
     /// `false` → invisible searchable layer (`3 Tr`); `true` → painted (`0 Tr`).
     pub visible: bool,
+    /// Measured typographic metrics from `doc.v1` (`None` for word-level
+    /// searchable runs and legacy JSON without the per-line keys) — see
+    /// [`TextMetrics`].
+    pub metrics: Option<TextMetrics>,
+}
+
+/// A text run's measured typography, from `doc.v1`'s per-line
+/// `xheight`/`ascrise`/`descdrop`/`baseline` keys (all image pixels,
+/// top-down). `font_px` is `xheight + ascrise - descdrop` — the full
+/// ascender-to-descender body height, which is exactly the quantity real
+/// Tesseract uses as the nominal font size
+/// (`LTRResultIterator::WordFontAttributes`, `ltrresultiterator.cpp:168-172`:
+/// `row_height = x_height + ascenders - descenders`, then px → printer
+/// points; its PDF renderer emits that value per word,
+/// `pdfrenderer.cpp:434-447`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextMetrics {
+    /// Nominal font size in image pixels (`xheight + ascrise - descdrop`).
+    pub font_px: f32,
+    /// Baseline y in TOP-DOWN image pixels.
+    pub baseline_px: f32,
 }
 
 /// A placed table: its outer bbox, grid dimensions, cells, and whether to
@@ -233,6 +257,7 @@ fn emit_text_run(
     text: &str,
     dpi: u32,
     page_h_pt: f64,
+    metrics: Option<&TextMetrics>,
 ) -> usize {
     let (left, top, right, bottom) = bbox;
     if right <= left || bottom <= top {
@@ -246,9 +271,23 @@ fn emit_text_run(
     let box_w_pt = px_to_pt(f64::from(right - left), dpi);
     let box_h_pt = px_to_pt(f64::from(bottom - top), dpi);
     let x_pt = px_to_pt(f64::from(left), dpi);
-    // Baseline = box bottom (APPROX); PDF y is bottom-up.
-    let y_pt = page_h_pt - px_to_pt(f64::from(bottom), dpi);
-    let fontsize_pt = box_h_pt * TEXT_HEIGHT_TO_FONTSIZE;
+    // With measured metrics: font size = the row's typographic body height
+    // (`xheight + ascrise - descdrop`), and the pen sits on the MEASURED
+    // baseline -- both exactly what real Tesseract renders from
+    // (`ltrresultiterator.cpp:168-172` / `pdfrenderer.cpp:434-447`). Without
+    // metrics (word-level searchable runs, legacy doc.v1): baseline = box
+    // bottom and font size from the box height via TEXT_HEIGHT_TO_FONTSIZE,
+    // the pre-metrics behaviour, unchanged.
+    let (y_pt, fontsize_pt) = match metrics {
+        Some(m) => (
+            page_h_pt - px_to_pt(f64::from(m.baseline_px), dpi),
+            px_to_pt(f64::from(m.font_px), dpi).max(1.0),
+        ),
+        None => (
+            page_h_pt - px_to_pt(f64::from(bottom), dpi),
+            box_h_pt * TEXT_HEIGHT_TO_FONTSIZE,
+        ),
+    };
     let natural_width_pt = fontsize_pt * f64::from(natural_width_1000em) / 1000.0;
     let tz = 100.0 * box_w_pt / natural_width_pt;
 
@@ -364,7 +403,14 @@ fn build_layout_content(page: &LayoutPage, dpi: u32) -> (Vec<u8>, usize) {
         for block in &page.blocks {
             if let Block::Text(t) = block {
                 if !t.visible {
-                    substitutions += emit_text_run(&mut ops, t.bbox, &t.text, dpi, page_h_pt);
+                    substitutions += emit_text_run(
+                        &mut ops,
+                        t.bbox,
+                        &t.text,
+                        dpi,
+                        page_h_pt,
+                        t.metrics.as_ref(),
+                    );
                 }
             }
         }
@@ -383,12 +429,19 @@ fn build_layout_content(page: &LayoutPage, dpi: u32) -> (Vec<u8>, usize) {
         for block in &page.blocks {
             match block {
                 Block::Text(t) if t.visible => {
-                    substitutions += emit_text_run(&mut ops, t.bbox, &t.text, dpi, page_h_pt);
+                    substitutions += emit_text_run(
+                        &mut ops,
+                        t.bbox,
+                        &t.text,
+                        dpi,
+                        page_h_pt,
+                        t.metrics.as_ref(),
+                    );
                 }
                 Block::Table(t) => {
                     for cell in &t.cells {
                         substitutions +=
-                            emit_text_run(&mut ops, cell.bbox, &cell.text, dpi, page_h_pt);
+                            emit_text_run(&mut ops, cell.bbox, &cell.text, dpi, page_h_pt, None);
                     }
                 }
                 _ => {}
@@ -547,7 +600,12 @@ fn css_box(bbox: (u32, u32, u32, u32)) -> String {
 /// PDF's painted/invisible text actually looks like, not an unrelated fixed
 /// size. Clamped to at least `1.0` so a degenerate/thin box never emits
 /// `font-size:0px`.
-fn text_font_size_px(bbox: (u32, u32, u32, u32)) -> f64 {
+fn text_font_size_px(bbox: (u32, u32, u32, u32), metrics: Option<&TextMetrics>) -> f64 {
+    if let Some(m) = metrics {
+        // Same measured body height the PDF projection uses -- Klickwege
+        // parity applies to text SIZE, not just position.
+        return f64::from(m.font_px).max(1.0);
+    }
     let (_, top, _, bottom) = bbox;
     (f64::from(bottom.saturating_sub(top)) * TEXT_HEIGHT_TO_FONTSIZE).max(1.0)
 }
@@ -639,7 +697,7 @@ pub fn render_preview_html(doc: &LayoutDoc) -> String {
         for block in &page.blocks {
             match block {
                 Block::Text(t) => {
-                    let font_px = text_font_size_px(t.bbox);
+                    let font_px = text_font_size_px(t.bbox, t.metrics.as_ref());
                     html.push_str(&format!(
                         "  <div class=\"text\" style=\"{};font-size:{font_px}px;line-height:1\">{}</div>\n",
                         css_box(t.bbox),
@@ -668,7 +726,7 @@ pub fn render_preview_html(doc: &LayoutDoc) -> String {
                         // parity anchor is the table's own bbox on the div above.
                         let (l, top) = (cl.saturating_sub(tl), ct.saturating_sub(tt));
                         let (w, h) = (cr.saturating_sub(cl), cb.saturating_sub(ct));
-                        let font_px = text_font_size_px(cell.bbox);
+                        let font_px = text_font_size_px(cell.bbox, None);
                         html.push_str(&format!(
                             "    <div class=\"cell\" style=\"left:{l}px;top:{top}px;\
                              width:{w}px;height:{h}px;font-size:{font_px}px;line-height:1\">{}</div>\n",
@@ -801,6 +859,7 @@ pub fn searchable_layout(pages: Vec<PageOcr>) -> LayoutDoc {
                         bbox: w.box_,
                         text: w.text,
                         visible: false,
+                        metrics: None,
                     })
                 })
                 .collect();
@@ -898,6 +957,15 @@ struct JsonLine {
     bbox: Option<[i64; 4]>,
     #[serde(default)]
     words: Vec<JsonWord>,
+    // The additive per-line metric keys (doc.v1; absent in legacy JSON).
+    #[serde(default)]
+    xheight: Option<f32>,
+    #[serde(default)]
+    ascrise: Option<f32>,
+    #[serde(default)]
+    descdrop: Option<f32>,
+    #[serde(default)]
+    baseline: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -1045,10 +1113,22 @@ pub fn doc_v1_layout(doc_json: &str, page_rasters: &[GreyImage]) -> Result<Layou
                             Some(b) => to_u32_bbox(b),
                             None => union_words(&line.words),
                         };
+                        // Metrics require xheight + baseline; ascrise/descdrop
+                        // default to 0 when absent (font_px degrades to the
+                        // bare x-height, still far better than band height).
+                        let metrics = match (line.xheight, line.baseline) {
+                            (Some(xh), Some(bl)) => Some(TextMetrics {
+                                font_px: xh + line.ascrise.unwrap_or(0.0)
+                                    - line.descdrop.unwrap_or(0.0),
+                                baseline_px: bl,
+                            }),
+                            _ => None,
+                        };
                         blocks.push(Block::Text(TextBlock {
                             bbox,
                             text,
                             visible: true,
+                            metrics,
                         }));
                     }
                 }
@@ -1061,6 +1141,7 @@ pub fn doc_v1_layout(doc_json: &str, page_rasters: &[GreyImage]) -> Result<Layou
                 bbox: to_u32_bbox(field.bbox),
                 text: field.value.clone(),
                 visible: true,
+                metrics: None,
             }));
         }
 
@@ -1224,6 +1305,7 @@ mod tests {
                         bbox: (10, 20, 60, 40),
                         text: "Hi".to_string(),
                         visible: true,
+                        metrics: None,
                     }),
                     Block::Image {
                         bbox: (80, 10, 180, 90),
@@ -1315,6 +1397,7 @@ mod tests {
                     bbox: (5, 5, 60, 30),
                     text: "Visible".to_string(),
                     visible: true,
+                    metrics: None,
                 })],
             }],
         };
@@ -1346,11 +1429,13 @@ mod tests {
                         bbox: (0, 0, 100, 30),
                         text: "Line one".to_string(),
                         visible: true,
+                        metrics: None,
                     }),
                     Block::Text(TextBlock {
                         bbox: (0, 15, 100, 45),
                         text: "Line two".to_string(),
                         visible: true,
+                        metrics: None,
                     }),
                 ],
             }],
@@ -1499,5 +1584,95 @@ mod tests {
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foob"), "Zm9vYg==");
+    }
+
+    // --- Measured line metrics drive both projections ------------------------
+
+    /// With [`TextMetrics`] present, the PDF projection's `Tf` is the measured
+    /// body height (`px == pt` at dpi 72) and the pen `Tm` sits on the
+    /// MEASURED baseline — not the bbox-derived heuristic — and the HTML
+    /// projection's `font-size` uses the same measured value (Klickwege
+    /// parity applied to text size).
+    #[test]
+    fn measured_metrics_drive_font_size_and_baseline() {
+        let doc = LayoutDoc {
+            dpi: 72,
+            pages: vec![LayoutPage {
+                width: 200,
+                height: 100,
+                background: None,
+                blocks: vec![Block::Text(TextBlock {
+                    // Band bbox (30..70): the heuristic would give Tf = 20*0.5
+                    // = 20 too here, so pin baseline to distinguish, and use a
+                    // font_px (17) that differs from every bbox derivation.
+                    bbox: (10, 30, 150, 70),
+                    text: "Hello".to_string(),
+                    visible: true,
+                    metrics: Some(TextMetrics {
+                        font_px: 17.0,
+                        baseline_px: 60.0, // top-down → pen y = 100 - 60 = 40
+                    }),
+                })],
+            }],
+        };
+        let (pdf, _r) = render_pdf(&doc).expect("render");
+        let content = page_content(&pdf);
+        assert!(
+            ops(&content, "Tf")
+                .iter()
+                .any(|o| (num(o, 1) - 17.0).abs() < 1e-3),
+            "Tf must be the measured font_px (17), not a bbox heuristic"
+        );
+        assert!(
+            ops(&content, "Tm")
+                .iter()
+                .any(|o| (num(o, 5) - 40.0).abs() < 1e-3),
+            "pen y must sit on the measured baseline (100-60=40)"
+        );
+        let html = render_preview_html(&doc);
+        assert!(
+            html.contains("font-size:17px"),
+            "HTML font-size must use the same measured value: {html}"
+        );
+    }
+
+    /// `doc_v1_layout` parses the additive per-line metric keys into
+    /// [`TextMetrics`] (`font_px = xheight + ascrise - descdrop`), and leaves
+    /// `metrics: None` for legacy lines without them.
+    #[test]
+    fn doc_v1_layout_parses_line_metrics() {
+        let json = r#"{
+          "schema": "tesseract-rs/doc.v1",
+          "pages": [{
+            "page": 1, "width": 100, "height": 100,
+            "regions": [
+              {"type": "text", "bbox": [5,5,80,20], "lines": [
+                {"bbox": [5,5,80,20],
+                 "xheight": 10.0, "ascrise": 4.0, "descdrop": -3.0, "baseline": 17.5,
+                 "words": [{"text": "Hi", "bbox": [5,5,40,20]}]},
+                {"bbox": [5,25,80,40], "words": [{"text": "legacy", "bbox": [5,25,40,40]}]}
+              ]}
+            ],
+            "fields": []
+          }]
+        }"#;
+        let doc = doc_v1_layout(json, &[]).expect("parse");
+        let texts: Vec<&TextBlock> = doc.pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 2);
+        assert_eq!(
+            texts[0].metrics,
+            Some(TextMetrics {
+                font_px: 17.0, // 10 + 4 - (-3)
+                baseline_px: 17.5,
+            })
+        );
+        assert_eq!(texts[1].metrics, None, "legacy line stays metrics-less");
     }
 }

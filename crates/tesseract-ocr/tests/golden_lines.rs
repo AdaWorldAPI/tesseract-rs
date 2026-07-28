@@ -164,7 +164,11 @@ fn golden_line36_dict_tsv() {
     let words = recognizer()
         .recognize_image_file_words(&img_path, Some(dict()), line_box, 1.0)
         .unwrap_or_else(|e| panic!("recognize_image_file_words(line36, dict): {e}"));
-    let line = LineWords { words, line_box };
+    let line = LineWords {
+        words,
+        line_box,
+        metrics: None,
+    };
 
     let tsv = render_tsv(&[line], &recognizer().charset, w as u32, h as u32);
 

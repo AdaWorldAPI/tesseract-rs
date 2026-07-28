@@ -642,6 +642,53 @@ local (no Core change) → this file + the commit are the record.
 > Check the direction your backstop actually works in.** 12/12 `rectify`
 > tests, 165/165 crate suite.
 
+**★ Measured line metrics → true text sizing (2026-07-28).** The structured
+PDF's text height "lacked the basics" (operator): every run was sized by a
+`×0.5`-of-band-height GUESS (`TEXT_HEIGHT_TO_FONTSIZE`), because the numbers
+that should drive it — the row's real `xheight`/`ascrise`/`descdrop` from
+wave-3 `compute_block_xheight` — were computed to size the recognition band,
+then thrown away. Now threaded end-to-end: `MakerowRowCrop` keeps them, a new
+`renderer::LineMetrics` (bottom-up, + the fitted mid-line `baseline`) rides
+`LineWords`, `structured::DocLineMetrics` converts top-down and `doc.v1`
+emits them as ADDITIVE per-line keys (`xheight`/`ascrise`/`descdrop`/
+`baseline`, 1dp; consumers ignore unknown keys), `tesseract-ocr-pdf` parses
+them into `TextBlock::metrics` (`TextMetrics { font_px, baseline_px }`), and
+BOTH projections consume them: `emit_text_run` sets `Tf = px_to_pt(font_px)`
+and puts the pen on the MEASURED baseline; `text_font_size_px` uses the same
+value (Klickwege parity applied to text SIZE). The derivation is real
+Tesseract's own, not invented: `LTRResultIterator::WordFontAttributes`
+(`ltrresultiterator.cpp:168-172`) sizes fonts as `row_height = x_height +
+ascenders - descenders` px→points — exactly `LineMetrics::row_height()` —
+and its PDF renderer emits that per word (`pdfrenderer.cpp:434-447`).
+Metrics-less paths (word-level searchable runs, legacy doc.v1, table cells)
+keep the old heuristic unchanged. No Core change → this file + the commit
+are the record.
+
+**★ Multi-column reading order — `recognize_page_blocks_words` (2026-07-28).**
+The 8-column resolution test sheet read as 26 FULL-WIDTH lines (~176
+per-column lines exist): whole-page makerow projects across the ENTIRE page
+width, so side-by-side columns merge into single rows read ACROSS the gutter,
+and `xy_cut` only classified regions AFTER recognition. New consumer-side
+composition (NOT a transcode — real Tesseract likewise runs layout analysis
+before per-block line finding): `xy_cut` FIRST, then the proven makerow
+finder WITHIN each block crop (`kImagePadding = 4` slack), outputs translated
+back to page space (`x += crop_left`, y-up `+= page_h - crop_bottom`,
+covering `line_box`, every `char_box`, and `metrics.baseline`), blocks
+concatenated in XY-cut reading order. 0-or-1-leaf pages take the EXACT
+whole-page path (byte-identical — golden pages unaffected). **No-content-loss
+guard:** a block recognizing to NOTHING may be a figure (fine) or a
+degenerate over-split (xy_cut carving a sparse page into per-glyph
+micro-blocks — page_roomy doubled reproduces it); in that case the
+whole-page surface runs too and the reading with MORE total words wins, so
+the blocked path can never silently drop text the old path found. Wired:
+`recognize_document` (doc.v1/PDF/debug) + the web demo's text mode;
+`recognize_page_makerow_words` itself is UNCHANGED (parity anchors intact).
+Integration falsifiers in `tests/blocks_columns.rs` (real-paragraph
+two-column composite: column containment, column-major order, per-column
+text == the single band's text, metrics surviving translation; plus the
+over-split fallback). No Core change → this file + the commit are the
+record.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the

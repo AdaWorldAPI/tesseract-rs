@@ -93,6 +93,49 @@ pub struct LineWords {
     /// `TBOX`-constructor-argument order as the `line_box` parameter passed
     /// to `recognize_image_file_words` (`recodebeam.cpp:647-654`).
     pub line_box: (i32, i32, i32, i32),
+    /// The row's measured typographic metrics ([`LineMetrics`]), when the
+    /// line came through the makerow pipeline (which computes them as part
+    /// of sizing the recognition band). `None` for paths with no row object
+    /// (e.g. `recognize_image_file_words` on a bare pre-cropped line strip).
+    pub metrics: Option<LineMetrics>,
+}
+
+/// A recognized row's typographic metrics — `TO_ROW`'s
+/// `xheight`/`ascrise`/`descdrop` (wave-3 `compute_block_xheight` output,
+/// `makerow.cpp:1279-1389`) plus the fitted baseline, in the same bottom-up
+/// PAGE space as [`LineWords::line_box`].
+///
+/// This is the exact quantity real Tesseract's renderers size fonts from:
+/// `LTRResultIterator::WordFontAttributes` (`ltrresultiterator.cpp:168-172`)
+/// computes `row_height = row->x_height() + row->ascenders() -
+/// row->descenders()` (descenders ≤ 0, so this is the full
+/// ascender-to-descender body height) and converts it to printer points —
+/// the `fontsize` the PDF renderer then emits per word
+/// (`pdfrenderer.cpp:434-447`). Carrying the raw trio (rather than a
+/// pre-derived font size) keeps `doc.v1` factual and lets each renderer
+/// apply its own conversion.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineMetrics {
+    /// `TO_ROW::xheight` — the x-height estimate, in pixels.
+    pub xheight: f32,
+    /// `TO_ROW::ascrise` — ascender rise above the x-height (≥ 0).
+    pub ascrise: f32,
+    /// `TO_ROW::descdrop` — descender drop below the baseline (≤ 0).
+    pub descdrop: f32,
+    /// The fitted baseline's y at the line's horizontal midpoint
+    /// (`line_m·mid_x + parallel_c`), bottom-up PAGE space.
+    pub baseline: f32,
+}
+
+impl LineMetrics {
+    /// `row_height` exactly as `WordFontAttributes` computes it
+    /// (`ltrresultiterator.cpp:168-169`): `x_height + ascenders -
+    /// descenders`, the full typographic body height in pixels — the
+    /// natural nominal font size for this row's text.
+    #[must_use]
+    pub fn row_height(&self) -> f32 {
+        self.xheight + self.ascrise - self.descdrop
+    }
 }
 
 /// Clamp `v` into `[lo, hi]` — `ClipToRange` (`ccutil/helpers.h`), used
@@ -535,6 +578,7 @@ mod tests {
                 word(&[2], true, -0.1, (6, 0, 10, 10)),
             ],
             line_box: (0, 0, 10, 10),
+            metrics: None,
         };
         // Line 2: "a" (no leading space) + "b" (leading_space=false, e.g. glued) -> "ab\n"
         let line2 = LineWords {
@@ -543,6 +587,7 @@ mod tests {
                 word(&[2], false, -0.1, (6, 0, 10, 10)),
             ],
             line_box: (0, 0, 10, 10),
+            metrics: None,
         };
         let cs = test_charset();
         assert_eq!(render_text(&[line1, line2], &cs), "a b\nab\n");
@@ -553,10 +598,12 @@ mod tests {
         let empty = LineWords {
             words: vec![],
             line_box: (0, 0, 10, 10),
+            metrics: None,
         };
         let line = LineWords {
             words: vec![word(&[1], false, -0.1, (0, 0, 5, 10))],
             line_box: (0, 0, 10, 10),
+            metrics: None,
         };
         let cs = test_charset();
         // The empty line contributes NOTHING - no blank line, no separator.
@@ -577,6 +624,7 @@ mod tests {
                 word(&[2], true, -0.2, (5, 0, 9, 10)),
             ],
             line_box: (0, 0, 10, 10),
+            metrics: None,
         };
         let cs = test_charset();
         let tsv = render_tsv(&[line], &cs, 10, 10);
@@ -598,6 +646,7 @@ mod tests {
         let empty = LineWords {
             words: vec![],
             line_box: (0, 0, 10, 10),
+            metrics: None,
         };
         let cs = test_charset();
         let tsv = render_tsv(&[empty], &cs, 10, 10);
@@ -666,10 +715,12 @@ mod tests {
                 word(&[2], true, -0.2, (5, 0, 9, 10)),
             ],
             line_box: (0, 0, 10, 10),
+            metrics: None,
         };
         let line2 = LineWords {
             words: vec![word(&[1], false, -0.1, (0, 0, 4, 10))],
             line_box: (0, 0, 10, 10),
+            metrics: None,
         };
         (vec![line1, line2], test_charset())
     }
@@ -739,10 +790,12 @@ mod tests {
         let empty = LineWords {
             words: vec![],
             line_box: (0, 0, 10, 10),
+            metrics: None,
         };
         let line = LineWords {
             words: vec![word(&[1], false, -0.1, (0, 0, 4, 10))],
             line_box: (0, 0, 10, 10),
+            metrics: None,
         };
         let cs = test_charset();
 
@@ -761,6 +814,7 @@ mod tests {
         let empty = LineWords {
             words: vec![],
             line_box: (0, 0, 10, 10),
+            metrics: None,
         };
         let cs = test_charset();
         let hocr = render_hocr(&[empty], &cs, 10, 10, "x");

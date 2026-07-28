@@ -90,6 +90,35 @@ pub struct DocLine {
     pub bbox: (i32, i32, i32, i32),
     /// Words in reading order.
     pub words: Vec<DocWord>,
+    /// The row's measured typographic metrics, top-down converted (`None`
+    /// when the recognition path carried none) — see [`DocLineMetrics`].
+    pub metrics: Option<DocLineMetrics>,
+}
+
+/// A [`DocLine`]'s typographic metrics in the DOM's own (top-down) frame —
+/// the renderer-facing conversion of
+/// [`LineMetrics`](crate::renderer::LineMetrics). Emitted into `doc.v1`
+/// as additive per-line keys (`xheight`/`ascrise`/`descdrop`/`baseline`);
+/// consumers must ignore unknown keys, so old readers are unaffected.
+///
+/// `xheight + ascrise - descdrop` (descdrop ≤ 0) is the full typographic
+/// body height — exactly what real Tesseract sizes fonts from
+/// (`LTRResultIterator::WordFontAttributes`, `ltrresultiterator.cpp:168-172`:
+/// `row_height = x_height + ascenders - descenders`, converted to printer
+/// points). The line's recognition-band `bbox` is deliberately TALLER than
+/// this (ascender/descender slack plus `kImagePadding`), which is why sizing
+/// text from the bbox alone overshoots.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DocLineMetrics {
+    /// x-height in pixels.
+    pub xheight: f32,
+    /// Ascender rise above the x-height (≥ 0), pixels.
+    pub ascrise: f32,
+    /// Descender drop below the baseline (≤ 0), pixels.
+    pub descdrop: f32,
+    /// Baseline y at the line's horizontal midpoint, TOP-DOWN image pixels
+    /// (`page_height - bottom_up_baseline`).
+    pub baseline: f32,
 }
 
 /// One page of structured output — the unit [`render_json`] serializes.
@@ -123,6 +152,13 @@ impl DocPage {
             .iter()
             .filter(|l| !l.words.is_empty())
             .map(|line| DocLine {
+                metrics: line.metrics.map(|m| DocLineMetrics {
+                    xheight: m.xheight,
+                    ascrise: m.ascrise,
+                    descdrop: m.descdrop,
+                    // Bottom-up page space → the DOM's top-down frame.
+                    baseline: ph as f32 - m.baseline,
+                }),
                 bbox: crate::renderer::to_image_box(line.line_box, pw, ph),
                 words: line
                     .words
@@ -628,6 +664,15 @@ fn render_doc(page: &DocPage, regions: &[EmitRegion], fields: &[HarvestedField])
             }
             out.push_str("{\"bbox\":");
             out.push_str(&json_bbox(line.bbox));
+            if let Some(m) = &line.metrics {
+                // Additive per-line keys (consumers must ignore unknown
+                // keys): the measured row metrics + top-down baseline, 1dp
+                // (sub-pixel noise beyond that is meaningless downstream).
+                out.push_str(&format!(
+                    ",\"xheight\":{:.1},\"ascrise\":{:.1},\"descdrop\":{:.1},\"baseline\":{:.1}",
+                    m.xheight, m.ascrise, m.descdrop, m.baseline
+                ));
+            }
             out.push_str(",\"words\":[");
             for (wi, w) in line.words.iter().enumerate() {
                 if wi > 0 {
@@ -1131,7 +1176,78 @@ mod tests {
     }
 
     fn dl(bbox: (i32, i32, i32, i32), words: Vec<DocWord>) -> DocLine {
-        DocLine { bbox, words }
+        DocLine {
+            bbox,
+            words,
+            metrics: None,
+        }
+    }
+
+    /// Line metrics flow: `from_line_words` converts the bottom-up
+    /// [`crate::renderer::LineMetrics`] into the DOM's top-down frame
+    /// (`baseline_td = page_h - baseline_up`), and `render_json` emits the
+    /// additive per-line keys; a metrics-less line emits none (legacy shape
+    /// byte-stable).
+    #[test]
+    fn render_json_emits_line_metrics_when_present() {
+        use crate::renderer::{LineMetrics, LineWords};
+        use tesseract_core::dawg::PermuterType;
+        use tesseract_core::WordResult;
+        let word = WordResult {
+            unichar_ids: vec![1],
+            certs: vec![-0.1],
+            ratings: vec![0.1],
+            char_boxes: vec![(10, 60, 30, 80)],
+            permuter: PermuterType::TopChoicePerm,
+            space_certainty: 0.0,
+            leading_space: false,
+        };
+        let with_metrics = LineWords {
+            words: vec![word.clone()],
+            line_box: (10, 60, 90, 80),
+            metrics: Some(LineMetrics {
+                xheight: 10.0,
+                ascrise: 4.0,
+                descdrop: -3.0,
+                baseline: 62.5, // bottom-up; page_h=100 → top-down 37.5
+            }),
+        };
+        let without = LineWords {
+            words: vec![word],
+            line_box: (10, 20, 90, 40),
+            metrics: None,
+        };
+        let charset =
+            tesseract_core::CharSet::load_from_str("2\nNULL 0 Common 0\na 3 0 a Left a a\n")
+                .expect("charset");
+        let page = DocPage::from_line_words(&[with_metrics, without], &charset, 200, 100);
+
+        assert_eq!(
+            page.lines[0].metrics,
+            Some(DocLineMetrics {
+                xheight: 10.0,
+                ascrise: 4.0,
+                descdrop: -3.0,
+                baseline: 37.5,
+            }),
+            "bottom-up baseline must convert to top-down"
+        );
+        assert_eq!(page.lines[1].metrics, None);
+
+        let json = render_json(&page, &[]);
+        assert!(
+            json.contains("\"xheight\":10.0,\"ascrise\":4.0,\"descdrop\":-3.0,\"baseline\":37.5"),
+            "metric keys emitted: {json}"
+        );
+        // The metrics-less line's object carries none of the keys.
+        let second_line = json
+            .split("{\"bbox\":[10,60,")
+            .nth(1)
+            .expect("second line obj");
+        assert!(
+            !second_line.starts_with("90,80],\"xheight\""),
+            "metrics-less line must not emit metric keys"
+        );
     }
 
     // --- numeric hardening -------------------------------------------------
@@ -1756,11 +1872,13 @@ mod tests {
             LineWords {
                 words: vec![],
                 line_box: (0, 0, 10, 10),
+                metrics: None,
             },
             LineWords {
                 // Bottom-up TBOX (0,0,4,10) on a 10-high page -> top-down (0,0,4,10).
                 words: vec![word(&[1], -0.2, (0, 0, 4, 10))],
                 line_box: (0, 0, 10, 10),
+                metrics: None,
             },
         ];
         let page = DocPage::from_line_words(&lines, &charset, 10, 10);
