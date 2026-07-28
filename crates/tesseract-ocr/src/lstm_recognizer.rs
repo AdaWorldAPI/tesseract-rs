@@ -602,12 +602,23 @@ impl LstmRecognizer {
         h: usize,
         dict: Option<&DictLite>,
     ) -> Result<Vec<crate::renderer::LineWords>, RecognizerError> {
-        // Same target height prepare_grid derives (lstm_recognizer.rs:244-247);
-        // scale_factor = band_h / target_h = 1 / im_factor un-does the prescale.
+        // Same target height prepare_grid derives (lstm_recognizer.rs:244-247).
         let target_h = self
             .network
             .input_shape
             .map_or(36, |s| s.height.max(1) as usize);
+        // `RecognizeLine`'s "Reduction factor from image to coords"
+        // (`lstmrecognizer.cpp:327,344`):
+        //     min_width      = network_->XScaleFactor()
+        //     *scale_factor  = im_factor        (set by PrepareLSTMInputs)
+        //     *scale_factor  = min_width / *scale_factor
+        // i.e. scale_factor = XScaleFactor() / im_factor. The beam's
+        // character_boundaries are DECODER TIMESTEP indices, and the network
+        // reduces width by XScaleFactor() (eng.lstm: 3, from `Mp3,3`), so the
+        // pooling factor is as load-bearing as the prescale — omitting it
+        // compresses every word box toward the line's left edge by exactly
+        // that factor while leaving the TEXT correct.
+        let x_scale = self.network.x_scale_factor().max(1) as f32;
         let crops = self.makerow_row_crops(grey, w, h);
         let mut out: Vec<crate::renderer::LineWords> = Vec::with_capacity(crops.len());
         for row in &crops {
@@ -626,7 +637,7 @@ impl LstmRecognizer {
             }
             let simple = self.network.simple_text_output();
             let logits: Vec<&[f32]> = (0..outputs.width()).map(|t| outputs.f(t)).collect();
-            let scale_factor = row.band_h as f32 / target_h as f32;
+            let scale_factor = x_scale * (row.band_h as f32 / target_h as f32);
             let words = if let Some(dict) = dict.cloned() {
                 let mut beam = RecodeBeamSearch::new_with_dict(
                     &self.recoder,
@@ -900,6 +911,16 @@ impl LstmRecognizer {
     /// boxes land in the ORIGINAL image's pixel space (`1.0` for a model-height
     /// image, matching [`Self::recognize_image_file`]'s byte-parity scope).
     ///
+    /// **The caller supplies the IMAGE factor only.** The network's own
+    /// horizontal reduction ([`Network::x_scale_factor`], eng.lstm: 3 from
+    /// `Mp3,3`) is folded in here, mirroring the C++ split: `PrepareLSTMInputs`
+    /// yields the image's `im_factor` and `RecognizeLine` then applies
+    /// `*scale_factor = XScaleFactor() / im_factor` (`lstmrecognizer.cpp:344`,
+    /// "Reduction factor from image to coords"). Callers cannot reasonably be
+    /// expected to know the loaded model's pooling, and every in-repo caller
+    /// previously passed a bare `1.0` — which silently compressed all word
+    /// boxes into the left third of each line.
+    ///
     /// # Errors
     ///
     /// Same as [`Self::recognize_image_file`].
@@ -926,6 +947,9 @@ impl LstmRecognizer {
         }
         let simple = self.network.simple_text_output();
         let rows: Vec<&[f32]> = (0..outputs.width()).map(|t| outputs.f(t)).collect();
+        // Fold in the network's horizontal reduction (see the doc comment):
+        // the beam's character_boundaries are decoder TIMESTEP indices.
+        let scale_factor = scale_factor * self.network.x_scale_factor().max(1) as f32;
         let words = if let Some(dict) = dict {
             let mut beam = RecodeBeamSearch::new_with_dict(
                 &self.recoder,
@@ -1170,6 +1194,65 @@ mod makerow_page_tests {
     /// right, top)` from `extract_best_path_as_words`; `line_box` bottom/top were
     /// derived from the raster crop via `h` (`bottom = h - img_bottom`,
     /// `top = h - img_top`). Allow the `kImagePadding = 4` slack on all sides.
+    /// Word boxes must SPAN their line, not merely sit inside it.
+    ///
+    /// The sibling test above only asserts char boxes are *within* `line_box`
+    /// — which stayed trivially true while every box was compressed toward
+    /// the line's left edge by the network's `XScaleFactor()` (eng.lstm: 3,
+    /// from `Mp3,3`), because the beam's `character_boundaries` are decoder
+    /// TIMESTEP indices and `scale_factor` originally carried only the image
+    /// prescale (`lstmrecognizer.cpp:344` folds in `XScaleFactor()` too:
+    /// "Reduction factor from image to coords"). That shipped: on a wide page
+    /// word boxes covered exactly 33.3% of the content width, so the
+    /// searchable-PDF text layer bunched into the left third instead of
+    /// stretching across the page. Recognized TEXT was unaffected, which is
+    /// why nothing caught it. This test pins the absolute-position invariant
+    /// the other one cannot see.
+    #[test]
+    fn word_boxes_span_the_line_not_just_its_left_third() {
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+        // Graceful skip when the (gitignored) model / fixtures are absent.
+        if !corpus.join("model/eng.lstm").exists() || !corpus.join("lines/page_roomy.pgm").exists()
+        {
+            return;
+        }
+        let lstm = std::fs::read(corpus.join("model/eng.lstm")).unwrap();
+        let uni = std::fs::read_to_string(corpus.join("model/eng.lstm-unicharset")).unwrap();
+        let rec = std::fs::read(corpus.join("model/eng.lstm-recoder")).unwrap();
+        let img = std::fs::read(corpus.join("lines/page_roomy.pgm")).unwrap();
+        let r = LstmRecognizer::from_components(&lstm, &uni, &rec).unwrap();
+        let (grey, w, h) = crate::image_input::parse_pgm(&img).unwrap();
+
+        let lines = r.recognize_page_makerow_words(&grey, w, h, None).unwrap();
+        let non_empty: Vec<_> = lines.iter().filter(|l| !l.words.is_empty()).collect();
+        assert!(!non_empty.is_empty(), "expected recognized lines");
+
+        // For each line, the rightmost char box must reach most of the way to
+        // the line box's right edge. Under the 3x compression this ratio sat
+        // near 1/3; a correct mapping puts it near 1.0.
+        let mut worst = f32::MAX;
+        for line in &non_empty {
+            let (lb_left, _, lb_right, _) = line.line_box;
+            let span = (lb_right - lb_left) as f32;
+            if span <= 0.0 {
+                continue;
+            }
+            let max_r = line
+                .words
+                .iter()
+                .flat_map(|word| word.char_boxes.iter().map(|b| b.2))
+                .max()
+                .unwrap_or(lb_left);
+            worst = worst.min((max_r - lb_left) as f32 / span);
+        }
+        assert!(
+            worst > 0.6,
+            "rightmost word box only reaches {:.1}% of the line width \
+             (a 3x-compressed mapping lands near 33%)",
+            worst * 100.0
+        );
+    }
+
     #[test]
     fn words_page_matches_string_lines_and_boxes_within_line_box() {
         let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
