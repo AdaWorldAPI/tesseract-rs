@@ -584,6 +584,33 @@ m1=0.0006` keystone recovered to `m0≈0.0005, m1≈-0.00002` after `auto_rectif
 — ~600× and ~28× reduction respectively. `tesseract-ocr`/`tesseract-ocr-web`-
 local (no Core change) → this file + the commit are the record.
 
+> **⚠ MARGIN-FORMULA CORRECTION (PR #53 codex review, fixed post-merge).**
+> The margin above was computed as
+> `ceil(max(|ramp.at(0)|, |ramp.at(h-1)|) · w/2)` — **wrong whenever
+> `m1 ≠ 0`**, and it silently re-loses exactly the page-corner content the
+> canvas expansion exists to keep. The flaw: `shear_sample` evaluates the
+> ramp's slope at the OUTPUT coordinate `y_out_old`, so once that coordinate
+> is pushed into the padding zone (the whole *point* of the margin), the
+> slope used to compute the padding grows too — the required displacement and
+> the slope are **mutually dependent**, not two independent quantities you can
+> multiply. Codex's repro: `w=400, h=300, m0=0.04, m1=0.0004` → old formula
+> gives `margin=32`, but source pixel `(x=0, y=0)` actually needs
+> `y_out_old ≈ -34.7`, genuinely outside it. Fix: new `required_margin()`
+> **solves the inverse map** instead of bounding it —
+> `src_y_f = A(dx)·y_out_old − B(dx)` with `A(dx) = 1 + m1·dx`,
+> `B(dx) = dx·(m0 + m1·(h−1))` ⇒ `y_out_old = (src_y_f + B)/A`, evaluated at
+> the four `(dx, src_y_f)` corners (`dx ∈ {−cx, +cx}` × `src ∈ {0, h−1}`);
+> the margin is however far that range reaches past `[0, h−1]`. `A(dx)`
+> crossing zero (a keystone far past this module's small-angle premise) is
+> guarded defensively — skip that corner, rely on the hard `h` cap. Regression
+> test `rectify_grey_recovers_the_corner_a_naive_margin_formula_missed`
+> reproduces codex's exact numbers, asserts the corrected margin EXCEEDS the
+> naive one, and proves the corner pixel survives. **Lesson worth keeping:
+> when a transform's parameter is evaluated at the coordinate the transform
+> itself is displacing, bounding it by "worst-case slope × worst-case lever
+> arm" is a product of two things that aren't independent — solve the map,
+> don't estimate it.** 11/11 `rectify` tests, 164/164 crate suite.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the
