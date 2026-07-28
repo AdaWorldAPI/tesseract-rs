@@ -1,0 +1,231 @@
+{
+ "ascent": 21,
+ "cell_h": 111,
+ "cell_w": 353,
+ "cells": [
+  {
+   "col": 0,
+   "factor": 1.0,
+   "index": 0,
+   "row": 0,
+   "x": 24,
+   "y": 24
+  },
+  {
+   "col": 1,
+   "factor": 0.92,
+   "index": 1,
+   "row": 0,
+   "x": 425,
+   "y": 24
+  },
+  {
+   "col": 2,
+   "factor": 0.85,
+   "index": 2,
+   "row": 0,
+   "x": 826,
+   "y": 24
+  },
+  {
+   "col": 3,
+   "factor": 0.78,
+   "index": 3,
+   "row": 0,
+   "x": 1227,
+   "y": 24
+  },
+  {
+   "col": 4,
+   "factor": 0.72,
+   "index": 4,
+   "row": 0,
+   "x": 1628,
+   "y": 24
+  },
+  {
+   "col": 5,
+   "factor": 0.66,
+   "index": 5,
+   "row": 0,
+   "x": 2029,
+   "y": 24
+  },
+  {
+   "col": 6,
+   "factor": 0.6,
+   "index": 6,
+   "row": 0,
+   "x": 2430,
+   "y": 24
+  },
+  {
+   "col": 7,
+   "factor": 0.55,
+   "index": 7,
+   "row": 0,
+   "x": 2831,
+   "y": 24
+  },
+  {
+   "col": 0,
+   "factor": 0.5,
+   "index": 8,
+   "row": 1,
+   "x": 24,
+   "y": 191
+  },
+  {
+   "col": 1,
+   "factor": 0.46,
+   "index": 9,
+   "row": 1,
+   "x": 425,
+   "y": 191
+  },
+  {
+   "col": 2,
+   "factor": 0.42,
+   "index": 10,
+   "row": 1,
+   "x": 826,
+   "y": 191
+  },
+  {
+   "col": 3,
+   "factor": 0.38,
+   "index": 11,
+   "row": 1,
+   "x": 1227,
+   "y": 191
+  },
+  {
+   "col": 4,
+   "factor": 0.34,
+   "index": 12,
+   "row": 1,
+   "x": 1628,
+   "y": 191
+  },
+  {
+   "col": 5,
+   "factor": 0.3,
+   "index": 13,
+   "row": 1,
+   "x": 2029,
+   "y": 191
+  },
+  {
+   "col": 6,
+   "factor": 0.26,
+   "index": 14,
+   "row": 1,
+   "x": 2430,
+   "y": 191
+  },
+  {
+   "col": 7,
+   "factor": 0.11,
+   "index": 15,
+   "row": 1,
+   "x": 2831,
+   "y": 191
+  }
+ ],
+ "cols": 8,
+ "descent": 6,
+ "font_px": 22,
+ "grid_h": 326,
+ "grid_w": 3208,
+ "lines": [
+  {
+   "baseline_y": 33,
+   "text": "Optical character readers turn",
+   "words": [
+    {
+     "text": "Optical",
+     "x0": 10.0,
+     "x1": 87.7
+    },
+    {
+     "text": "character",
+     "x0": 94.7,
+     "x1": 200.05
+    },
+    {
+     "text": "readers",
+     "x0": 207.05,
+     "x1": 290.64
+    },
+    {
+     "text": "turn",
+     "x0": 297.64,
+     "x1": 342.8
+    }
+   ],
+   "x": 10
+  },
+  {
+   "baseline_y": 63,
+   "text": "printed pages into machine",
+   "words": [
+    {
+     "text": "printed",
+     "x0": 10.0,
+     "x1": 89.19
+    },
+    {
+     "text": "pages",
+     "x0": 96.19,
+     "x1": 162.61
+    },
+    {
+     "text": "into",
+     "x0": 169.61,
+     "x1": 211.73
+    },
+    {
+     "text": "machine",
+     "x0": 218.73,
+     "x1": 313.27
+    }
+   ],
+   "x": 10
+  },
+  {
+   "baseline_y": 93,
+   "text": "readable text for search and",
+   "words": [
+    {
+     "text": "readable",
+     "x0": 10.0,
+     "x1": 106.64
+    },
+    {
+     "text": "text",
+     "x0": 113.64,
+     "x1": 157.05
+    },
+    {
+     "text": "for",
+     "x0": 164.05,
+     "x1": 194.3
+    },
+    {
+     "text": "search",
+     "x0": 201.3,
+     "x1": 274.38
+    },
+    {
+     "text": "and",
+     "x0": 281.38,
+     "x1": 322.77
+    }
+   ],
+   "x": 10
+  }
+ ],
+ "pitch": 30,
+ "rows": 2,
+ "schema": "tesseract-rs/resgrid-gt.v1"
+}

@@ -23,6 +23,11 @@ image = { version = "0.25", default-features = false, features = [
     "pnm",
 ], optional = true }
 
+[dev-dependencies]
+# The quality-fence CI (`tests/quality_resolution_grid.rs`) parses its own
+# doc.v1 output + the generated ground-truth sidecar; test-only.
+serde_json = "1"
+
 [features]
 # D3.0 (Batch 3-alt): the projection-profile line segmenter + page-level
 # recognition composition. MARKED APPROXIMATION — not a Tesseract transcode;
