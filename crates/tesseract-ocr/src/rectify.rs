@@ -294,11 +294,32 @@ fn shear_same_size(grey: &[u8], w: usize, h: usize, ramp: &ShearRamp) -> Vec<u8>
 /// `dx ∈ {-cx, +cx}` (the page's horizontal extremes) × `src_y_f ∈ {0, h-1}`
 /// (the source's full vertical extent) — bounds the `y_out_old` range that
 /// must be covered; the margin is however far that range reaches past the
-/// un-padded `[0, h-1]`. `A(dx)` can only cross zero for a keystone steep
-/// enough that this module's own small-angle premise has already broken
-/// down (see the module docs) — guarded defensively (skip that corner) rather
-/// than assumed impossible; [`rectify_grey`]'s hard cap at `h` is the
-/// backstop if every corner degenerates.
+/// un-padded `[0, h-1]`.
+///
+/// ## Why corner evaluation needs `A(dx)` bounded away from zero
+///
+/// `y_out_old = (src + B(dx))/A(dx)` is a RATIONAL function of `dx`, so its
+/// extremes sit at the interval endpoints only while `A(dx)` keeps away from
+/// zero. If `A` reaches zero anywhere in `dx ∈ [-cx, cx]` the map is
+/// genuinely unbounded over the page and NO finite margin recovers every
+/// pixel — corner evaluation would report a small (even zero) margin that is
+/// simply wrong. A second codex review caught the first version silently
+/// doing exactly that: it `continue`d past a degenerate corner and claimed to
+/// "rely on the hard cap", but [`rectify_grey`]'s cap is `.min(h)` — it
+/// LOWERS an over-large margin and cannot RAISE a spuriously-small one. For
+/// `w=400, h=300, m0≈1.49249, m1=-0.005`: `A(+200) = 0` is skipped, the
+/// surviving corner yields margin `0`, yet a captured pixel at `x=399` needs
+/// `y_out_old ≈ -99.9` — dropped.
+///
+/// `A(dx) = 1 + m1·dx` is LINEAR, so it approaches or crosses zero somewhere
+/// in `[-cx, cx]` iff its two endpoint values straddle zero or either
+/// endpoint is itself near zero — checking both endpoints is therefore
+/// necessary AND sufficient. In that regime this function returns `h`, the
+/// same value [`rectify_grey`]'s cap would clamp to: pad maximally rather
+/// than compute a bogus small margin. Such a ramp is far past this module's
+/// small-angle premise (see the module docs) — a degenerate/noisy fit, not a
+/// real photographed page — so maximal padding plus the existing
+/// trim-to-content pass is the honest response, not a silent crop.
 #[must_use]
 fn required_margin(ramp: &ShearRamp, w: usize, h: usize) -> usize {
     if h == 0 {
@@ -306,13 +327,20 @@ fn required_margin(ramp: &ShearRamp, w: usize, h: usize) -> usize {
     }
     let cx = w as f32 / 2.0;
     let h1 = (h - 1) as f32;
+
+    // Degeneracy check across the WHOLE dx interval (see the doc comment):
+    // A is linear, so its endpoint values fully characterise whether it
+    // nears/crosses zero anywhere between them.
+    const A_MIN: f32 = 1e-4;
+    let a_neg = 1.0 + ramp.m1 * -cx;
+    let a_pos = 1.0 + ramp.m1 * cx;
+    if a_neg.abs() < A_MIN || a_pos.abs() < A_MIN || (a_neg < 0.0) != (a_pos < 0.0) {
+        return h;
+    }
+
     let mut lo = 0.0f32; // the un-padded canvas already covers [0, h-1]
     let mut hi = h1;
-    for &dx in &[-cx, cx] {
-        let a = 1.0 + ramp.m1 * dx;
-        if a.abs() < 1e-4 {
-            continue; // model breakdown at this extreme — rely on the hard cap
-        }
+    for (dx, a) in [(-cx, a_neg), (cx, a_pos)] {
         let b = dx * (ramp.m0 + ramp.m1 * h1);
         for &src in &[0.0f32, h1] {
             let y_out_old = (src + b) / a;
@@ -747,6 +775,64 @@ mod tests {
             "margin must be capped at h, so h2 <= 3h; got new_h={new_h} for h={h}"
         );
         assert_eq!(out.len(), w * new_h);
+    }
+
+    /// Second codex review on the inverse-map margin: when `A(dx) = 1 + m1·dx`
+    /// reaches zero inside `[-cx, cx]`, corner evaluation is invalid — the map
+    /// is unbounded there. The first version `continue`d past the degenerate
+    /// corner and claimed to "rely on the hard cap", but that cap is `.min(h)`
+    /// and can only LOWER a margin, never raise a spuriously-small one.
+    /// Reproduces the reported shape (`w=400, h=300, m0≈1.49249, m1=-0.005`):
+    /// `A(+200) = 0`, the surviving corner alone yields margin 0, yet a
+    /// captured pixel at `x=399` needs `y_out_old ≈ -99.9`.
+    #[test]
+    fn required_margin_forces_the_cap_when_an_inverse_corner_degenerates() {
+        let (w, h) = (400usize, 300usize);
+        let ramp = ShearRamp {
+            m0: 1.49249,
+            m1: -0.005,
+        };
+        let cx = w as f32 / 2.0;
+
+        // Pin the reported degeneracy: A(+cx) is (numerically) zero.
+        assert!(
+            (1.0 + ramp.m1 * cx).abs() < 1e-4,
+            "sanity-check the reported repro: A(+cx) should be ~0"
+        );
+
+        // The surviving corner alone would have produced NO padding at all.
+        let h1 = (h - 1) as f32;
+        let a_neg = 1.0 + ramp.m1 * -cx;
+        let b_neg = -cx * (ramp.m0 + ramp.m1 * h1);
+        let (mut lo, mut hi) = (0.0f32, h1);
+        for &src in &[0.0f32, h1] {
+            let y = (src + b_neg) / a_neg;
+            lo = lo.min(y);
+            hi = hi.max(y);
+        }
+        let one_corner_margin = (-lo).max(0.0).ceil().max((hi - h1).max(0.0).ceil()) as usize;
+        assert_eq!(
+            one_corner_margin, 0,
+            "repro premise: the non-degenerate corner alone yields a zero margin"
+        );
+
+        // The fix must instead force the cap.
+        assert_eq!(
+            required_margin(&ramp, w, h),
+            h,
+            "a degenerate inverse corner must force the capped margin"
+        );
+
+        // End to end: a captured top-edge pixel near the degenerate side is
+        // still recovered, which the zero-margin path would have dropped.
+        let mut straight = vec![255u8; w * h];
+        let mx = w - 1;
+        straight[mx] = 0; // (x = w-1, y = 0)
+        let (rectified, new_h) = rectify_grey(&straight, w, h, &ramp);
+        assert!(
+            rectified.chunks(w).take(new_h).any(|row| row[mx] == 0),
+            "top-edge pixel at x={mx} must survive the degenerate-ramp path"
+        );
     }
 
     #[test]
