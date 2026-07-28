@@ -263,6 +263,68 @@ fn shear_same_size(grey: &[u8], w: usize, h: usize, ramp: &ShearRamp) -> Vec<u8>
     out
 }
 
+/// The vertical padding [`rectify_grey`] needs so that EVERY source pixel
+/// `(x, y)` for `x ∈ [0, w)`, `y ∈ [0, h-1]` is reachable by SOME
+/// `y_out_old ∈ [-margin, h-1+margin]` — i.e. no genuinely-captured content
+/// is lost.
+///
+/// Naively bounding this by `max(|ramp.at(0)|, |ramp.at(h-1)|) · w/2` (this
+/// function's first version) is WRONG whenever `m1 ≠ 0`: [`shear_sample`]
+/// evaluates `ramp.at(...)` at the OUTPUT coordinate `y_out_old`, and once
+/// `y_out_old` is pushed outside `[0, h-1]` — which is the whole point of the
+/// padding — that evaluation point moves too. The required displacement and
+/// the slope used to compute it are mutually dependent, not two independent
+/// quantities you can multiply (caught by codex review on the first version:
+/// for `w=400, h=300, m0=0.04, m1=0.0004`, the old formula gave `margin=32`,
+/// but source pixel `(x=0, y=0)` actually needs `y_out_old ≈ -34.7` to be
+/// recovered — genuinely outside that margin, silently re-losing the exact
+/// content this whole mechanism exists to keep).
+///
+/// The correct closed form comes from actually solving [`shear_sample`]'s
+/// linear map for `y_out_old` given a target `src_y_f` and column offset
+/// `dx = x_out - cx`:
+///
+/// ```text
+/// src_y_f = y_out_old·(1 + m1·dx) - dx·(m0 + m1·(h-1))
+///         = A(dx)·y_out_old - B(dx)
+/// ⇒ y_out_old = (src_y_f + B(dx)) / A(dx)
+/// ```
+///
+/// Evaluated at the four corners of the `(dx, src_y_f)` rectangle —
+/// `dx ∈ {-cx, +cx}` (the page's horizontal extremes) × `src_y_f ∈ {0, h-1}`
+/// (the source's full vertical extent) — bounds the `y_out_old` range that
+/// must be covered; the margin is however far that range reaches past the
+/// un-padded `[0, h-1]`. `A(dx)` can only cross zero for a keystone steep
+/// enough that this module's own small-angle premise has already broken
+/// down (see the module docs) — guarded defensively (skip that corner) rather
+/// than assumed impossible; [`rectify_grey`]'s hard cap at `h` is the
+/// backstop if every corner degenerates.
+#[must_use]
+fn required_margin(ramp: &ShearRamp, w: usize, h: usize) -> usize {
+    if h == 0 {
+        return 0;
+    }
+    let cx = w as f32 / 2.0;
+    let h1 = (h - 1) as f32;
+    let mut lo = 0.0f32; // the un-padded canvas already covers [0, h-1]
+    let mut hi = h1;
+    for &dx in &[-cx, cx] {
+        let a = 1.0 + ramp.m1 * dx;
+        if a.abs() < 1e-4 {
+            continue; // model breakdown at this extreme — rely on the hard cap
+        }
+        let b = dx * (ramp.m0 + ramp.m1 * h1);
+        for &src in &[0.0f32, h1] {
+            let y_out_old = (src + b) / a;
+            lo = lo.min(y_out_old);
+            hi = hi.max(y_out_old);
+        }
+    }
+    let margin_low = (-lo).max(0.0).ceil();
+    let margin_high = (hi - h1).max(0.0).ceil();
+    margin_low.max(margin_high) as usize
+}
+
 /// Apply a vertical shear-ramp correction to `grey` (`w × h`, row-major),
 /// returning `(new_grey, new_h)` — width is never changed (this is a
 /// vertical-only correction), but height MAY GROW: a shear that pushes
@@ -273,42 +335,32 @@ fn shear_same_size(grey: &[u8], w: usize, h: usize, ramp: &ShearRamp) -> Vec<u8>
 ///
 /// ## Canvas sizing — "expand by the exact restoration size, then crop"
 ///
-/// `ramp.at(y)` is linear in `y`, so its extreme magnitude over the page
-/// occurs at one of the two height endpoints; the worst-case horizontal lever
-/// arm is the page center-to-edge distance `w/2`. The needed vertical margin
-/// is therefore exactly:
-///
-/// ```text
-/// margin = ceil(max(|ramp.at(0)|, |ramp.at(h-1)|) · w/2)
-/// ```
-///
-/// — closed-form because this is a linear shear model, not a general
-/// projective transform (which would need to trace all four corners through
-/// the map). The output canvas grows by `2·margin` (padding above AND below,
-/// since a keystone can push content past EITHER edge depending on which way
-/// it fans). That margin is a WORST CASE, evaluated at the page's horizontal
-/// extremes — most rows need far less, so the padded canvas is mostly blank
-/// near the top/bottom corners; any fully-background row is then trimmed off
-/// the top and bottom (not the middle — interior blank rows, e.g. paragraph
-/// gaps, are real content and stay untouched), so the returned image is
-/// exactly as tall as its content requires, never fatter than necessary and
-/// never missing a row that had real ink.
+/// The output canvas grows by `2·margin` (padding above AND below, since a
+/// keystone can push content past EITHER edge depending on which way it
+/// fans) — see [`required_margin`] for the closed-form derivation. That
+/// margin is a WORST CASE, evaluated at the page's horizontal extremes —
+/// most rows need far less, so the padded canvas is mostly blank near the
+/// top/bottom corners; any fully-background row is then trimmed off the top
+/// and bottom (not the middle — interior blank rows, e.g. paragraph gaps,
+/// are real content and stay untouched), so the returned image is exactly as
+/// tall as its content requires, never fatter than necessary and never
+/// missing a row that had real ink.
 #[must_use]
 pub fn rectify_grey(grey: &[u8], w: usize, h: usize, ramp: &ShearRamp) -> (Vec<u8>, usize) {
     if w == 0 || h == 0 {
         return (grey.to_vec(), h);
     }
     let cx = w as f32 / 2.0;
-    let m_extreme = ramp.at(0.0).abs().max(ramp.at((h - 1) as f32).abs());
     // Capped at `h`: a margin this module's own small-angle premise would
     // ever produce for a plausibly-real photographed page stays a small
-    // fraction of `h` (see the doc comment above) — a fit that would demand
-    // MORE than doubling the canvas is already well outside the regime this
-    // approximation is trusted in, so there is nothing to gain from honoring
-    // it literally. The cap is a hard backstop against a degenerate/noisy
-    // fit (e.g. segmentation garbage on non-text input) driving an unbounded
-    // allocation, not a case this module expects to hit on real input.
-    let margin = ((m_extreme * cx).ceil().max(0.0) as usize).min(h);
+    // fraction of `h` (see `required_margin`'s doc comment) — a fit that
+    // would demand MORE than doubling the canvas is already well outside the
+    // regime this approximation is trusted in, so there is nothing to gain
+    // from honoring it literally. The cap is a hard backstop against a
+    // degenerate/noisy fit (e.g. segmentation garbage on non-text input)
+    // driving an unbounded allocation, not a case this module expects to hit
+    // on real input.
+    let margin = required_margin(ramp, w, h).min(h);
     let h2 = h + 2 * margin;
 
     let mut out = vec![255u8; w * h2];
@@ -632,6 +684,51 @@ mod tests {
         assert!(
             survives,
             "marker at ({mx},{my}) must survive the canvas-expanding correction"
+        );
+    }
+
+    /// codex review on the first canvas-expansion version: with `m1 ≠ 0`,
+    /// `shear_sample` evaluates the ramp's slope at the OUTPUT coordinate, so
+    /// once that coordinate is pushed into the padding zone the slope used
+    /// to compute the padding keeps growing too — the naive
+    /// `max(|ramp.at(0)|, |ramp.at(h-1)|) · w/2` margin under-counts this
+    /// feedback and silently re-loses page-corner content. Reproduces the
+    /// exact reported shape (`w=400, h=300, m0=0.04, m1=0.0004`): source
+    /// `(x=0, y=0)` needs `y_out_old ≈ -34.7` to be recovered, genuinely
+    /// outside the old formula's `margin=32`. [`required_margin`]'s
+    /// corrected closed form must cover it.
+    #[test]
+    fn rectify_grey_recovers_the_corner_a_naive_margin_formula_missed() {
+        let (w, h) = (400usize, 300usize);
+        let mut straight = vec![255u8; w * h];
+        straight[0] = 0; // (x=0, y=0) — raster top-left corner
+
+        let ramp = ShearRamp {
+            m0: 0.04,
+            m1: 0.0004,
+        };
+
+        // The old (wrong) formula's margin, for direct comparison.
+        let m_extreme = ramp.at(0.0).abs().max(ramp.at((h - 1) as f32).abs());
+        let cx = w as f32 / 2.0;
+        let naive_margin = (m_extreme * cx).ceil() as usize;
+        assert_eq!(
+            naive_margin, 32,
+            "sanity-check the reported repro's numbers"
+        );
+
+        let corrected_margin = required_margin(&ramp, w, h);
+        assert!(
+            corrected_margin > naive_margin,
+            "corrected margin ({corrected_margin}) must exceed the naive one ({naive_margin}) \
+             for this m1 != 0 case"
+        );
+
+        let (rectified, new_h) = rectify_grey(&straight, w, h, &ramp);
+        let survives = rectified.chunks(w).take(new_h).any(|row| row[0] == 0);
+        assert!(
+            survives,
+            "the page's top-left corner pixel must survive rectification"
         );
     }
 
