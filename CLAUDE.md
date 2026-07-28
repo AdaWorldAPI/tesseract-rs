@@ -611,6 +611,37 @@ local (no Core change) → this file + the commit are the record.
 > arm" is a product of two things that aren't independent — solve the map,
 > don't estimate it.** 11/11 `rectify` tests, 164/164 crate suite.
 
+> **⚠ DEGENERATE-CORNER CORRECTION (PR #54 codex review, fixed post-merge).**
+> The inverse-map fix above still had a hole: when `A(dx) = 1 + m1·dx`
+> reaches zero somewhere in `dx ∈ [-cx, cx]`, the version above `continue`d
+> past that corner with the comment *"rely on the hard cap"* — **which was
+> simply false.** `rectify_grey`'s cap is `.min(h)`: it LOWERS an over-large
+> margin and can never RAISE a spuriously-small one. So a degenerate corner
+> was silently discarded and the margin computed from the surviving corner
+> alone — which can be **zero**. Codex's repro (`w=400, h=300, m0≈1.49249,
+> m1=-0.005`): `A(+200) = 0` is skipped, the `dx=-200` corner yields margin
+> `0`, yet a captured pixel at `x=399` needs `y_out_old ≈ -99.9` → dropped,
+> in exactly the degenerate/noisy-fit case the cap was supposed to contain.
+> **Root cause (the generalizable bit):** `y_out_old = (src + B(dx))/A(dx)`
+> is a **rational** function of `dx`, so evaluating only at the interval
+> endpoints is valid ONLY while `A(dx)` stays bounded away from zero. If `A`
+> reaches zero inside the interval the map is genuinely unbounded over the
+> page and NO finite margin recovers every pixel — the corner values are not
+> merely imprecise, they're meaningless. Fix: because `A(dx)` is **linear**,
+> it nears/crosses zero in `[-cx, cx]` iff its two endpoint values straddle
+> zero or either is itself near zero — checking both endpoints is necessary
+> AND sufficient. On that detection `required_margin` returns `h` (pad
+> maximally, the same value the cap clamps to) instead of a bogus small
+> number. Regression test
+> `required_margin_forces_the_cap_when_an_inverse_corner_degenerates` pins
+> codex's numbers, asserts the surviving corner alone WOULD have yielded `0`,
+> asserts the fix returns `h`, and proves the `x=399` pixel survives
+> end-to-end. **Lesson: a "defensive `continue`" that skips a case is only
+> safe if the fallback it defers to can actually cover that case — here the
+> cap could only clamp downward, so skipping meant silently under-padding.
+> Check the direction your backstop actually works in.** 12/12 `rectify`
+> tests, 165/165 crate suite.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the
