@@ -541,6 +541,12 @@ impl LstmRecognizer {
                 band_w,
                 band_h,
                 line_box,
+                metrics: crate::renderer::LineMetrics {
+                    xheight: row.xheight,
+                    ascrise: row.ascrise,
+                    descdrop: row.descdrop,
+                    baseline,
+                },
             });
         }
         out
@@ -661,7 +667,118 @@ impl LstmRecognizer {
             out.push(crate::renderer::LineWords {
                 words,
                 line_box: row.line_box,
+                metrics: Some(row.metrics),
             });
+        }
+        Ok(out)
+    }
+
+    /// **Multi-column reading order** — consumer-side composition (NOT a
+    /// Tesseract transcode; same footing as `structured.rs`): run
+    /// [`xy_cut`](crate::xy_cut::xy_cut) layout analysis FIRST, then the
+    /// proven makerow row finder WITHIN each block, concatenating the
+    /// blocks' lines in XY-cut reading order.
+    ///
+    /// Why: whole-page makerow finds rows by projection across the FULL page
+    /// width, so side-by-side columns merge into single full-width rows read
+    /// ACROSS the gutter — a real repro (an 8-column resolution test sheet)
+    /// produced 26 full-width lines where ~176 per-column lines exist, each
+    /// "line" concatenating all 8 columns left-to-right. Real Tesseract's own
+    /// pipeline runs layout analysis (textord blocks) before per-block line
+    /// finding; this composition mirrors that ordering with the pieces this
+    /// crate already has.
+    ///
+    /// A page where XY-cut finds no split (0 or 1 leaf — the common
+    /// single-column case) takes the EXACT whole-page
+    /// [`Self::recognize_page_makerow_words`] path: byte-identical output,
+    /// no behaviour change for existing single-column consumers.
+    ///
+    /// Per-block outputs are translated back into full-page coordinates
+    /// (`x += crop_left`; bottom-up `y += page_h - crop_bottom`), covering
+    /// `line_box`, every word's `char_boxes`, and the line metrics' baseline
+    /// — so downstream consumers (doc.v1, renderers, region assignment) see
+    /// one coherent page space regardless of which path ran.
+    ///
+    /// # Errors
+    ///
+    /// The first [`RecognizerError`] from any block's recognition.
+    pub fn recognize_page_blocks_words(
+        &self,
+        grey: &[u8],
+        w: usize,
+        h: usize,
+        dict: Option<&DictLite>,
+    ) -> Result<Vec<crate::renderer::LineWords>, RecognizerError> {
+        let blocks = crate::xy_cut::xy_cut(grey, w, h, &crate::xy_cut::XyCutParams::default());
+        if blocks.len() <= 1 {
+            return self.recognize_page_makerow_words(grey, w, h, dict);
+        }
+        let mut any_block_empty = false;
+
+        // GetRectImage's kImagePadding (imagedata.h:39) — the same slack the
+        // per-row crops get, so a block's edge glyphs keep their context.
+        const PAD: usize = 4;
+        let mut out: Vec<crate::renderer::LineWords> = Vec::new();
+        for blk in &blocks {
+            let left = blk.left.saturating_sub(PAD);
+            let top = blk.top.saturating_sub(PAD);
+            let right = (blk.right + PAD).min(w);
+            let bottom = (blk.bottom + PAD).min(h);
+            if right <= left || bottom <= top {
+                continue;
+            }
+            let (cw, ch) = (right - left, bottom - top);
+            let mut crop = Vec::with_capacity(cw * ch);
+            for y in top..bottom {
+                crop.extend_from_slice(&grey[y * w + left..y * w + right]);
+            }
+
+            let lines = self.recognize_page_makerow_words(&crop, cw, ch, dict)?;
+            if lines.is_empty() {
+                any_block_empty = true;
+            }
+
+            // Crop space → page space. x shifts by the crop's left edge; the
+            // bottom-up y frames relate by dy = page_h - crop_bottom (a crop
+            // y-up coordinate yc sits at page raster row `top + (ch - yc)`,
+            // i.e. page y-up `h - top - ch + yc = yc + (h - bottom)`).
+            let dx = left as i32;
+            let dy = (h - bottom) as i32;
+            for mut line in lines {
+                let (l, b, r, t) = line.line_box;
+                line.line_box = (l + dx, b + dy, r + dx, t + dy);
+                for word in &mut line.words {
+                    for cb in &mut word.char_boxes {
+                        cb.0 += dx;
+                        cb.1 += dy;
+                        cb.2 += dx;
+                        cb.3 += dy;
+                    }
+                }
+                if let Some(m) = &mut line.metrics {
+                    m.baseline += dy as f32;
+                }
+                out.push(line);
+            }
+        }
+
+        // No-content-loss guard: a block that recognized to NOTHING is either
+        // a genuine non-text block (a figure — fine) or a degenerate
+        // over-split crop the row finder cannot handle (e.g. XY-cut carving a
+        // sparse page into per-glyph micro-blocks) — which would silently
+        // LOSE text the whole-page reading finds. Arbitrate by total
+        // recognized words: only when a block came back empty, run the
+        // whole-page surface too and keep whichever recognized MORE words
+        // (ties → the blocked reading, whose column order is strictly
+        // better). The extra whole-page pass costs one recognition, paid only
+        // in the suspicious case, never on a cleanly-split page.
+        if any_block_empty || out.is_empty() {
+            let whole = self.recognize_page_makerow_words(grey, w, h, dict)?;
+            let words_of =
+                |ls: &[crate::renderer::LineWords]| ls.iter().map(|l| l.words.len()).sum::<usize>();
+            if words_of(&whole) > words_of(&out) {
+                return Ok(whole);
+            }
         }
         Ok(out)
     }
@@ -694,7 +811,7 @@ impl LstmRecognizer {
         dict: Option<&DictLite>,
         harvest: Option<&[crate::structured::FieldSpec]>,
     ) -> Result<Document, RecognizerError> {
-        let lines = self.recognize_page_makerow_words(grey, w, h, dict)?;
+        let lines = self.recognize_page_blocks_words(grey, w, h, dict)?;
         let mut page =
             crate::structured::DocPage::from_line_words(&lines, &self.charset, w as u32, h as u32);
         crate::structured::harden_numeric_tokens(&mut page);
@@ -1031,6 +1148,13 @@ struct MakerowRowCrop {
     /// The crop rectangle in bottom-up `TBOX` PAGE space `(left, bottom, right,
     /// top)` — the `line_box` passed to `extract_best_path_as_words`.
     line_box: (i32, i32, i32, i32),
+    /// The row's typographic metrics (`TO_ROW` xheight/ascrise/descdrop from
+    /// wave 3 + the fitted mid-line baseline) — the same numbers the band
+    /// extension above the crop was computed FROM, preserved instead of
+    /// discarded so renderers can size text from measurement rather than
+    /// guessing from the (deliberately generous) band height. Bottom-up PAGE
+    /// space, matching `line_box`.
+    metrics: crate::renderer::LineMetrics,
 }
 
 /// Reads the lstm component's trailing scalar fields (`TFile` LE encoding,

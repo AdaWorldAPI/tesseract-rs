@@ -70,7 +70,11 @@ fn main() {
     let page_w = box_r.max(0) as u32;
     let page_h = box_t.max(0) as u32;
 
-    let line = LineWords { words, line_box };
+    let line = LineWords {
+        words,
+        line_box,
+        metrics: None,
+    };
     let charset = &r.charset;
 
     let text = render_text(std::slice::from_ref(&line), charset);

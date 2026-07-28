@@ -318,7 +318,11 @@ mod tests {
     }
 
     fn dl(bbox: (i32, i32, i32, i32), words: Vec<DocWord>) -> DocLine {
-        DocLine { bbox, words }
+        DocLine {
+            bbox,
+            words,
+            metrics: None,
+        }
     }
 
     /// A 800x1000 page: header band = y in [0, 80], footer band = y in
