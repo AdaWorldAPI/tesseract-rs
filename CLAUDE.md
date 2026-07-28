@@ -689,6 +689,66 @@ text == the single band's text, metrics surviving translation; plus the
 over-split fallback). No Core change → this file + the commit are the
 record.
 
+**★ Quality fences over generated fixtures — resolution grid + typography
+overlay (2026-07-28).** Two NEW consumer-side CIs, same footing as
+`structured.rs`'s `doc.v1` and `rectify.rs` above: **NOT byte-parity
+transcodes** (no C++ oracle exists for either — there is nothing in
+libtesseract to diff against), they are quality/regression fences that pin
+MEASURED behaviour of the assembled pipeline against EXACT generated ground
+truth. Treat every threshold below as a **pinned observation**, not a proof —
+if the recognizer or the typography math changes on purpose, the numbers get
+re-measured and re-pinned, not defended.
+
+- **Fixture generator** — `corpus/gen/gen_resolution_grid.py` produces
+  `corpus/quality/resgrid.pgm` + `corpus/quality/resgrid.gt.json`. Same
+  license-clean rule as `corpus/gen/gen_pages.py`: every byte is generated
+  from text authored in the generator using the system DejaVu font, nothing
+  scraped or copied. It mirrors the SHAPE of a public "resolution testset"
+  sheet (an 8×2 grid of the same paragraph at descending effective
+  resolution) but is entirely self-authored: 3 lines/cell, 16 cells, constant
+  cell geometry, a downscale→upscale LANCZOS "ladder" per cell so ONE
+  typography ground truth (font_px/ascent/descent/pitch/per-line baseline_y/
+  per-word x-spans, all cell-relative px) holds for every cell regardless of
+  its degradation.
+- **Quality fence — `crates/tesseract-ocr/tests/quality_resolution_grid.rs`**
+  (~8m44s). Scores each cell by **Levenshtein CER** (character error rate),
+  deliberately not a word-level/bag-of-words score — CER is the only measure
+  that can see degradation INSIDE a word, which is exactly this print-trained
+  LSTM's characteristic failure mode (confident confusable substitution, not
+  outright non-recognition). MEASURED per-cell CER: **0.000 for cells 0-13**,
+  **0.023 for cell 14**, **0.814 for cell 15** — pinned as the **8+7+0**
+  pattern (all 8 top-row cells legible at CER ≤ 0.05; 7 of the 8 bottom-row
+  cells 8-14 legible; cell 15 DEAD at CER ≥ 0.5). The dead-cell bound is
+  **two-sided on purpose**: if the engine ever improves past the cliff the
+  test fails upward too, forcing a ladder re-pin rather than a silent
+  threshold drift. Also fences multi-column reading order on this fixture
+  (≥ 44 of ~48 per-cell lines recovered; a merged full-width reading would
+  yield ~6 — the failure mode `recognize_page_blocks_words` above exists to
+  prevent). Note on why cell scores are comparable at all: the LSTM is
+  recurrent, so this only holds because the block-aware path segments and
+  recognizes each cell from its OWN crop — no cell inherits another's hidden
+  state; a full-width read would let a sharp left cell's context mask a
+  blurred right cell's difficulty.
+- **Typography + overlay fence —
+  `crates/tesseract-ocr-pdf/tests/typography_overlay.rs`** (~1 min, crisp
+  cell 0 only). Four groups, each checked against EXACT generated ground
+  truth: (1) **font size** — measured `xheight` within `[0.40, 0.65]·font_px`
+  and `row_height = xheight + ascrise - descdrop` within `[0.7, 1.2]·font_px`
+  (the exact quantity real Tesseract sizes fonts from,
+  `ltrresultiterator.cpp:168-172`); (2) **type spacing** — consecutive
+  measured baselines reproduce the generator's 30px pitch within 2px, per-line
+  word count equals the authored word count; (3) **placement** — each
+  measured baseline within 3px of the known `baseline_y`, line left edge
+  within 6px of the known text x, first/last word x-spans within 6px/8px of
+  the known spans; (4) **original overlay** — every word bbox must cover real
+  ink in the original raster (≥ 5 dark px), and in the rendered searchable
+  PDF every invisible run's `Tm` must sit at its word bbox (`Tm.x ==
+  bbox.left`, `Tm.y == page_h - bbox.bottom`, within 0.51pt at 72dpi). All
+  five assertion groups were verified as REAL falsifiers by deliberately
+  breaking each expectation one at a time and confirming the test fails —
+  the same discipline the byte-parity leaves use, applied to a fence that
+  has no C++ side to diff against.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the

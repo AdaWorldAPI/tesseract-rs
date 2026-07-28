@@ -5,6 +5,10 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+  workflow_dispatch: {}
+  schedule:
+    # Nightly, for the `quality` job (slow end-to-end regression fences).
+    - cron: '0 3 * * *'
 
 env:
   CARGO_TERM_COLOR: always
@@ -108,3 +112,45 @@ jobs:
         cargo fmt -p tesseract-ocr-pdf -- --check
         cargo fmt -p tesseract-ogar -- --check
         cargo fmt -p tesseract-ocr-web -- --check
+
+  quality:
+    # Slow end-to-end quality-regression tests (~10 min total): the 8+7+0
+    # resolution-ladder CER fence (tesseract-ocr) and the typography-overlay
+    # PDF fence (tesseract-ocr-pdf). Both read corpus/quality/resgrid.* +
+    # corpus/model/eng.lstm* (committed fixtures) and skip gracefully if
+    # those are absent, so this job is hermetic but not part of the fast PR
+    # gate above — nightly + on-demand + push to master only.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    steps:
+    # Same sibling-checkout layout as the build job (see comment there):
+    # tesseract-core path-deps lance-graph-contract, tesseract-recognizer
+    # path-deps ndarray.
+    - uses: actions/checkout@v4
+      with:
+        path: tesseract-rs
+    - uses: actions/checkout@v4
+      with:
+        repository: AdaWorldAPI/lance-graph
+        path: lance-graph
+    - uses: actions/checkout@v4
+      with:
+        repository: AdaWorldAPI/ndarray
+        path: ndarray
+    - uses: actions/checkout@v4
+      with:
+        repository: AdaWorldAPI/OGAR
+        path: OGAR
+    # ndarray declares rust-version = 1.95; bump the toolchain to satisfy it.
+    - name: Rust 1.95 toolchain
+      run: rustup toolchain install 1.95 --profile minimal && rustup default 1.95
+    - name: Quality (resolution ladder, ocr)
+      working-directory: tesseract-rs
+      run: cargo +1.95 test -p tesseract-ocr --test quality_resolution_grid --verbose
+    - name: Quality (typography overlay, ocr-pdf)
+      working-directory: tesseract-rs
+      run: cargo +1.95 test -p tesseract-ocr-pdf --test typography_overlay --verbose
