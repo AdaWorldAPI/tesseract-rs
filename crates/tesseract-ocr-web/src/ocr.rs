@@ -302,17 +302,21 @@ pub fn ocr_image_bytes_debug(
     lang: Option<&str>,
     rectify: bool,
 ) -> Result<OcrDebugOutcome, String> {
-    let (decoded, w, h) = decode_grey(bytes)?;
-    // auto_rectify is a documented no-op (returns its input unchanged) when
-    // nothing significant was detected — comparing before/after is the
-    // honest way to report whether rectification actually did anything,
-    // rather than just echoing back the request flag.
-    let (raw, rectified) = if rectify {
-        let out = tesseract_ocr::rectify::auto_rectify(&decoded, w, h);
-        let changed = out != decoded;
-        (out, changed)
+    let (decoded, w, decoded_h) = decode_grey(bytes)?;
+    // auto_rectify is a documented no-op (returns its input + height
+    // unchanged) when nothing significant was detected — comparing
+    // before/after is the honest way to report whether rectification
+    // actually did anything, rather than just echoing back the request
+    // flag. Its canvas can GROW (or, after its own content-crop, shrink) —
+    // `h` MUST be rebound to the returned height; everything downstream
+    // (recognition, the reported page dimensions) has to agree with the
+    // buffer `raw` actually holds, not the originally-decoded size.
+    let (raw, h, rectified) = if rectify {
+        let (out, out_h) = tesseract_ocr::rectify::auto_rectify(&decoded, w, decoded_h);
+        let changed = out_h != decoded_h || out != decoded;
+        (out, out_h, changed)
     } else {
-        (decoded, false)
+        (decoded, decoded_h, false)
     };
     let (lang, model) = state.model(lang);
 

@@ -538,6 +538,52 @@ checkbox being checked and the page actually being corrected are different
 facts), surfaced in the debug stats panel. `tesseract-ocr`/`tesseract-ocr-pdf`-
 local (no Core change) → this file + the commit are the record.
 
+**★ Page rectification — eager-cropping fix (2026-07-24, same day follow-up).**
+`rectify_grey`'s first version kept the output canvas pinned to the SAME `w×h`
+as the input and CLAMPED any out-of-range sample to the nearest edge row —
+"eager cropping" reborn one layer up: content the correction itself shifts
+past the original top/bottom edge got smeared (clamp duplicates the edge row)
+or effectively lost, exactly the truncation-shaped failure the whole feature
+was built to fix, just relocated from "before rectify" to "inside rectify".
+Fixed with the standard rectification technique — **canvas-expansion
+warping** (the same idea behind `PIL.Image.rotate(expand=True)` /
+`cv2.warpAffine` with a computed output size): since `ShearRamp::at(y)` is
+linear, its extreme magnitude over the page occurs at one of the two height
+endpoints, so the needed vertical margin is closed-form —
+`margin = ceil(max(|ramp.at(0)|, |ramp.at(h-1)|) · w/2)` — no general
+four-corner tracing needed (this is a vertical shear, not a full homography).
+`rectify_grey`'s signature is now `(grey, w, h, ramp) -> (Vec<u8>, usize)`:
+width never changes, height MAY GROW. **"Expand by the exact restoration
+size, then crop after"** (the operator's own framing): the worst-case margin
+above is evaluated at the page's horizontal extremes, so most rows need far
+less — every fully-background row is trimmed off the top/bottom (never the
+middle; interior blank rows are real content, e.g. paragraph gaps) after
+expansion, so the returned page is exactly as tall as its content needs, not
+fatter than necessary and never missing a row that had real ink. A NEW
+`shear_sample` helper returns `Option<u8>` (`None` = genuinely no source data,
+not a clamp-fabricated duplicate); the round-trip test fixture
+(`synthetic_sheared_page`) now builds its "distorted" input via a separate
+`#[cfg(test)]`-only `shear_same_size` (same-size, no expansion) — deliberately
+DIFFERENT from production `rectify_grey`, since a real camera genuinely loses
+content that shears past the frame (a fixture should simulate that), while
+correction must recover content that WAS captured. `auto_rectify` threads the
+new `(Vec<u8>, usize)` through its up-to-3-pass loop; `ocr_image_bytes_debug`
+(`tesseract-ocr-web`) rebinds `h` to the returned height for everything
+downstream (recognition, reported page dimensions) — the original decoded `h`
+is no longer valid once rectify has run. Also added a hard margin CAP at `h`
+(so the canvas can at most triple) — not needed for any real photographed-page
+distortion this module's small-angle premise applies to, but a cheap backstop
+against a degenerate/noisy fit (e.g. segmentation garbage on non-text input)
+driving an unbounded allocation; a dedicated pathological-ramp test guards it.
+3 new tests (content-survival falsifier computing, not assuming, that a
+same-size clamp would have lost the marker; a "doesn't pointlessly inflate"
+sanity check; the margin-cap regression) — 13/13 `rectify` tests, 0
+regressions across the full 163-test crate suite. Verified against a REAL
+corpus page (not just synthetic bars): a deliberately-injected `m0=0.08,
+m1=0.0006` keystone recovered to `m0≈0.0005, m1≈-0.00002` after `auto_rectify`
+— ~600× and ~28× reduction respectively. `tesseract-ocr`/`tesseract-ocr-web`-
+local (no Core change) → this file + the commit are the record.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the

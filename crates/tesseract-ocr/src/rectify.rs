@@ -183,21 +183,26 @@ pub fn fit_shear_ramp(shears: &[RowShear]) -> Option<ShearRamp> {
     }
 }
 
-/// Apply a vertical shear-ramp correction to `grey` (`w × h`, row-major),
-/// returning a new buffer of the SAME dimensions.
+/// Sample one output pixel under the shear-ramp map, or `None` when the
+/// computed source position falls outside `[0, h-1]` — i.e. genuinely no
+/// source data exists there (as opposed to clamping, which would fabricate
+/// a duplicate of the nearest edge row). `y_out_old` is the SAME-SIZE
+/// (unpadded) output row index — negative or `>= h` are valid inputs (the
+/// caller may be sampling into a padded/expanded canvas); `cx` is `w/2.0`,
+/// passed in so callers computing it once don't repeat the division per row.
 ///
 /// ## Derivation
 ///
 /// A row with local slope `m` at page-up height `y0` satisfies (in the
-/// SOURCE/observed image) `observed_y_pageup(x) ≈ y0 + m·(x - cx)` for its
-/// center `cx = w/2` — this is exactly `ToRow::line_m`/`parallel_c`'s fitted
-/// line, reparametrized around the page's horizontal center. To recover the
-/// TRUE (horizontal) content at output position `(x_out, y_out)`, invert
-/// this — using the output row's OWN page-up height as a first-order stand-in
-/// for the (unknown until inverted) observed height when evaluating `m`, a
-/// safe approximation because row-to-row spacing is normally far larger than
-/// the shear-induced within-row height drift for a "typical photographed
-/// page" (as opposed to an extreme, near-90° keystone):
+/// SOURCE/observed image) `observed_y_pageup(x) ≈ y0 + m·(x - cx)` — this is
+/// exactly `ToRow::line_m`/`parallel_c`'s fitted line, reparametrized around
+/// the page's horizontal center. To recover the TRUE (horizontal) content at
+/// output position `(x_out, y_out)`, invert this — using the output row's
+/// OWN page-up height as a first-order stand-in for the (unknown until
+/// inverted) observed height when evaluating `m`, a safe approximation
+/// because row-to-row spacing is normally far larger than the shear-induced
+/// within-row height drift for a "typical photographed page" (as opposed to
+/// an extreme, near-90° keystone):
 ///
 /// ```text
 /// true_y_pageup = h - 1 - y_out
@@ -210,30 +215,135 @@ pub fn fit_shear_ramp(shears: &[RowShear]) -> Option<ShearRamp> {
 /// `m=0.1` observes at `x=cx+50` as page-up `55` → raster `44`; the formula
 /// gives `src_y = 49 - 0.1·50 = 44`. ✓)
 ///
-/// `src_y_raster` is rounded to the nearest source row and clamped to
-/// `[0, h-1]` (nearest-neighbour — no bilinear interpolation in this first
-/// version; OCR accuracy, not visual smoothness, is the target metric, and
-/// nearest-neighbour cannot systematically bias a least-squares-fit
-/// correction, only add minor per-pixel jitter). `src_x` is never adjusted
-/// (this is a vertical-shear-only correction — see the module docs for what
-/// is deliberately NOT attempted).
-#[must_use]
-pub fn rectify_grey(grey: &[u8], w: usize, h: usize, ramp: &ShearRamp) -> Vec<u8> {
-    if w == 0 || h == 0 {
-        return grey.to_vec();
+/// `src_y_raster` is rounded to the nearest source row (nearest-neighbour —
+/// no bilinear interpolation in this first version; OCR accuracy, not
+/// visual smoothness, is the target metric, and nearest-neighbour cannot
+/// systematically bias a least-squares-fit correction, only add minor
+/// per-pixel jitter). `src_x` is never adjusted (this is a vertical-shear-
+/// only correction — see the module docs for what is deliberately NOT
+/// attempted).
+fn shear_sample(
+    grey: &[u8],
+    w: usize,
+    h: usize,
+    ramp: &ShearRamp,
+    cx: f32,
+    y_out_old: i64,
+    x_out: usize,
+) -> Option<u8> {
+    let true_y_pageup = (h - 1) as f32 - y_out_old as f32;
+    let m = ramp.at(true_y_pageup);
+    let src_y_f = y_out_old as f32 - m * (x_out as f32 - cx);
+    if !(-0.5..=(h - 1) as f32 + 0.5).contains(&src_y_f) {
+        return None;
     }
+    let src_y = src_y_f.round().clamp(0.0, (h - 1) as f32) as usize;
+    Some(grey[src_y * w + x_out])
+}
+
+/// Same-size shear application — no canvas growth, background (255) where
+/// [`shear_sample`] finds nothing. Used ONLY by the round-trip test fixture
+/// ([`tests::synthetic_sheared_page`]) to simulate how a REAL camera "loses"
+/// content that shears past the frame edge (never captured in the first
+/// place) — a fundamentally different situation from [`rectify_grey`]'s job
+/// (recover content that WAS captured but the correction would otherwise
+/// push outside a fixed-size canvas), which is why production code must
+/// never call this instead of [`rectify_grey`].
+#[cfg(test)]
+fn shear_same_size(grey: &[u8], w: usize, h: usize, ramp: &ShearRamp) -> Vec<u8> {
     let cx = w as f32 / 2.0;
-    let mut out = vec![0u8; w * h];
+    let mut out = vec![255u8; w * h];
     for y_out in 0..h {
-        let true_y_pageup = (h - 1 - y_out) as f32;
-        let m = ramp.at(true_y_pageup);
         for x_out in 0..w {
-            let src_y_f = y_out as f32 - m * (x_out as f32 - cx);
-            let src_y = src_y_f.round().clamp(0.0, (h - 1) as f32) as usize;
-            out[y_out * w + x_out] = grey[src_y * w + x_out];
+            if let Some(v) = shear_sample(grey, w, h, ramp, cx, y_out as i64, x_out) {
+                out[y_out * w + x_out] = v;
+            }
         }
     }
     out
+}
+
+/// Apply a vertical shear-ramp correction to `grey` (`w × h`, row-major),
+/// returning `(new_grey, new_h)` — width is never changed (this is a
+/// vertical-only correction), but height MAY GROW: a shear that pushes
+/// genuinely-captured content past the original `[0, h-1]` rows would
+/// otherwise be lost (or, with naive clamping, smeared — duplicating the
+/// nearest edge row) instead of recovered. See [`shear_sample`]'s doc for the
+/// per-pixel derivation.
+///
+/// ## Canvas sizing — "expand by the exact restoration size, then crop"
+///
+/// `ramp.at(y)` is linear in `y`, so its extreme magnitude over the page
+/// occurs at one of the two height endpoints; the worst-case horizontal lever
+/// arm is the page center-to-edge distance `w/2`. The needed vertical margin
+/// is therefore exactly:
+///
+/// ```text
+/// margin = ceil(max(|ramp.at(0)|, |ramp.at(h-1)|) · w/2)
+/// ```
+///
+/// — closed-form because this is a linear shear model, not a general
+/// projective transform (which would need to trace all four corners through
+/// the map). The output canvas grows by `2·margin` (padding above AND below,
+/// since a keystone can push content past EITHER edge depending on which way
+/// it fans). That margin is a WORST CASE, evaluated at the page's horizontal
+/// extremes — most rows need far less, so the padded canvas is mostly blank
+/// near the top/bottom corners; any fully-background row is then trimmed off
+/// the top and bottom (not the middle — interior blank rows, e.g. paragraph
+/// gaps, are real content and stay untouched), so the returned image is
+/// exactly as tall as its content requires, never fatter than necessary and
+/// never missing a row that had real ink.
+#[must_use]
+pub fn rectify_grey(grey: &[u8], w: usize, h: usize, ramp: &ShearRamp) -> (Vec<u8>, usize) {
+    if w == 0 || h == 0 {
+        return (grey.to_vec(), h);
+    }
+    let cx = w as f32 / 2.0;
+    let m_extreme = ramp.at(0.0).abs().max(ramp.at((h - 1) as f32).abs());
+    // Capped at `h`: a margin this module's own small-angle premise would
+    // ever produce for a plausibly-real photographed page stays a small
+    // fraction of `h` (see the doc comment above) — a fit that would demand
+    // MORE than doubling the canvas is already well outside the regime this
+    // approximation is trusted in, so there is nothing to gain from honoring
+    // it literally. The cap is a hard backstop against a degenerate/noisy
+    // fit (e.g. segmentation garbage on non-text input) driving an unbounded
+    // allocation, not a case this module expects to hit on real input.
+    let margin = ((m_extreme * cx).ceil().max(0.0) as usize).min(h);
+    let h2 = h + 2 * margin;
+
+    let mut out = vec![255u8; w * h2];
+    for y_out_new in 0..h2 {
+        let y_out_old = y_out_new as i64 - margin as i64;
+        for x_out in 0..w {
+            if let Some(v) = shear_sample(grey, w, h, ramp, cx, y_out_old, x_out) {
+                out[y_out_new * w + x_out] = v;
+            }
+        }
+    }
+
+    // "Expand gracefully and crop after": trim fully-background rows off the
+    // top/bottom only, so the worst-case margin above doesn't leave a fatter
+    // canvas than the content actually needs.
+    let is_blank_row = |y: usize| out[y * w..(y + 1) * w].iter().all(|&v| v == 255);
+    let mut top = 0;
+    while top < h2 && is_blank_row(top) {
+        top += 1;
+    }
+    let mut bottom = h2;
+    while bottom > top && is_blank_row(bottom - 1) {
+        bottom -= 1;
+    }
+    if top == 0 && bottom == h2 {
+        return (out, h2);
+    }
+    let new_h = bottom - top;
+    if new_h == 0 {
+        // Defensive only (an all-blank page never reaches this function via
+        // auto_rectify, which requires a significant ramp fit from real
+        // detected rows) — never return a degenerate zero-height image.
+        return (out, h2);
+    }
+    (out[top * w..bottom * w].to_vec(), new_h)
 }
 
 /// Bound on [`auto_rectify`]'s correction passes. Each pass is a first-order
@@ -248,27 +358,34 @@ pub fn rectify_grey(grey: &[u8], w: usize, h: usize, ramp: &ShearRamp) -> Vec<u8
 const MAX_RECTIFY_PASSES: u32 = 3;
 
 /// Detect + fit + apply, iterating up to [`MAX_RECTIFY_PASSES`] times until
-/// the measured ramp is no longer [`ShearRamp::is_significant`]. A SAFE
-/// NO-OP (returns `grey` unchanged, cloned) when there aren't enough
+/// the measured ramp is no longer [`ShearRamp::is_significant`]. Returns
+/// `(new_grey, new_h)` — [`rectify_grey`]'s canvas may grow (or, after its
+/// own top/bottom trim, shrink) each pass, so callers MUST use the returned
+/// height for anything downstream, not the original `h`. A SAFE NO-OP
+/// (returns `(grey unchanged, h unchanged)`, cloned) when there aren't enough
 /// recognizable rows to fit a ramp, or the very first fit already isn't
 /// significant — the common case (an already-straight page) must never be
 /// perturbed by needless resampling.
 #[must_use]
-pub fn auto_rectify(grey: &[u8], w: usize, h: usize) -> Vec<u8> {
+pub fn auto_rectify(grey: &[u8], w: usize, h: usize) -> (Vec<u8>, usize) {
     let Some(first) = fit_shear_ramp(&detect_row_shears(grey, w, h)) else {
-        return grey.to_vec();
+        return (grey.to_vec(), h);
     };
     if !first.is_significant(h) {
-        return grey.to_vec();
+        return (grey.to_vec(), h);
     }
-    let mut current = rectify_grey(grey, w, h, &first);
+    let (mut current, mut current_h) = rectify_grey(grey, w, h, &first);
     for _ in 1..MAX_RECTIFY_PASSES {
-        match fit_shear_ramp(&detect_row_shears(&current, w, h)) {
-            Some(ramp) if ramp.is_significant(h) => current = rectify_grey(&current, w, h, &ramp),
+        match fit_shear_ramp(&detect_row_shears(&current, w, current_h)) {
+            Some(ramp) if ramp.is_significant(current_h) => {
+                let (next, next_h) = rectify_grey(&current, w, current_h, &ramp);
+                current = next;
+                current_h = next_h;
+            }
             _ => break,
         }
     }
-    current
+    (current, current_h)
 }
 
 #[cfg(test)]
@@ -312,7 +429,11 @@ mod tests {
     /// blob geometry, not recognizable characters, to fit a baseline), then
     /// apply a KNOWN forward shear-ramp distortion (the exact inverse of what
     /// `rectify_grey` corrects), so the recovered ramp can be checked against
-    /// ground truth.
+    /// ground truth. SAME-SIZE distortion ([`shear_same_size`], not
+    /// [`rectify_grey`]) — simulating what a real camera captures (content
+    /// sheared past the frame edge is simply never captured), distinct from
+    /// what correction should do (recover content the correction itself would
+    /// otherwise push outside a fixed canvas).
     fn synthetic_sheared_page(
         w: usize,
         h: usize,
@@ -340,19 +461,19 @@ mod tests {
             }
         }
 
-        // 2) Apply the FORWARD distortion by calling rectify_grey ITSELF with
-        // the NEGATED ramp, rather than hand-deriving a separate forward
-        // formula (a first attempt at that independently-derived formula had
-        // a sign/role bug — easy to get wrong twice, impossible to get wrong
-        // once: same trusted implementation, negated input). This is exact
-        // for pure rotation (m1=0): rectify_grey(rectify_grey(straight,
-        // -ramp), ramp) == straight algebraically, since a constant shear
-        // and its negation are exact inverses of each other. For m1≠0 it's a
-        // first-order approximation (same order as rectify_grey's own
+        // 2) Apply the FORWARD distortion by calling shear_same_size with the
+        // NEGATED ramp, rather than hand-deriving a separate forward formula
+        // (a first attempt at that independently-derived formula had a
+        // sign/role bug — easy to get wrong twice, impossible to get wrong
+        // once: same trusted per-pixel math, negated input). This is exact
+        // for pure rotation (m1=0): shearing by -ramp then correcting by
+        // +ramp cancels algebraically, since a constant shear and its
+        // negation are exact inverses of each other. For m1≠0 it's a
+        // first-order approximation (same order as the correction's own
         // approximation), which is all the recovery tests below require.
         let ramp = ShearRamp { m0, m1 };
         let neg_ramp = ShearRamp { m0: -m0, m1: -m1 };
-        let distorted = rectify_grey(&straight, w, h, &neg_ramp);
+        let distorted = shear_same_size(&straight, w, h, &neg_ramp);
         (distorted, ramp)
     }
 
@@ -401,8 +522,13 @@ mod tests {
         let before = fit_shear_ramp(&detect_row_shears(&distorted, 400, 300)).expect("fit before");
         assert!(before.is_significant(300), "fixture should be distorted");
 
-        let rectified = rectify_grey(&distorted, 400, 300, &truth);
-        let after_shears = detect_row_shears(&rectified, 400, 300);
+        let (rectified, new_h) = rectify_grey(&distorted, 400, 300, &truth);
+        assert_eq!(
+            rectified.len(),
+            400 * new_h,
+            "buffer length must match the reported height"
+        );
+        let after_shears = detect_row_shears(&rectified, 400, new_h);
         let after = fit_shear_ramp(&after_shears).expect("fit after");
         assert!(
             after.m0.abs() < before.m0.abs(),
@@ -417,32 +543,113 @@ mod tests {
             after.m1
         );
         assert!(
-            !after.is_significant(300),
+            !after.is_significant(new_h),
             "rectified page should read as ~straight: m0={} m1={}",
             after.m0,
             after.m1
         );
     }
 
+    /// The canvas-expansion + crop-back-to-content round trip
+    /// [`rectify_grey`] does internally must not systematically grow the
+    /// page — a worst-case-margin expansion followed by trimming every
+    /// fully-background row off the top/bottom should land close to (not
+    /// wildly larger than) the original height for a realistic distortion.
+    #[test]
+    fn rectify_grey_does_not_pointlessly_inflate_page_height() {
+        let (distorted, truth) = synthetic_sheared_page(400, 300, 8, 0.04, 0.0004);
+        let (_rectified, new_h) = rectify_grey(&distorted, 400, 300, &truth);
+        assert!(
+            new_h <= 300 + 40,
+            "expected the trimmed height to stay close to 300, got {new_h}"
+        );
+    }
+
     #[test]
     fn auto_rectify_is_a_no_op_on_an_already_straight_page() {
         let (straight, _) = synthetic_sheared_page(400, 300, 8, 0.0, 0.0);
-        let out = auto_rectify(&straight, 400, 300);
+        let (out, out_h) = auto_rectify(&straight, 400, 300);
         assert_eq!(out, straight, "a straight page must not be perturbed");
+        assert_eq!(out_h, 300, "height must not change on a no-op");
     }
 
     #[test]
     fn auto_rectify_corrects_a_significantly_distorted_page() {
         let (distorted, _) = synthetic_sheared_page(400, 300, 8, 0.05, 0.0005);
-        let out = auto_rectify(&distorted, 400, 300);
-        assert_ne!(out, distorted, "a distorted page should be corrected");
-        let after = fit_shear_ramp(&detect_row_shears(&out, 400, 300)).expect("fit after");
+        let (out, out_h) = auto_rectify(&distorted, 400, 300);
+        assert_ne!(
+            (out.clone(), out_h),
+            (distorted.clone(), 300),
+            "a distorted page should be corrected"
+        );
+        assert_eq!(
+            out.len(),
+            400 * out_h,
+            "buffer length must match the reported height"
+        );
+        let after = fit_shear_ramp(&detect_row_shears(&out, 400, out_h)).expect("fit after");
         assert!(
-            !after.is_significant(300),
+            !after.is_significant(out_h),
             "auto-rectified output should read as ~straight: m0={} m1={}",
             after.m0,
             after.m1
         );
+    }
+
+    /// The direct falsifier for the reported "eager cropping" gap: a same-
+    /// size, clamped correction genuinely cannot show this marker at ANY
+    /// output row (verified below, not assumed) — the shear pushes its true
+    /// position outside `[0, h-1]` entirely, not just near the boundary.
+    /// [`rectify_grey`]'s canvas-expanding correction must still recover it.
+    #[test]
+    fn rectify_grey_preserves_content_a_fixed_size_clamp_would_have_lost() {
+        let (w, h) = (200usize, 100usize);
+        let mut straight = vec![255u8; w * h];
+        // Far from the horizontal center (maximum shear lever arm) and deep
+        // enough into the page that a same-size correction cannot reach it
+        // by rounding alone (verified, not assumed, below).
+        let (mx, my) = (w - 1, h - 20);
+        straight[my * w + mx] = 0;
+
+        let ramp = ShearRamp { m0: 0.5, m1: 0.0 };
+        let (rectified, new_h) = rectify_grey(&straight, w, h, &ramp);
+
+        // Confirm the premise: no y_out in the OLD same-size range 0..h
+        // would have retrieved this marker.
+        let cx = w as f32 / 2.0;
+        let reachable_same_size = (0..h).any(|y_out| {
+            let true_y_pageup = (h - 1 - y_out) as f32;
+            let m = ramp.at(true_y_pageup);
+            let src_y = (y_out as f32 - m * (mx as f32 - cx)).round();
+            src_y as i64 == my as i64
+        });
+        assert!(
+            !reachable_same_size,
+            "test premise violated: marker would already survive a same-size correction"
+        );
+
+        let survives = rectified.chunks(w).take(new_h).any(|row| row[mx] == 0);
+        assert!(
+            survives,
+            "marker at ({mx},{my}) must survive the canvas-expanding correction"
+        );
+    }
+
+    /// A degenerate/pathological ramp (well outside any plausible
+    /// photographed-page distortion) must not blow up the output canvas —
+    /// the margin cap backstops a noisy/garbage fit (e.g. segmentation on
+    /// non-text input) from driving an unbounded allocation.
+    #[test]
+    fn rectify_grey_caps_the_margin_on_a_pathological_ramp() {
+        let (w, h) = (300usize, 200usize);
+        let straight = vec![255u8; w * h];
+        let ramp = ShearRamp { m0: 500.0, m1: 0.0 };
+        let (out, new_h) = rectify_grey(&straight, w, h, &ramp);
+        assert!(
+            new_h <= 3 * h,
+            "margin must be capped at h, so h2 <= 3h; got new_h={new_h} for h={h}"
+        );
+        assert_eq!(out.len(), w * new_h);
     }
 
     #[test]
