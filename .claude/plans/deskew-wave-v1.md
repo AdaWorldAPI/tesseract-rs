@@ -80,6 +80,49 @@ predecessor. **One leaf per commit**, each byte-parity green before the next.
 | **D7** | `pixDeskewBoth` | `skew.c:166-189` | `deskew` | deskew → rot90 → deskew → rot90⁻¹. The 90° round-trip exists because the differential-square-sum detector is directional; one pass cannot see skew in both axes. Needs D1. |
 | **D8** | Pipeline wiring | — | end-to-end | Same page-geometry slot `auto_rectify` occupies. |
 
+## The pi-literal rule, refined by measurement (2026-07-29)
+
+Audit §1/§2 says each C pi literal must be reproduced with **its own exact
+literal**, never a shared `std::f*::consts::PI`, "which would be MORE precise
+than either C literal and could diverge in the last bit." That is correct as a
+general rule and the reason the audit flags the sites at all.
+
+It also collides head-on with this repo's **no `#[allow(...)]`** rule, because
+clippy's `approx_constant` rejects the literals outright. Measured, so the
+conflict is resolved by evidence rather than by whoever edits last:
+
+| | f64 bits | `== f64::consts::PI` |
+|---|---|---|
+| `shear.c` `3.14159265` | `0x400921fb53c8d4f1` | **no** |
+| `skew.c` `3.1415926535` | `0x400921fb54411744` | **no** |
+| `f64::consts::PI` | `0x400921fb54442d18` | — |
+
+So in **f64** the literals genuinely differ from `PI` — three distinct values.
+The audit's caution is real, not theoretical.
+
+**But both sites narrow to f32 immediately**, and after that narrowing the
+difference vanishes: `(3.14159265_f64 / 2.0) as f32` is bit-identical to
+`(PI / 2.0) as f32`, and `(3.1415926535_f64 / 180.0) as f32` is bit-identical
+to `(PI / 180.0) as f32`. The extra f64 precision is discarded by the cast
+before it can reach anything observable.
+
+**The rule, therefore:**
+
+- Substituting `consts::PI` is safe **only where the result is narrowed to
+  f32**, and only after checking the bits. Two sites qualify:
+  `normalize_angle_for_shear`'s `pi2` and the sweep's `deg2rad`.
+- It is **NOT** safe anywhere the value stays f64. If a future change removes
+  an `as f32` — e.g. widening the sweep's arithmetic — the substitution
+  silently becomes wrong and the parity diff is the only thing that would
+  catch it.
+- The f32-side precedent is different and simpler:
+  `deskew_dump.rs`'s `oracle_deg_to_rad` uses `f32::consts::PI` because the C++
+  side's literal is itself a `float` literal, so both round to `0x40490fdb` at
+  parse time. That one needs no narrowing argument.
+
+Record the bits in the code comment at each site. A bare "verified identical"
+is not enough — the next reader needs to know *which* condition made it true.
+
 ## D8 — should deskew default ON? (decide when D6 lands, not before)
 
 `rectify` and `sauvola` are both **opt-in**, and the reflex is to make deskew
