@@ -80,6 +80,40 @@ predecessor. **One leaf per commit**, each byte-parity green before the next.
 | **D7** | `pixDeskewBoth` | `skew.c:166-189` | `deskew` | deskew → rot90 → deskew → rot90⁻¹. The 90° round-trip exists because the differential-square-sum detector is directional; one pass cannot see skew in both axes. Needs D1. |
 | **D8** | Pipeline wiring | — | end-to-end | Same page-geometry slot `auto_rectify` occupies. |
 
+## D8 — should deskew default ON? (decide when D6 lands, not before)
+
+`rectify` and `sauvola` are both **opt-in**, and the reflex is to make deskew
+opt-in too. But deskew is structurally different from both, in a way that
+argues the other direction:
+
+**Leptonica already gates it.** `pixDeskewGeneral` refuses to rotate unless
+`|angle| >= 0.1°` **and** `conf >= 3.0` — below either it returns the original,
+unrotated. So on an already-straight page the leaf is a **no-op by the C's own
+design**, not by our restraint. That is a much stronger safety property than
+`auto_rectify`'s (which is a no-op only because *we* checked
+`ShearRamp::is_significant`) and than Sauvola's (which is not a no-op at all —
+it produces different pixels on every page).
+
+Measured evidence the gate is real and tight: `page_01.pgm` — a cleanly
+rendered, nominally straight page — measures `angle = −0.141°`, `conf = 3.36`.
+That sits **just inside both thresholds**, so even our own straight corpus page
+would be rotated. Which means "no-op on straight pages" is NOT automatic in
+practice, and the reflex to default it ON is premature.
+
+So the decision procedure, once D6 exists:
+
+1. Run the corpus under deskew-on vs deskew-off through the **8+7+0 CER fence**
+   and the golden anchors. The fence is already two-sided, so it detects
+   improvement as well as regression.
+2. Default ON only if the goldens are unchanged **or** deliberately re-pinned
+   with the CER moving the right way. `page_01` sitting at conf 3.36 says the
+   goldens probably DO move — treat a re-pin as the expected outcome, not a
+   surprise.
+3. If they move ambiguously, ship opt-in like rectify and say why.
+
+Do not decide this from the gate constants alone — they look conservative and
+the one page we measured says otherwise.
+
 ## Composition with `rectify` — order matters
 
 Deskew and rectify are complementary, not redundant, but they **overlap in
