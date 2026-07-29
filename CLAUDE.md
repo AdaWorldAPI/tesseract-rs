@@ -749,6 +749,148 @@ re-measured and re-pinned, not defended.
   the same discipline the byte-parity leaves use, applied to a fence that
   has no C++ side to diff against.
 
+**★ Deskew wave OPEN and D1/D2/D5 byte-parity GREEN (2026-07-29).** The
+rotational half of page geometry — `rectify.rs` corrects *keystone* only, and
+`decide_if_table`'s steps 1-4 front-end has been blocked on this. Provenance is
+clean: `/tmp/leptonica-src` at tag **1.82.0**, an exact match for the installed
+`liblept`, so **zero ABI/version skew** (same footing as Sauvola).
+
+Manifest: `.claude/harvest/leptonica-skew-callgraph.txt` (ruff-driven, ~20 C
+functions across `skew.c` / `rotate.c` / `rotateam.c` / `rotateshear.c` /
+`rotateorth.c` / **`shear.c`** — the sixth was outside the original scope but is
+unavoidable, since the sweep's rotation and the shear dispatch's kernel live
+there). Plan: `.claude/plans/deskew-wave-v1.md` (D1-D8). Oracle:
+`.claude/harvest/oracles/skew_oracle.cpp` (+ harness `run_skew_parity.sh`).
+
+Shipped in `crates/tesseract-ocr/src/deskew.rs`, each diffed against real
+liblept: **D1** `rotate90_grey` (identical both directions, full page); **D2**
+`find_differential_square_sum` (identical at angle 0, full page); **D5**
+`rotate_am_gray` + `rotate_am_gray_corner` (**161/161 each** on a dense
+−20°..+20° / 0.25° sweep, plus 5 full-page angles).
+
+**The dense sweep is the method, not decoration.** Audit §3's trap: `sina`/`cosa`
+are computed in **f64** and narrowed to f32 **once**, after which the entire
+per-pixel loop runs in **f32** — an all-f32 *or* all-f64 port diverges only on a
+*subset* of angles, so a handful of round numbers passes while the port is wrong.
+The fixture must also be non-flat: a uniform field cannot expose it at all (the
+16×16 sub-pixel weights sum to 256 regardless of precision path — pinned by the
+module's own `rotate_am_gray_uniform_field_stays_uniform` test). Other pinned
+sites: `(l_int32)` truncates toward zero → plain `as i32`, **never `+0.5`** (that
+convention belongs to `pixEmbedForRotation`, a different function); `skiph =
+(0.05_f64 * w as f64) as i32`; the dss accumulation is **sequential f32 in row
+order** — an f64 accumulator does not match.
+
+> **⚠ ORACLE LESSONS (two codex P1s + two gaps found by running it).** The
+> oracle was wrong twice in ways that would have cost the wave real time:
+> (1) the sweep arm called `pixFindSkewSweep` — the standalone API, which is
+> **not on `pixFindSkew`'s path** (the manifest's own STEP 3 classifies it SKIP)
+> and refines with `numaFitMax` where the real entry takes the raw coarse max and
+> binary-searches; (2) the `dss` arm prepared its image with
+> `pixRotateShearCenter`, a **composed** two/three-shear rotation, where the
+> sweep applies a **single** vertical shear — so a CORRECT D3 would have FAILED
+> the oracle while an implementation of the WRONG operation could have PASSED.
+> Plus `rot90` and `rotamgraycorner` arms were missing entirely, leaving D1 and
+> the corner kernel with no oracle side. **The generalizable rule: an oracle must
+> reproduce the operation under test, not something in its neighbourhood that
+> also rotates.** Verified the pivot is load-bearing — at 2° the pivots give
+> 23310 (corner) vs 23090 (center); at 0° they agree exactly (258022), which is
+> precisely what makes D2 diffable in isolation before D3 exists.
+
+Also added `format_g9` in `examples/deskew_dump.rs` — C's `%.9g`. Rust has no
+`%g`, and both obvious substitutes are wrong for a whole-file diff (`{:.9e}`
+always uses exponent form; `{}` uses shortest-round-trip, a third rule), so a
+formatter mismatch flags every float line as a parity failure and buries the real
+signal. `f32::consts::PI` replaces the C++ pi literal only because clippy's
+`approx_constant` rejects it — verified free, both are `0x40490fdb`; the doc
+records why it is **not** `f32::to_radians()` (that folds `PI/180` into a
+constant *before* multiplying, and fp multiply is not associative).
+
+Remaining: D3 (vertical shear), D4 (sweep+search), D6/D7
+(`pixDeskewGeneral`/`Both`), D8 (pipeline wiring — deskew runs BEFORE rectify, so
+a purely-rotated page must then measure `m0 ≈ 0`, a free falsifier).
+
+**★ Binarization mode is selectable — and the measurement says DON'T flip the
+default yet (2026-07-29).** `BinarizeMode` now threads through
+`XyCutParams::binarize_mode` and `LstmRecognizer::recognize_document_with_mode`.
+Otsu stays default everywhere, proven not asserted: `golden_pages` (779 s) and
+the 8+7+0 CER fence (506 s) both pass untouched, plus a `Document`-equality
+regression test.
+
+Probe `examples/binarize_ab.rs` over generated `corpus/quality/uneven_*.pgm`
+(a real page × a multiplicative illumination field — the existing corpus is
+cleanly-rendered pages where Sauvola's advantage is invisible, so the fixture had
+to be built to make the difference *reachable*). Two findings pointing opposite
+ways, numbers in `.claude/harvest/sauvola-vs-otsu-probe.md`:
+
+1. **Sauvola does what it claims.** Under uneven light Otsu classifies **~48% of
+   the page as ink** (a single threshold cannot separate when the background's own
+   value spans most of the range, so the dark half floods solid black); Sauvola
+   holds at **~2.8%**, indistinguishable from its own clean-page value. ~17×,
+   stable across both degradation shapes and both strengths.
+2. **It cannot currently improve OCR text — by construction.** CER and
+   `word_count` are byte-identical between modes on every fixture, because
+   `binarize_mode` reaches the layout + region/table pass only. Word/line
+   recognition runs through `recognize_page_blocks_words` →
+   `segment::segment_rows`, a **THIRD independent always-Otsu binarizer** called
+   before `binarize_mode` is in scope. (Three separate Otsu binarizers exist in
+   this crate; two are now mode-aware, `segment.rs` is not.)
+
+**So `segment.rs` is the lever, and the top standalone priority** — it is what
+makes *any* binarization improvement reach recognized text. Without it Wolf and
+Singh would land and change nothing, exactly as Sauvola just did. It is also the
+path every golden anchor and the 8+7+0 fence runs through, so use the same safe
+shape: thread the mode, keep Otsu default, measure, then decide.
+
+Next rungs (`.claude/harvest/binarization-roadmap.md`): **Wolf-Jolion** then
+**Singh et al.** (arXiv 1201.5227). One family, one shape — `binarize.rs` already
+carries the expensive machinery byte-parity green, so each rung is a new *closing
+formula*, not a new pipeline. Wolf fixes Sauvola's fixed `R=128` collapsing on
+faded scans; Singh drops the squared integral entirely. **Parity caveat up front:
+leptonica implements Sauvola but NOT Wolf or Singh**, so neither can be a liblept
+byte-parity leaf — either oracle against the reference impl or drop to the
+quality-fence footing and *say so in the module docs*.
+
+**★ Two "blocked" deferrals were never data-blocked (2026-07-29).** Both
+falsifying fixtures are now committed (`corpus/model/README.md` § "Falsifier
+fixtures" carries provenance, histograms, SHA256s, and the
+`eng.unicharset` vs `eng.lstm-unicharset` trap):
+
+- **C3 unblocked** — `chi_sim.lstm-recoder`. The `next_codes_` trie is
+  *structurally empty* for eng/deu (every code length 1), so C3's paths were
+  unreachable, not untested. chi_sim: 4022 entries, lengths
+  `{1:128, 2:278, 3:2077, 4:1515, 5:24}`. **This also corrects the plan's
+  standing "Han codes are length-3" claim — 3 is the mode, not the range.**
+  Evidence is positive: the parser was cross-validated on eng/deu first (both hit
+  `4 + 9N` exactly; chi_sim does not, which is *how* we know it is genuinely
+  multi-code rather than mis-parsed).
+- **bbox/stats unblocked** — the legacy `eng.unicharset` has **112/112 distinct**
+  CSV blobs where the LSTM one has 111 identical.
+
+Still deferred, with reasons: **2-D / softmax-LSTM** is blocked *architecturally*
+(four models across three scripts and two capacities all land in one architecture
+family; those paths are vestigial from Tesseract 4.0's pre-standardization phase
+— unblocking needs custom training, not another download). **`pixScaleSmooth`
+(f<0.02) + colour scale**: `f<0.02` means a source >50× the target height, not a
+line crop, and real Tesseract's own `PreparePixInput` converts to grey *before*
+scaling, so the colour path is unreachable in the reference implementation too.
+
+**Doc-drift root cause found:** Phase C listed C1/C2 as open, but both shipped
+under a *different* plan's labels (`pdf-to-text-ocr-v1.md` D1.1-D1.3), and that
+plan's own tracker is stale too. **Source is ground truth; both docs had
+drifted.** `extract_best_path_as_words` is also already present, so B3-full is
+*unverified-open*, not trusted-open.
+
+**★ The OCR landscape is two ladders, not one** (`.claude/harvest/ocr-landscape-2026.md`).
+Ladder A (Otsu → Sauvola → Wolf → Singh) *improves* this repo. Ladder B (GOT-OCR2.0
+2409.01704 → olmOCR → DeepSeek-OCR 2510.18234) *replaces* the classical pipeline
+and does NOT belong inside a byte-parity transcode — a 380M-7B GPU model would
+falsify the crate's whole premise (pure-Rust, zero C at runtime, CPU-only, ~4 MB).
+It has an obvious correct seam anyway: `doc.v1` is already "the OPTIONAL seed a
+consumer feeds via OGAR", so a VLM arm slots *there*, never inside the recognizer.
+Worth naming: **DeepSeek-OCR's "contexts optical compression" is this workspace's
+own thesis in a different medium** — it compresses the input representation,
+bgz-tensor compresses the computation; they compose.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the
