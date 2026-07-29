@@ -1,4 +1,4 @@
-//! **ClassView placement — the same synthesize-the-border algorithm, rotated.**
+//! **Furniture bands — the same synthesize-the-border algorithm, rotated.**
 //!
 //! A page IS a table with one big cell: `Main`, with `Header` above and
 //! `Footer` below. The whitespace separating them is the same signal as the
@@ -7,8 +7,18 @@
 //! page's furniture bands, and this measures whether it does, against `xy_cut`
 //! (what the pipeline uses today) on a fixture with KNOWN band positions.
 //!
-//! Named ClassView per the OGAR concept: one register, projected into a typed
-//! reading. `ogar_doc_ir::RegionKind` already carries `Header`/`Main`/`Footer`.
+//! **Naming (operator correction):** these are *furniture bands*, NOT a
+//! "ClassView". That term is **reserved in lance-graph** — it is the
+//! `classid → ClassView` method-resolution manifest, used mainly for
+//! projection inside lance-graph and for **Klickwege parity measurement**
+//! (`ClassView × WideFieldMask` is the Klickwege brick). Reusing it for a
+//! projection over ink would collide with a load-bearing architectural term
+//! and quietly widen its meaning — the kind of vocabulary drift that makes a
+//! reserved word stop reserving anything.
+//!
+//! What this produces feeds `ogar_doc_ir::RegionKind`, which already carries
+//! `Header`/`Main`/`Footer` — that is the output vocabulary, and it is the
+//! consumer-side name to use.
 
 use std::path::Path;
 use tesseract_ocr::{xy_cut, XyCutParams};
@@ -21,7 +31,7 @@ fn corpus() -> std::path::PathBuf {
 /// inter-LINE leading does not read as a region boundary. Exactly the table
 /// algorithm's gutter filter, on the other axis: band gaps are the outliers,
 /// line leading is the median.
-fn classview_bands(grey: &[u8], w: usize, h: usize) -> Vec<(usize, usize)> {
+fn furniture_bands(grey: &[u8], w: usize, h: usize) -> Vec<(usize, usize)> {
     let inked: Vec<bool> = (0..h)
         .map(|y| (0..w).any(|x| grey[y * w + x] < 128))
         .collect();
@@ -59,7 +69,7 @@ fn classview_bands(grey: &[u8], w: usize, h: usize) -> Vec<(usize, usize)> {
 }
 
 #[test]
-fn classview_vs_xy_cut_placement_exactness() {
+fn furniture_bands_vs_xy_cut_placement_exactness() {
     let p = corpus().join("pages/page_furniture.pgm");
     if !p.exists() {
         eprintln!("skipping: furniture fixture absent");
@@ -85,9 +95,9 @@ fn classview_vs_xy_cut_placement_exactness() {
         eprintln!("   top={} bottom={}", r.top, r.bottom);
     }
 
-    // ── the ClassView band projection ──
-    let bands = classview_bands(&grey, w, h);
-    eprintln!("classview produced {} bands:", bands.len());
+    // ── the furniture-band projection ──
+    let bands = furniture_bands(&grey, w, h);
+    eprintln!("furniture bands produced {}:", bands.len());
     for (t, b) in &bands {
         eprintln!("   top={t} bottom={b}");
     }
@@ -110,7 +120,7 @@ fn classview_vs_xy_cut_placement_exactness() {
             .map(|&(t, b)| ((t as i64 - gt_t).abs() + (b as i64 - gt_b).abs(), t, b))
             .min();
         eprintln!(
-            "  {name:7} gt=[{gt_t},{gt_b}]  xy_cut={:?}  classview={:?}",
+            "  {name:7} gt=[{gt_t},{gt_b}]  xy_cut={:?}  bands={:?}",
             best_xy.map(|(e, t, b)| format!("[{t},{b}] err={e}")),
             best_cv.map(|(e, t, b)| format!("[{t},{b}] err={e}")),
         );
@@ -130,7 +140,7 @@ fn classview_vs_xy_cut_placement_exactness() {
 /// us. A guard that fires on everything carries as much information as one
 /// that never fires.
 #[test]
-fn classview_does_not_invent_furniture_on_a_plain_page() {
+fn furniture_bands_do_not_invent_structure_on_a_plain_page() {
     let p = corpus().join("pages/page_01.pgm");
     if !p.exists() {
         eprintln!("skipping: corpus pages absent");
@@ -138,7 +148,7 @@ fn classview_does_not_invent_furniture_on_a_plain_page() {
     }
     let bytes = std::fs::read(&p).unwrap();
     let (grey, w, h) = tesseract_ocr::image_input::parse_pgm(&bytes).unwrap();
-    let bands = classview_bands(&grey, w, h);
+    let bands = furniture_bands(&grey, w, h);
     eprintln!("plain page_01 (no furniture): {} band(s)", bands.len());
     for (t, b) in &bands {
         eprintln!("   top={t} bottom={b}");
