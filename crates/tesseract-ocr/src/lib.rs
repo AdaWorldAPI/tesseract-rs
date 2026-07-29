@@ -17,6 +17,7 @@ pub mod binarize;
 pub mod binreduce;
 pub mod blob_filter;
 pub mod conncomp;
+pub mod deskew;
 pub mod image_input;
 #[cfg(feature = "seg-approx")]
 pub mod line_segment;

@@ -18,7 +18,9 @@
 //   sweep     <pgm> <thresh> <redsweep> <redsearch> <sweepcenter> <sweeprange>
 //             <sweepdelta> <minbsdelta> <pivot 1=corner|2=center>
 //   dss       <pgm> <thresh> <angle_deg> <pivot 1=corner|2=center>
+//   rot90     <pgm> <direction 1=cw|-1=ccw>
 //   rotamgray <pgm> <angle_deg> <grayval>
+//   rotamgraycorner <pgm> <angle_deg> <grayval>
 //   deskew    <pgm> <redsearch>
 //
 // ── CONVENTIONS (get these wrong and every diff is noise) ────────────────────
@@ -94,12 +96,15 @@ int main(int argc, char** argv) {
   if (argc < 3) {
     fprintf(stderr,
             "usage:\n"
-            "  %s findskew  <pgm> <thresh>\n"
-            "  %s sweep     <pgm> <thresh> <redsweep> <sweeprange> <sweepdelta>\n"
-            "  %s dss       <pgm> <thresh> <angle_deg>\n"
-            "  %s rotamgray <pgm> <angle_deg> <grayval>\n"
-            "  %s deskew    <pgm> <redsearch>\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0]);
+            "  %s findskew        <pgm> <thresh>\n"
+            "  %s sweep           <pgm> <thresh> <redsweep> <redsearch> <sweepcenter>"
+            " <sweeprange> <sweepdelta> <minbsdelta> <pivot 1=corner|2=center>\n"
+            "  %s dss             <pgm> <thresh> <angle_deg> <pivot 1=corner|2=center>\n"
+            "  %s rot90           <pgm> <direction 1=cw|-1=ccw>\n"
+            "  %s rotamgray       <pgm> <angle_deg> <grayval>\n"
+            "  %s rotamgraycorner <pgm> <angle_deg> <grayval>\n"
+            "  %s deskew          <pgm> <redsearch>\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 2;
   }
   const char* arm = argv[1];
@@ -210,9 +215,15 @@ int main(int argc, char** argv) {
     if (!pixr) { fprintf(stderr, "vshear failed\n"); return 1; }
     l_float32 sum = 0.0f;
     l_int32 rc = pixFindDifferentialSquareSum(pixr, &sum);
+    // NOTE: the pivot is deliberately NOT printed. The Rust `dss` arm has no
+    // pivot concept (it scores WITHOUT shearing — D3 is not built yet), so
+    // the two sides are only diff-compatible at angle 0, where the shear is a
+    // verified no-op (both pivots return the identical sum). Printing the
+    // pivot would add a line the Rust side cannot produce and break that
+    // diff for no information gain — the harness already records which pivot
+    // it passed, in the test label.
     printf("rc\t%d\n", rc);
     print_f32("deg", deg);
-    printf("pivot\t%d\n", pivot);
     print_f32("sum", sum);
     pixDestroy(&pixg);
     pixDestroy(&pixb);
@@ -234,6 +245,43 @@ int main(int argc, char** argv) {
     if (!pixr) { fprintf(stderr, "pixRotateAMGray failed\n"); return 1; }
     print_f32("deg", deg);
     dump_pix("rot", pixr);
+    pixDestroy(&pixg);
+    pixDestroy(&pixr);
+    return 0;
+  }
+
+  // ── ARM 4b: pixRotateAMGrayCorner — the CORNER-pivot variant. ────────────
+  // Same f64-then-narrow-once precision trap as ARM 4 (audit §3) but a
+  // different per-pixel formula (no xcen/ycen offset), so it needs its own
+  // parity coverage — a center-pivot-only sweep would leave the corner
+  // kernel entirely unexercised.
+  if (!strcmp(arm, "rotamgraycorner")) {
+    if (argc < 5) { fprintf(stderr, "rotamgraycorner needs <angle_deg> <grayval>\n"); return 2; }
+    PIX* pixg = read_grey(path);
+    if (!pixg) return 1;
+    l_float32 deg = static_cast<l_float32>(atof(argv[3]));
+    l_float32 rad = deg * 3.14159265358979323846f / 180.0f;
+    PIX* pixr = pixRotateAMGrayCorner(pixg, rad, static_cast<l_uint8>(atoi(argv[4])));
+    if (!pixr) { fprintf(stderr, "pixRotateAMGrayCorner failed\n"); return 1; }
+    print_f32("deg", deg);
+    dump_pix("rot", pixr);
+    pixDestroy(&pixg);
+    pixDestroy(&pixr);
+    return 0;
+  }
+
+  // ── ARM 1b: pixRotate90 — lossless orthogonal rotation (D1). ─────────────
+  // A pure index remap: no interpolation, no float math at all, exact for
+  // any depth. Needed by pixDeskewBoth's 90-degree round trip (D7). Cheapest
+  // leaf in the wave and the one that proves the harness itself works before
+  // any precision-sensitive kernel is diffed.
+  if (!strcmp(arm, "rot90")) {
+    if (argc < 4) { fprintf(stderr, "rot90 needs <direction 1=cw|-1=ccw>\n"); return 2; }
+    PIX* pixg = read_grey(path);
+    if (!pixg) return 1;
+    PIX* pixr = pixRotate90(pixg, atoi(argv[3]));
+    if (!pixr) { fprintf(stderr, "pixRotate90 failed\n"); return 1; }
+    dump_pix("rot90", pixr);
     pixDestroy(&pixg);
     pixDestroy(&pixr);
     return 0;
