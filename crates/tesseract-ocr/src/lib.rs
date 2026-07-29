@@ -17,6 +17,7 @@ pub mod binarize;
 pub mod binreduce;
 pub mod blob_filter;
 pub mod conncomp;
+pub mod deskew;
 pub mod image_input;
 #[cfg(feature = "seg-approx")]
 pub mod line_segment;
@@ -83,4 +84,4 @@ pub use threshold::{
     otsu_threshold_channels, otsu_threshold_gray, threshold_rect_to_binary,
     threshold_rect_to_binary_multi, OtsuChannel, OtsuResult, OtsuStatsResult, HISTOGRAM_SIZE,
 };
-pub use xy_cut::{xy_cut, PageRect, XyCutParams};
+pub use xy_cut::{xy_cut, BinarizeMode, PageRect, XyCutParams};

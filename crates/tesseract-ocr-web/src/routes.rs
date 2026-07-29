@@ -44,6 +44,11 @@ struct ResultTemplate {
     /// `true` when the recognizer was not confident — the result page shows a
     /// warning banner (likely handwriting / low-resolution / non-printed text).
     low_confidence: bool,
+    /// `true` when [`tesseract_ocr::rectify::auto_rectify`] actually changed
+    /// the page (requested AND the fitted ramp cleared significance) —
+    /// mirrors [`crate::ocr::OcrDebugOutcome::rectified`]'s honesty signal,
+    /// shown the same "applied"/"no change" way the debug stats panel does.
+    rectified: bool,
     /// The text to show in the result `<pre>` block: recognized text, or the
     /// rendered JSON document. Askama HTML-escapes this on render.
     text: String,
@@ -117,6 +122,10 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
     let mut url: Option<String> = None;
     let mut format = OutputFormat::Text;
     let mut lang: Option<String> = None;
+    // An HTML checkbox only sends its field AT ALL when checked (any value,
+    // conventionally "on") — its mere presence is the signal, same
+    // consume-the-body discipline as read_image_upload's "rectify" field.
+    let mut rectify = false;
 
     loop {
         match multipart.next_field().await {
@@ -150,6 +159,13 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
                                 lang = Some(t.trim().to_string());
                             }
                         }
+                    }
+                    "rectify" => {
+                        // Discard the value (conventionally "on") — the
+                        // field's mere presence is the checkbox signal, same
+                        // as read_image_upload's identical field.
+                        let _ = field.text().await;
+                        rectify = true;
                     }
                     _ => {}
                 }
@@ -185,7 +201,7 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
         OutputFormat::Text => {
             let outcome = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                ocr_image_bytes(&st, &bytes, lang.as_deref())
+                ocr_image_bytes(&st, &bytes, lang.as_deref(), rectify)
             })
             .await;
             match outcome {
@@ -200,7 +216,7 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
         OutputFormat::Json => {
             let outcome = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                ocr_image_bytes_json(&st, &bytes, lang.as_deref())
+                ocr_image_bytes_json(&st, &bytes, lang.as_deref(), rectify)
             })
             .await;
             match outcome {
@@ -219,38 +235,68 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
 // PDF export (A / B) + verbose debug preview (A vs B side by side)
 // ===========================================================================
 
-/// The `?mode=`/`?lang=` selectors for [`pdf`]. `mode="structured"` →
-/// reconstruction "B" ([`doc_v1_layout`] + [`render_pdf`]); anything else —
+/// The `?mode=`/`?lang=`/`?rectify=` selectors for [`pdf`]. `mode="structured"`
+/// → reconstruction "B" ([`doc_v1_layout`] + [`render_pdf`]); anything else —
 /// `"searchable"`, an unknown value, or an absent field — → the searchable
 /// facsimile "A". `lang="deu"` → the German model; anything else → English
 /// (the pre-existing default) — see [`crate::state::AppState::model`].
+/// `rectify="true"` → run [`tesseract_ocr::rectify::auto_rectify`] before
+/// recognition; anything else (absent, empty, a typo) → `false` — see
+/// [`Self::wants_rectify`].
 ///
 /// `pub(crate)`: also used by [`crate::api`] so `POST /api/v1/pdf` accepts
-/// the exact same `?mode=`/`?lang=` contract as the HTML `/pdf` route (which
-/// reads `lang` from the multipart body instead, alongside `file`/`url`, and
-/// so ignores this struct's `lang` field).
+/// the exact same `?mode=`/`?lang=`/`?rectify=` contract as the HTML `/pdf`
+/// route (which reads `lang`/`rectify` from the multipart body instead,
+/// alongside `file`/`url`, and so ignores this struct's `lang`/`rectify`
+/// fields).
 #[derive(Debug, Default, serde::Deserialize)]
 pub(crate) struct PdfQuery {
     #[serde(default)]
     mode: Option<String>,
     #[serde(default)]
     pub(crate) lang: Option<String>,
+    #[serde(default)]
+    rectify: Option<String>,
 }
 
 impl PdfQuery {
     pub(crate) fn is_structured(&self) -> bool {
         matches!(self.mode.as_deref(), Some("structured"))
     }
+
+    /// `true` only for the literal query value `rectify=true` — same
+    /// exact-match, never-a-hard-error philosophy as [`Self::is_structured`].
+    /// A plain `bool` field would make axum's `Query` extractor itself reject
+    /// the whole request (with a non-JSON body) on anything other than
+    /// `true`/`false`/`1`/`0`; matching a `String` the same forgiving way
+    /// every other field in this crate is read keeps that failure mode out
+    /// of this router entirely — an absent field, empty string, or any other
+    /// value (including a typo) just falls back to `false`.
+    pub(crate) fn wants_rectify(&self) -> bool {
+        matches!(self.rectify.as_deref(), Some("true"))
+    }
 }
 
-/// The `?lang=` selector for [`crate::api`] endpoints that have no `?mode=`
-/// concept of their own (`/api/v1/recognize`, `/api/v1/pdf/structured`).
-/// `"deu"` → the German model; anything else → English — see
-/// [`crate::state::AppState::model`].
+/// The `?lang=`/`?rectify=` selectors for [`crate::api`] endpoints that have
+/// no `?mode=` concept of their own (`/api/v1/recognize`,
+/// `/api/v1/pdf/structured`). `"deu"` → the German model; anything else →
+/// English — see [`crate::state::AppState::model`]. `rectify="true"` → run
+/// [`tesseract_ocr::rectify::auto_rectify`] before recognition; anything else
+/// → `false` — see [`Self::wants_rectify`], same exact-match philosophy as
+/// [`PdfQuery::wants_rectify`].
 #[derive(Debug, Default, serde::Deserialize)]
 pub(crate) struct LangQuery {
     #[serde(default)]
     pub(crate) lang: Option<String>,
+    #[serde(default)]
+    rectify: Option<String>,
+}
+
+impl LangQuery {
+    /// See [`PdfQuery::wants_rectify`] — identical exact-match semantics.
+    pub(crate) fn wants_rectify(&self) -> bool {
+        matches!(self.rectify.as_deref(), Some("true"))
+    }
 }
 
 /// A minimal `tesseract-rs/doc.v1` deserialize — only the fields the debug
@@ -888,6 +934,7 @@ fn result_of_text(out: OcrOutcome) -> ResultTemplate {
         elapsed_ms: format!("{:.1}", out.elapsed_ms),
         confidence: confidence_str(out.mean_conf),
         low_confidence: out.low_confidence,
+        rectified: out.rectified,
         text: out.text,
         download_datauri: datauri,
         download_filename: "ocr.txt",
@@ -908,6 +955,7 @@ fn result_of_json(out: OcrJsonOutcome) -> ResultTemplate {
         elapsed_ms: format!("{:.1}", out.elapsed_ms),
         confidence: confidence_str(out.mean_conf),
         low_confidence: out.low_confidence,
+        rectified: out.rectified,
         text: out.json,
         download_datauri: datauri,
         download_filename: "result.json",
@@ -1020,7 +1068,7 @@ mod tests {
         let state = AppState::load(&dir).expect("load model");
         let page = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pages/page_01.pgm");
         let bytes = std::fs::read(&page).expect("read page_01.pgm");
-        let out = ocr_image_bytes(&state, &bytes, None).expect("ocr");
+        let out = ocr_image_bytes(&state, &bytes, None, false).expect("ocr");
         assert!(out.width > 0 && out.height > 0);
         assert!(
             out.line_count >= 2,
@@ -1046,7 +1094,7 @@ mod tests {
         let state = AppState::load(&dir).expect("load model");
         let page = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pages/page_01.pgm");
         let bytes = std::fs::read(&page).expect("read page_01.pgm");
-        let out = ocr_image_bytes_json(&state, &bytes, None).expect("ocr json");
+        let out = ocr_image_bytes_json(&state, &bytes, None, false).expect("ocr json");
         assert!(out.width > 0 && out.height > 0);
         assert!(
             out.json.starts_with("{\"schema\":\"tesseract-rs/doc.v1\""),
@@ -1444,5 +1492,86 @@ mod tests {
         // Still recognizes correctly — rectify=true must not corrupt an
         // already-good page.
         assert!(html.contains("clock"), "recognition still works: {html}");
+    }
+
+    /// `rectify` now wires through `/ocr` too, not just `/debug`/`/pdf` — the
+    /// gap this crate's own `CLAUDE.md` history called out as "kept surgical
+    /// for this pass" is closed. Same no-op-on-a-clean-page contract as
+    /// [`post_debug_with_rectify_is_a_no_op_on_a_clean_page`]: checking the
+    /// box must not error, corrupt, or otherwise change recognition on an
+    /// already-straight page, and the result page must honestly report "no
+    /// change" via [`ResultTemplate::rectified`].
+    #[tokio::test]
+    async fn post_ocr_with_rectify_is_a_no_op_on_a_clean_page() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = model_dir();
+        if !dir.join("eng.lstm").exists() {
+            eprintln!("skipping: corpus model absent");
+            return;
+        }
+        let state = Arc::new(AppState::load(&dir).expect("load model"));
+        let app = router(state);
+        let (ct, body) = multipart_file_with_rectify(&page_01_bytes());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ocr")
+                    .header("content-type", ct)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8_lossy(&out);
+        assert!(
+            html.contains("no change"),
+            "a clean page must report no change from auto-rectify"
+        );
+        assert!(html.contains("clock"), "recognition still works: {html}");
+    }
+
+    /// [`PdfQuery::wants_rectify`] is an exact-match-only "true" check, same
+    /// philosophy as [`PdfQuery::is_structured`] — an absent field, empty
+    /// string, or any value other than the literal `"true"` (including a
+    /// typo'd `"True"`/`"1"`) must fall back to `false` rather than being
+    /// treated as truthy. Runs with no corpus model dependency.
+    #[test]
+    fn pdf_query_wants_rectify_is_exact_match_only() {
+        let q = PdfQuery {
+            rectify: Some("true".to_string()),
+            ..Default::default()
+        };
+        assert!(q.wants_rectify());
+
+        for v in [None, Some("false"), Some("1"), Some("True"), Some("")] {
+            let q = PdfQuery {
+                rectify: v.map(|s| s.to_string()),
+                ..Default::default()
+            };
+            assert!(!q.wants_rectify(), "{v:?} must not enable rectify");
+        }
+    }
+
+    /// Same exact-match contract as [`pdf_query_wants_rectify_is_exact_match_only`],
+    /// for [`LangQuery::wants_rectify`].
+    #[test]
+    fn lang_query_wants_rectify_is_exact_match_only() {
+        let on = LangQuery {
+            rectify: Some("true".to_string()),
+            ..Default::default()
+        };
+        assert!(on.wants_rectify());
+
+        let off = LangQuery {
+            rectify: None,
+            ..Default::default()
+        };
+        assert!(!off.wants_rectify());
     }
 }

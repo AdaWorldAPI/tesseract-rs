@@ -110,8 +110,7 @@ fn resolution_grid_holds_the_8_7_0_pattern() {
                     for (i, cell) in cells.iter().enumerate() {
                         let (x, y) = (cell["x"].as_i64().unwrap(), cell["y"].as_i64().unwrap());
                         if cx >= x && cx < x + cw && cy >= y && cy < y + ch {
-                            per_cell[i]
-                                .push(word["text"].as_str().unwrap_or_default().to_string());
+                            per_cell[i].push(word["text"].as_str().unwrap_or_default().to_string());
                         }
                     }
                 }
@@ -135,8 +134,8 @@ fn resolution_grid_holds_the_8_7_0_pattern() {
             .join(" ")
     );
 
-    // Multi-column reading order: 16 cells × 6 lines each. A merged
-    // across-the-gutter reading would produce ~12 full-width lines instead.
+    // Multi-column reading order: 16 cells × 3 lines each. A merged
+    // across-the-gutter reading would produce ~6 full-width lines instead.
     assert!(
         line_count >= 44,
         "expected ~48 per-cell lines (16 cells x 3), got {line_count} \

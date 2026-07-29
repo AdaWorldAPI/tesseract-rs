@@ -99,9 +99,9 @@ security scheme; this pass ships only the API-key gate.
 
 | operationId | Method + path | Input | Output |
 |---|---|---|---|
-| `RecognizeDocument` | `POST /api/v1/recognize` (optional `?lang=eng\|deu` for a binary body) | binary image body (`application/octet-stream`) **or** `application/json` `{"content_base64": "...", "lang": "eng"}` | `tesseract-rs/doc.v1` JSON |
-| `SearchablePdf` | `POST /api/v1/pdf` (optional `?mode=searchable\|structured`, `?lang=eng\|deu`) | same as above | `application/pdf` |
-| `StructuredPdf` | `POST /api/v1/pdf/structured` (optional `?lang=eng\|deu`) | same as above | `application/pdf` (always the structured reconstruction) |
+| `RecognizeDocument` | `POST /api/v1/recognize` (optional `?lang=eng\|deu`, `?rectify=true` for a binary body) | binary image body (`application/octet-stream`) **or** `application/json` `{"content_base64": "...", "lang": "eng", "rectify": false}` | `tesseract-rs/doc.v1` JSON |
+| `SearchablePdf` | `POST /api/v1/pdf` (optional `?mode=searchable\|structured`, `?lang=eng\|deu`, `?rectify=true`) | same as above | `application/pdf` |
+| `StructuredPdf` | `POST /api/v1/pdf/structured` (optional `?lang=eng\|deu`, `?rectify=true`) | same as above | `application/pdf` (always the structured reconstruction) |
 
 Notes:
 
@@ -115,6 +115,17 @@ Notes:
   other than `"deu"` — including an absent field, `"eng"`, or an unrecognized
   string — falls back to English; requesting `deu` when the deployment never
   loaded it also falls back to English (never a hard error).
+- **`rectify` optionally runs page rectification before recognition** —
+  auto-corrects rotational skew and first-order keystone/trapezoid distortion
+  from a photographed page (see the crate's `tesseract_ocr::rectify` module
+  docs). Opt-in; defaults to `false` everywhere. For a binary body, pass
+  `?rectify=true` on the query string (only the literal value `true` enables
+  it — an absent field, `false`, or any other value falls back to `false`,
+  never a hard error). For a `application/json` body, either the query
+  parameter or the JSON body's own `rectify` field enables it — unlike
+  `lang`, there is no "which source wins": a plain flag only needs `true`
+  from either place. Always a safe no-op on an already-straight page — it
+  never fails a request that would otherwise succeed.
 - **Upload size** is capped at 12 MB, shared with the HTML upload form's
   `DefaultBodyLimit`/`RequestBodyLimitLayer` — a larger body is rejected by
   the framework before any handler runs.

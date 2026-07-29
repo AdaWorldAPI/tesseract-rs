@@ -64,6 +64,48 @@ Each leaf is proven this way (the `/tmp` artifacts are ephemeral — rebuild the
    unicharset_dump -- <unicharset> {properties|script|other_case}`; `diff` the two.
    eng data = a trained `eng.lstm-unicharset` (`combine_tessdata -u`).
 
+## Model allocation policy (standing rule — set it BEFORE spawning, not per call)
+
+Mirrors lance-graph's own Model Policy, which this repo lacked. The split that
+matters is **grindwork vs accumulation**, and for a byte-parity transcode it has
+a sharp, repo-specific edge:
+
+- **Orchestrator / main thread: Opus.** Every decision that composes evidence
+  across sources: wave sequencing, what a precision audit implies, whether a
+  measurement means what it appears to mean, whether to flip a default, reading
+  a review finding for whether it is actually right. **Also all central gating**
+  — `cargo fmt` / `clippy -D warnings` / the full scoped test suite run ONCE
+  (never per agent), plus every `git commit` / `push`.
+- **Sonnet subagents: bounded transcription against a written spec.** Port THIS
+  C function given THIS audit; harvest THIS call graph; thread THIS flag through
+  THESE call sites; build THIS oracle arm. One source in, one shape out.
+- **Never Haiku** for any subagent here — the quality floor is Sonnet regardless
+  of how mechanical the task looks.
+
+**Declare the allocation up front, in the plan, not implicitly at each spawn.**
+Consistency is not the same as policy: a session can spawn every agent at the
+right tier and still leave no rule behind, so the next session re-derives it.
+
+**Every Sonnet worker brief MUST carry, verbatim:**
+- Do NOT run `cargo build/check/test/clippy/fmt` — not once. `tesseract-core`
+  path-deps the lance-graph workspace, and per-agent compiles both blow up the
+  shared `target/` and produce spurious cross-agent failures. The orchestrator
+  compiles centrally (see Iron rule 1).
+- Do NOT run `git commit/push/checkout/restore/reset/clean/worktree`.
+- The exact file scope, and which files another agent owns concurrently.
+- "Do not claim it compiles or that tests pass — you did not run it."
+
+**Fan out on DISJOINT files only.** Two agents in one module is a lost-write
+race. When a shared file must change (a `mod` line, a re-export), the
+**orchestrator** makes that edit after the agents land — this session held
+`lib.rs` back for exactly that reason and avoided a clobber.
+
+**What the orchestrator must NOT delegate**, because this session shows each
+being missed by a competent agent working correctly inside its own scope: is the
+oracle running the operation under test; is a null result real or a wiring
+artifact; does a "tidy" refactor silently change a default; is a passing diff
+comparing two empty outputs.
+
 ## Iron rules (learned this arc — do not relearn the hard way)
 
 1. **NEVER `cargo --all` / `--all-targets` / `cargo fmt --all` from this repo.**
@@ -748,6 +790,262 @@ re-measured and re-pinned, not defended.
   breaking each expectation one at a time and confirming the test fails —
   the same discipline the byte-parity leaves use, applied to a fence that
   has no C++ side to diff against.
+
+**★ Deskew wave OPEN and D1/D2/D5 byte-parity GREEN (2026-07-29).** The
+rotational half of page geometry — `rectify.rs` corrects *keystone* only, and
+`decide_if_table`'s steps 1-4 front-end has been blocked on this. Provenance is
+clean: `/tmp/leptonica-src` at tag **1.82.0**, an exact match for the installed
+`liblept`, so **zero ABI/version skew** (same footing as Sauvola).
+
+Manifest: `.claude/harvest/leptonica-skew-callgraph.txt` (ruff-driven, ~20 C
+functions across `skew.c` / `rotate.c` / `rotateam.c` / `rotateshear.c` /
+`rotateorth.c` / **`shear.c`** — the sixth was outside the original scope but is
+unavoidable, since the sweep's rotation and the shear dispatch's kernel live
+there). Plan: `.claude/plans/deskew-wave-v1.md` (D1-D8). Oracle:
+`.claude/harvest/oracles/skew_oracle.cpp` (+ harness `run_skew_parity.sh`).
+
+Shipped in `crates/tesseract-ocr/src/deskew.rs`, each diffed against real
+liblept: **D1** `rotate90_grey` (identical both directions, full page); **D2**
+`find_differential_square_sum` (identical at angle 0, full page); **D5**
+`rotate_am_gray` + `rotate_am_gray_corner` (**161/161 each** on a dense
+−20°..+20° / 0.25° sweep, plus 5 full-page angles).
+
+**The dense sweep is the method, not decoration.** Audit §3's trap: `sina`/`cosa`
+are computed in **f64** and narrowed to f32 **once**, after which the entire
+per-pixel loop runs in **f32** — an all-f32 *or* all-f64 port diverges only on a
+*subset* of angles, so a handful of round numbers passes while the port is wrong.
+The fixture must also be non-flat: a uniform field cannot expose it at all (the
+16×16 sub-pixel weights sum to 256 regardless of precision path — pinned by the
+module's own `rotate_am_gray_uniform_field_stays_uniform` test). Other pinned
+sites: `(l_int32)` truncates toward zero → plain `as i32`, **never `+0.5`** (that
+convention belongs to `pixEmbedForRotation`, a different function); `skiph =
+(0.05_f64 * w as f64) as i32`; the dss accumulation is **sequential f32 in row
+order** — an f64 accumulator does not match.
+
+> **⚠ ORACLE LESSONS (two codex P1s + two gaps found by running it).** The
+> oracle was wrong twice in ways that would have cost the wave real time:
+> (1) the sweep arm called `pixFindSkewSweep` — the standalone API, which is
+> **not on `pixFindSkew`'s path** (the manifest's own STEP 3 classifies it SKIP)
+> and refines with `numaFitMax` where the real entry takes the raw coarse max and
+> binary-searches; (2) the `dss` arm prepared its image with
+> `pixRotateShearCenter`, a **composed** two/three-shear rotation, where the
+> sweep applies a **single** vertical shear — so a CORRECT D3 would have FAILED
+> the oracle while an implementation of the WRONG operation could have PASSED.
+> Plus `rot90` and `rotamgraycorner` arms were missing entirely, leaving D1 and
+> the corner kernel with no oracle side. **The generalizable rule: an oracle must
+> reproduce the operation under test, not something in its neighbourhood that
+> also rotates.** Verified the pivot is load-bearing — at 2° the pivots give
+> 23310 (corner) vs 23090 (center); at 0° they agree exactly (258022), which is
+> precisely what makes D2 diffable in isolation before D3 exists.
+
+Also added `format_g9` in `examples/deskew_dump.rs` — C's `%.9g`. Rust has no
+`%g`, and both obvious substitutes are wrong for a whole-file diff (`{:.9e}`
+always uses exponent form; `{}` uses shortest-round-trip, a third rule), so a
+formatter mismatch flags every float line as a parity failure and buries the real
+signal. `f32::consts::PI` replaces the C++ pi literal only because clippy's
+`approx_constant` rejects it — verified free, both are `0x40490fdb`; the doc
+records why it is **not** `f32::to_radians()` (that folds `PI/180` into a
+constant *before* multiplying, and fp multiply is not associative).
+
+Remaining: D3 (vertical shear), D4 (sweep+search), D6/D7
+(`pixDeskewGeneral`/`Both`), D8 (pipeline wiring — deskew runs BEFORE rectify, so
+a purely-rotated page must then measure `m0 ≈ 0`, a free falsifier).
+
+**★ Binarization mode is selectable — and the measurement says DON'T flip the
+default yet (2026-07-29).** `BinarizeMode` now threads through
+`XyCutParams::binarize_mode` and `LstmRecognizer::recognize_document_with_mode`.
+Otsu stays default everywhere, proven not asserted: `golden_pages` (779 s) and
+the 8+7+0 CER fence (506 s) both pass untouched, plus a `Document`-equality
+regression test.
+
+Probe `examples/binarize_ab.rs` over generated `corpus/quality/uneven_*.pgm`
+(a real page × a multiplicative illumination field — the existing corpus is
+cleanly-rendered pages where Sauvola's advantage is invisible, so the fixture had
+to be built to make the difference *reachable*). Two findings pointing opposite
+ways, numbers in `.claude/harvest/sauvola-vs-otsu-probe.md`:
+
+1. **Sauvola does what it claims.** Under uneven light Otsu classifies **~48% of
+   the page as ink** (a single threshold cannot separate when the background's own
+   value spans most of the range, so the dark half floods solid black); Sauvola
+   holds at **~2.8%**, indistinguishable from its own clean-page value. ~17×,
+   stable across both degradation shapes and both strengths.
+2. **It cannot currently improve OCR text — by construction.** CER and
+   `word_count` are byte-identical between modes on every fixture, because
+   `binarize_mode` reaches the layout + region/table pass only. Word/line
+   recognition runs through `recognize_page_blocks_words` →
+   `segment::segment_rows`, a **THIRD independent always-Otsu binarizer** called
+   before `binarize_mode` is in scope. (Three separate Otsu binarizers exist in
+   this crate; two are now mode-aware, `segment.rs` is not.)
+
+**`segment.rs` WAS the lever — it is now threaded, and the re-measurement is the
+headline result of the session.** `binarize_mode` reaches word/line recognition;
+default is still Otsu and provably unchanged (`golden_pages` 784 s +
+the 8+7+0 fence 492 s + `golden_lines` + `blocks_columns`, 0 failures). Re-ran
+the **identical** probe on the **identical** fixtures:
+
+| fixture | Otsu CER | Sauvola CER | words otsu → sauvola |
+|---|---|---|---|
+| clean | 0.0000 | 0.0000 | 42 → 42 |
+| linear_060 | 0.2805 | **0.0045** | 32 → **42** |
+| linear_085 | 0.6154 | **0.0181** | 19 → **42** |
+| vignette_060 | 0.0000 | 0.0000 | 42 → 42 |
+| vignette_085 | 0.6244 | **0.0000** | 18 → **42** |
+
+`mean_cer 0.3041 → 0.0045` — a **68× reduction**. Every degraded fixture
+recovers the full 42-word text; `vignette_085` goes from 0.6244 to *exactly
+zero*. The clean page is untouched (`mode_delta_cer` 0.0000), so the adaptive
+path costs nothing on good input.
+
+> **⚠ THE METHODOLOGICAL LESSON, worth more than the number.** The FIRST run of
+> this probe returned identical CER between modes and I nearly recorded that as
+> "Sauvola cannot help OCR text." It was not a finding about Sauvola at all — it
+> was a finding about the **wiring**: the mode never reached the code being
+> measured. Same probe, same fixtures, same metric, both times; only the
+> plumbing differed, and the answer moved by 68×. **A null result is a claim
+> about the measurement apparatus until proven otherwise** — read the trace to
+> find out *why* a null is null before promoting it to a conclusion.
+
+**Consequence — the default-flip question is now LIVE and strongly favoured**,
+where an hour earlier the evidence said don't bother. Still gated on the goldens
++ the 8+7+0 fence, but note the clean-page delta is exactly 0.0000, so those may
+well be unchanged. Measure; do not assume in either direction. And Wolf/Singh
+are now worth building for real — they reach recognized text now, which is
+exactly what they could not do before.
+
+Next rungs (`.claude/harvest/binarization-roadmap.md`): **Wolf-Jolion** then
+**Singh et al.** (arXiv 1201.5227). One family, one shape — `binarize.rs` already
+carries the expensive machinery byte-parity green, so each rung is a new *closing
+formula*, not a new pipeline. Wolf fixes Sauvola's fixed `R=128` collapsing on
+faded scans; Singh drops the squared integral entirely. **Parity caveat up front:
+leptonica implements Sauvola but NOT Wolf or Singh**, so neither can be a liblept
+byte-parity leaf — either oracle against the reference impl or drop to the
+quality-fence footing and *say so in the module docs*.
+
+**★ Two "blocked" deferrals were never data-blocked (2026-07-29).** Both
+falsifying fixtures are now committed (`corpus/model/README.md` § "Falsifier
+fixtures" carries provenance, histograms, SHA256s, and the
+`eng.unicharset` vs `eng.lstm-unicharset` trap):
+
+- **C3 unblocked** — `chi_sim.lstm-recoder`. The `next_codes_` trie is
+  *structurally empty* for eng/deu (every code length 1), so C3's paths were
+  unreachable, not untested. chi_sim: 4022 entries, lengths
+  `{1:128, 2:278, 3:2077, 4:1515, 5:24}`. **This also corrects the plan's
+  standing "Han codes are length-3" claim — 3 is the mode, not the range.**
+  Evidence is positive: the parser was cross-validated on eng/deu first (both hit
+  `4 + 9N` exactly; chi_sim does not, which is *how* we know it is genuinely
+  multi-code rather than mis-parsed).
+- **bbox/stats unblocked** — the legacy `eng.unicharset` has **112/112 distinct**
+  CSV blobs where the LSTM one has 111 identical.
+
+Still deferred, with reasons: **2-D / softmax-LSTM** is blocked *architecturally*
+(four models across three scripts and two capacities all land in one architecture
+family; those paths are vestigial from Tesseract 4.0's pre-standardization phase
+— unblocking needs custom training, not another download). **`pixScaleSmooth`
+(f<0.02) + colour scale**: `f<0.02` means a source >50× the target height, not a
+line crop, and real Tesseract's own `PreparePixInput` converts to grey *before*
+scaling, so the colour path is unreachable in the reference implementation too.
+
+**Doc-drift root cause found:** Phase C listed C1/C2 as open, but both shipped
+under a *different* plan's labels (`pdf-to-text-ocr-v1.md` D1.1-D1.3), and that
+plan's own tracker is stale too. **Source is ground truth; both docs had
+drifted.** `extract_best_path_as_words` is also already present, so B3-full is
+*unverified-open*, not trusted-open.
+
+**★ The OCR landscape is two ladders, not one** (`.claude/harvest/ocr-landscape-2026.md`).
+Ladder A (Otsu → Sauvola → Wolf → Singh) *improves* this repo. Ladder B (GOT-OCR2.0
+2409.01704 → olmOCR → DeepSeek-OCR 2510.18234) *replaces* the classical pipeline
+and does NOT belong inside a byte-parity transcode — a 380M-7B GPU model would
+falsify the crate's whole premise (pure-Rust, zero C at runtime, CPU-only, ~4 MB).
+It has an obvious correct seam anyway: `doc.v1` is already "the OPTIONAL seed a
+consumer feeds via OGAR", so a VLM arm slots *there*, never inside the recognizer.
+Worth naming: **DeepSeek-OCR's "contexts optical compression" is this workspace's
+own thesis in a different medium** — it compresses the input representation,
+bgz-tensor compresses the computation; they compose.
+
+## ★ AS-IS BOUNDARY (2026-07-29) — the reasoning layer is NOT wired, and that is the line
+
+**Operator observation, verified: lance-graph's NARS reasoning and per-sentence
+SPO/SoA capabilities are not used by this pipeline at all.** This version is
+finalized AS-IS with that gap explicit, not implicit. Do not let a future
+session rediscover it by accident.
+
+**What is actually imported** — every `lance_graph_contract::` module this
+workspace touches: `dawg`, `facet`, `network`, `ogar_codebook`, `unichar`,
+`unicharcompress`, `unicharset`. **All seven are content/codec.** Zero
+reasoning surfaces. A grep for `nars` / `TruthValue` / `SoaEnvelope` /
+`BindSpace` / `Belief` across `crates/*/src` returns **nothing** (earlier
+apparent hits were substring noise — `corresponds`, `response`,
+`XyTranspose`).
+
+**And `doc.v1` — explicitly designed as "the OPTIONAL seed a consumer feeds
+via OGAR" — is consumed only by RENDERERS**: `tesseract-ocr-pdf`,
+`tesseract-ocr-python`, `tesseract-ocr-web`. Nothing reasons over it. The
+capability exists on both sides of that seam and the wire between them is
+dead.
+
+### The cost split — three pieces, NOT one (this is the part worth knowing)
+
+The architecture doc reads as if "use lance-graph's reasoning" is a single
+heavy decision. Measured, it is three, and two are cheap:
+
+| piece | where | cost to reach from here |
+|---|---|---|
+| **`NarsTruth`** (frequency/confidence pair) | `lance-graph-contract/src/exploration.rs:89` | **Free.** Zero-dep contract crate, already a dependency. Per-word `mean_conf` is already computed — attaching a truth value to recognized content costs nothing architecturally. |
+| **Per-sentence SPO** (6-state PoS FSM → triples) | `crates/deepnsm` (lance-graph, workspace-EXCLUDED) | **Cheap.** Its path deps are `ndarray` + `lance-graph-contract` — **both already in this tree** (`tesseract-recognizer` deps ndarray; `tesseract-core` deps the contract). No new heavy dependency. Note the old "0 deps" claim for deepnsm is stale — it has two path deps, both already satisfied here. |
+| **NARS *reasoning*** — belief arena, revision, the 5 tactics (RCR/TR/CAS/ASC/CR) | `lance-graph-planner/src/nars/{belief,tactics,truth,inference}.rs` | **The real boundary.** Lives in the planner, which pulls `serde`/`serde_yml`/`tokio`/`tracing` — outside this crate's dep set and against the lean-binary proposition. This is the piece that genuinely belongs downstream or in the opt-in OGAR image. |
+
+### Why this matters for what to build next
+
+The dict beam (C1) already does **lexical** correction via DAWG — a word that
+is misrecognized into another *real* word passes today, because nothing checks
+whether it makes *sense*. That is precisely the gap NARS revision over
+accumulated beliefs would close, and it is invisible to every metric this repo
+currently has (CER against a known transcript cannot see it either, since the
+fixture text is the ground truth).
+
+So the AS-IS line is: **recognition is byte-parity faithful and now measured;
+reasoning over what was recognized is absent by design, not by oversight.**
+The two cheap pieces above are the natural first step if that changes — and
+they land inside the standalone binary, which is why they are worth
+distinguishing from the third.
+
+Cross-ref: the operator-set boundary already recorded above ("tesseract-rs =
+faithful recognition → rich doc.v1; the JSON is the OPTIONAL seed … Store /
+graph / KV / PDF-from-data are NOT tesseract-rs concerns") — that ruling stands.
+This section records that the *consumer side of it has never been built*, which
+the ruling itself does not say.
+
+### The intended consumer, and the ONE structural gap in the seam
+
+Operator intent (2026-07-29): **`lance-graph-arm-discovery` consumes this
+`doc.v1` JSON to inhale the meaning of whole books.** That is credible rather
+than aspirational — lance-graph has already run the whole-book falsifier
+(`deepnsm-v2/examples/bible_wave.rs`: the entire KJV, 23,145 verses in ONE 64k
+tile, 31,327 triples over 606 subjects, and the finding that **63.3% of
+same-subject links reach beyond ±5**, which is what retired the ±5 window).
+What that arc lacks is a way in from *paper*; this crate is exactly that.
+
+**`doc.v1` is well shaped for it** — not flat text but
+`pages → regions(type) → lines → words`, with per-word bbox + `conf`, per-line
+measured metrics (`xheight`/`ascrise`/`descdrop`/`baseline`), `mean_conf`,
+quality/`low_confidence` flags, table cell grids, and a
+`key`/`value`/`numeric_norm`/`value_cents` field surface.
+
+**The gap is the unit of meaning: there is NO sentence.** `bible_wave` had
+**verses** — a pre-existing semantic segmentation the KJV supplies for free. A
+scanned book supplies no such thing. It supplies *lines*, which are a
+**typographic artifact**: a sentence spans several of them (hyphenated at the
+breaks), and one line can hold several sentences. `deepnsm`'s 6-state PoS FSM →
+SPO triples operates **per sentence**. So the seam's real work item is a
+lines→sentences assembly step (de-hyphenation, cross-line and cross-page
+joining, reading order), NOT the JSON handoff, which is already fine.
+
+**Prerequisite already shipped, by accident:** `recognize_page_blocks_words`
+(multi-column reading order). Sentence assembly is impossible if lines are read
+ACROSS a gutter — the 8-column sheet that used to read as 26 full-width lines
+would have produced nonsense sentences no PoS FSM could rescue. That fix turned
+out to be on the critical path for the reasoning arc, not just for layout
+fidelity.
 
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 

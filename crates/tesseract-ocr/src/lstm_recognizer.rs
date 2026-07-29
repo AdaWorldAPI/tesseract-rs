@@ -30,6 +30,7 @@ use tesseract_recognizer::{from_grey_pix, NetworkIo, TRand};
 
 use crate::image_input::{parse_pgm, prescale_grey_to_height, PgmError};
 use crate::network::{NetError, Network};
+use crate::xy_cut::BinarizeMode;
 
 /// `TF_COMPRESS_UNICHARSET` (`lstmrecognizer.h` `TrainingFlags`): the recoder is
 /// present (recoding on) rather than a pass-through identity codec.
@@ -415,17 +416,40 @@ impl LstmRecognizer {
         h: usize,
         dict: Option<&DictLite>,
     ) -> Result<String, RecognizerError> {
+        self.recognize_page_makerow_with_mode(grey, w, h, dict, BinarizeMode::default())
+    }
+
+    /// The same [`Self::recognize_page_makerow`] composition, with the
+    /// makerow line-finder's own segmentation binarization selectable via an
+    /// explicit [`BinarizeMode`](crate::xy_cut::BinarizeMode).
+    /// [`Self::recognize_page_makerow`] is exactly this method called with
+    /// `BinarizeMode::default()` (i.e. [`BinarizeMode::Otsu`]) — byte-identical
+    /// to its pre-existing behaviour, so every existing caller of
+    /// [`Self::recognize_page_makerow`] is unaffected by this addition.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::recognize_page_makerow`].
+    pub fn recognize_page_makerow_with_mode(
+        &self,
+        grey: &[u8],
+        w: usize,
+        h: usize,
+        dict: Option<&DictLite>,
+        binarize_mode: BinarizeMode,
+    ) -> Result<String, RecognizerError> {
         // The shared makerow layout prefix (binarize → components → y-flip →
         // filter → make_rows → xheight → per-row typographic crop) lives in
         // [`Self::makerow_row_crops`] so this string method and
-        // [`Self::recognize_page_makerow_words`] cannot drift. The tail below
-        // is byte-identical to the pre-refactor loop: each non-empty row's
-        // crop → [`recognize_grey_line`] → keep the non-empty text → join with
-        // `'\n'`. (Rows the prefix skipped — empty `row.blobs` or a degenerate
-        // padded box — never surface as crops, exactly as the old `continue`s.)
+        // [`Self::recognize_page_makerow_words_with_mode`] cannot drift. The
+        // tail below is byte-identical to the pre-refactor loop: each
+        // non-empty row's crop → [`recognize_grey_line`] → keep the
+        // non-empty text → join with `'\n'`. (Rows the prefix skipped —
+        // empty `row.blobs` or a degenerate padded box — never surface as
+        // crops, exactly as the old `continue`s.)
         //
         // [`recognize_grey_line`]: LstmRecognizer::recognize_grey_line
-        let crops = self.makerow_row_crops(grey, w, h);
+        let crops = self.makerow_row_crops(grey, w, h, binarize_mode);
         let mut lines: Vec<String> = Vec::with_capacity(crops.len());
         for row in &crops {
             let (_ids, text) =
@@ -438,18 +462,24 @@ impl LstmRecognizer {
     }
 
     /// The shared makerow layout prefix behind both
-    /// [`Self::recognize_page_makerow`] and
-    /// [`Self::recognize_page_makerow_words`]: binarize the page, find
-    /// components, run the real make_rows line finder, and emit — per
-    /// recognizable row, in top-of-page-first order — the padded typographic
-    /// crop plus that row's bottom-up `TBOX` line box in PAGE space.
+    /// [`Self::recognize_page_makerow_with_mode`] and
+    /// [`Self::recognize_page_makerow_words_with_mode`]: binarize the page
+    /// (under the given [`BinarizeMode`]), find components, run the real
+    /// make_rows line finder, and emit — per recognizable row, in
+    /// top-of-page-first order — the padded typographic crop plus that
+    /// row's bottom-up `TBOX` line box in PAGE space.
     ///
     /// Factored out verbatim from the original `recognize_page_makerow` body so
     /// the string and word surfaces feed the recognizer IDENTICAL crops in
     /// IDENTICAL order; see [`Self::recognize_page_makerow`]'s doc comment for
-    /// the full chain rationale (Otsu → [`conn_comp_areas`] → [`filter_blobs`]
+    /// the full chain rationale (binarize → [`conn_comp_areas`] → [`filter_blobs`]
     /// → [`make_rows`] → [`compute_block_xheight`] → `linerec.cpp:239-246`
     /// typographic band + `GetRectImage` `kImagePadding = 4` pad/clip).
+    /// `binarize_mode` reaches this binarization step via
+    /// `crate::segment::segment_rows_with_mode` — see that module's docs for
+    /// why `crate::rectify` (a NEW, non-Tesseract preprocessing addition)
+    /// needs a DIFFERENT sibling entry point (`segment_rows_independent`)
+    /// rather than sharing this one.
     ///
     /// Rows the pipeline cannot feed produce NO entry (mirroring the original
     /// inline `continue`s): a row with empty `row.blobs`, or one whose
@@ -460,14 +490,21 @@ impl LstmRecognizer {
     /// [`filter_blobs`]: crate::blob_filter::filter_blobs
     /// [`make_rows`]: crate::textline::make_rows
     /// [`compute_block_xheight`]: crate::textline::compute_block_xheight
-    fn makerow_row_crops(&self, grey: &[u8], w: usize, h: usize) -> Vec<MakerowRowCrop> {
+    fn makerow_row_crops(
+        &self,
+        grey: &[u8],
+        w: usize,
+        h: usize,
+        binarize_mode: BinarizeMode,
+    ) -> Vec<MakerowRowCrop> {
         // The binarize→components→make_rows→xheight prefix is factored out
-        // as crate::segment::segment_rows (extracted verbatim from this
-        // function's original body; no behaviour change) — see that module's
-        // docs for why crate::rectify (a NEW, non-Tesseract preprocessing
-        // addition) needs a DIFFERENT sibling entry point
+        // as crate::segment::segment_rows_with_mode (segment.rs threads
+        // BinarizeMode through what used to be extracted verbatim from this
+        // function's original body; no OTHER behaviour change) — see that
+        // module's docs for why crate::rectify (a NEW, non-Tesseract
+        // preprocessing addition) needs a DIFFERENT sibling entry point
         // (segment_rows_independent) rather than sharing this one.
-        let block = crate::segment::segment_rows(grey, w, h);
+        let block = crate::segment::segment_rows_with_mode(grey, w, h, binarize_mode);
 
         // Rows (top-of-page first) → the TYPOGRAPHIC line box → the proven
         // line path. This is the real pipeline's feeding, not the expanded
@@ -608,6 +645,29 @@ impl LstmRecognizer {
         h: usize,
         dict: Option<&DictLite>,
     ) -> Result<Vec<crate::renderer::LineWords>, RecognizerError> {
+        self.recognize_page_makerow_words_with_mode(grey, w, h, dict, BinarizeMode::default())
+    }
+
+    /// The same [`Self::recognize_page_makerow_words`] composition, with the
+    /// makerow line-finder's own segmentation binarization selectable via an
+    /// explicit [`BinarizeMode`](crate::xy_cut::BinarizeMode).
+    /// [`Self::recognize_page_makerow_words`] is exactly this method called
+    /// with `BinarizeMode::default()` (i.e. [`BinarizeMode::Otsu`]) —
+    /// byte-identical to its pre-existing behaviour, so every existing
+    /// caller of [`Self::recognize_page_makerow_words`] is unaffected by
+    /// this addition.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::recognize_page_makerow_words`].
+    pub fn recognize_page_makerow_words_with_mode(
+        &self,
+        grey: &[u8],
+        w: usize,
+        h: usize,
+        dict: Option<&DictLite>,
+        binarize_mode: BinarizeMode,
+    ) -> Result<Vec<crate::renderer::LineWords>, RecognizerError> {
         // Same target height prepare_grid derives (lstm_recognizer.rs:244-247).
         let target_h = self
             .network
@@ -625,7 +685,7 @@ impl LstmRecognizer {
         // compresses every word box toward the line's left edge by exactly
         // that factor while leaving the TEXT correct.
         let x_scale = self.network.x_scale_factor().max(1) as f32;
-        let crops = self.makerow_row_crops(grey, w, h);
+        let crops = self.makerow_row_crops(grey, w, h, binarize_mode);
         let mut out: Vec<crate::renderer::LineWords> = Vec::with_capacity(crops.len());
         for row in &crops {
             // PrepareLSTMInputs min-size gate (input.cpp:92-96): a crop too
@@ -638,7 +698,7 @@ impl LstmRecognizer {
             let outputs = self.network.forward(&grid, &mut rng)?;
             if outputs.int_mode() {
                 return Err(RecognizerError::Network(NetError::Forward(
-                    "recognize_page_makerow_words expects softmax float logits (int-mode output)",
+                    "recognize_page_makerow_words_with_mode expects softmax float logits (int-mode output)",
                 )));
             }
             let simple = self.network.simple_text_output();
@@ -709,9 +769,41 @@ impl LstmRecognizer {
         h: usize,
         dict: Option<&DictLite>,
     ) -> Result<Vec<crate::renderer::LineWords>, RecognizerError> {
-        let blocks = crate::xy_cut::xy_cut(grey, w, h, &crate::xy_cut::XyCutParams::default());
+        self.recognize_page_blocks_words_with_mode(grey, w, h, dict, BinarizeMode::default())
+    }
+
+    /// The same [`Self::recognize_page_blocks_words`] composition, with the
+    /// column-layout `xy_cut` split AND the makerow line-finder's own
+    /// segmentation binarization both selectable via a single explicit
+    /// [`BinarizeMode`](crate::xy_cut::BinarizeMode) — the fix for the gap
+    /// `.claude/harvest/sauvola-vs-otsu-probe.md` measured: `binarize_mode`
+    /// used to reach only the LAYOUT `xy_cut` call inside
+    /// [`Self::recognize_document_with_mode`], never the word/line
+    /// recognition this method performs.
+    /// [`Self::recognize_page_blocks_words`] is exactly this method called
+    /// with `BinarizeMode::default()` (i.e. [`BinarizeMode::Otsu`]) —
+    /// byte-identical to its pre-existing behaviour, so every existing
+    /// caller of [`Self::recognize_page_blocks_words`] is unaffected by
+    /// this addition.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::recognize_page_blocks_words`].
+    pub fn recognize_page_blocks_words_with_mode(
+        &self,
+        grey: &[u8],
+        w: usize,
+        h: usize,
+        dict: Option<&DictLite>,
+        binarize_mode: BinarizeMode,
+    ) -> Result<Vec<crate::renderer::LineWords>, RecognizerError> {
+        let xy_params = crate::xy_cut::XyCutParams {
+            binarize_mode,
+            ..crate::xy_cut::XyCutParams::default()
+        };
+        let blocks = crate::xy_cut::xy_cut(grey, w, h, &xy_params);
         if blocks.len() <= 1 {
-            return self.recognize_page_makerow_words(grey, w, h, dict);
+            return self.recognize_page_makerow_words_with_mode(grey, w, h, dict, binarize_mode);
         }
         let mut any_block_empty = false;
 
@@ -733,7 +825,8 @@ impl LstmRecognizer {
                 crop.extend_from_slice(&grey[y * w + left..y * w + right]);
             }
 
-            let lines = self.recognize_page_makerow_words(&crop, cw, ch, dict)?;
+            let lines =
+                self.recognize_page_makerow_words_with_mode(&crop, cw, ch, dict, binarize_mode)?;
             if lines.is_empty() {
                 any_block_empty = true;
             }
@@ -773,7 +866,8 @@ impl LstmRecognizer {
         // better). The extra whole-page pass costs one recognition, paid only
         // in the suspicious case, never on a cleanly-split page.
         if any_block_empty || out.is_empty() {
-            let whole = self.recognize_page_makerow_words(grey, w, h, dict)?;
+            let whole =
+                self.recognize_page_makerow_words_with_mode(grey, w, h, dict, binarize_mode)?;
             let words_of =
                 |ls: &[crate::renderer::LineWords]| ls.iter().map(|l| l.words.len()).sum::<usize>();
             if words_of(&whole) > words_of(&out) {
@@ -811,7 +905,52 @@ impl LstmRecognizer {
         dict: Option<&DictLite>,
         harvest: Option<&[crate::structured::FieldSpec]>,
     ) -> Result<Document, RecognizerError> {
-        let lines = self.recognize_page_blocks_words(grey, w, h, dict)?;
+        self.recognize_document_with_mode(grey, w, h, dict, harvest, BinarizeMode::default())
+    }
+
+    /// The same one-shot structured-document composition as
+    /// [`Self::recognize_document`], with binarization mode selectable via
+    /// an explicit [`BinarizeMode`](crate::xy_cut::BinarizeMode).
+    /// [`Self::recognize_document`] is exactly this method called with
+    /// `BinarizeMode::default()` (i.e. [`BinarizeMode::Otsu`]) — byte-identical
+    /// to its pre-existing behaviour, so every existing caller of
+    /// [`Self::recognize_document`] is unaffected by this addition.
+    ///
+    /// `binarize_mode` governs EVERY internal binarization pass this
+    /// composition runs: word/line text recognition
+    /// ([`Self::recognize_page_blocks_words_with_mode`], called first,
+    /// below — which threads `binarize_mode` through its own layout
+    /// `xy_cut` split AND the makerow line-finder's segmentation
+    /// binarization), the layout-block [`xy_cut`](crate::xy_cut::xy_cut)
+    /// segmentation (reading order fed to
+    /// [`build_regions`](crate::structured::build_regions)), and the region
+    /// classifier's own pass feeding [`Self::region_figures`] /
+    /// [`Self::block_is_table`].
+    ///
+    /// **This closes a gap this method used to have** (measured, see
+    /// `examples/binarize_ab.rs` and
+    /// `.claude/harvest/sauvola-vs-otsu-probe.md`): `binarize_mode` used to
+    /// reach only the layout `xy_cut` + region/table classification pass,
+    /// never word/line text recognition — which ran its own separate,
+    /// always-Otsu binarization internally, untouched by this parameter.
+    /// `Document::word_count`, `Document::line_count`, and
+    /// `Document::mean_confidence` CAN now differ between modes on the same
+    /// input, in addition to the emitted `doc.v1` JSON's region/table/figure
+    /// classification (which was already mode-aware).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::recognize_document`].
+    pub fn recognize_document_with_mode(
+        &self,
+        grey: &[u8],
+        w: usize,
+        h: usize,
+        dict: Option<&DictLite>,
+        harvest: Option<&[crate::structured::FieldSpec]>,
+        binarize_mode: BinarizeMode,
+    ) -> Result<Document, RecognizerError> {
+        let lines = self.recognize_page_blocks_words_with_mode(grey, w, h, dict, binarize_mode)?;
         let mut page =
             crate::structured::DocPage::from_line_words(&lines, &self.charset, w as u32, h as u32);
         crate::structured::harden_numeric_tokens(&mut page);
@@ -825,12 +964,15 @@ impl LstmRecognizer {
         // ("figure") regions from the byte-parity leptonica pixGetRegionsBinary
         // composition. All are parity-proven library layers.
         let furniture = crate::page_furniture::detect_page_furniture(&page);
-        let blocks: Vec<(i32, i32, i32, i32)> =
-            crate::xy_cut::xy_cut(grey, w, h, &crate::xy_cut::XyCutParams::default())
-                .into_iter()
-                .map(|r| (r.left as i32, r.top as i32, r.right as i32, r.bottom as i32))
-                .collect();
-        let binary = Self::binarize_page(grey, w, h);
+        let xy_params = crate::xy_cut::XyCutParams {
+            binarize_mode,
+            ..crate::xy_cut::XyCutParams::default()
+        };
+        let blocks: Vec<(i32, i32, i32, i32)> = crate::xy_cut::xy_cut(grey, w, h, &xy_params)
+            .into_iter()
+            .map(|r| (r.left as i32, r.top as i32, r.right as i32, r.bottom as i32))
+            .collect();
+        let binary = Self::binarize_page_with(grey, w, h, binarize_mode);
         let figures = Self::region_figures(&binary, w, h);
         // A block is a TABLE when its FULL bbox (rules + column corridors, not
         // just the text-line union the region carries) clears decide_if_table.
@@ -878,8 +1020,8 @@ impl LstmRecognizer {
     /// ([`Regions::textblock`](crate::pageseg::Regions::textblock)) is the
     /// pixel-level text-region witness the same composition also yields.
     ///
-    /// Takes the already-binarized page ([`Self::binarize_page`]) — the caller
-    /// binarizes once and shares it with the table pass.
+    /// Takes the already-binarized page ([`Self::binarize_page_with`]) — the
+    /// caller binarizes once and shares it with the table pass.
     fn region_figures(binary: &[u8], w: usize, h: usize) -> Vec<(i32, i32, i32, i32)> {
         if w < crate::pageseg::MIN_WIDTH || h < crate::pageseg::MIN_HEIGHT {
             return Vec::new();
@@ -896,19 +1038,17 @@ impl LstmRecognizer {
             .collect()
     }
 
-    /// Otsu binarization (with the fixed-128 fallback the library segmenters
-    /// use when Otsu declines) → this crate's 1bpp `0` = ON. Shared by the
-    /// region classifier's figure ([`Self::region_figures`]) and table
-    /// ([`Self::block_is_table`]) paths — the caller binarizes once.
-    fn binarize_page(grey: &[u8], w: usize, h: usize) -> Vec<u8> {
-        let otsu = crate::threshold::otsu_threshold_gray(grey, w, 0, 0, w, h);
-        if otsu.hi_value == -1 {
-            grey.iter()
-                .map(|&p| if p < 128 { 0 } else { 255 })
-                .collect()
-        } else {
-            crate::threshold::threshold_rect_to_binary(grey, w, 0, 0, w, h, otsu)
-        }
+    /// Binarize the page once → this crate's 1bpp `0` = ON, under an
+    /// explicit [`BinarizeMode`]. Shared by the region classifier's figure
+    /// ([`Self::region_figures`]) and table ([`Self::block_is_table`]) paths
+    /// — the caller binarizes once. Delegates to
+    /// [`crate::xy_cut::binarize_page_with`] rather than re-implementing the
+    /// Otsu-with-fixed-128-fallback logic a second time in this file;
+    /// [`BinarizeMode::Otsu`] (the default — see
+    /// [`Self::recognize_document`]) reproduces this method's pre-existing
+    /// (pre-[`BinarizeMode`]) Otsu-only body byte-for-byte.
+    fn binarize_page_with(grey: &[u8], w: usize, h: usize, mode: BinarizeMode) -> Vec<u8> {
+        crate::xy_cut::binarize_page_with(grey, w, h, mode)
     }
 
     /// Whether an XY-cut layout `block` is a TABLE — the byte-parity leptonica
@@ -1506,6 +1646,158 @@ mod makerow_page_tests {
         assert_eq!(harvested.line_count, words.len());
     }
 
+    /// **The default-preservation invariant.** `recognize_document` must
+    /// produce byte-identical `Document`s to
+    /// `recognize_document_with_mode(.., BinarizeMode::default())` — the
+    /// whole point of the `_with_mode` sibling pattern is that adding the
+    /// new parameter never changes a single existing caller's behaviour.
+    #[test]
+    fn recognize_document_matches_with_mode_default() {
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+        if !corpus.join("model/eng.lstm").exists() || !corpus.join("lines/page_roomy.pgm").exists()
+        {
+            return;
+        }
+        let lstm = std::fs::read(corpus.join("model/eng.lstm")).unwrap();
+        let uni = std::fs::read_to_string(corpus.join("model/eng.lstm-unicharset")).unwrap();
+        let rec = std::fs::read(corpus.join("model/eng.lstm-recoder")).unwrap();
+        let img = std::fs::read(corpus.join("lines/page_roomy.pgm")).unwrap();
+        let r = LstmRecognizer::from_components(&lstm, &uni, &rec).unwrap();
+        let (grey, w, h) = crate::image_input::parse_pgm(&img).unwrap();
+
+        let via_plain = r.recognize_document(&grey, w, h, None, None).unwrap();
+        let via_with_mode = r
+            .recognize_document_with_mode(&grey, w, h, None, None, BinarizeMode::default())
+            .unwrap();
+        assert_eq!(via_plain.json, via_with_mode.json, "json must match");
+        assert_eq!(via_plain.word_count, via_with_mode.word_count);
+        assert_eq!(via_plain.line_count, via_with_mode.line_count);
+        assert_eq!(via_plain.mean_confidence, via_with_mode.mean_confidence);
+        assert_eq!(via_plain.low_confidence, via_with_mode.low_confidence);
+    }
+
+    /// **Mode-threading safety net for the NEW `_with_mode` siblings added
+    /// alongside `crate::segment::segment_rows_with_mode` /
+    /// `segment_rows_independent_with_mode`.** Mirrors
+    /// [`recognize_document_matches_with_mode_default`] (the pre-existing
+    /// invariant for `recognize_document`/`recognize_document_with_mode`),
+    /// extended to the three new pairs this pass introduces:
+    /// `recognize_page_makerow`/`_with_mode`,
+    /// `recognize_page_makerow_words`/`_with_mode`, and
+    /// `recognize_page_blocks_words`/`_with_mode`. Each `_with_mode` sibling
+    /// called with `BinarizeMode::default()` MUST reproduce its plain
+    /// counterpart byte-for-byte — the regression this pass exists to
+    /// prevent is an accidental default-behaviour change silently re-pinning
+    /// every golden anchor and the 8+7+0 CER fence, both of which run
+    /// through `crate::segment::segment_rows_with_mode` underneath these methods.
+    #[test]
+    fn new_with_mode_siblings_match_their_plain_counterparts_at_default() {
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+        if !corpus.join("model/eng.lstm").exists() || !corpus.join("lines/page_roomy.pgm").exists()
+        {
+            return;
+        }
+        let lstm = std::fs::read(corpus.join("model/eng.lstm")).unwrap();
+        let uni = std::fs::read_to_string(corpus.join("model/eng.lstm-unicharset")).unwrap();
+        let rec = std::fs::read(corpus.join("model/eng.lstm-recoder")).unwrap();
+        let img = std::fs::read(corpus.join("lines/page_roomy.pgm")).unwrap();
+        let r = LstmRecognizer::from_components(&lstm, &uni, &rec).unwrap();
+        let (grey, w, h) = crate::image_input::parse_pgm(&img).unwrap();
+
+        let string_plain = r.recognize_page_makerow(&grey, w, h, None).unwrap();
+        let string_with_mode = r
+            .recognize_page_makerow_with_mode(&grey, w, h, None, BinarizeMode::default())
+            .unwrap();
+        assert_eq!(
+            string_plain, string_with_mode,
+            "recognize_page_makerow(default) must match recognize_page_makerow_with_mode(default)"
+        );
+
+        let words_plain = r.recognize_page_makerow_words(&grey, w, h, None).unwrap();
+        let words_with_mode = r
+            .recognize_page_makerow_words_with_mode(&grey, w, h, None, BinarizeMode::default())
+            .unwrap();
+        assert_eq!(
+            words_plain, words_with_mode,
+            "recognize_page_makerow_words(default) must match _with_mode(default)"
+        );
+
+        let blocks_plain = r.recognize_page_blocks_words(&grey, w, h, None).unwrap();
+        let blocks_with_mode = r
+            .recognize_page_blocks_words_with_mode(&grey, w, h, None, BinarizeMode::default())
+            .unwrap();
+        assert_eq!(
+            blocks_plain, blocks_with_mode,
+            "recognize_page_blocks_words(default) must match _with_mode(default)"
+        );
+    }
+
+    /// `recognize_document_with_mode` must accept the non-default
+    /// [`BinarizeMode::Sauvola`] end-to-end without panicking and still
+    /// produce well-formed `doc.v1` JSON.
+    ///
+    /// **This test previously asserted `otsu.word_count == sauvola.word_count`
+    /// as a "regression guard" — that assertion encoded the very gap this
+    /// change fixes.** `binarize_mode` used to reach only region/table
+    /// classification, never word/line text recognition, so the two modes
+    /// were guaranteed to agree on `word_count`/`mean_confidence` regardless
+    /// of input. Now that `binarize_mode` also governs the makerow line
+    /// finder's own segmentation binarization
+    /// (`crate::segment::segment_rows_with_mode`), Otsu and Sauvola CAN
+    /// legitimately disagree on word/line output — measuring whether/how
+    /// much they actually do on a given input is exactly what
+    /// `examples/binarize_ab.rs` is for (see
+    /// `.claude/harvest/sauvola-vs-otsu-probe.md`'s "clean" row for a case
+    /// where the two still agree closely on an evenly-lit page). Pinning
+    /// numeric equality here would just re-assert the old bug, so this test
+    /// now only guards against a panic or malformed-output regression when
+    /// Sauvola is selected — not equality with Otsu.
+    #[test]
+    fn recognize_document_with_mode_sauvola_is_well_formed() {
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus");
+        if !corpus.join("model/eng.lstm").exists() || !corpus.join("lines/page_roomy.pgm").exists()
+        {
+            return;
+        }
+        let lstm = std::fs::read(corpus.join("model/eng.lstm")).unwrap();
+        let uni = std::fs::read_to_string(corpus.join("model/eng.lstm-unicharset")).unwrap();
+        let rec = std::fs::read(corpus.join("model/eng.lstm-recoder")).unwrap();
+        let img = std::fs::read(corpus.join("lines/page_roomy.pgm")).unwrap();
+        let r = LstmRecognizer::from_components(&lstm, &uni, &rec).unwrap();
+        let (grey, w, h) = crate::image_input::parse_pgm(&img).unwrap();
+
+        let otsu = r
+            .recognize_document_with_mode(&grey, w, h, None, None, BinarizeMode::Otsu)
+            .unwrap();
+        let sauvola = r
+            .recognize_document_with_mode(
+                &grey,
+                w,
+                h,
+                None,
+                None,
+                BinarizeMode::Sauvola {
+                    whsize: 16,
+                    k: 0.34,
+                },
+            )
+            .unwrap();
+        assert!(sauvola
+            .json
+            .starts_with("{\"schema\":\"tesseract-rs/doc.v1\""));
+        // A sanity floor, not an equality pin: Sauvola must still recognize
+        // *something* on a fixture Otsu recognizes cleanly, even if the
+        // exact count now legitimately differs.
+        assert!(
+            otsu.word_count > 0,
+            "fixture sanity: Otsu must find words on page_roomy.pgm"
+        );
+        assert!(
+            sauvola.word_count > 0,
+            "Sauvola must still recognize words on the same fixture, not silently zero"
+        );
+    }
+
     /// The region-classifier figure path (`region_figures`) is corpus-free —
     /// it takes a grey page and runs the byte-parity `get_regions_binary`
     /// composition. A page with a solid image block + text columns must yield
@@ -1590,7 +1882,7 @@ mod makerow_page_tests {
             yb += 14;
         }
 
-        let binary = LstmRecognizer::binarize_page(&grey, w, h);
+        let binary = LstmRecognizer::binarize_page_with(&grey, w, h, BinarizeMode::Otsu);
         assert!(
             LstmRecognizer::block_is_table(&binary, w, h, (18, 18, 224, 236)),
             "ruled grid block → table"

@@ -211,6 +211,55 @@ The eng.lstm front-end: `Input → [C3,3Ft16] (Convolve+Reconfig) → Mp3,3 (Max
 
 ### Phase C — completeness (C2 is a B3 prereq; C1/C3 are the deferred accuracy waves)
 
+> **⚠ STATUS CORRECTION (2026-07-29).** The C1 and C2 bullets below are the
+> ORIGINAL SCOPING and are **stale as status** — both have since SHIPPED. They
+> are kept unedited as the record of what was scoped; read them as history, not
+> as open work. Verified in `crates/tesseract-core/src/recodebeam.rs`:
+>
+> - **C1 — dict / LM beam: SHIPPED.** `continue_dawg` (:969, citing
+>   `recodebeam.cpp:1057-1136`), `push_initial_dawg_if_better` (:1130), the
+>   `is_dawg` beam indexing (`beam_index`/`is_dawg_from_index`, :158-175, used
+>   at :703 and :1378-1383), and the `dict: Option<DictLite>` /
+>   `dict_ratio` / `cert_offset` / `worst_dict_cert` scoring fields (:361-372)
+>   are all present, over `DictLite::def_letter_is_okay`. The production beam
+>   params captured live from the CLI (`dict_ratio=2.25`, `cert_offset=-0.085`,
+>   `worst_dict_cert=-25/7`) are recorded in the CTC correction note in
+>   `CLAUDE.md`; the dict arm has a golden anchor at
+>   `corpus/golden/lines/line36.dict.tsv`.
+> - **C2 — `ExtractBestPathAsUnicharIds`: SHIPPED.**
+>   `extract_best_path_as_unichar_ids` (:1500) returns
+>   `(unichar_ids, certs, ratings, xcoords)` as scoped, and the `certainty`
+>   field the bullet asks to "re-add when C2 lands" is back on `RecodeNode`
+>   (:219).
+>
+> **Why this drifted:** C1/C2 shipped under a DIFFERENT plan's wave labels —
+> `.claude/plans/pdf-to-text-ocr-v1.md` § "Batch 1A — C1: the dictionary beam"
+> (D1.1 dawg load, D1.2/D1.2b `DictLite` walker, D1.3 beam dict arms) — and
+> this section was never back-updated. That plan's own tracker line is stale
+> too (`dict beam C1 / word boxes B3-full ⬜`). **Source is ground truth; both
+> plan docs had drifted.** The dict path is wired in production, not just
+> tests: `lstm_recognizer.rs` calls `new_with_dict` + `decode_with_dict` with
+> `K_DICT_RATIO`/`K_CERT_OFFSET`/`K_WORST_DICT_CERT` at three call sites
+> (:230/237, :648/655, :1071/1078); the dawg load side is
+> `tesseract-core/src/dict_walker.rs`.
+>
+> **B3-full may also be further along than documented** —
+> `extract_best_path_as_words` is present at `recodebeam.rs:1663-1742`. Its
+> wiring status was not fully audited; treat the B3-full bullet as unverified
+> rather than trusted-open.
+>
+> **Genuinely still open in Phase C: C3 only** — and its blocking data is now
+> IN THE REPO (`corpus/model/chi_sim.lstm-recoder`, 4022 entries, code lengths
+> 1-5). **Correction to the C3 bullet below:** it says "code length 3"; the
+> real histogram is `{1:128, 2:278, 3:2077, 4:1515, 5:24}` — 3 is the mode,
+> not the range, and 3894 entries exceed length 1. See
+> `corpus/model/README.md` § "Falsifier fixtures".
+>
+> The bbox/stats sub-leaf at the end of this section is likewise **no longer
+> data-blocked** — `corpus/model/eng.unicharset` (the legacy build) has
+> 112/112 distinct bbox+stats CSV blobs against the LSTM unicharset's uniform
+> 111. Both are now scheduling choices, not gaps.
+
 - **C1 — dict / language-model beam.** The dawg machinery skipped in 7b:
   `ContinueDawg`, `PushInitialDawgIfBetter`, `DawgPositionVector`, the
   `is_dawg` beams, `worst_dict_cert`/`dict_ratio` scoring (`recodebeam.cpp:1057-
