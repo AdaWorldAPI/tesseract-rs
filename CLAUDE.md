@@ -1040,18 +1040,93 @@ the polyfill, never before.**
 
 | stage | ms | % of one `recognize_document` |
 |---|---|---|
-| `binarize[otsu]` | 1.34 | 0.14% |
-| `binarize[sauvola]` | 4.73 | 0.50% |
-| `binarize[wolf]` | 5.18 | 0.54% |
-| `binarize[singh]` | 4.58 | 0.48% |
-| **`strip_borders`** | **91.87** | **9.65%** |
-| `recognize_document` | 951.92 | 100% |
+| `binarize[otsu]` | 1.32 | 0.15% |
+| `binarize[sauvola]` | 4.42 | 0.51% |
+| `binarize[wolf]` | 4.88 | 0.56% |
+| `binarize[singh]` | 4.65 | 0.54% |
+| **`strip_borders`** | **86.92** | **10.00%** |
+| **`prescale` (all 7 lines)** | **1.06** | **0.12%** |
+| `recognize_document` | 868.83 | 100% |
 
-**Binarization is 0.14-0.54% of a page.** Making any of those loops
-*infinitely* fast buys half a percent — far less than the cost of the ndarray
-dependency edge and the two-foundations argument it would reopen. The
-deferral is now a measured decision, not an assumption. Do not revisit
-without a new measurement.
+**★ The `prescale` row settles a FOUNDING claim, against it.** Before the
+transcode existed, part of the case for transcoding rather than *binding* to
+libtesseract was: a pure-Rust pipeline can route its hot pixel work through
+`ndarray::simd`, **and the image resizing is the target**. A binding is stuck
+with leptonica's kernels; a transcode is not.
+
+Measured, **resizing is the SMALLEST pixel stage** — 0.12%, below plain Otsu.
+The line crops are tiny (7 lines × ~512×28 ≈ 100k px against 368,640 for one
+whole-page binarize, at a gentle `f ≈ 1.3` upscale). **Nor is that an artifact
+of a 7-line page:** `prescale` is per-line and the LSTM forward is per-line, so
+both sides of the ratio scale together (~0.15 ms scaling vs ~110 ms
+recognition, per line). A 176-line page multiplies both by 25; the fixed
+whole-page overhead amortizes away and leaves the LSTM an even *larger* share.
+
+**The transcode was still right — the reason was mis-attributed.** Its payoff
+is what this repo actually demonstrates: zero C at runtime (the web demo is a
+glibc binary + ~4 MB model), byte-parity *provability* (you cannot diff a
+binding against itself), WASM/Docker/Railway deployability, and the entire
+`doc.v1` surface a binding could never have produced. None of that is a SIMD
+argument and none of it needed one. Do not re-file "SIMD the resizer" — it is
+measured and closed.
+
+> **⚠ THOSE PERCENTAGES WERE INVALID — corrected by a codex P1 on PR #62.**
+> Dividing ONE isolated `binarize_page_with` call by ONE `recognize_document`
+> is not an Amdahl fraction: (a) the adaptive rows time Sauvola/Wolf/Singh
+> while the denominator runs **Otsu**, so the numerator was a stage the
+> denominator never executed; (b) even for Otsu the pipeline binarizes
+> **several times per page** — the initial binarize, the `xy_cut` inside
+> `recognize_page_blocks_words_with_mode`, per-block makerow segmentation, and
+> the layout `xy_cut` again. The valid measurement times the **whole pipeline
+> per mode**, which counts every call site automatically and stays correct if
+> one is added later:
+>
+> | mode | page ms | Δ vs otsu | Δ as % of page |
+> |---|---|---|---|
+> | otsu | 1002.98 | — | — |
+> | **sauvola** | 1031.53 | +28.54 ms | **+2.85%** |
+> | wolf | 1014.72 | +11.73 ms | +1.17% |
+> | singh | 1008.61 | +5.63 ms | +0.56% |
+>
+> **Sauvola's real in-pipeline cost is 2.85%, not the 0.50% first published —
+> 5.7× larger.** The conclusion survives (a few percent does not justify the
+> ndarray dependency edge on `tesseract-ocr`), but the evidence as first
+> stated did not support it, and a green test gate could never have caught
+> that. Note the delta method's own limit: it gives each adaptive mode's cost
+> *relative to Otsu*, not Otsu's absolute in-pipeline cost — bounding that
+> would need a null binarizer as baseline. Isolated Otsu is 1.50 ms/call, so
+> total binarization is plausibly ~1-4% of a page.
+
+**Binarization is a low single-digit percentage of a page.** Making those
+loops *infinitely* fast recovers a few percent — less than the cost of the
+ndarray dependency edge and the two-foundations argument it would reopen. The
+deferral is a measured decision, not an assumption. Do not revisit without a
+new measurement.
+
+**★ `array_windows` does NOT fit the binarizers, and that is a considered
+no.** `ndarray::simd_ops::array_windows<T, const N>` is a fixed-size sliding
+window. The windowed mean / mean-square here use **integral images** — a
+4-corner difference, O(1) per pixel *regardless of window size*. At
+`whsize = 16` the window is 33×33 = 1089 px and the integral form touches
+**4**, so a sliding window would be a ~270× *increase* in work. It is the
+right tool for a small fixed stencil (a 3-tap filter, a header walk); wrong
+for a large-window box filter that already has an O(1) formulation.
+`strip_borders`' 100×1 / 1×100 morphology is separable and wants running
+min/max, not naive windows either.
+
+**★ Rayon is the genuinely promising lever, and it is NOT the pixel stages.**
+Parallelizing 2.85% recovers nothing. Line recognition is where the ~1000 ms
+lives, and the lines are **independent**: `seeded_randomizer(&self)` hands
+each line a FRESH deterministically-seeded `TRand` inside `prepare_grid`
+(never carried across lines), the network weights are `&self` read-only, and
+the LSTM recurrence is *within* a line, not across. So a rayon fan-out over
+lines would be both correct and **byte-deterministic** — the output must not
+change at all, which is the falsifier any such change owes. Not scheduled;
+the real costs are a new dependency on a deliberately lean crate, the WASM
+build's threading story (the web demo ships one binary), and a
+parallel-vs-sequential `doc.v1` equality test to prove the determinism rather
+than assume it. Recorded because it is ~100× more valuable than SIMD-ing a
+binarizer.
 
 **`strip_borders` at 9.65% is the only pixel stage that is even visible** —
 130× Sauvola's cost. Three things about it, in order: it is **opt-in and
