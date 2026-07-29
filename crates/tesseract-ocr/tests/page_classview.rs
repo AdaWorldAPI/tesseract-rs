@@ -116,3 +116,42 @@ fn classview_vs_xy_cut_placement_exactness() {
         );
     }
 }
+
+/// **The false-positive falsifier.** `page_01` is a single column of
+/// paragraph lines with NO header or footer (its generator documents it as
+/// "single column, top-to-bottom reading order"). A band projection that
+/// promotes ordinary inter-paragraph leading into furniture boundaries would
+/// invent structure that is not on the page — the exact failure mode that
+/// would do damage in an import path, since a fabricated Header/Footer band
+/// removes real content from Main.
+///
+/// Reported rather than hard-asserted at a specific count: what matters is
+/// whether the median-relative filter *discriminates*, and the number tells
+/// us. A guard that fires on everything carries as much information as one
+/// that never fires.
+#[test]
+fn classview_does_not_invent_furniture_on_a_plain_page() {
+    let p = corpus().join("pages/page_01.pgm");
+    if !p.exists() {
+        eprintln!("skipping: corpus pages absent");
+        return;
+    }
+    let bytes = std::fs::read(&p).unwrap();
+    let (grey, w, h) = tesseract_ocr::image_input::parse_pgm(&bytes).unwrap();
+    let bands = classview_bands(&grey, w, h);
+    eprintln!("plain page_01 (no furniture): {} band(s)", bands.len());
+    for (t, b) in &bands {
+        eprintln!("   top={t} bottom={b}");
+    }
+
+    // The furniture fixture yields 3. A plain page must yield materially
+    // fewer, or the filter is not discriminating and the 3 above were luck.
+    assert!(
+        bands.len() < 3,
+        "a page with NO header/footer produced {} bands — the median-relative \
+         filter is promoting ordinary paragraph leading into furniture \
+         boundaries, which would fabricate Header/Footer regions and remove \
+         real content from Main",
+        bands.len()
+    );
+}
