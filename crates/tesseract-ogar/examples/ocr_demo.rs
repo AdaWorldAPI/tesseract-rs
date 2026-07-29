@@ -94,6 +94,7 @@ fn main() {
             grey: &grey,
             width: w,
             height: h,
+            binarize: tesseract_ogar::BinarizeMode::default(),
             with_dict: true,
             harvest_profile: Some("german_invoice"),
         })

@@ -42,6 +42,8 @@
 //! *join*: proving, at compile time and test time, that the declared
 //! capability table and the actual executable surface never diverge.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 use tesseract_core::dawg::DawgError;
@@ -116,6 +118,17 @@ const _: () = assert!(
 /// feature.
 #[cfg(feature = "image-decode")]
 pub use tesseract_ocr::{decode_image, ImageDecodeError};
+
+/// Segmentation binarization mode selectable via
+/// [`OcrRequest::RecognizeDocument`]'s `binarize` field — re-exported so a
+/// caller doesn't need a direct `tesseract-ocr` dependency merely to name a
+/// mode. [`BinarizeMode::Otsu`] (also [`BinarizeMode::default`]) is the
+/// crate-wide default: a single global threshold, byte-identical to this
+/// executor's behaviour before this field existed. [`BinarizeMode::Sauvola`]
+/// is the adaptive per-pixel alternative for source pages a single global
+/// threshold under-serves (uneven illumination, aged scans). See
+/// [`tesseract_ocr::BinarizeMode`] for the full algorithm documentation.
+pub use tesseract_ocr::BinarizeMode;
 
 /// One typed request per declared OGAR OCR capability. Plain Rust types,
 /// zero serialization — see the module docs.
@@ -216,7 +229,12 @@ pub enum OcrRequest<'a> {
     /// (classified regions) + typed field harvest. `harvest_profile`
     /// selects the field set (`Some("german_invoice")`; `None` / empty = no
     /// harvest; any other value FAILS with
-    /// [`OcrExecError::UnknownHarvestProfile`]).
+    /// [`OcrExecError::UnknownHarvestProfile`]). `binarize` selects the
+    /// segmentation binarization mode threaded through EVERY internal
+    /// binarization pass `recognize_document_with_mode` runs (word/line text
+    /// recognition, the layout `xy_cut` split, and region/table
+    /// classification) — this is the same axis a hot record's
+    /// [`RecognitionConfig`] can later be used to recall documents by.
     RecognizeDocument {
         /// Row-major 8-bit grey page.
         grey: &'a [u8],
@@ -228,6 +246,14 @@ pub enum OcrRequest<'a> {
         with_dict: bool,
         /// The field-harvest profile (`None` = no harvest).
         harvest_profile: Option<&'a str>,
+        /// Segmentation binarization mode (see [`BinarizeMode`]).
+        /// [`BinarizeMode::default()`] (Otsu) reproduces this variant's
+        /// exact pre-existing behaviour — every existing caller that
+        /// constructs this variant must now supply this field explicitly
+        /// (plain Rust enums have no per-field defaults), and passing
+        /// [`BinarizeMode::default()`] keeps that caller's output
+        /// byte-identical to before this field existed.
+        binarize: BinarizeMode,
     },
     /// `harvest_fields` — the typed field harvest over an already-recognized
     /// page's word output. `harvest_profile` is required (unknown / empty
@@ -425,6 +451,122 @@ pub struct OcrExecutor {
     dict: Option<DictLite>,
 }
 
+/// The model-determined half of a recognized document's provenance —
+/// everything knowable about HOW a page was recognized once an
+/// [`OcrExecutor`] has finished loading, independent of any one page it
+/// later recognizes. Built via [`OcrExecutor::config`].
+///
+/// ## Why record configuration, not just a confidence score
+///
+/// A downstream KV writer storing a scanned document keyed by
+/// `documentpath/documentid` wants a small, scannable **hot record** — enough
+/// to answer "which documents were recognized under which conditions?"
+/// without parsing the (much larger) `doc.v1` payload or touching the raw
+/// blob in a secondary table. A confidence score alone cannot answer that
+/// question *retroactively*: this session's own measurements found a real
+/// unevenly-lit page recognized at `mean_conf` **99.47** whose actual
+/// character error rate was **0.6154** (61.5% wrong) — 99.5% confident and
+/// mostly wrong. If the configuration that produced a recognition is never
+/// recorded, there is no way to later ask "every document recognized under
+/// the configuration now known to be unreliable on uneven lighting" — every
+/// such document's confidence score looked equally plausible at the time it
+/// was written. [`RecognitionConfig`] (or its [`RecognitionConfig::config_id`]
+/// digest) is that recall key: a document's hot record can carry it so a
+/// later audit or reprocessing pass can select documents by CONFIGURATION,
+/// not just by score.
+///
+/// ## What's included, and why
+///
+/// - `network_spec` and `null_char` identify the loaded MODEL — different
+///   models (`eng` vs `deu`) have measurably different spec strings and
+///   `null_char` values (each model self-derives its own from its own
+///   unicharset size; see `tesseract-rs/CLAUDE.md`'s eng/deu parity notes).
+/// - `charset_len` and `code_range` identify the model's SHAPE (vocabulary
+///   size and recoder lattice width) as a cheap architecture fingerprint,
+///   without hashing the model's weight bytes.
+/// - `dict_loaded` records whether the dictionary beam was available —
+///   decode behaviour differs materially with the dict beam active
+///   (different certainty constants, different word-boundary handling; see
+///   [`tesseract_ocr::LstmRecognizer::recognize_grid_with_dict`]), so this is
+///   load-bearing provenance, not a cosmetic flag.
+///
+/// ## Deliberately OMITTED: `deskew_fired` / `rectify_fired`
+///
+/// A configuration flag that can never report `true` carries no recall
+/// value — it is indistinguishable from a flag that is always false by
+/// construction, and recording it would look like real provenance while
+/// being permanently inert (this workspace's own rule: a guard that cannot
+/// fire is the defect one level up). Neither preprocessing stage is wired
+/// into this executor today:
+///
+/// - **Deskew** has no pipeline-wiring step yet (plan step D8 — see
+///   `tesseract-rs/CLAUDE.md`'s "Deskew wave" section); `deskew.rs`'s
+///   primitives exist and are byte-parity proven, but nothing calls them
+///   from [`OcrExecutor::execute`].
+/// - **Rectify** (`rectify.rs`'s `auto_rectify`) is wired into
+///   `tesseract-ocr-web`'s debug/PDF routes as an opt-in checkbox, but is
+///   NOT threaded through this executor's [`OcrRequest::RecognizeDocument`]
+///   path at all.
+///
+/// Add these fields only once the corresponding stage is actually threaded
+/// through [`OcrExecutor::execute`] and can genuinely report `true` on some
+/// real input — until then they would be exactly the inert-flag
+/// anti-pattern this doc section exists to avoid.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecognitionConfig {
+    /// The loaded model's VGSL-ish spec string (e.g.
+    /// `[1,36,0,1Ct3,3,16Mp3,3...O1c111]`) — identifies the network
+    /// architecture actually running.
+    pub network_spec: String,
+    /// The CTC null/blank class id. A real, measured model discriminator,
+    /// not cosmetic: `eng.lstm` is 110, `deu.lstm` is 114.
+    pub null_char: i32,
+    /// The loaded character set's entry count. `eng` is 112, `deu` is 116
+    /// (the extra `ä ö ü ß`) — a cheap shape fingerprint that distinguishes
+    /// models without hashing the model bytes.
+    pub charset_len: usize,
+    /// The recoder's lattice width (its `code_range`) — another model-shape
+    /// discriminator alongside [`Self::charset_len`].
+    pub code_range: i32,
+    /// Whether a word/punctuation/number dictionary DAWG was loaded (see
+    /// [`OcrExecutor::from_data_paths`]).
+    pub dict_loaded: bool,
+}
+
+impl RecognitionConfig {
+    /// A hash over every field, meant to index a KV hot record on one scalar
+    /// column (a cheap equality check or group-by) instead of a
+    /// multi-column scan across `network_spec`/`null_char`/`charset_len`/
+    /// `code_range`/`dict_loaded`.
+    ///
+    /// # NOT a persisted identity — NOT stable across Rust or crate versions
+    ///
+    /// This is built on [`std::collections::hash_map::DefaultHasher`], whose
+    /// algorithm the standard library explicitly documents as **unspecified
+    /// and subject to change between releases** of Rust. It is equally
+    /// unstable across changes to THIS crate — adding, removing, or
+    /// reordering the fields this method hashes changes the result. Treat
+    /// `config_id` as an **in-deployment index key only**: safe to compare
+    /// within one running deployment on one build, unsafe to compare across
+    /// a Rust upgrade, a `tesseract-ogar` upgrade, or a value persisted
+    /// long-term and read back after either. A caller that needs
+    /// cross-version stability must hash the fields itself with an
+    /// explicitly-versioned scheme instead of relying on this method.
+    /// Silently assuming stability here is exactly the failure mode this
+    /// warning exists to prevent: it would corrupt a recall query across an
+    /// upgrade without any error at the point of corruption.
+    #[must_use]
+    pub fn config_id(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.network_spec.hash(&mut hasher);
+        self.null_char.hash(&mut hasher);
+        self.charset_len.hash(&mut hasher);
+        self.code_range.hash(&mut hasher);
+        self.dict_loaded.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
 impl OcrExecutor {
     /// Load the recognizer network/charset/recoder and, if all three DAWG
     /// paths are given, the word/punctuation/number dictionary, from files
@@ -487,6 +629,23 @@ impl OcrExecutor {
             OcrRequest::SegmentPage { .. } => "segment_page",
             OcrRequest::DetectHalftoneRegions { .. } => "detect_halftone_regions",
             OcrRequest::DetectPageFurniture { .. } => "detect_page_furniture",
+        }
+    }
+
+    /// A structured recognition-configuration snapshot of this executor —
+    /// the model-determined half of a document's provenance, independent of
+    /// any one page later recognized. See [`RecognitionConfig`]'s doc
+    /// comment for why this exists (a downstream KV writer's hot-record
+    /// recall key). No I/O; the only allocation is the returned
+    /// [`RecognitionConfig`]'s `network_spec` `String` clone.
+    #[must_use]
+    pub fn config(&self) -> RecognitionConfig {
+        RecognitionConfig {
+            network_spec: self.recognizer.network_str.clone(),
+            null_char: self.recognizer.null_char,
+            charset_len: self.recognizer.charset.size(),
+            code_range: self.recognizer.recoder.code_range(),
+            dict_loaded: self.dict.is_some(),
         }
     }
 
@@ -591,12 +750,20 @@ impl OcrExecutor {
                 height,
                 with_dict,
                 harvest_profile,
+                binarize,
             } => {
                 let dict = if with_dict { self.dict.as_ref() } else { None };
                 let specs = harvest_specs(harvest_profile)?;
                 let Document { json, fields, .. } = self
                     .recognizer
-                    .recognize_document(grey, width, height, dict, specs.as_deref())
+                    .recognize_document_with_mode(
+                        grey,
+                        width,
+                        height,
+                        dict,
+                        specs.as_deref(),
+                        binarize,
+                    )
                     .map_err(OcrExecError::Recognizer)?;
                 Ok(OcrResponse::DocumentOut {
                     doc_json: json,
@@ -667,7 +834,7 @@ impl OcrExecutor {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     /// The full confirmation loop, closed generically: this crate's
     /// [`HOT_PLUG`] resolves through the authority — every hot-plugged
@@ -760,6 +927,7 @@ mod tests {
                 height: 0,
                 with_dict: false,
                 harvest_profile: None,
+                binarize: BinarizeMode::default(),
             },
             OcrRequest::HarvestFields {
                 line_words: &[],
@@ -915,5 +1083,236 @@ mod tests {
             }
             other => panic!("unexpected response variant: {other:?}"),
         }
+    }
+
+    /// The bundled `corpus/model` eng loader for [`RecognitionConfig`]/
+    /// `binarize`-default tests below, mirroring `examples/ocr_demo.rs`'s
+    /// loading pattern exactly (same crate, same `corpus/model` layout).
+    /// Returns `None` when `corpus/model/eng.lstm` isn't present in this
+    /// environment, so callers can skip gracefully instead of failing CI in
+    /// an environment that hasn't staged the bundled model.
+    fn load_bundled_eng_executor() -> Option<OcrExecutor> {
+        let model = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/model");
+        if !model.join("eng.lstm").exists() {
+            return None;
+        }
+        let dawg = |name: &str| {
+            let p = model.join(name);
+            p.exists().then_some(p)
+        };
+        Some(
+            OcrExecutor::from_data_paths(
+                &model.join("eng.lstm"),
+                &model.join("eng.lstm-unicharset"),
+                &model.join("eng.lstm-recoder"),
+                dawg("eng.lstm-word-dawg").as_deref(),
+                dawg("eng.lstm-punc-dawg").as_deref(),
+                dawg("eng.lstm-number-dawg").as_deref(),
+            )
+            .expect("load the eng recognizer + dictionary from corpus/model"),
+        )
+    }
+
+    /// [`OcrExecutor::config`] reports the ACTUAL loaded model's values (not
+    /// placeholders), and [`RecognitionConfig::config_id`] is stable across
+    /// two separate `config()` calls on the same executor. Real, measured
+    /// pins from `tesseract-rs/CLAUDE.md`'s eng/deu parity notes: eng.lstm's
+    /// `null_char` is 110, its unicharset has 112 entries, its recoder's
+    /// `code_range` is 111 (`E-OCR-RECOGNIZER-LOAD-1`).
+    #[test]
+    fn config_reports_the_loaded_models_real_values() {
+        let Some(executor) = load_bundled_eng_executor() else {
+            eprintln!(
+                "config_reports_the_loaded_models_real_values: skipping — \
+                 corpus/model/eng.lstm not present in this environment"
+            );
+            return;
+        };
+
+        let config_a = executor.config();
+        let config_b = executor.config();
+        assert_eq!(
+            config_a, config_b,
+            "two config() calls on the same executor must agree field-for-field"
+        );
+        assert_eq!(
+            config_a.config_id(),
+            config_b.config_id(),
+            "config_id must be stable across two config() calls on the same executor"
+        );
+
+        assert_eq!(config_a.null_char, 110, "eng.lstm's measured null_char");
+        assert_eq!(
+            config_a.charset_len, 112,
+            "eng.lstm-unicharset's measured entry count"
+        );
+        assert_eq!(
+            config_a.code_range, 111,
+            "eng.lstm-recoder's measured code_range"
+        );
+        // MEASURED, and it is NOT what the prose says. eng.lstm's stored
+        // `network_str` is
+        // `[1,36,0,1Ct3,3,16Mp3,3Lfys48Lfx96Lrx96Lfx192O1c1]` — the head reads
+        // **`O1c1`**, not `O1c111`. The spec string is the VGSL recorded at
+        // TRAINING time, where the class count was still a placeholder; the
+        // loaded layer's real output width is carried by `code_range` (111),
+        // asserted separately above. Do not "correct" this to `O1c111` from
+        // documentation prose — that mismatch is exactly how this assertion
+        // was wrong the first time.
+        assert!(
+            config_a.network_spec.contains("O1c1"),
+            "eng.lstm's measured VGSL spec must carry its softmax/CTC head: {}",
+            config_a.network_spec
+        );
+        assert!(
+            config_a.network_spec.starts_with("[1,36,0,1Ct3,3,16Mp3,3"),
+            "eng.lstm's measured VGSL prefix (36-row input, 3x3 conv, 3x3 maxpool): {}",
+            config_a.network_spec
+        );
+        assert!(
+            config_a.dict_loaded,
+            "corpus/model ships all three eng dawgs, so the dict beam must be loaded"
+        );
+    }
+
+    /// [`RecognitionConfig::config_id`] must actually discriminate: two
+    /// independently hand-built configs with IDENTICAL fields hash
+    /// identically, and flipping exactly one field at a time changes the
+    /// digest. Hand-built (no model/corpus dependency) so this always runs.
+    #[test]
+    fn config_id_differs_when_a_field_differs() {
+        let base = RecognitionConfig {
+            network_spec: "[1,36,0,1Ct3,3,16Mp3,3O1c111]".to_owned(),
+            null_char: 110,
+            charset_len: 112,
+            code_range: 111,
+            dict_loaded: true,
+        };
+
+        // Two field-for-field identical configs must hash identically — the
+        // model-independent half of "stable".
+        let identical = base.clone();
+        assert_eq!(
+            base.config_id(),
+            identical.config_id(),
+            "field-for-field identical configs must hash identically"
+        );
+
+        // Flipping exactly one field at a time must change the digest — a
+        // real discrimination test, not merely "some fields produce a hash".
+        let diff_null = RecognitionConfig {
+            null_char: 114,
+            ..base.clone()
+        };
+        assert_ne!(
+            base.config_id(),
+            diff_null.config_id(),
+            "differing null_char must change config_id"
+        );
+
+        let diff_charset = RecognitionConfig {
+            charset_len: 116,
+            ..base.clone()
+        };
+        assert_ne!(
+            base.config_id(),
+            diff_charset.config_id(),
+            "differing charset_len must change config_id"
+        );
+
+        let diff_code_range = RecognitionConfig {
+            code_range: 115,
+            ..base.clone()
+        };
+        assert_ne!(
+            base.config_id(),
+            diff_code_range.config_id(),
+            "differing code_range must change config_id"
+        );
+
+        let diff_dict = RecognitionConfig {
+            dict_loaded: false,
+            ..base.clone()
+        };
+        assert_ne!(
+            base.config_id(),
+            diff_dict.config_id(),
+            "differing dict_loaded must change config_id"
+        );
+
+        let diff_spec = RecognitionConfig {
+            network_spec: "a-different-spec-string".to_owned(),
+            ..base.clone()
+        };
+        assert_ne!(
+            base.config_id(),
+            diff_spec.config_id(),
+            "differing network_spec must change config_id"
+        );
+    }
+
+    /// The `binarize` field's default must remain [`BinarizeMode::Otsu`] —
+    /// the goldens and the 8+7+0 CER fence (`tesseract-ocr`'s own test
+    /// suite; see `tesseract-rs/CLAUDE.md`) both depend on Otsu never
+    /// silently becoming a different default. Pins the value directly (no
+    /// model needed), then — when `corpus/model/eng.lstm` and
+    /// `corpus/pages/page_01.pgm` are present — proves the `binarize` field
+    /// [`OcrExecutor::execute`] reads actually REACHES
+    /// `recognize_document_with_mode` rather than being silently ignored: a
+    /// request built with `BinarizeMode::default()` must produce
+    /// byte-identical output to the same request built with an explicit
+    /// `BinarizeMode::Otsu`.
+    #[test]
+    fn recognize_document_default_binarize_mode_is_otsu() {
+        assert_eq!(
+            BinarizeMode::default(),
+            BinarizeMode::Otsu,
+            "the crate-wide segmentation default must stay Otsu"
+        );
+
+        let Some(executor) = load_bundled_eng_executor() else {
+            eprintln!(
+                "recognize_document_default_binarize_mode_is_otsu: skipping the \
+                 end-to-end half — corpus/model/eng.lstm not present in this environment"
+            );
+            return;
+        };
+        let page = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pages/page_01.pgm");
+        if !page.exists() {
+            eprintln!(
+                "recognize_document_default_binarize_mode_is_otsu: skipping the \
+                 end-to-end half — corpus/pages/page_01.pgm not present in this environment"
+            );
+            return;
+        }
+        let bytes = std::fs::read(&page).expect("read corpus/pages/page_01.pgm");
+        let (grey, w, h) =
+            tesseract_ocr::parse_pgm(&bytes).expect("parse corpus/pages/page_01.pgm");
+
+        let via_default = executor
+            .execute(OcrRequest::RecognizeDocument {
+                grey: &grey,
+                width: w,
+                height: h,
+                with_dict: false,
+                harvest_profile: None,
+                binarize: BinarizeMode::default(),
+            })
+            .expect("recognize_document via BinarizeMode::default()");
+        let via_explicit_otsu = executor
+            .execute(OcrRequest::RecognizeDocument {
+                grey: &grey,
+                width: w,
+                height: h,
+                with_dict: false,
+                harvest_profile: None,
+                binarize: BinarizeMode::Otsu,
+            })
+            .expect("recognize_document via explicit BinarizeMode::Otsu");
+        assert_eq!(
+            via_default, via_explicit_otsu,
+            "BinarizeMode::default() must reach recognize_document_with_mode identically \
+             to an explicit BinarizeMode::Otsu"
+        );
     }
 }

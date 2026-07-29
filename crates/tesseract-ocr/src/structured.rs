@@ -320,7 +320,13 @@ impl RegionKind {
 
 /// One cell of a [`TableGrid`] — its grid position, image bbox, and the
 /// concatenated text of the words that fell inside it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Eq` is deliberately NOT derived (unlike the rest of this struct's
+/// siblings before [`TableCell::conf`] existed): `f32` has no total
+/// ordering/equality (`NaN`), so a struct carrying one can only offer
+/// `PartialEq`. `assert_eq!`/`==` are unaffected — only a generic `T: Eq`
+/// bound would need reconsidering, and none of this crate's callers need one.
+#[derive(Clone, Debug, PartialEq)]
 pub struct TableCell {
     /// 0-based row (a recognized text line within the table region).
     pub row: usize,
@@ -330,6 +336,18 @@ pub struct TableCell {
     pub bbox: (i32, i32, i32, i32),
     /// The cell's words joined in reading order.
     pub text: String,
+    /// The cell's confidence (0–100, same scale as [`DocWord::conf`]) —
+    /// the **MINIMUM** over the confidences of the words that fell inside
+    /// it, deliberately NOT the mean.
+    ///
+    /// Min is the conservative aggregate on purpose: a lab/invoice VALUE
+    /// cell is a single fact (`1O.5` vs `10.5`), and one misread character
+    /// invalidates the whole reading — a mean would dilute exactly the
+    /// signal a downstream low-confidence review gate exists to catch. A
+    /// two-word cell reading "95% / 40%" confidence should report `40`, not
+    /// `67.5`; a consumer gating on "is this cell trustworthy" needs the
+    /// worst word, not the average one.
+    pub conf: f32,
     /// `true` for the first row (the likely header).
     pub header: bool,
 }
@@ -340,7 +358,10 @@ pub struct TableCell {
 /// (`lance-graph-arm-discovery` / DeepNSM); it is pragmatic synthesis over the
 /// proven word surface (like the rest of this module), NOT a Tesseract
 /// transcode. Emitted inside a `"table"` region as `rows`/`cols`/`cells`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Eq` is not derived — see [`TableCell`]'s doc comment (this type holds
+/// `Vec<TableCell>`, so the same `f32`-has-no-`Eq` reasoning cascades here).
+#[derive(Clone, Debug, PartialEq)]
 pub struct TableGrid {
     /// Row count (= recognized lines in the region).
     pub rows: usize,
@@ -353,7 +374,10 @@ pub struct TableGrid {
 /// One classified page region: its kind, its top-down bbox, the indices of the
 /// [`DocPage::lines`] it owns (empty for [`RegionKind::Figure`]), and — for a
 /// [`RegionKind::Table`] — its reconstructed [`TableGrid`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Eq` is not derived — see [`TableCell`]'s doc comment (`table: Option<TableGrid>`
+/// carries the same `f32`-has-no-`Eq` cascade).
+#[derive(Clone, Debug, PartialEq)]
 pub struct DocRegion {
     /// The region's kind (serialized as the `type` value).
     pub kind: RegionKind,
@@ -465,11 +489,16 @@ pub fn extract_table_grid(lines: &[&DocLine]) -> TableGrid {
                 .map(|w| w.text.as_str())
                 .collect::<Vec<_>>()
                 .join(" ");
+            // MIN over the cell's words — see TableCell::conf's doc comment
+            // for why (the same "worst word wins" rule word_confidence's own
+            // per-character min already applies one level up).
+            let conf = ws.iter().map(|w| w.conf).fold(f32::MAX, f32::min);
             cells.push(TableCell {
                 row,
                 col,
                 bbox,
                 text,
+                conf,
                 header: row == 0,
             });
         }
@@ -493,11 +522,12 @@ fn emit_table_json(out: &mut String, grid: &TableGrid) {
             out.push(',');
         }
         out.push_str(&format!(
-            "{{\"row\":{},\"col\":{},\"bbox\":{},\"text\":\"{}\",\"header\":{}}}",
+            "{{\"row\":{},\"col\":{},\"bbox\":{},\"text\":\"{}\",\"conf\":{:.2},\"header\":{}}}",
             c.row,
             c.col,
             json_bbox(c.bbox),
             json_escape(&c.text),
+            c.conf,
             c.header
         ));
     }
@@ -1843,6 +1873,90 @@ mod tests {
             .find(|c| c.row == 1 && c.col == 0)
             .unwrap();
         assert_eq!(desc.text, "Kabel HDMI", "the description cell stays whole");
+    }
+
+    #[test]
+    fn table_cell_conf_is_min_over_words_not_mean() {
+        // Same geometry as extract_table_grid_keeps_multiword_cell_intact
+        // (proven to keep "Kabel HDMI" as one cell) -- only the confidences
+        // differ. 95.0 and 40.0 average to 67.5; the cell must report 40.0.
+        let rows = [
+            dl(
+                (10, 10, 360, 30),
+                vec![
+                    dw("Pos", (10, 10, 40, 30), 99.0),
+                    dw("Preis", (300, 10, 360, 30), 99.0),
+                ],
+            ),
+            dl(
+                (10, 40, 350, 60),
+                vec![
+                    dw("Kabel", (10, 40, 60, 60), 95.0),
+                    dw("HDMI", (90, 40, 140, 60), 40.0), // the low-confidence word
+                    dw("5,00", (300, 40, 350, 60), 99.0),
+                ],
+            ),
+        ];
+        let line_refs: Vec<&DocLine> = rows.iter().collect();
+        let grid = extract_table_grid(&line_refs);
+
+        let desc = grid
+            .cells
+            .iter()
+            .find(|c| c.row == 1 && c.col == 0)
+            .unwrap();
+        assert_eq!(desc.text, "Kabel HDMI");
+        assert_eq!(
+            desc.conf, 40.0,
+            "cell conf must be the MIN over its words (40.0), never the mean (67.5)"
+        );
+
+        // A single-word cell simply reports that word's own confidence.
+        let price = grid
+            .cells
+            .iter()
+            .find(|c| c.row == 1 && c.col == 1)
+            .unwrap();
+        assert_eq!(price.conf, 99.0);
+    }
+
+    #[test]
+    fn render_json_emits_table_cell_conf() {
+        let page = DocPage {
+            width: 500,
+            height: 100,
+            lines: vec![
+                dl(
+                    (10, 10, 470, 30),
+                    vec![
+                        dw("Pos", (10, 10, 40, 30), 99.0),
+                        dw("Preis", (400, 10, 470, 30), 99.0),
+                    ],
+                ),
+                dl(
+                    (10, 40, 450, 60),
+                    vec![
+                        dw("1", (10, 40, 25, 60), 88.0),
+                        dw("5,00", (400, 40, 450, 60), 72.5),
+                    ],
+                ),
+            ],
+        };
+        let line_refs: Vec<&DocLine> = page.lines.iter().collect();
+        let grid = extract_table_grid(&line_refs);
+        let regions = vec![DocRegion {
+            kind: RegionKind::Table,
+            bbox: (10, 10, 470, 60),
+            line_indices: vec![0, 1],
+            table: Some(grid),
+        }];
+        let json = render_json_with_regions(&page, &regions, &[]);
+        // Header row cells (conf 99.0 each) and the two data cells (88.0,
+        // 72.5) all round-trip at 2 decimals, matching word_confidence's own
+        // formatting convention elsewhere in this module.
+        assert!(json.contains("\"conf\":99.00"), "header cell conf: {json}");
+        assert!(json.contains("\"conf\":88.00"), "row cell conf: {json}");
+        assert!(json.contains("\"conf\":72.50"), "row cell conf: {json}");
     }
 
     // --- from_line_words ---------------------------------------------------

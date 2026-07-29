@@ -161,6 +161,7 @@ impl Engine {
                 grey: &grey,
                 width,
                 height,
+                binarize: tesseract_ogar::BinarizeMode::default(),
                 with_dict: false,
                 harvest_profile: None,
             })
