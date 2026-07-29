@@ -615,6 +615,99 @@ mod tests {
         assert_eq!(wo.binary[bg], 0, "Wolf must not flood the background");
     }
 
+    /// **Page-scale falsifier, at unit scale.** Grounded in a REAL
+    /// measurement, not an invented fixture: `corpus/gen/gen_faded_contrast.py`
+    /// applied to a real corpus page (uniform dynamic-range compression
+    /// toward mid-grey — a faded/worn-toner scan, not a lighting field) and
+    /// `binarize_ab.rs` recognized the result under all four modes. On the
+    /// severe fade (`faded_085.pgm`, spread compressed from 255 to 38 grey
+    /// levels): Otsu 42/42 words correct, Wolf 42/42, Singh 42/42 — **Sauvola
+    /// 0/42, every word lost, CER 1.0**. The page's own histogram (measured):
+    /// a spike of 355,298 px (96.4%) at grey 147 (background), a cluster of
+    /// 4,624 px (1.25%) near grey 109 (ink), the rest antialiasing in between.
+    ///
+    /// This is a SHARPER and more useful result than the earlier "Wolf beats
+    /// Sauvola" framing suggests, and it does not go the direction a first
+    /// guess would predict:
+    ///
+    /// - **Otsu is fine.** A uniform monotonic compression preserves the
+    ///   histogram's bimodal SHAPE (spike at 147, cluster at 109, a real
+    ///   valley between), and Otsu's threshold depends only on that shape —
+    ///   not on the absolute contrast. Faded contrast alone does not defeat a
+    ///   global histogram threshold.
+    /// - **Sauvola specifically fails, and for the reason the module docs
+    ///   name:** ink is SPARSE (1.25% of pixels), so almost every local
+    ///   window is nearly all background — local mean `m` sits near 147, and
+    ///   with `s << 128` uniformly, `t = m*(1-k*(1-s/128))` collapses toward
+    ///   `m*(1-k)` regardless of the window's real content. At `m≈147`,
+    ///   `k=0.34`, that is `≈97` — comfortably ABOVE the actual ink value
+    ///   (109), so every ink pixel fails `grey < t` and reads as background.
+    ///   The whole page returns empty.
+    /// - **Wolf and Singh both recover, by different independent mechanisms**
+    ///   (Wolf's `max_s` renormalization; Singh's per-pixel `∂` has no fixed
+    ///   `R` to collapse in the first place) — two different fixes converging
+    ///   on the same page, which is corroborating rather than redundant.
+    ///
+    /// This fixture reproduces the same qualitative shape at unit scale:
+    /// sparse ink (a small block, not a full-height stripe — density matters
+    /// here, not just contrast) on a near-uniform background, at the real
+    /// measured cluster centres (147 / 109) rather than round numbers.
+    #[test]
+    fn sauvola_fails_on_sparse_ink_at_faded_contrast_but_wolf_and_singh_recover() {
+        const W: usize = 60;
+        const H: usize = 60;
+        // Background 147 with a SPARSE 6x6 ink block at 109 -- sparse, not a
+        // full-height stripe, because density (how much of a local window is
+        // background) is what drives Sauvola's collapse here, not contrast
+        // alone (the wolf_recovers_faint_ink test above already covers a
+        // dense full-height stripe at a different mean level).
+        let mut g = vec![147u8; W * H];
+        for y in 27..33 {
+            for x in 27..33 {
+                g[y * W + x] = 109;
+            }
+        }
+        let ink = 30 * W + 30; // block centre
+        let bg = 30 * W + 5; // far from the block
+
+        let s = sauvola_binarize(&g, W, H, 5, 0.34);
+        let wo = wolf_binarize(&g, W, H, 5, 0.5);
+        let si = singh_binarize(&g, W, H, 5, 0.06);
+
+        eprintln!(
+            "sparse faded ink: sauvola t(ink)={} t(bg)={} | wolf t(ink)={} t(bg)={} | \
+             singh t(ink)={} t(bg)={}",
+            s.threshold[ink],
+            s.threshold[bg],
+            wo.threshold[ink],
+            wo.threshold[bg],
+            si.threshold[ink],
+            si.threshold[bg]
+        );
+
+        assert_eq!(
+            s.binary[ink], 0,
+            "Sauvola is EXPECTED to miss sparse ink at this contrast (fixed \
+             R=128 collapses toward m*(1-k) when nearly the whole local \
+             window is background); if it now finds it, this fixture no \
+             longer reproduces the measured faded_085.pgm failure -- \
+             re-derive the numbers from a fresh binarize_ab run rather than \
+             deleting this assertion"
+        );
+        assert_eq!(
+            wo.binary[ink], 1,
+            "Wolf must recover the sparse ink -- measured on the real page"
+        );
+        assert_eq!(
+            si.binary[ink], 1,
+            "Singh must ALSO recover it, by an independent mechanism (no \
+             fixed R to collapse) -- measured on the real page"
+        );
+        assert_eq!(s.binary[bg], 0, "Sauvola must not flood the background");
+        assert_eq!(wo.binary[bg], 0, "Wolf must not flood the background");
+        assert_eq!(si.binary[bg], 0, "Singh must not flood the background");
+    }
+
     /// Degenerate `max_s == 0`: a flat page has zero local deviation
     /// everywhere, so `s/max_s` is `0/0`. Guarded to `0`, which lands on
     /// `t = m` (because `m == min_I` on a flat page) and yields all-background
