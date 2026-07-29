@@ -126,7 +126,31 @@ fn ruled_table_is_detected() {
     );
 }
 
-/// The **borderless** case — measured, and the answer is NO.
+/// The **NARROW borderless** case — measured, and the answer is NO.
+///
+/// ⚠ This does NOT generalize to "borderless tables are undetected". A REAL
+/// borderless grid IS detected — see `real_borderless_grid_measured` below,
+/// where `corpus/quality/resgrid.pgm` (8 columns of real text, zero rules)
+/// scores `nvw=17` and classifies as a table.
+///
+/// The measured difference is entirely `nvw` — the count of tall vertical
+/// whitespace corridors:
+///
+/// ```text
+///   synthetic 4-col borderless : nhb=0 nvb=0 nvw= 1  score=0  -> NOT a table
+///   resgrid    8-col borderless: nhb=0 nvb=0 nvw=17  score=2  -> a table
+/// ```
+///
+/// Two of the four conditions count ruled lines, so a borderless page can
+/// only ever score on the whitespace pair (`nvw>3`, `nvw>6`) — it needs BOTH
+/// to reach the threshold of 2, making `nvw>6` the binding constraint. Wide
+/// grids clear it comfortably; narrow ones do not.
+///
+/// **The consequence for the import path:** a typical 4-column lab report or
+/// invoice (test | value | unit | range) is on the WRONG side of this. That
+/// is the real defect — not that borderless is unreachable, but that the
+/// only signal available to it scales with column count rather than with
+/// whether the thing is actually a table.
 ///
 /// Pinned two-sided ON PURPOSE: if this starts detecting a table, that is a
 /// FIX (or a threshold change), and it must be re-pinned deliberately and the
@@ -134,6 +158,13 @@ fn ruled_table_is_detected() {
 /// previously unreachable for them.
 #[test]
 fn borderless_table_is_not_detected() {
+    {
+        let d = decide(&table_page(false));
+        eprintln!(
+            "synthetic 4-col borderless: nhb={} nvb={} nvw={} score={}",
+            d.nhb, d.nvb, d.nvw, d.score
+        );
+    }
     let d = decide(&table_page(false));
     assert!(
         d.score < pageseg::TABLE_SCORE_THRESHOLD,
@@ -186,4 +217,40 @@ fn fixtures_are_non_degenerate() {
         "ruled ({ruled_ink}) should out-ink borderless ({plain_ink}) — the \
          rules are what distinguishes them"
     );
+}
+
+/// **The real borderless fixture.** `corpus/quality/resgrid.pgm` is an 8x2
+/// grid of REAL rendered text separated by pure whitespace — no rules at all,
+/// with exact ground-truth cell rects in its sidecar. It is a better
+/// borderless-table specimen than any synthetic one, and it was already in the
+/// corpus: the 8+7+0 quality fence proves `xy_cut` finds its column gutters
+/// (44+ per-cell lines recovered), so the whitespace structure is
+/// demonstrably there to be seen.
+///
+/// Reported, not asserted beyond the classification itself — the point is to
+/// record what `decide_if_table` actually scores on a genuine borderless
+/// multi-column text grid.
+#[test]
+fn real_borderless_grid_measured() {
+    let p =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/quality/resgrid.pgm");
+    if !p.exists() {
+        eprintln!("skipping: resgrid fixture absent");
+        return;
+    }
+    let bytes = std::fs::read(&p).unwrap();
+    let (grey, w, h) = tesseract_ocr::image_input::parse_pgm(&bytes).unwrap();
+    let otsu = tesseract_ocr::otsu_threshold_gray(&grey, w, 0, 0, w, h);
+    let binary = tesseract_ocr::threshold_rect_to_binary(&grey, w, 0, 0, w, h, otsu);
+    let d = pageseg::decide_if_table(&binary, w, h);
+    eprintln!(
+        "resgrid {w}x{h} (8x2 borderless text grid): nhb={} nvb={} nvw={} score={} -> table={}",
+        d.nhb,
+        d.nvb,
+        d.nvw,
+        d.score,
+        d.score >= pageseg::TABLE_SCORE_THRESHOLD
+    );
+    assert_eq!(d.nhb, 0, "a borderless grid must have NO horizontal rules");
+    assert_eq!(d.nvb, 0, "a borderless grid must have NO vertical rules");
 }
