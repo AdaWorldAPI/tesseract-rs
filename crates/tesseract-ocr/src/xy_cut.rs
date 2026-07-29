@@ -84,7 +84,7 @@
     reason = "raster coordinates and pixel counts stay well within f32/usize range; the gap-threshold arithmetic is deliberately low-precision"
 )]
 
-use crate::binarize::sauvola_binarize;
+use crate::binarize::{sauvola_binarize, singh_binarize, wolf_binarize, LocalBinarization};
 use crate::threshold::{otsu_threshold_gray, threshold_rect_to_binary};
 
 /// An axis-aligned region in raster space: **top-down** image coordinates with
@@ -223,6 +223,41 @@ pub enum BinarizeMode {
         /// Sauvola sensitivity factor `k` (typically `0.34`).
         k: f32,
     },
+    /// Adaptive Wolf-Jolion threshold ([`wolf_binarize`]) — Sauvola with its
+    /// *fixed* `R = 128` replaced by the image's **actual** maximum local
+    /// standard deviation, and the correction anchored to the global minimum
+    /// grey. Aimed at faded / low-contrast source, where Sauvola's fixed `R`
+    /// collapses and it under-thresholds. Same small-page fallback to
+    /// [`BinarizeMode::Otsu`] as `Sauvola`.
+    ///
+    /// **Quality-fence footing, NOT byte-parity** — leptonica does not
+    /// implement this method, so no oracle exists; see
+    /// [`crate::binarize`]'s module docs.
+    Wolf {
+        /// Window half-size. Must be `>= 2`, and the page must be at least
+        /// `2·whsize + 3` on each side, or this mode falls back to `Otsu`.
+        whsize: usize,
+        /// Wolf sensitivity `k` — reference default `0.5`. **Not** Sauvola's
+        /// `0.34`: `k` is not transferable between methods.
+        k: f32,
+    },
+    /// Adaptive Singh et al. threshold ([`singh_binarize`]) — a **per-pixel**
+    /// mean deviation `∂ = I - m` in place of the windowed standard
+    /// deviation, so the second-moment accumulation disappears entirely and
+    /// the cost is flat in window size. Same small-page fallback to
+    /// [`BinarizeMode::Otsu`] as `Sauvola`.
+    ///
+    /// **Quality-fence footing, NOT byte-parity** — no reference
+    /// implementation identified; see [`crate::binarize`]'s module docs.
+    Singh {
+        /// Window half-size. Must be `>= 2`, and the page must be at least
+        /// `2·whsize + 3` on each side, or this mode falls back to `Otsu`.
+        whsize: usize,
+        /// Singh sensitivity `k`, paper range `[0, 1]` (its document figure
+        /// uses `0.06`). Sweep empirically — see [`singh_binarize`] for why a
+        /// figure's printed value cannot be taken at face value.
+        k: f32,
+    },
 }
 
 /// Binarize the full page once into this crate's `0` = ink / `255` = background
@@ -264,21 +299,42 @@ pub fn binarize_page_with(grey: &[u8], w: usize, h: usize, mode: BinarizeMode) -
                 threshold_rect_to_binary(grey, w, 0, 0, w, h, otsu)
             }
         }
-        BinarizeMode::Sauvola { whsize, k: factor } => {
-            let window_ok = whsize >= 2 && w >= 2 * whsize + 3 && h >= 2 * whsize + 3;
-            if !window_ok {
-                // Too small for the requested window — fall back to Otsu
-                // rather than reaching sauvola_binarize's own panic guard.
-                return binarize_page_with(grey, w, h, BinarizeMode::Otsu);
-            }
-            let sauvola = sauvola_binarize(grey, w, h, whsize, factor);
-            sauvola
-                .binary
-                .iter()
-                .map(|&fg| if fg == 1 { 0 } else { 255 })
-                .collect()
+        BinarizeMode::Sauvola { whsize, k } => {
+            local_adaptive(grey, w, h, whsize, k, sauvola_binarize)
         }
+        BinarizeMode::Wolf { whsize, k } => local_adaptive(grey, w, h, whsize, k, wolf_binarize),
+        BinarizeMode::Singh { whsize, k } => local_adaptive(grey, w, h, whsize, k, singh_binarize),
     }
+}
+
+/// Shared body of the three local-adaptive arms of [`binarize_page_with`]:
+/// check the window fits, run `method`, and convert its own foreground
+/// convention (`1` = black text, `0` = background) into this crate's
+/// `{0, 255}` convention (`0` = ink, `255` = background) — the inverse byte
+/// value, same semantic split.
+///
+/// The window check mirrors the guard each method asserts on
+/// (`whsize >= 2` and `w, h >= 2·whsize + 3`); too small falls back to
+/// [`BinarizeMode::Otsu`] rather than reaching that panic. Every adaptive
+/// mode shares this so a new rung cannot forget the fallback and turn a
+/// small page into a panic.
+fn local_adaptive(
+    grey: &[u8],
+    w: usize,
+    h: usize,
+    whsize: usize,
+    k: f32,
+    method: fn(&[u8], usize, usize, usize, f32) -> LocalBinarization,
+) -> Vec<u8> {
+    let window_ok = whsize >= 2 && w >= 2 * whsize + 3 && h >= 2 * whsize + 3;
+    if !window_ok {
+        return binarize_page_with(grey, w, h, BinarizeMode::Otsu);
+    }
+    method(grey, w, h, whsize, k)
+        .binary
+        .iter()
+        .map(|&fg| if fg == 1 { 0 } else { 255 })
+        .collect()
 }
 
 /// Per-column ink profile of `rect` (used to find VERTICAL cuts / left→right

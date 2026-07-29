@@ -124,20 +124,57 @@ pub struct TextBlock {
 
 /// A text run's measured typography, from `doc.v1`'s per-line
 /// `xheight`/`ascrise`/`descdrop`/`baseline` keys (all image pixels,
-/// top-down). `font_px` is `xheight + ascrise - descdrop` — the full
-/// ascender-to-descender body height, which is exactly the quantity real
+/// top-down), OR — when present, PREFERRED — the newer `glyph_px` measured
+/// ink-height key (via [`GLYPH_PX_TO_FONT_PX`]). Either way `font_px` ends
+/// up the same quantity: the full ascender-to-descender body height real
 /// Tesseract uses as the nominal font size
 /// (`LTRResultIterator::WordFontAttributes`, `ltrresultiterator.cpp:168-172`:
 /// `row_height = x_height + ascenders - descenders`, then px → printer
 /// points; its PDF renderer emits that value per word,
-/// `pdfrenderer.cpp:434-447`).
+/// `pdfrenderer.cpp:434-447`) — `xheight + ascrise - descdrop` when derived
+/// from the band keys, or `glyph_px * GLYPH_PX_TO_FONT_PX` when the
+/// measured-ink key is present.
+///
+/// `glyph_px` is a DIRECT measurement (the topmost-to-bottommost ink row
+/// within each glyph's own char box, p90 across a line —
+/// `tesseract_ocr::structured::attach_glyph_px`) rather than a statistical
+/// fit over blob boxes, so [`doc_v1_layout`] prefers it whenever `doc.v1`
+/// carries it: that statistical fit is unstable row-to-row (two
+/// identically-printed table rows measured `24.7` vs `14.2` px through it).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TextMetrics {
-    /// Nominal font size in image pixels (`xheight + ascrise - descdrop`).
+    /// Nominal font size in image pixels (see the derivation above).
     pub font_px: f32,
     /// Baseline y in TOP-DOWN image pixels.
     pub baseline_px: f32,
 }
+
+/// Scale factor converting a measured glyph ink-height (`doc.v1`'s
+/// `glyph_px`, from `tesseract_ocr::structured::attach_glyph_px` — the p90
+/// topmost-to-bottommost ink row within a char box's x-span) into the
+/// equivalent full ascender-to-descender body height
+/// ([`TextMetrics::font_px`]'s existing unit, `xheight + ascrise -
+/// descdrop`).
+///
+/// Not a magic number: derived from the SAME transcoded band fractions
+/// `tesseract-ocr/src/textline.rs` uses for `TO_ROW::xheight`/`ascrise`/
+/// `descdrop` (`tesseract::CCStruct::kXHeightFraction = 0.5`,
+/// `kAscenderFraction = 0.25`, `kDescenderFraction = 0.25`,
+/// `ccstruct.cpp:25-27` — private `const`s in that module, so restated
+/// here by value and provenance rather than imported). A row's nominal
+/// size divides `x-height : ascender-rise : descender-drop = 0.5 : 0.25 :
+/// 0.25`, so the FULL ascender-to-descender body height `font_px` sizes
+/// from is `1.0` of that total (`0.5 + 0.25 + 0.25`). A glyph's MEASURED
+/// ink extent, by contrast, is bounded by its baseline row below and the
+/// top of an ascender or capital letter above — `0.5 + 0.25 = 0.75` of the
+/// total — because the p90 statistic
+/// (`tesseract_ocr::structured::attach_glyph_px`) predominantly rides the
+/// ascender/cap-height population of a line's glyphs: almost every printed
+/// line contains SOME tall letters or capitals, and it is exactly those
+/// that push a HIGH percentile up past the x-height-only majority. The
+/// ratio between the two, `1.0 / 0.75 = 4/3`, converts a measured ink
+/// height into its equivalent full body height.
+const GLYPH_PX_TO_FONT_PX: f32 = 4.0 / 3.0;
 
 /// A placed table: its outer bbox, grid dimensions, cells, and whether to
 /// stroke the cell/outer rectangles as visible rules.
@@ -966,6 +1003,13 @@ struct JsonLine {
     descdrop: Option<f32>,
     #[serde(default)]
     baseline: Option<f32>,
+    // The newer additive measured-ink-height key (doc.v1;
+    // `tesseract_ocr::structured::attach_glyph_px`) — absent in legacy JSON
+    // and in lines the measurement pass never reached. See
+    // [`GLYPH_PX_TO_FONT_PX`] for how this is preferred over the band keys
+    // above when both are present.
+    #[serde(default)]
+    glyph_px: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -1116,12 +1160,26 @@ pub fn doc_v1_layout(doc_json: &str, page_rasters: &[GreyImage]) -> Result<Layou
                         // Metrics require xheight + baseline; ascrise/descdrop
                         // default to 0 when absent (font_px degrades to the
                         // bare x-height, still far better than band height).
+                        // Three-tier font-size preference: (1) the measured
+                        // glyph_px ink-height, scaled via GLYPH_PX_TO_FONT_PX,
+                        // when present; (2) else the xheight+ascrise-descdrop
+                        // band fit (previous behaviour, unchanged); (3) else
+                        // (no xheight/baseline at all) `metrics` stays `None`
+                        // and the bbox-height heuristic downstream
+                        // (TEXT_HEIGHT_TO_FONTSIZE) applies, exactly as before.
                         let metrics = match (line.xheight, line.baseline) {
-                            (Some(xh), Some(bl)) => Some(TextMetrics {
-                                font_px: xh + line.ascrise.unwrap_or(0.0)
-                                    - line.descdrop.unwrap_or(0.0),
-                                baseline_px: bl,
-                            }),
+                            (Some(xh), Some(bl)) => {
+                                let band_font_px =
+                                    xh + line.ascrise.unwrap_or(0.0) - line.descdrop.unwrap_or(0.0);
+                                let font_px = line
+                                    .glyph_px
+                                    .map(|g| g * GLYPH_PX_TO_FONT_PX)
+                                    .unwrap_or(band_font_px);
+                                Some(TextMetrics {
+                                    font_px,
+                                    baseline_px: bl,
+                                })
+                            }
                             _ => None,
                         };
                         blocks.push(Block::Text(TextBlock {
@@ -1674,5 +1732,56 @@ mod tests {
             })
         );
         assert_eq!(texts[1].metrics, None, "legacy line stays metrics-less");
+    }
+
+    /// When a line carries BOTH the measured `glyph_px` key and the older
+    /// `xheight`/`ascrise`/`descdrop` band keys, [`doc_v1_layout`] must
+    /// prefer `glyph_px * GLYPH_PX_TO_FONT_PX`, NOT the band-derived value
+    /// — a real falsifier, not a coincidence: the fixture picks numbers
+    /// (`glyph_px: 9.0` → `12.0`; band fit → `17.0`) that differ enough to
+    /// prove the code actually reads `glyph_px`, not merely tolerates its
+    /// presence. `baseline_px` is unaffected either way (always sourced
+    /// from `baseline`).
+    #[test]
+    fn doc_v1_layout_prefers_glyph_px_over_the_band_derived_font_size() {
+        let json = r#"{
+          "schema": "tesseract-rs/doc.v1",
+          "pages": [{
+            "page": 1, "width": 100, "height": 100,
+            "regions": [
+              {"type": "text", "bbox": [5,5,80,20], "lines": [
+                {"bbox": [5,5,80,20],
+                 "xheight": 10.0, "ascrise": 4.0, "descdrop": -3.0,
+                 "baseline": 17.5, "glyph_px": 9.0,
+                 "words": [{"text": "Hi", "bbox": [5,5,40,20]}]}
+              ]}
+            ],
+            "fields": []
+          }]
+        }"#;
+        let doc = doc_v1_layout(json, &[]).expect("parse");
+        let texts: Vec<&TextBlock> = doc.pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1);
+        let m = texts[0].metrics.expect("metrics present");
+        assert!(
+            (m.font_px - 9.0 * GLYPH_PX_TO_FONT_PX).abs() < 1e-4,
+            "font_px must come from glyph_px * GLYPH_PX_TO_FONT_PX (~{}), got {}",
+            9.0 * GLYPH_PX_TO_FONT_PX,
+            m.font_px
+        );
+        assert!(
+            (m.font_px - 17.0).abs() > 1.0,
+            "the glyph_px-derived size must genuinely differ from the \
+             band-derived 17.0, or this test cannot distinguish preference \
+             from coincidence"
+        );
+        assert_eq!(m.baseline_px, 17.5, "baseline always comes from `baseline`");
     }
 }

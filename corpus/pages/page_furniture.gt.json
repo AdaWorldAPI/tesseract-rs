@@ -1,0 +1,18 @@
+{
+ "footer": {
+  "bottom": 739,
+  "top": 712
+ },
+ "header": {
+  "bottom": 75,
+  "top": 48
+ },
+ "height": 792,
+ "left": 72,
+ "main": {
+  "bottom": 551,
+  "top": 150
+ },
+ "schema": "tesseract-rs/page-furniture-gt.v1",
+ "width": 612
+}

@@ -47,7 +47,7 @@ pub use image_input::{decode_image, ImageDecodeError};
 pub use image_input::{parse_pgm, prescale_grey_to_height, PgmError};
 #[cfg(feature = "seg-approx")]
 pub use line_segment::{find_text_lines, LineBand};
-pub use lstm_recognizer::{Document, LstmRecognizer, RecognizerError};
+pub use lstm_recognizer::{Document, DocumentOptions, LstmRecognizer, RecognizerError};
 pub use morph::{
     close_brick, close_safe_brick, dilate_brick, erode_brick, morph_sequence, open_brick,
 };
@@ -58,8 +58,8 @@ pub use network::{InputShape, NetError, Network, Node, ReverseKind};
 pub use page_furniture::{detect_page_furniture, PageFurniture};
 pub use pageseg::{
     decide_if_table, gen_textblock_mask, gen_textline_mask, generate_halftone_mask,
-    get_regions_binary, HalftoneMask, Regions, TableDecision, TextlineMask, MIN_HEIGHT, MIN_WIDTH,
-    TABLE_SCORE_THRESHOLD,
+    get_regions_binary, strip_borders, strip_borders_grey, strip_borders_page, HalftoneMask,
+    Regions, TableDecision, TextlineMask, MIN_HEIGHT, MIN_WIDTH, TABLE_SCORE_THRESHOLD,
 };
 pub use renderer::{render_hocr, render_text, render_tsv, LineMetrics, LineWords};
 pub use seedfill::seedfill_binary;

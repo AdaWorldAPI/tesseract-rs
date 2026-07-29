@@ -403,6 +403,202 @@ pub struct TableDecision {
 /// conditions (`pageseg.c`, `pixDecideIfTable`).
 pub const TABLE_SCORE_THRESHOLD: i32 = 2;
 
+/// What [`border_analysis`] recovers from a region in one pass: the two printed
+/// rule counts and the region with those rules removed.
+struct BorderAnalysis {
+    /// `nhb` — horizontal black lines (`o100.1 + c1.4` components).
+    nhb: usize,
+    /// `nvb` — vertical black lines (`o1.100 + c4.1` components).
+    nvb: usize,
+    /// The region with both rule families subtracted (`pix1 - (pix3 | pix5)`).
+    delined: Vec<u8>,
+}
+
+/// The rule-detection prefix of `pixDecideIfTable` (`pageseg.c`, steps 5-7),
+/// factored out because it produces TWO independently useful things and the
+/// second was being thrown away.
+///
+/// Open the region for horizontal rules (`o100.1 + c1.4`) and vertical borders
+/// (`o1.100 + c4.1`), count the components of each, seedfill both masks back
+/// through the region so they recover the borders' true thickness, OR them, and
+/// subtract — leaving the region with its printed borders removed.
+///
+/// **Why this is factored out.** `decide_if_table` needs the counts; the
+/// de-lined region is what a table's own text recognition wants, because the
+/// printed borders are otherwise fed to the recognizer AS GLYPHS. Measured on a
+/// ruled four-column lab-report fixture, they come back as `|`, `=`, `—`, `‘`
+/// — which both corrupts the cell text and, more damagingly, **fills the
+/// inter-column gutters with "words"**, so `structured::extract_table_grid`
+/// (which splits columns on whitespace gaps between recognized words) has no
+/// gap left to split on. The masks needed to prevent that were already being
+/// computed and discarded one line later. See `tests/lab_table_columns.rs`.
+///
+/// Returns `None` when any morphology or seedfill step fails, matching
+/// [`decide_if_table`]'s own bail-to-empty behaviour.
+fn border_analysis(binary: &[u8], w: usize, h: usize) -> Option<BorderAnalysis> {
+    // Horizontal + vertical black lines (dims preserved — no reduce/expand op).
+    let (pix2, _, _) = morph_sequence(binary, w, h, "o100.1 + c1.4")?;
+    let (pix4, _, _) = morph_sequence(binary, w, h, "o1.100 + c4.1")?;
+    let nhb = conn_comp_bb(&pix2, w, h, 8).len();
+    let nvb = conn_comp_bb(&pix4, w, h, 8).len();
+
+    // Seedfill each line mask back through the region, OR, and subtract to
+    // remove the lines (pix3 | pix5 = pix6; pix1 -= pix6).
+    let pix3 = seedfill_binary(&pix2, w, h, binary, w, h, 8)?;
+    let pix5 = seedfill_binary(&pix4, w, h, binary, w, h, 8)?;
+    let delined = subtract(binary, &or(&pix3, &pix5));
+    Some(BorderAnalysis { nhb, nvb, delined })
+}
+
+/// Remove printed borders (table borders, form underlines, heading rules) from
+/// a bitonal region, returning the region with them subtracted — this crate's
+/// `0` = ON convention in and out.
+///
+/// This is [`decide_if_table`]'s own rule-removal step, exposed on its own.
+/// Every operation it composes (`morph_sequence`, `conn_comp_bb`,
+/// `seedfill_binary`, `subtract`, `or`) is already byte-parity-proven against
+/// liblept, and the composition is exactly the one `pixDecideIfTable` performs
+/// internally — but leptonica never returns this intermediate, so the
+/// FUNCTION is ours even though every step in it is transcoded.
+///
+/// The seedfill is what makes this safe to apply: the opened masks find only
+/// the borders' skeletal cores, and seedfilling them back through the region
+/// recovers each rule's true extent — so a rule is removed whole, rather than
+/// leaving a fringe behind that the recognizer would then read as speckle.
+/// Glyph strokes are not recovered by that fill because they were never in
+/// the seed: `o100.1` survives only runs ≥ 100 px wide, far longer than any
+/// stroke at document resolution.
+///
+/// Returns `None` when any morphology or seedfill step fails.
+///
+/// # Panics
+/// Panics if `binary.len() != w * h`.
+#[must_use]
+pub fn strip_borders(binary: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
+    assert_eq!(binary.len(), w * h, "binary buffer length must be w * h");
+    border_analysis(binary, w, h).map(|r| r.delined)
+}
+
+/// [`strip_borders`] applied to a GREY page: paint the removed rule pixels to
+/// background so the result can be fed to recognition, which consumes grey.
+///
+/// `binary` is the caller's already-computed binarization of `grey` (this
+/// crate's `0` = ink convention) — taken as a parameter rather than
+/// re-derived, so this cannot silently disagree with the binarization the
+/// rest of the caller's pipeline used, and so no [`crate::xy_cut::BinarizeMode`]
+/// dependency reaches this module.
+///
+/// # Why per-ROW background, not a constant
+///
+/// Painting to a flat `255` would be wrong on any page whose paper is not
+/// pure white: a rule replaced by a brighter-than-paper streak shifts the
+/// local white estimate `crate::image_input::from_grey_pix` derives from
+/// row extrema, and on a shaded page it can read as a new feature. Each
+/// removed pixel is instead painted with the **median grey of its own row's
+/// background pixels**, which is both local (so it follows a lighting
+/// gradient down the page) and well-defined for the case that matters — a
+/// horizontal rule spans a row that is otherwise almost entirely background.
+/// Rows with no background pixel at all fall back to the page-wide
+/// background median, and a page with no background anywhere falls back to
+/// `255`.
+///
+/// Returns `None` when [`strip_borders`] does.
+///
+/// # Panics
+/// Panics if `grey.len() != w * h` or `binary.len() != w * h`.
+///
+/// # Example — the intended call site
+///
+/// This is a PRE-PROCESSING step on the grey page, applied by the caller
+/// before recognition, exactly as [`crate::rectify::auto_rectify`] is. See
+/// [`strip_borders_page`] for the one-call form.
+#[must_use]
+pub fn strip_borders_grey(grey: &[u8], binary: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
+    assert_eq!(grey.len(), w * h, "grey buffer length must be w * h");
+    assert_eq!(binary.len(), w * h, "binary buffer length must be w * h");
+    let delined = strip_borders(binary, w, h)?;
+
+    // The page-wide fallback: median grey over every background pixel.
+    let mut page_bg: Vec<u8> = (0..w * h)
+        .filter(|&i| binary[i] != 0)
+        .map(|i| grey[i])
+        .collect();
+    let page_median = if page_bg.is_empty() {
+        255
+    } else {
+        let mid = page_bg.len() / 2;
+        *page_bg.select_nth_unstable(mid).1
+    };
+
+    let mut out = grey.to_vec();
+    let mut row_bg: Vec<u8> = Vec::with_capacity(w);
+    for y in 0..h {
+        let base = y * w;
+        // A pixel was REMOVED iff it was ink and is now background.
+        let removed_in_row = (0..w).any(|x| binary[base + x] == 0 && delined[base + x] != 0);
+        if !removed_in_row {
+            continue;
+        }
+        row_bg.clear();
+        row_bg.extend(
+            (0..w)
+                .filter(|&x| binary[base + x] != 0)
+                .map(|x| grey[base + x]),
+        );
+        let fill = if row_bg.is_empty() {
+            page_median
+        } else {
+            let mid = row_bg.len() / 2;
+            *row_bg.select_nth_unstable(mid).1
+        };
+        for x in 0..w {
+            if binary[base + x] == 0 && delined[base + x] != 0 {
+                out[base + x] = fill;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// One-call rule removal for a grey page: binarize under `mode`, strip the
+/// printed borders, paint them to background. The form a caller actually wants
+/// — [`strip_borders_grey`] takes a pre-computed binary so it cannot disagree
+/// with a pipeline that already has one, but a caller starting from grey
+/// should not have to know that.
+///
+/// **This is an opt-in pre-processing step, not a default.** It sits at the
+/// same place in the pipeline as [`crate::rectify::auto_rectify`] — applied
+/// by the caller to the grey page, before recognition — and is wired the
+/// same way: available and tested, off unless asked for. Rule removal
+/// changes what the recognizer sees on every ruled page, so making it a
+/// default is a behavioural change that needs its own measurement pass
+/// against the golden anchors, not a quiet flip.
+///
+/// **What it is for.** Printed rules — table borders, form-field underlines,
+/// a rule under a heading — are never text, but the recognizer has no way to
+/// know that and reads them as glyphs (`|`, `=`, `—`, `‘` measured on a
+/// ruled lab-report fixture). Beyond corrupting the text, those phantom
+/// glyphs sit IN the inter-column gutters, which is what defeats
+/// `crate::structured::extract_table_grid`: it splits columns on whitespace
+/// gaps between recognized words, and a border-glyph leaves no gap to split
+/// on. See `tests/lab_table_columns.rs` for the measured defect.
+///
+/// Returns `None` when the morphology or seedfill chain fails.
+///
+/// # Panics
+/// Panics if `grey.len() != w * h`.
+#[must_use]
+pub fn strip_borders_page(
+    grey: &[u8],
+    w: usize,
+    h: usize,
+    mode: crate::xy_cut::BinarizeMode,
+) -> Option<Vec<u8>> {
+    assert_eq!(grey.len(), w * h, "grey buffer length must be w * h");
+    let binary = crate::xy_cut::binarize_page_with(grey, w, h, mode);
+    strip_borders_grey(grey, &binary, w, h)
+}
+
 /// Decide whether an upright 1bpp region is a table — the DECISION CORE of
 /// `pixDecideIfTable` (`pageseg.c`, steps 5-9). `binary` is the region at
 /// ~75 ppi, ALREADY deskewed + dilated (this crate's `0` = ON convention).
@@ -436,25 +632,9 @@ pub fn decide_if_table(binary: &[u8], w: usize, h: usize) -> TableDecision {
         score: 0,
     };
 
-    // Horizontal + vertical black lines (dims preserved — no reduce/expand op).
-    let (Some((pix2, _, _)), Some((pix4, _, _))) = (
-        morph_sequence(binary, w, h, "o100.1 + c1.4"),
-        morph_sequence(binary, w, h, "o1.100 + c4.1"),
-    ) else {
+    let Some(BorderAnalysis { nhb, nvb, delined }) = border_analysis(binary, w, h) else {
         return empty;
     };
-    let nhb = conn_comp_bb(&pix2, w, h, 8).len();
-    let nvb = conn_comp_bb(&pix4, w, h, 8).len();
-
-    // Seedfill each line mask back through the region, OR, and subtract to
-    // remove the lines (pix3 | pix5 = pix6; pix1 -= pix6).
-    let (Some(pix3), Some(pix5)) = (
-        seedfill_binary(&pix2, w, h, binary, w, h, 8),
-        seedfill_binary(&pix4, w, h, binary, w, h, 8),
-    ) else {
-        return empty;
-    };
-    let delined = subtract(binary, &or(&pix3, &pix5));
 
     // Remove noise, invert, find long vertical whitespace corridors.
     let Some((pix7, _, _)) = morph_sequence(&delined, w, h, "c4.1 + o8.1") else {
@@ -576,6 +756,60 @@ mod tests {
             }
         }
         (buf, w, h)
+    }
+
+    /// A ruled table WITH glyph-sized ink in its cells — the fixture
+    /// [`strip_borders`] needs, which neither existing one provides
+    /// ([`table_fixture`] is rules with no text; [`text_para_fixture`] is text
+    /// with no rules, and a `strip_borders` test needs BOTH present to show it
+    /// separates them).
+    ///
+    /// Returns `(buf, w, h, rule_mask, glyph_mask)` — the two ink populations
+    /// tracked separately as they are drawn, so the assertions can count each
+    /// one independently rather than inferring which pixel was which
+    /// afterwards.
+    ///
+    /// Glyph marks are `8×10` solid blocks. That size is chosen against the
+    /// openings, not by eye: `o100.1` keeps only horizontal runs ≥ 100 px and
+    /// `o1.100` only vertical runs ≥ 100 px, so an `8×10` mark cannot seed
+    /// either border mask at any position. A mark long enough to survive one of
+    /// those openings would be a rule, correctly.
+    fn ruled_text_fixture() -> (Vec<u8>, usize, usize, Vec<bool>, Vec<bool>) {
+        let (w, h) = (240usize, 280usize);
+        let mut buf = vec![255u8; w * h];
+        let mut rule_mask = vec![false; w * h];
+        let mut glyph_mask = vec![false; w * h];
+
+        // Same grid geometry as `table_fixture`.
+        for y in 0..h {
+            for x in 0..w {
+                let hline = [20usize, 90, 160, 230]
+                    .iter()
+                    .any(|&r| y >= r && y < r + 2 && (20..220).contains(&x));
+                let vline = [20usize, 90, 160, 220]
+                    .iter()
+                    .any(|&c| x >= c && x < c + 2 && (20..232).contains(&y));
+                if hline || vline {
+                    buf[y * w + x] = 0;
+                    rule_mask[y * w + x] = true;
+                }
+            }
+        }
+        // Two glyph marks per cell, clear of every rule.
+        for &cy in &[40usize, 110, 180] {
+            for &cx in &[30usize, 100, 170] {
+                for gi in 0..2 {
+                    let x0 = cx + gi * 14;
+                    for y in cy..cy + 10 {
+                        for x in x0..x0 + 8 {
+                            buf[y * w + x] = 0;
+                            glyph_mask[y * w + x] = true;
+                        }
+                    }
+                }
+            }
+        }
+        (buf, w, h, rule_mask, glyph_mask)
     }
 
     /// The 240×280 text-paragraph fixture — horizontal char stripes, no lines.
@@ -823,6 +1057,91 @@ mod tests {
             "vwhite dims"
         );
         assert_eq!(&pix9, &o["tab_vwhite"].2, "vertical-whitespace mask");
+    }
+
+    /// [`strip_borders`] must remove the printed borders and leave the glyphs.
+    ///
+    /// Both halves are asserted, and both are needed: "removes rules" alone
+    /// is satisfied by returning a blank page, and "keeps glyphs" alone is
+    /// satisfied by returning the input untouched. Only the pair pins the
+    /// actual behaviour.
+    ///
+    /// The anti-vacuity guard comes first — a fixture that somehow carried
+    /// no border ink would make the removal assertion trivially true, which is
+    /// exactly the failure mode that let an earlier invalid table fixture
+    /// (solid ink blocks aliasing to rules under `o100.1`) pass for the wrong
+    /// reason.
+    #[test]
+    fn strip_borders_removes_borders_and_keeps_the_glyphs() {
+        let (buf, w, h, rule_mask, glyph_mask) = ruled_text_fixture();
+
+        let rule_ink_before = (0..w * h).filter(|&i| rule_mask[i] && buf[i] == 0).count();
+        let glyph_ink_before = (0..w * h).filter(|&i| glyph_mask[i] && buf[i] == 0).count();
+        assert!(
+            rule_ink_before > 1000,
+            "fixture must actually carry substantial border ink or the removal \
+             assertion below proves nothing (got {rule_ink_before})"
+        );
+        assert!(
+            glyph_ink_before > 500,
+            "fixture must actually carry glyph ink (got {glyph_ink_before})"
+        );
+
+        let delined = strip_borders(&buf, w, h).expect("strip_borders on a valid region");
+
+        let rule_ink_after = (0..w * h)
+            .filter(|&i| rule_mask[i] && delined[i] == 0)
+            .count();
+        let glyph_ink_after = (0..w * h)
+            .filter(|&i| glyph_mask[i] && delined[i] == 0)
+            .count();
+        eprintln!(
+            "strip_borders: border ink {rule_ink_before} -> {rule_ink_after}; \
+             glyph ink {glyph_ink_before} -> {glyph_ink_after}"
+        );
+
+        assert_eq!(
+            rule_ink_after, 0,
+            "every border pixel must be removed (was {rule_ink_before})"
+        );
+        assert_eq!(
+            glyph_ink_after, glyph_ink_before,
+            "glyph ink must survive untouched — a rule remover that eats text \
+             is worse than none"
+        );
+    }
+
+    /// [`strip_borders_grey`] must paint the borders out of the GREY page — to
+    /// the page's own background level, not to a constant — and leave every
+    /// glyph pixel's grey value bit-identical.
+    ///
+    /// The fixture's paper is deliberately `200`, not `255`: a implementation
+    /// that painted a flat white would pass a "rules are gone" check while
+    /// leaving a brighter-than-paper streak behind, which is exactly the
+    /// defect the per-row median exists to avoid. Asserting the fill EQUALS
+    /// the paper value is what distinguishes the two.
+    #[test]
+    fn strip_borders_grey_paints_borders_to_the_pages_own_background() {
+        let (bin, w, h, rule_mask, glyph_mask) = ruled_text_fixture();
+        // Grey twin of the bitonal fixture: paper 200, ink 40.
+        let grey: Vec<u8> = bin.iter().map(|&p| if p == 0 { 40 } else { 200 }).collect();
+
+        let out = strip_borders_grey(&grey, &bin, w, h).expect("strip_borders_grey");
+
+        let painted = (0..w * h).filter(|&i| rule_mask[i]).count();
+        assert!(painted > 1000, "fixture must carry border ink ({painted})");
+        for i in 0..w * h {
+            if rule_mask[i] {
+                assert_eq!(
+                    out[i], 200,
+                    "border pixel {i} must be painted to the PAGE's background \
+                     (200), not to a constant white"
+                );
+            }
+            if glyph_mask[i] {
+                assert_eq!(out[i], 40, "glyph pixel {i} must keep its grey value");
+            }
+        }
     }
 
     /// The 97×61 close-safe fixture — the binreduce oracle's formula.

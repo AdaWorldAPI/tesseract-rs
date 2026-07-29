@@ -2,7 +2,7 @@
 
 Read first, every session. The repo's commits + PRs are the durable record of
 prior sessions; **this file is the awareness that would otherwise reset with the
-session** — the rules, the proven method, and what's next.
+session** — the borders, the proven method, and what's next.
 
 ## What this is
 
@@ -920,6 +920,122 @@ faded scans; Singh drops the squared integral entirely. **Parity caveat up front
 leptonica implements Sauvola but NOT Wolf or Singh**, so neither can be a liblept
 byte-parity leaf — either oracle against the reference impl or drop to the
 quality-fence footing and *say so in the module docs*.
+
+**★ Wolf-Jolion + Singh SHIPPED — and the measurement says the fixtures, not
+the methods, are the gap (2026-07-29).** Both rungs live in `binarize.rs`
+(`wolf_binarize` / `singh_binarize`), sharing Sauvola's parity-proven
+`windowed_stats` front half, selectable via `BinarizeMode::{Wolf, Singh}`
+through BOTH the layout path and the text path. **Quality-fence footing, NOT
+parity** — leptonica implements neither, so no oracle exists; said so in the
+module docs per the repo rule.
+
+Measured (`examples/binarize_ab.rs`, 4 modes × 5 fixtures): mean CER
+otsu **0.3041** → sauvola **0.0045** → wolf **0.0054** → singh **0.0090**. All
+three adaptive modes recover the full 42-word text on every degraded fixture
+where Otsu drops to 18-32 words.
+
+**Wolf did NOT beat Sauvola, and that is a statement about the fixtures.** On
+all four degraded fixtures Wolf and Sauvola are byte-identical; Wolf's only
+delta is one character of error on the CLEAN page. `uneven_*.pgm` is uneven
+ILLUMINATION — full local contrast, shifting background — which is Sauvola's
+home turf. Wolf's claim is about FADED contrast, where `s ≪ 128` collapses the
+fixed `R = 128`. **The probe never exercised the failure mode Wolf exists to
+fix.** It IS exercised at unit scale
+(`wolf_recovers_faint_ink_that_sauvola_misses`, a 20-level stripe): Sauvola
+`t(ink)=136` misses ink at 180; Wolf `t(ink)=191` catches it; neither floods
+background. Two-sided on one fixture, so it cannot pass if Wolf were merely a
+second name for Sauvola. **Next: a faded arm for the corpus** (compress the
+dynamic range, `grey → a + b·grey`, `b ≪ 1`) — until then there is no
+page-scale evidence either way. Sauvola remains the default-flip candidate.
+Singh's claim is COST (flat in window size), which this probe does not time —
+judging it on CER is judging it on the axis it does not compete on.
+
+Implementation notes in `.claude/harvest/binarization-roadmap.md`; the one
+worth repeating: **Singh's pole cancels — never transcribe eq. (13)
+literally.** `∂/(1−∂)` diverges at `∂ = 1` and the outer `m·` then gives
+`0·inf = NaN`; rearranged, the numerator carries a matching `m`, the limit is
+`1`, and `T → k`. The test asserts the exact limit value, not "not NaN" — a
+NaN guard maps to `0` and would look valid.
+
+**★ The table defect is THREE coupled problems, and two are now fixed
+(2026-07-29).** Chasing the "borders are recognized as glyphs" finding produced a
+sharper picture than the original two-defect writeup, each step measured:
+
+1. **Border-glyph pollution** — printed borders recognized as `|`/`=`/`—`/`‘`,
+   corrupting cell text and, worse, filling the inter-column gutters so
+   `extract_table_grid` has no whitespace gap to split on. **FIXED** by
+   `pageseg::strip_borders` / `strip_borders_grey` / `strip_borders_page`: the
+   `decide_if_table` chain ALREADY computed the de-lined region internally
+   (`pix1 - (pix3 | pix5)`) and discarded it one line later. Factored out as
+   `border_analysis`; the byte-parity `decide_if_table_matches_liblept` still
+   green, so the refactor did not drift the leaf. Measured: 3248 border px → 0,
+   1440 glyph px → 1440 unchanged.
+2. **Stripping destroys detection** — two of `decide_if_table`'s four score
+   conditions (`nhb > 1`, `nvb > 2`) COUNT BORDERS, so a stripped page can only
+   score on the whitespace pair, which is exactly the borderless case that
+   does not clear the threshold. Measured: pre-stripping the page turned
+   3 recovered columns into **zero table regions**. **The printed borders are
+   simultaneously what ruins the columns and what proves it is a table.**
+   **HANDLED** by stripping INSIDE the recognizer —
+   `DocumentOptions::strip_borders` (default off, `recognize_document` unchanged):
+   layout / `decide_if_table` / figures read the ORIGINAL binarization, only
+   word+line recognition reads the stripped page. A caller cannot express that
+   split from outside, which is why this is a recognizer option and not a
+   pre-processing step like `auto_rectify`. (`recog_binary` is also rebuilt
+   from the stripped page so `attach_glyph_px` measures what was actually
+   recognized — a char box overlapping a removed border would otherwise report a
+   wildly oversized glyph.)
+3. **Table rows must be recognized FULL-WIDTH — OPEN.** With the borders gone
+   the gutters are genuinely empty, so `xy_cut` correctly splits the table into
+   four blocks and `recognize_page_blocks_words` reads each column
+   top-to-bottom. The text becomes clean (`13.5-17.5` where the un-stripped
+   read gave `13.5 -17.5`; `Referenz` where it gave
+   `=©=)—<S~SCSY's~SCiéRRflerrernz`) but the grid goes `7×3` → `28×1`, because
+   `extract_table_grid`'s founding assumption — **"rows ARE the recognized
+   lines"** — holds only while the whole table is one block spanning every
+   column, which is true only while the borders bridge the gutters. Well-posed
+   remaining work: a block already classified a table needs its recognition to
+   bypass the per-column split that is right for prose and wrong for a table —
+   and `decide_if_table` already runs per block on the original page, so the
+   classification needed to make that choice exists before recognition would
+   act on it.
+
+All three states are pinned two-sided in `tests/lab_table_columns.rs`
+(`naive_pre_strip_destroys_table_detection`,
+`stripping_borders_cleans_text_but_the_grid_needs_full_width_rows`), so when
+ingredient 3 lands the tests fail and force a deliberate re-pin rather than
+drifting.
+
+**★ SIMD status — nothing hand-rolled, and here is what the polyfill actually
+has (2026-07-29).** Checked because the invariant is easy to violate silently:
+**all SIMD must come from `ndarray::simd`** (`simd.rs` + `simd_ops.rs` >
+`simd_{arch}.rs`), never raw intrinsics — the `simd-savant` rule the Ada stack
+enforces. This session's diff contains **zero** `core::arch`, `_mm_*`,
+`#[cfg(target_arch)]`, or `target_feature` — every new pixel loop
+(`wolf_get_threshold`, `singh_get_threshold`, `local_sd`, `strip_borders_grey`,
+`attach_glyph_px`) is plain scalar. No violation, and none of the loops was
+vectorized.
+
+Recorded so a future session does not re-derive it: the polyfill's **free
+functions** (`simd_ops` / `simd_int_ops`) cover f32/f64 arithmetic, i8/i16
+ops, GEMM, bf16 conversion — none of which fit a u8-compare/threshold sweep.
+But the **typed wrappers** are the richer surface and DO fit: `sqrt`,
+`simd_min` / `simd_max` / `simd_clamp`, `mul_add`, `round`, `reduce_max` /
+`reduce_min` / `reduce_sum`, `cmp_gt` / `cmpgt_mask` / `movemask`,
+`mask_blend`, `popcnt` — implemented across AVX2 / AVX-512 / NEON / wasm /
+scalar and cfg-dispatched through `simd.rs`. So Wolf's `max_s` reduction, the
+per-pixel `sqrt`, the `grey < t` compare and the `strip_borders_grey` select all
+have primitives already.
+
+**Two things stand between here and using them, and neither is "write
+intrinsics":** (a) `tesseract-ocr` declares no `ndarray` dependency at all —
+only `tesseract-recognizer` does, which is where the invariant currently bites
+(`matmul_i8_to_i32`) — so reaching `ndarray::simd` means adding that dep and
+deciding whether it crosses the deliberate two-foundations split; (b) no
+measurement says binarization is hot. Sauvola on a 512×720 page is ~370k
+pixels of integral-image arithmetic against an LSTM forward that dominates the
+per-page cost. **Vectorize after profiling, through the polyfill, never
+before.**
 
 **★ Two "blocked" deferrals were never data-blocked (2026-07-29).** Both
 falsifying fixtures are now committed (`corpus/model/README.md` § "Falsifier
