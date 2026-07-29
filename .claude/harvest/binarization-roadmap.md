@@ -23,7 +23,7 @@ new pipeline.
 | 1 | Niblack | `m + k·s` | local contrast | windowed mean + stddev |
 | 2 | **Sauvola** (shipped, byte-parity) | `m·(1 − k·(1 − s/R))`, `R=128` | Niblack's noise explosion in blank regions | same windows |
 | 3 | **Wolf-Jolion** (next) | `m + k·(s/max_s − 1)·(m − min_I)` — **verified from Wolf's own source**, see below | Sauvola's weakness on **low-contrast / faded** regions — Sauvola's `s/R` uses a *fixed* `R=128`, so on a washed-out scan where `s ≪ 128` the term collapses and `t → m`, under-thresholding. Wolf rescales by the image's ACTUAL max stddev. | + one global reduction for `max_s`, `min_I` |
-| 4 | **Singh et al.** (arXiv 1201.5227) | local **mean deviation** instead of standard deviation — **exact equation not yet obtained**, see below | mainly a **cost** win: `O(n²)` vs `O(w²·n²)`, and independent of window size | cheapest of 2-4 |
+| 4 | **Singh et al.** (arXiv 1201.5227) | `m·[1 + k·(∂/(1−∂) − 1)]` where **`∂ = I(x,y) − m(x,y)`** is a **PER-PIXEL** deviation — **verified from the paper, eq. (13)**, see below | mainly a **cost** win: `O(n²)` vs `O(w²·n²)`, **flat across window size** (measured 0.19-0.25 s where Sauvola goes 7.1→13.3) | **no second integral at all** — `∂` is per-pixel, so nothing is accumulated |
 
 > **⚠ The Wolf row above was CORRECTED 2026-07-29.** It previously carried
 > `(1−a)·m + a·M + a·s/S·(m−M)`, written from recollection. The verified form
@@ -43,9 +43,13 @@ new pipeline.
 - `pixApplyLocalThreshold` — the `grey < t` application.
 
 Wolf-Jolion reuses **all four** and changes only `pixSauvolaGetThreshold`'s
-formula plus one extra global reduction (min grey, max local stddev). Singh
-reuses the first and last and swaps the mean-square integral for a mean-deviation
-one.
+formula plus one extra global reduction (min grey, max local stddev).
+
+Singh reuses only the **mean** half and the application step — and this is
+sharper than first assumed: because `∂ = I(x,y) − m(x,y)` is **per-pixel**,
+it does not swap the mean-square integral for a different accumulator, it
+**deletes that half outright**. No `pixWindowedMeanSquare`, no f64 integral,
+no sqrt. Just the mean it already has, minus the pixel.
 
 ## The parity question — read before starting
 
@@ -144,12 +148,102 @@ repo reports the method placed **5th in DIBCO 2009**.
 Sudipta Roy, O. Imocha Singh, Tejmani Sinam, Kh. Manglem Singh. IJCSI vol. 8,
 Nov 2011.
 
-**⚠ The exact equation could NOT be extracted.** The PDF's formulas are set in
-a math font with custom encoding and come out of the text layer as glyph soup
-(`10),(yxb ifotherwiseyxTyxI`). Everything below is from the paper's *prose*,
-which is unambiguous; the closing formula must be read off the rendered PDF or
-a reference implementation before coding. **Do not reconstruct it from
-memory — that is exactly the kind of paraphrase this repo has been burned by.**
+**✅ EQUATION OBTAINED** (operator supplied page screenshots, 2026-07-29 —
+the PDF text layer could not yield it; see the note at the end of this
+section for what failed and why).
+
+### Eq. (13) — the proposed threshold
+
+```
+T(x,y) = m(x,y) · [ 1 + k · ( ∂(x,y) / (1 − ∂(x,y)) − 1 ) ]
+```
+
+with **`∂(x,y) = I(x,y) − m(x,y)`**, the *local mean deviation*, and `k` a
+bias with range **[0,1] only**.
+
+**The thing that could not have been guessed, and that IS the cost win:**
+`∂` is **per-pixel** — the pixel minus its own local mean — **not a windowed
+statistic**. There is nothing to accumulate, so no second integral image
+exists. Sauvola needs the mean-square integral to get `δ`; Singh needs
+nothing beyond the mean it already has.
+
+Supporting definitions from the same paper (all now verified, not recalled):
+
+| eq | formula | notes |
+|---|---|---|
+| (1) | `g(x,y) = ΣΣ I(i,j)` | integral sum image (Viola-Jones) |
+| (2-4) | `g(x,y) = I(x,y) + g(x,y−1) + g(x−1,y) − g(x−1,y−1)` | single-pass build |
+| (6) | `s(x,y) = [g(x+d−1,y+d−1) + g(x−d,y−d)] − [g(x−d,y+d−1) + g(x+d−1,y−d)]`, `d = round(w/2)` | window sum, 2 adds + 1 sub, **window-size independent** |
+| (7) | `m(x,y) = s(x,y) / w²` | local mean |
+| (8) | `b(x,y) = 0 if I(x,y) ≤ T(x,y) else 1` | **note `I(x,y) ∈ [0,1]`** |
+| (9) | `T = m + k·δ` | Niblack, `k = −0.2`, `w = 15` |
+| (10) | `T = m·[1 + k·(δ/R − 1)]` | Sauvola, `R = 128`, `k ∈ [0.2, 0.5]` |
+| (11-12) | `T = 0.5·(Imax + Imin)`, contrast `C = Imax − Imin ≥ 15` | Bernsen, `w = 31` |
+
+Eq. (10) **exactly matches** what Wolf's C++ has for Sauvola — two
+independent sources agreeing, which is the cross-check worth having.
+
+### Behaviour the paper states explicitly (useful for the port's tests)
+
+- `k = 0` ⟹ `T = m`, the plain local mean.
+- Uniform window ⟹ `I(x,y) = m(x,y)` ⟹ `∂ = 0` ⟹ `T < m` ⟹ pixel is
+  **background**. This is the blank-region behaviour Niblack gets wrong.
+- `m = 0` ⟹ `T = 0` ⟹ pixel is background.
+- Lower `k` raises the threshold; higher `k` lowers it.
+
+### ⚠ Implementation gotcha the formula hides
+
+`∂/(1−∂)` has a **singularity at `∂ = 1`**, reachable when `I = 1` and
+`m = 0` (a white pixel in a fully black window). Intensities MUST be
+normalized to `[0,1]` per eq. (8) — on a raw `0..=255` buffer the term is
+meaningless. Guard the denominator.
+
+Note also that `∂ = I − m` is **signed**: a pixel darker than its own local
+mean gives `∂ < 0`, so `∂/(1−∂)` is negative and the bracket drops below
+`1 − k`. That is the intended discrimination, but it means the term is NOT
+bounded in `[0,1]` the way `s/R` is in Sauvola — an implementation that
+clamps `∂` to non-negative would silently delete half the method.
+
+### ⚠ The paper contradicts itself on `k` — do not trust one reading
+
+Eq. (13)'s own text gives **`k ∈ [0,1]`**, and the document-comparison figure
+uses `k = 0.06`. But the window-size figure states **`k = 15`** (against
+Sauvola's `k = 5` in the same figure). Those cannot both be the `k` of eq.
+(13) — at `k = 15` the bracket `1 + 15·(∂/(1−∂) − 1)` is wildly negative for
+any `∂ < 1`, making `T` negative and every pixel foreground.
+
+**Consequence for the port: `k` must be swept empirically, not taken from the
+paper.** Treat `[0, 1]` as the live range (it is the one attached to the
+equation itself) and treat the `k = 15` figure as either a different
+parameterization or an erratum. This is exactly the "`k` is not comparable
+across methods" warning Wolf's repo gives, showing up *within* one paper.
+
+### Measured timing (Table 1, Lena 512×512, seconds)
+
+| window | **Proposed** | Bernsen | Niblack | Sauvola |
+|---|---|---|---|---|
+| 3 | 0.2496 | 0.8112 | 7.176 | 7.1448 |
+| 15 | 0.234 | 3.4164 | 8.5177 | 8.5489 |
+| 35 | **0.1872** | 12.0589 | 13.2913 | 13.3225 |
+
+Singh is **flat** (~0.19-0.25 s) across a 12× window-size range while Sauvola
+nearly doubles. That is the `O(n²)` vs `O(w²·n²)` claim, measured — and it
+does not get *faster* than Sauvola at small windows by much, so the win is
+specifically **window-size independence**, not raw speed.
+
+One more datum from the Sauvola discussion worth carrying: the paper reports
+`k = 0.5` as used by Sauvola/Sezgin/Badekas but finds **`k = 0.34` gives the
+best results**, adding that "the algorithm is not very sensitive to the value
+of k".
+
+### What the PDF text layer could not give (kept as a method note)
+
+The PDF's formulas are set in a math font with custom encoding and extract as
+glyph soup (`10),(yxb ifotherwiseyxTyxI`). Recording it as *unobtained*
+rather than reconstructing from memory was the right call: the same file had
+just carried a wrong Wolf formula written from recollection, and the real
+Singh equation — a **per-pixel** `∂`, not a windowed one — is not what a
+plausible reconstruction would have produced.
 
 What the prose establishes, verbatim in substance:
 
@@ -171,6 +265,88 @@ One citation from the paper worth carrying, because it bears on our use case:
 the authors cite Sezgin & Sankur's comparative analysis finding Sauvola "is
 the best on non documental images, **but somewhat poor in document images**".
 Ours are document images.
+
+---
+
+# SHIPPED + MEASURED (2026-07-29)
+
+Both rungs are implemented in `crates/tesseract-ocr/src/binarize.rs`
+(`wolf_binarize` / `singh_binarize`, sharing Sauvola's parity-proven
+`windowed_stats` front half) and selectable end-to-end via
+`BinarizeMode::{Wolf, Singh}` through BOTH the layout path (`xy_cut`) and the
+text path (`segment.rs`). Option (2) was taken: **quality fence, not parity**,
+stated in the module docs as the repo rule requires.
+
+## The measurement — `examples/binarize_ab.rs`, 4 modes × 5 fixtures
+
+| mode | mean_cer | mean_ink_frac |
+|---|---|---|
+| otsu | 0.3041 | 0.3898 |
+| **sauvola** | **0.0045** | 0.0279 |
+| wolf | 0.0054 | 0.0285 |
+| singh | 0.0090 | 0.0303 |
+
+**All three adaptive methods recover the full 42-word text on every degraded
+fixture**; Otsu drops to 18-32 words. That part is unambiguous.
+
+**But Wolf did not beat Sauvola — and the reason is the fixtures, not Wolf.**
+On all four *degraded* fixtures Wolf and Sauvola are byte-identical
+(0.0045/0.0045, 0.0181/0.0181, 0.0000/0.0000, 0.0000/0.0000). Wolf's only
+difference is on the CLEAN page, where it introduces one character of error
+Sauvola does not.
+
+That is the expected result once stated plainly: **`uneven_*.pgm` is uneven
+ILLUMINATION, not FADED contrast.** Those pages have full local contrast and
+merely a shifting background — Sauvola's home turf, the case its local mean
+already handles. Wolf's claim is specifically about low-contrast source, where
+`s ≪ 128` collapses the fixed `R` and `t → m`. **The probe never exercised the
+failure mode Wolf exists to fix.**
+
+Wolf's claim IS measured, at unit scale, by
+`binarize::tests::wolf_recovers_faint_ink_that_sauvola_misses`: a 20-grey-level
+stripe on a 200-grey field. Measured thresholds — Sauvola `t(ink)=136` (ink at
+180 sails over it, MISSED), Wolf `t(ink)=191` (ink at 180 falls under it,
+CAUGHT), neither flooding the background. Two-sided on the same fixture, so it
+cannot pass if `wolf_binarize` were merely a second name for Sauvola.
+
+**Consequences, in priority order:**
+
+1. **The fixture set needs a FADED arm.** `gen_uneven_light.py` multiplies by
+   an illumination field; a faded page needs the dynamic range COMPRESSED
+   (`grey → a + b·grey`, `b ≪ 1`). Until that exists, no page-scale evidence
+   for or against Wolf exists — the table above is silent on its actual claim.
+2. **Sauvola remains the default-flip candidate**, unchanged by this work.
+   Neither new rung beats it on evidence in hand.
+3. **Singh's claim is COST, and cost was not measured here.** It is ~2× Sauvola's
+   CER on these fixtures (0.0090 vs 0.0045 — about one character in 226) and
+   loses one word on the clean page. Its selling point is window-size
+   independence (paper Table 1: flat 0.19-0.25 s where Sauvola goes
+   7.1→13.3 s), which this probe does not time. Judging Singh on CER alone
+   would be judging it on the axis it does not compete on.
+
+## Implementation notes worth keeping
+
+- **Singh's pole cancels — do not transcribe eq. (13) literally.** `∂/(1−∂)`
+  diverges at `∂ = 1`, and the outer `m·` factor then gives `0 · inf = NaN`.
+  Rearranged as `T = m + k·(m·∂/(1−∂) − m)` with `den = 1 − I + m`, the risky
+  product is `m·(I−m)/den`, whose numerator carries a matching factor of `m`;
+  the limit is `1`, so `T → k`. Pinned by
+  `singh_singularity_yields_the_cancelled_limit_not_nan`, which asserts the
+  exact limit value (`15 == (0.06·255) as u8`) rather than merely "not NaN" —
+  a NaN guard maps to `0` and would otherwise look valid.
+- **Wolf's `u8` threshold clamp is exact, not lossy.** `s/max_s − 1 ≤ 0` and
+  `m − min_I ≥ 0`, so for `k ≥ 0` the correction is non-positive and
+  `t ≤ m ≤ 255` — it can never overflow upward. `t < 0` is reachable, and
+  clamping to `0` is decision-identical (no `u8` grey satisfies `grey < 0`).
+- **`max_s == 0`** (a flat page) is `0/0`; defined as `0`, which lands on
+  `t = m` and gives all-background — the right answer for a blank page and
+  the `0/0` limit anyway.
+- **`k` is per-method and NOT transferable.** The probe holds `whsize = 16`
+  constant across modes (isolating the closing formula) but deliberately uses
+  each method's own default `k`. So a losing row means "did not win untuned",
+  never "is worse".
+
+---
 
 ## Parity status — unchanged and still the deciding constraint
 

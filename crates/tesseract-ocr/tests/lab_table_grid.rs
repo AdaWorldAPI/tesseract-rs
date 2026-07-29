@@ -84,7 +84,7 @@ fn table_page(ruled: bool) -> Vec<u8> {
         }
     }
     if ruled {
-        // Horizontal rules above/below every row, and vertical rules between
+        // Horizontal rules above/below every row, and vertical borders between
         // the columns — what `nhb`/`nvb` count.
         for r in 0..=ROWS {
             let y = ROW_TOP + r * ROW_PITCH - 8;
@@ -184,7 +184,7 @@ fn borderless_table_is_not_detected() {
     );
     assert_eq!(
         d.nvb, 0,
-        "borderless fixture reports {} vertical rules — it is not borderless",
+        "borderless fixture reports {} vertical borders — it is not borderless",
         d.nvb
     );
 }
@@ -252,7 +252,7 @@ fn real_borderless_grid_measured() {
         d.score >= pageseg::TABLE_SCORE_THRESHOLD
     );
     assert_eq!(d.nhb, 0, "a borderless grid must have NO horizontal rules");
-    assert_eq!(d.nvb, 0, "a borderless grid must have NO vertical rules");
+    assert_eq!(d.nvb, 0, "a borderless grid must have NO vertical borders");
 }
 
 // ─── EXPERIMENT: synthesize the border, then reuse the proven classifier ───

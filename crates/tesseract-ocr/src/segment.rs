@@ -52,7 +52,7 @@
 //! re-pin all of them; `segment_rows_default_mode_is_otsu` guards it
 //! directly.
 
-use crate::binarize::sauvola_binarize;
+use crate::binarize::{sauvola_binarize, singh_binarize, wolf_binarize, LocalBinarization};
 use crate::blob_filter::filter_blobs;
 use crate::conncomp::conn_comp_areas;
 use crate::textline::{compute_block_xheight, make_initial_textrows, make_rows, ToBlockCtx};
@@ -74,32 +74,51 @@ use crate::xy_cut::BinarizeMode;
 /// rather than delegating to `binarize_page_with`, is what keeps
 /// `BinarizeMode::Otsu` byte-identical to this module's pre-`BinarizeMode`
 /// behaviour on EVERY input, including that edge case — the hard constraint
-/// this whole change is built around. [`BinarizeMode::Sauvola`] mirrors
-/// `binarize_page_with`'s Sauvola arm (same too-small-for-window guard),
-/// falling back to THIS module's own Otsu arm — not `xy_cut`'s — for the
-/// same reason.
+/// this whole change is built around. The three local-adaptive modes mirror
+/// `binarize_page_with`'s corresponding arms (same too-small-for-window
+/// guard), falling back to THIS module's own Otsu arm — not `xy_cut`'s — for
+/// the same reason.
 fn binarize_page_for_segmentation(grey: &[u8], w: usize, h: usize, mode: BinarizeMode) -> Vec<u8> {
     match mode {
         BinarizeMode::Otsu => {
             let otsu = otsu_threshold_gray(grey, w, 0, 0, w, h);
             threshold_rect_to_binary(grey, w, 0, 0, w, h, otsu)
         }
-        BinarizeMode::Sauvola { whsize, k: factor } => {
-            let window_ok = whsize >= 2 && w >= 2 * whsize + 3 && h >= 2 * whsize + 3;
-            if !window_ok {
-                // Too small for the requested window — fall back to this
-                // module's own Otsu arm (see the doc comment above for why
-                // that must be THIS arm, not `xy_cut::binarize_page_with`'s).
-                return binarize_page_for_segmentation(grey, w, h, BinarizeMode::Otsu);
-            }
-            let sauvola = sauvola_binarize(grey, w, h, whsize, factor);
-            sauvola
-                .binary
-                .iter()
-                .map(|&fg| if fg == 1 { 0 } else { 255 })
-                .collect()
+        BinarizeMode::Sauvola { whsize, k } => {
+            local_adaptive_for_segmentation(grey, w, h, whsize, k, sauvola_binarize)
+        }
+        BinarizeMode::Wolf { whsize, k } => {
+            local_adaptive_for_segmentation(grey, w, h, whsize, k, wolf_binarize)
+        }
+        BinarizeMode::Singh { whsize, k } => {
+            local_adaptive_for_segmentation(grey, w, h, whsize, k, singh_binarize)
         }
     }
+}
+
+/// Shared body of this module's local-adaptive arms — the segmentation-side
+/// twin of `xy_cut::local_adaptive`, differing ONLY in which Otsu arm it
+/// falls back to when the page is too small for the requested window (this
+/// module's, which has no `hi_value == -1` fallback; see
+/// [`binarize_page_for_segmentation`]'s doc comment for why that difference
+/// is load-bearing and must not be collapsed).
+fn local_adaptive_for_segmentation(
+    grey: &[u8],
+    w: usize,
+    h: usize,
+    whsize: usize,
+    k: f32,
+    method: fn(&[u8], usize, usize, usize, f32) -> LocalBinarization,
+) -> Vec<u8> {
+    let window_ok = whsize >= 2 && w >= 2 * whsize + 3 && h >= 2 * whsize + 3;
+    if !window_ok {
+        return binarize_page_for_segmentation(grey, w, h, BinarizeMode::Otsu);
+    }
+    method(grey, w, h, whsize, k)
+        .binary
+        .iter()
+        .map(|&fg| if fg == 1 { 0 } else { 255 })
+        .collect()
 }
 
 /// Binarize (mode-selectable, see [`binarize_page_for_segmentation`]) +

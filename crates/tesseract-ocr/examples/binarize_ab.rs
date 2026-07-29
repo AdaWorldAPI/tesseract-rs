@@ -1,5 +1,6 @@
-//! **The falsifying A/B probe** — Sauvola vs Otsu binarization under UNEVEN
-//! ILLUMINATION, the failure mode Sauvola's local mean/std is supposed to
+//! **The falsifying A/B probe** — the whole local-adaptive ladder (Otsu →
+//! Sauvola → Wolf-Jolion → Singh) under UNEVEN
+//! ILLUMINATION, the failure mode a local mean/std is supposed to
 //! survive and a single global Otsu threshold cannot (see `binarize.rs`'s
 //! module docs and the `xy_cut::BinarizeMode` doc comments). The existing
 //! rendered corpus (`corpus/pages/*.pgm`, `corpus/quality/resgrid.pgm`) is
@@ -47,10 +48,23 @@
 //! measures — this file does not assert an expected outcome; it prints the
 //! numbers and lets them decide.**
 //!
+//! ## What this probe can and cannot settle for Wolf and Singh
+//!
+//! Sauvola is a byte-parity leaf; Wolf and Singh are not, and no oracle
+//! exists for either (leptonica implements neither). **This probe is the
+//! only evidence they have** — which makes it worth being precise about what
+//! it establishes. It measures whether each method, at its own documented
+//! default `k`, recovers text a global threshold destroys on THESE fixtures.
+//! It does NOT establish that either implementation matches its reference; a
+//! transcription error that happened to still binarize sensibly would show up
+//! here as a merely-mediocre row, not as a failure. Read the numbers as
+//! "does this rung help on this degradation", never as "is this rung
+//! correct".
+//!
 //! The `mode_delta_cer` column makes the direct, per-fixture comparison
 //! explicit: it is the CER between a fixture's OWN Otsu-mode text and its
-//! OWN Sauvola-mode text (Otsu is `MODES[0]`, so it has no prior mode on a
-//! fixture to diff against and reports `-`). This isolates "did switching
+//! OWN text under each later mode (Otsu is `MODES[0]`, so it has no prior
+//! mode on a fixture to diff against and reports `-`). This isolates "did switching
 //! binarization mode change what was recognized on this input" from "how
 //! much did the degradation itself cost", which is what the pre-existing
 //! `cer` column measures (against the clean-page/Otsu reference).
@@ -98,10 +112,26 @@ const FIXTURES: &[(&str, &str)] = &[
     ("vignette_085", "uneven_vignette_085.pgm"),
 ];
 
-/// The two modes under test. The Sauvola window (`whsize = 16`) comfortably
-/// fits the 512x720 source page (well above its `2*whsize+3` minimum);
-/// `k = 0.34` is the typical production constant used throughout
-/// `binarize.rs`'s own tests.
+/// The modes under test — the whole Niblack ladder this crate implements.
+/// The window (`whsize = 16`) comfortably fits the 512x720 source page (well
+/// above its `2*whsize+3` minimum) and is held CONSTANT across modes so the
+/// comparison isolates the closing formula, which is the only thing that
+/// differs between them.
+///
+/// **`k` is deliberately NOT constant, and must not be made so.** It is not
+/// transferable between these methods — the reference implementation warns
+/// about exactly this, and Niblack famously needs a *negative* `k` where the
+/// others need a positive one. Each value below is that method's own
+/// documented default: Sauvola `0.34` (this crate's production constant),
+/// Wolf `0.5` (the reference implementation's default), Singh `0.06` (the
+/// paper's own document-binarization figure; its `[0,1]` range is the one
+/// attached to the equation itself — see `singh_binarize`'s docs for why a
+/// different figure in the same paper cannot be taken at face value).
+///
+/// Consequence for reading the table: a mode's row is that method **at its
+/// own default**, not that method at its best. A mode losing here has not
+/// been shown to be worse — it has been shown not to win untuned. Sweeping
+/// `k` per method is a separate measurement.
 const MODES: &[(&str, BinarizeMode)] = &[
     ("otsu", BinarizeMode::Otsu),
     (
@@ -109,6 +139,14 @@ const MODES: &[(&str, BinarizeMode)] = &[
         BinarizeMode::Sauvola {
             whsize: 16,
             k: 0.34,
+        },
+    ),
+    ("wolf", BinarizeMode::Wolf { whsize: 16, k: 0.5 }),
+    (
+        "singh",
+        BinarizeMode::Singh {
+            whsize: 16,
+            k: 0.06,
         },
     ),
 ];

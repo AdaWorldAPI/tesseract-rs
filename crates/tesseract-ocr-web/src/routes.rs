@@ -527,7 +527,7 @@ fn algorithms_trace(dbg: &OcrDebugOutcome) -> Vec<AlgoStep> {
         },
         AlgoStep {
             name: "3. Binarization".into(),
-            detail: "global Otsu (fixed-128 fallback) for the region / table classifier. Sauvola adaptive binarization is transcoded and available, but is NOT the segmentation default.".into(),
+            detail: "global Otsu (fixed-128 fallback) is the default everywhere. Three local-adaptive alternatives are implemented and selectable but NOT default: Sauvola (byte-parity transcode of leptonica), Wolf-Jolion and Singh (transcribed from primary sources, quality-fence footing \u{2014} no oracle exists for either).".into(),
         },
         AlgoStep {
             name: "4. LSTM forward".into(),

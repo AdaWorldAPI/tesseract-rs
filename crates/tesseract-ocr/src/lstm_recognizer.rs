@@ -84,6 +84,51 @@ impl From<NetError> for RecognizerError {
     }
 }
 
+/// Opt-in switches for [`LstmRecognizer::recognize_document_with_options`].
+///
+/// [`Default`] reproduces [`LstmRecognizer::recognize_document`] exactly:
+/// `Otsu`, no border stripping. Every field here is off-by-default on purpose
+/// — each changes what the recognizer sees, so each needs its own
+/// measurement before it could become a default.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DocumentOptions {
+    /// Binarization mode for every internal pass (see
+    /// [`LstmRecognizer::recognize_document_with_mode`]).
+    pub binarize_mode: BinarizeMode,
+    /// Paint printed borders out to background before recognition
+    /// ([`crate::pageseg::strip_borders_grey`]).
+    ///
+    /// # Why this is a recognizer option and not a caller pre-processing step
+    ///
+    /// Border stripping cannot simply be applied to the page before calling in,
+    /// the way [`crate::rectify::auto_rectify`] can — and the reason is a
+    /// measured coupling between this crate's two table defects, worth
+    /// stating because it is not obvious and it cost a wrong first attempt:
+    ///
+    /// - **Defect A:** printed borders are recognized AS GLYPHS (`|`, `=`, `—`,
+    ///   `‘`), which corrupts cell text and — worse — fills the inter-column
+    ///   gutters, so `crate::structured::extract_table_grid` has no
+    ///   whitespace gap left to split columns on.
+    /// - **Defect B:** a BORDERLESS table is not classified a table at all.
+    ///   Two of `pageseg::decide_if_table`'s four score conditions
+    ///   (`nhb > 1`, `nvb > 2`) COUNT BORDERS, and the whitespace pair alone
+    ///   does not clear the threshold in practice.
+    ///
+    /// So stripping the borders from the page a caller passes in fixes A by
+    /// causing B: the table stops being detected. Measured on the ruled
+    /// four-column lab fixture — 3 recovered columns became **zero table
+    /// regions** (`tests/lab_table_columns.rs`).
+    ///
+    /// **The printed borders are simultaneously what ruins the columns and what proves
+    /// it is a table.** The two consumers therefore need DIFFERENT inputs,
+    /// which only the recognizer can arrange: layout, `decide_if_table` and
+    /// figure detection all read the ORIGINAL binarization, while only word
+    /// and line recognition reads the stripped page. A caller outside this
+    /// function cannot express that split, because by the time it has a
+    /// `Document` both decisions are already made.
+    pub strip_borders: bool,
+}
+
 /// The result of [`LstmRecognizer::recognize_document`] — the rendered
 /// `tesseract-rs/doc.v1` JSON, the harvested typed fields, and word/line
 /// counts for callers that want stats without re-parsing the JSON.
@@ -950,7 +995,58 @@ impl LstmRecognizer {
         harvest: Option<&[crate::structured::FieldSpec]>,
         binarize_mode: BinarizeMode,
     ) -> Result<Document, RecognizerError> {
-        let lines = self.recognize_page_blocks_words_with_mode(grey, w, h, dict, binarize_mode)?;
+        self.recognize_document_with_options(
+            grey,
+            w,
+            h,
+            dict,
+            harvest,
+            DocumentOptions {
+                binarize_mode,
+                ..DocumentOptions::default()
+            },
+        )
+    }
+
+    /// [`Self::recognize_document_with_mode`] plus the opt-in pre-processing
+    /// switches — see [`DocumentOptions`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::recognize_document`].
+    pub fn recognize_document_with_options(
+        &self,
+        grey: &[u8],
+        w: usize,
+        h: usize,
+        dict: Option<&DictLite>,
+        harvest: Option<&[crate::structured::FieldSpec]>,
+        opts: DocumentOptions,
+    ) -> Result<Document, RecognizerError> {
+        let binarize_mode = opts.binarize_mode;
+        // The ORIGINAL page's binarization — hoisted above recognition
+        // because layout, table detection and figure detection must all see
+        // the page AS PRINTED. `strip_borders` (below) changes only what the
+        // RECOGNIZER sees; see `DocumentOptions::strip_borders` for why those
+        // two must not be the same buffer.
+        let binary = Self::binarize_page_with(grey, w, h, binarize_mode);
+        let stripped = if opts.strip_borders {
+            crate::pageseg::strip_borders_grey(grey, &binary, w, h)
+        } else {
+            None
+        };
+        let recog_grey: &[u8] = stripped.as_deref().unwrap_or(grey);
+        // Glyph-ink measurement must read the page that was actually
+        // RECOGNIZED — a char box overlapping a removed rule would otherwise
+        // measure the rule's ink and report a wildly oversized glyph.
+        let recog_binary: std::borrow::Cow<'_, [u8]> = if stripped.is_some() {
+            std::borrow::Cow::Owned(Self::binarize_page_with(recog_grey, w, h, binarize_mode))
+        } else {
+            std::borrow::Cow::Borrowed(&binary)
+        };
+
+        let lines =
+            self.recognize_page_blocks_words_with_mode(recog_grey, w, h, dict, binarize_mode)?;
         let mut page =
             crate::structured::DocPage::from_line_words(&lines, &self.charset, w as u32, h as u32);
         crate::structured::harden_numeric_tokens(&mut page);
@@ -972,7 +1068,6 @@ impl LstmRecognizer {
             .into_iter()
             .map(|r| (r.left as i32, r.top as i32, r.right as i32, r.bottom as i32))
             .collect();
-        let binary = Self::binarize_page_with(grey, w, h, binarize_mode);
 
         // MEASURED font sizing. Replaces the statistical `xheight + ascrise -
         // descdrop` fit, which is unstable on short rows — two table rows of
@@ -988,7 +1083,7 @@ impl LstmRecognizer {
         // line that had none. Additive: the existing band-derived fields are
         // untouched, and the renderer falls back to them when `glyph_px` is
         // absent.
-        crate::structured::attach_glyph_px(&mut page, &lines, &binary, w as u32, h as u32);
+        crate::structured::attach_glyph_px(&mut page, &lines, &recog_binary, w as u32, h as u32);
 
         let figures = Self::region_figures(&binary, w, h);
         // A block is a TABLE when its FULL bbox (rules + column corridors, not
@@ -1076,7 +1171,7 @@ impl LstmRecognizer {
     ///
     /// **Cropping the block, not the emitted text-region bbox, is the point.**
     /// The region bbox `build_regions` produces is the union of the OCR line
-    /// boxes; it excludes the rules, borders, and empty column corridors that
+    /// boxes; it excludes the borders, borders, and empty column corridors that
     /// live *between/around* the text — exactly the structure
     /// `decide_if_table` counts. Feeding it the text-line union would strip that
     /// signal and miss ruled tables (per the #39 review). The block bbox keeps
@@ -1865,7 +1960,7 @@ mod makerow_page_tests {
     /// the BLOCK bbox: a ruled grid block flips to a table (via the byte-parity
     /// `decide_if_table`) while a plain-paragraph block does not, and a block
     /// under the 100 px structural-scale floor is skipped. Cropping the block —
-    /// not the text-line union — is what keeps the rules and column corridors
+    /// not the text-line union — is what keeps the borders and column corridors
     /// the decision keys on (the #39 fix).
     #[test]
     fn block_is_table_detects_grid_not_paragraph() {

@@ -427,10 +427,10 @@ fn union_bbox(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, i3
 /// (a within-cell word space in a single row is neither, so a multi-word
 /// description stays ONE cell — codex #41 P2). Each word joins the column band
 /// its x-center lands in; a cell is one line's words in one column. Pragmatic
-/// synthesis over the proven word surface — no rule-mask or C-transcode
+/// synthesis over the proven word surface — no border-mask or C-transcode
 /// dependency, so it handles ruled and borderless tables alike. (Residual: a
 /// sparse table whose single within-cell gap is both wide AND uncovered by
-/// every other row stays ambiguous; a ruled table's vertical rule mask would
+/// every other row stays ambiguous; a ruled table's vertical border mask would
 /// settle it — future, this is word-only today.)
 #[must_use]
 pub fn extract_table_grid(lines: &[&DocLine]) -> TableGrid {
@@ -1286,7 +1286,7 @@ pub fn harvest_fields(page: &DocPage, specs: &[FieldSpec]) -> Vec<HarvestedField
 //
 // ## Known residual — NOT fixed here
 //
-// A recognized rule glyph (e.g. `|` misread from a table's vertical
+// A recognized border glyph (e.g. `|` misread from a table's vertical
 // divider) spans the FULL cell height, inflating whichever line's p90 it
 // lands in. `crate::pageseg::decide_if_table` already computes a de-lined
 // page and discards it; wiring that de-lined page into this measurement
