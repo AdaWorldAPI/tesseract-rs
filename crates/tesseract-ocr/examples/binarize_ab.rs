@@ -14,33 +14,55 @@
 //! cargo run -p tesseract-ocr --example binarize_ab
 //! ```
 //!
-//! ## An important, CODE-PROVEN finding this probe surfaces
+//! ## History — the gap this probe found, and its fix
 //!
+//! The first run of this probe found that
 //! [`LstmRecognizer::recognize_document_with_mode`]'s `binarize_mode`
-//! parameter (added alongside this probe — see `xy_cut.rs` /
-//! `lstm_recognizer.rs`) reaches ONLY the region/table classification pass
+//! parameter reached ONLY the region/table classification pass
 //! (`region_figures` / `block_is_table` / the layout `xy_cut` call feeding
 //! `build_regions`) — **not** the actual text-line finding/recognition
-//! (`recognize_page_blocks_words`, which runs its own separate, always-Otsu
+//! (`recognize_page_blocks_words`, which ran its own separate, always-Otsu
 //! binarization via `segment::segment_rows`, untouched by this parameter).
-//! Concretely: `Document::word_count`, `Document::line_count`, and
-//! `Document::mean_confidence` are computed from a `page` value built
-//! BEFORE `binarize_mode` is ever consulted, so those fields — and,
-//! transitively, the recognized WORD TEXT the CER column below is computed
-//! from — are **provably mode-independent** for any input, by construction,
-//! not by chance. Expect the `word_count` / `mean_conf` / `cer` columns
-//! below to read IDENTICAL for Otsu vs Sauvola on every fixture. That
-//! identity IS a measured falsifying result, not a bug in this probe: it
-//! means today's wiring cannot make Sauvola improve recognized TEXT quality
-//! on an unevenly-lit page — only how such a page's regions get
-//! CLASSIFIED. The `ink_frac` column (computed directly from
+//! `Document::word_count`, `Document::line_count`, and
+//! `Document::mean_confidence` were therefore computed from a `page` value
+//! built BEFORE `binarize_mode` was ever consulted — provably
+//! mode-independent for any input, by construction. That result is recorded
+//! in `.claude/harvest/sauvola-vs-otsu-probe.md`: every `word_count` /
+//! `mean_conf` / `cer` cell read IDENTICAL for Otsu vs Sauvola on every
+//! fixture, which was a measured falsifying result, not a bug in the probe
+//! — it meant the wiring at the time could not make Sauvola improve
+//! recognized TEXT quality on an unevenly-lit page, only how such a page's
+//! regions got CLASSIFIED.
+//!
+//! **That gap is now closed.** `binarize_mode` is threaded through
+//! `crate::segment::segment_rows_with_mode` /
+//! `segment_rows_independent_with_mode` and up through
+//! `recognize_page_blocks_words_with_mode` /
+//! `recognize_page_makerow_words_with_mode`, so
+//! `recognize_document_with_mode`'s mode now governs the SAME binarization
+//! the line finder and word/line recognizer use — not just region/table
+//! classification. The `word_count` / `mean_conf` / `cer` columns below can
+//! therefore legitimately differ between Otsu and Sauvola now. **Whether
+//! they actually do, and by how much, is exactly what this run of the probe
+//! measures — this file does not assert an expected outcome; it prints the
+//! numbers and lets them decide.**
+//!
+//! The `mode_delta_cer` column makes the direct, per-fixture comparison
+//! explicit: it is the CER between a fixture's OWN Otsu-mode text and its
+//! OWN Sauvola-mode text (Otsu is `MODES[0]`, so it has no prior mode on a
+//! fixture to diff against and reports `-`). This isolates "did switching
+//! binarization mode change what was recognized on this input" from "how
+//! much did the degradation itself cost", which is what the pre-existing
+//! `cer` column measures (against the clean-page/Otsu reference).
+//!
+//! The `ink_frac` column (computed directly from
 //! [`binarize_page_with`](tesseract_ocr::xy_cut::binarize_page_with),
-//! entirely independent of the OCR pipeline) is the column that DOES show
-//! Sauvola's real effect: the fraction of page pixels classified as ink,
-//! which a global Otsu split inflates sharply once the dimmed region's
-//! background drops toward — or past — the point the WHOLE page's
-//! histogram places its one threshold, while Sauvola holds near the clean
-//! page's own fraction throughout.
+//! entirely independent of the OCR pipeline) remains the lowest-level
+//! signal: the fraction of page pixels classified as ink, which a global
+//! Otsu split inflates sharply once the dimmed region's background drops
+//! toward — or past — the point the WHOLE page's histogram places its one
+//! threshold, while Sauvola holds near the clean page's own fraction
+//! throughout.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -214,6 +236,13 @@ fn main() {
         *clean_label, "clean",
         "FIXTURES[0] must be the clean baseline"
     );
+    // mode_delta_cer (below) diffs each fixture's Sauvola text against ITS
+    // OWN Otsu text from earlier in the same inner loop -- that only means
+    // what it says if Otsu really does run first every time.
+    assert_eq!(
+        MODES[0].0, "otsu",
+        "MODES[0] must be Otsu for mode_delta_cer's self-relative comparison"
+    );
     let clean_doc = recognizer
         .recognize_document_with_mode(
             clean_grey,
@@ -229,8 +258,8 @@ fn main() {
 
     println!("# binarize_ab — Sauvola vs Otsu under uneven illumination\n");
     println!("reference (clean, otsu) text: {reference_text:?}\n");
-    println!("| fixture | mode | word_count | mean_conf | cer | ink_frac |");
-    println!("|---|---|---|---|---|---|");
+    println!("| fixture | mode | word_count | mean_conf | cer | ink_frac | mode_delta_cer |");
+    println!("|---|---|---|---|---|---|---|");
 
     // Per-mode running sums for the closing summary line.
     let mut cer_sum = vec![0.0f64; MODES.len()];
@@ -238,6 +267,11 @@ fn main() {
     let mut n_rows = vec![0usize; MODES.len()];
 
     for (label, grey, w, h) in &pages {
+        // Otsu's recognized text for THIS fixture, captured on the mi==0
+        // pass so the Sauvola pass (mi==1) can diff against it directly --
+        // the per-fixture, mode-vs-mode comparison `mode_delta_cer` reports,
+        // as distinct from `cer` (each mode vs the clean/Otsu reference).
+        let mut fixture_otsu_text: Option<String> = None;
         for (mi, &(mode_label, mode)) in MODES.iter().enumerate() {
             let doc = recognizer
                 .recognize_document_with_mode(grey, *w, *h, dict.as_ref(), None, mode)
@@ -253,8 +287,26 @@ fn main() {
             let conf = doc
                 .mean_confidence
                 .map_or_else(|| "n/a".to_string(), |c| format!("{c:.2}"));
+            // How much did switching binarization mode change the RECOGNIZED
+            // TEXT for this SAME fixture -- the direct measurement of
+            // whether binarize_mode now reaches word/line recognition,
+            // isolated from how much the degradation itself hurt
+            // recognition (that's what `cer`, against the clean/Otsu
+            // reference, measures). Otsu (mi==0) has no prior mode on this
+            // fixture to diff against.
+            let mode_delta = match &fixture_otsu_text {
+                None => "-".to_string(),
+                Some(otsu_text) => {
+                    let len = otsu_text.chars().count().max(1);
+                    let d = levenshtein(otsu_text, &text) as f64 / len as f64;
+                    format!("{d:.4}")
+                }
+            };
+            if mi == 0 {
+                fixture_otsu_text = Some(text);
+            }
             println!(
-                "| {label} | {mode_label} | {} | {conf} | {cer:.4} | {ink:.4} |",
+                "| {label} | {mode_label} | {} | {conf} | {cer:.4} | {ink:.4} | {mode_delta} |",
                 doc.word_count
             );
             cer_sum[mi] += cer;

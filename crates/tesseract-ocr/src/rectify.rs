@@ -26,7 +26,7 @@
 //! (removable) constant rotation component, `m1` is the keystone component.
 //!
 //! **This needs [`crate::segment::segment_rows_independent`], NOT
-//! [`crate::segment::segment_rows`].** The latter — what recognition
+//! [`crate::segment::segment_rows_with_mode`].** The latter — what recognition
 //! actually uses — deliberately forces every row in a block onto ONE shared
 //! gradient (`fit_parallel_rows`, real Tesseract's own assumption that a
 //! rotated-but-flat page's lines stay mutually parallel); its `line_m()` is
@@ -75,7 +75,7 @@ pub struct RowShear {
     pub y_center: f32,
     /// The row's independently-fitted baseline slope — 0 is perfectly
     /// horizontal. From [`crate::segment::segment_rows_independent`], NOT
-    /// [`crate::segment::segment_rows`]: the latter (what recognition uses)
+    /// [`crate::segment::segment_rows_with_mode`]: the latter (what recognition uses)
     /// deliberately forces every row in a block onto ONE shared slope
     /// (`fit_parallel_rows`, real Tesseract's own assumption that a rotated
     /// page's lines stay mutually parallel) — a page-wide constant carries no
@@ -505,7 +505,7 @@ mod tests {
 
     /// Build a synthetic grey page: `n_lines` horizontal text-like bars
     /// (hollow-rectangle "glyphs" — see [`draw_hollow_rect`] — not real
-    /// glyphs; `segment_rows`' connected-component + row-finder only needs
+    /// glyphs; `segment_rows_with_mode`' connected-component + row-finder only needs
     /// blob geometry, not recognizable characters, to fit a baseline), then
     /// apply a KNOWN forward shear-ramp distortion (the exact inverse of what
     /// `rectify_grey` corrects), so the recovered ramp can be checked against
