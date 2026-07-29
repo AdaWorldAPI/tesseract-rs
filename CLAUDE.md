@@ -835,11 +835,40 @@ ways, numbers in `.claude/harvest/sauvola-vs-otsu-probe.md`:
    before `binarize_mode` is in scope. (Three separate Otsu binarizers exist in
    this crate; two are now mode-aware, `segment.rs` is not.)
 
-**So `segment.rs` is the lever, and the top standalone priority** — it is what
-makes *any* binarization improvement reach recognized text. Without it Wolf and
-Singh would land and change nothing, exactly as Sauvola just did. It is also the
-path every golden anchor and the 8+7+0 fence runs through, so use the same safe
-shape: thread the mode, keep Otsu default, measure, then decide.
+**`segment.rs` WAS the lever — it is now threaded, and the re-measurement is the
+headline result of the session.** `binarize_mode` reaches word/line recognition;
+default is still Otsu and provably unchanged (`golden_pages` 784 s +
+the 8+7+0 fence 492 s + `golden_lines` + `blocks_columns`, 0 failures). Re-ran
+the **identical** probe on the **identical** fixtures:
+
+| fixture | Otsu CER | Sauvola CER | words otsu → sauvola |
+|---|---|---|---|
+| clean | 0.0000 | 0.0000 | 42 → 42 |
+| linear_060 | 0.2805 | **0.0045** | 32 → **42** |
+| linear_085 | 0.6154 | **0.0181** | 19 → **42** |
+| vignette_060 | 0.0000 | 0.0000 | 42 → 42 |
+| vignette_085 | 0.6244 | **0.0000** | 18 → **42** |
+
+`mean_cer 0.3041 → 0.0045` — a **68× reduction**. Every degraded fixture
+recovers the full 42-word text; `vignette_085` goes from 0.6244 to *exactly
+zero*. The clean page is untouched (`mode_delta_cer` 0.0000), so the adaptive
+path costs nothing on good input.
+
+> **⚠ THE METHODOLOGICAL LESSON, worth more than the number.** The FIRST run of
+> this probe returned identical CER between modes and I nearly recorded that as
+> "Sauvola cannot help OCR text." It was not a finding about Sauvola at all — it
+> was a finding about the **wiring**: the mode never reached the code being
+> measured. Same probe, same fixtures, same metric, both times; only the
+> plumbing differed, and the answer moved by 68×. **A null result is a claim
+> about the measurement apparatus until proven otherwise** — read the trace to
+> find out *why* a null is null before promoting it to a conclusion.
+
+**Consequence — the default-flip question is now LIVE and strongly favoured**,
+where an hour earlier the evidence said don't bother. Still gated on the goldens
++ the 8+7+0 fence, but note the clean-page delta is exactly 0.0000, so those may
+well be unchanged. Measure; do not assume in either direction. And Wolf/Singh
+are now worth building for real — they reach recognized text now, which is
+exactly what they could not do before.
 
 Next rungs (`.claude/harvest/binarization-roadmap.md`): **Wolf-Jolion** then
 **Singh et al.** (arXiv 1201.5227). One family, one shape — `binarize.rs` already
