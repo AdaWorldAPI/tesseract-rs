@@ -29,11 +29,37 @@ path — see the top-level `CLAUDE.md`, "B2 is DONE").
 The three DAWGs are consumed together by `tesseract-core`'s DAWG walker
 (`DictLite`) for the dictionary-beam path (plan Phase 1, Batch 1A / "C1").
 
+## Falsifier fixtures (not part of the `eng` or `deu` model)
+
+Two components from *other* traineddata files live here for one reason: they
+carry **varied** data where `eng`/`deu` carry uniform data, so a byte-parity
+diff over them can actually fail. Each unblocks a leaf that was deferred not
+for difficulty but because the available data could not falsify it.
+
+| File | Source | Why it exists |
+|---|---|---|
+| `chi_sim.lstm-recoder` | `tessdata_fast/chi_sim.traineddata` | The recoder's `next_codes_` trie is **empty** for `eng`/`deu` — every code is length 1, so the multi-code beam paths are structurally unreachable. This one has 4022 entries with code lengths spanning **1-5** (histogram `{1:128, 2:278, 3:2077, 4:1515, 5:24}`), i.e. 3894 entries longer than 1. Unblocks "C3". Note this also corrects the plan's standing claim that Han codes are length-3: 3 is only the mode, not the range. |
+| `eng.unicharset` | `tessdata/eng.traineddata` (the **legacy**, non-`fast`/`best` build) | The LSTM unicharset's bbox+stats CSV is identical on all 111 non-NULL lines (`0,255,0,255,0,0,0,0,0,0`), so `get_top_bottom` and the 6 float stats cannot be falsified against it. The legacy unicharset has **112/112 distinct** CSV blobs (e.g. `0,69,188,255,456,1188,0,30,486,1188`). Unblocks the deferred bbox/stats sub-leaf. |
+
+Both were verified before being committed — the recoder histogram by parsing
+the real wire format (`u32 count`, then per entry `i8 self_normalized · i32
+length · length×i32 code`) with the parser cross-validated against
+`eng`/`deu` first (both parse to 0 trailing bytes and match the naive
+`4 + 9N` size formula exactly; `chi_sim` does **not** match it, which is the
+positive evidence that it is genuinely multi-code).
+
+**Do not confuse `eng.unicharset` with `eng.lstm-unicharset`.** They are
+different components of different builds and the bare name is the real one
+`combine_tessdata -u` emits for the legacy component — the LSTM path loads
+only the `lstm-` prefixed file.
+
 ## License
 
-These files are derived from the `eng.traineddata` file distributed by the
+These files are derived from traineddata distributed by the
 [`tesseract-ocr/tessdata`](https://github.com/tesseract-ocr/tessdata)
-repository, licensed under the
+and [`tessdata_fast`](https://github.com/tesseract-ocr/tessdata_fast)
+repositories (`eng`/`deu` and the two falsifier fixtures above), licensed
+under the
 [Apache License 2.0](https://github.com/tesseract-ocr/tessdata/blob/main/LICENSE).
 Redistribution here (as the split components produced by `combine_tessdata
 -u`, byte-identical to their content inside the original combined file) is
@@ -53,6 +79,8 @@ committed to this directory:
 | `eng.lstm-word-dawg` | `a5dabb1725487e85b364a49b095b5a9af5cc2720ef29c962189e4cf5294fc81c` |
 | `eng.lstm-punc-dawg` | `c3e90e22c6bfc25365e5f5cdf09397e9e3fd58e07903b6d1f76a4450893601bf` |
 | `eng.lstm-number-dawg` | `7104fc60ebd9093f2ebfefd5bd27347a68fe9b6ce03be3135c8cbdabcdd99994` |
+| `chi_sim.lstm-recoder` | `7ee2c195d397aa4fccd5efc5ab5e71d21d8e94425151d5f978cd74b546c4bb12` |
+| `eng.unicharset` (legacy) | `c55602aa6fcff8461491ef52362a176bacc9950ad9b6eb4ccf8b78e46f504179` |
 
 ## Why these files are here
 

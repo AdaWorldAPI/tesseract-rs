@@ -232,8 +232,33 @@ The eng.lstm front-end: `Input → [C3,3Ft16] (Convolve+Reconfig) → Mp3,3 (Max
 >   field the bullet asks to "re-add when C2 lands" is back on `RecodeNode`
 >   (:219).
 >
-> **Genuinely still open in Phase C: C3 only** (plus the deferred sub-leaves
-> listed at the end of this section).
+> **Why this drifted:** C1/C2 shipped under a DIFFERENT plan's wave labels —
+> `.claude/plans/pdf-to-text-ocr-v1.md` § "Batch 1A — C1: the dictionary beam"
+> (D1.1 dawg load, D1.2/D1.2b `DictLite` walker, D1.3 beam dict arms) — and
+> this section was never back-updated. That plan's own tracker line is stale
+> too (`dict beam C1 / word boxes B3-full ⬜`). **Source is ground truth; both
+> plan docs had drifted.** The dict path is wired in production, not just
+> tests: `lstm_recognizer.rs` calls `new_with_dict` + `decode_with_dict` with
+> `K_DICT_RATIO`/`K_CERT_OFFSET`/`K_WORST_DICT_CERT` at three call sites
+> (:230/237, :648/655, :1071/1078); the dawg load side is
+> `tesseract-core/src/dict_walker.rs`.
+>
+> **B3-full may also be further along than documented** —
+> `extract_best_path_as_words` is present at `recodebeam.rs:1663-1742`. Its
+> wiring status was not fully audited; treat the B3-full bullet as unverified
+> rather than trusted-open.
+>
+> **Genuinely still open in Phase C: C3 only** — and its blocking data is now
+> IN THE REPO (`corpus/model/chi_sim.lstm-recoder`, 4022 entries, code lengths
+> 1-5). **Correction to the C3 bullet below:** it says "code length 3"; the
+> real histogram is `{1:128, 2:278, 3:2077, 4:1515, 5:24}` — 3 is the mode,
+> not the range, and 3894 entries exceed length 1. See
+> `corpus/model/README.md` § "Falsifier fixtures".
+>
+> The bbox/stats sub-leaf at the end of this section is likewise **no longer
+> data-blocked** — `corpus/model/eng.unicharset` (the legacy build) has
+> 112/112 distinct bbox+stats CSV blobs against the LSTM unicharset's uniform
+> 111. Both are now scheduling choices, not gaps.
 
 - **C1 — dict / language-model beam.** The dawg machinery skipped in 7b:
   `ContinueDawg`, `PushInitialDawgIfBetter`, `DawgPositionVector`, the
