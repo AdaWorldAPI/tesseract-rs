@@ -1,0 +1,60 @@
+{
+ "cells": [
+  [
+   "Parameter",
+   "Ergebnis",
+   "Einheit",
+   "Referenz"
+  ],
+  [
+   "Haemoglobin",
+   "14.2",
+   "g/dl",
+   "13.5 - 17.5"
+  ],
+  [
+   "Glukose",
+   "98",
+   "mg/dl",
+   "74 - 106"
+  ],
+  [
+   "Kalium",
+   "4.1",
+   "mmol/l",
+   "3.5 - 5.1"
+  ],
+  [
+   "Natrium",
+   "141",
+   "mmol/l",
+   "136 - 145"
+  ],
+  [
+   "Kreatinin",
+   "0.9",
+   "mg/dl",
+   "0.7 - 1.3"
+  ],
+  [
+   "Calcium",
+   "2.4",
+   "mmol/l",
+   "2.2 - 2.6"
+  ]
+ ],
+ "col_x": [
+  60,
+  420,
+  700,
+  980
+ ],
+ "cols": 4,
+ "font_px": 26,
+ "height": 588,
+ "row_pitch": 64,
+ "row_top": 70,
+ "rows": 7,
+ "schema": "tesseract-rs/lab-table-gt.v1",
+ "width": 1400
+}
