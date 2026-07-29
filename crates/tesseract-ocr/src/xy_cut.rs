@@ -21,19 +21,22 @@
 //!
 //! ## Algorithm & the decisions behind it
 //!
-//! 1. **Binarize once** ([`binarize_page`]). The whole page is thresholded a
-//!    single time with [`otsu_threshold_gray`] + [`threshold_rect_to_binary`],
-//!    yielding a buffer in this crate's bitonal convention **`0` = foreground /
-//!    ink, `255` = background** (confirmed against the `threshold.rs` module
-//!    docs' "Output convention"). Recursion reads slices of this one buffer —
-//!    the profile at every level is a cheap re-scan, never a re-threshold, so a
-//!    region's binarization can never drift from its parent's. If Otsu returns
-//!    `hi_value == -1` ("no opinion", only reachable on a degenerate page) we
-//!    fall back to a fixed `pixel < 128` split, same as `line_segment.rs`.
-//!    [`binarize_page_with`] exposes this same step under an explicit
-//!    [`BinarizeMode`] — `Otsu` (the default, byte-identical to
-//!    [`binarize_page`]) or the opt-in adaptive `Sauvola` — but [`xy_cut`]
-//!    itself always calls [`binarize_page`], i.e. always `Otsu`.
+//! 1. **Binarize once** ([`binarize_page_with`]). The whole page is
+//!    thresholded a single time — by default with [`otsu_threshold_gray`] +
+//!    [`threshold_rect_to_binary`] ([`BinarizeMode::Otsu`]) — yielding a
+//!    buffer in this crate's bitonal convention **`0` = foreground / ink,
+//!    `255` = background** (confirmed against the `threshold.rs` module docs'
+//!    "Output convention"). Recursion reads slices of this one buffer — the
+//!    profile at every level is a cheap re-scan, never a re-threshold, so a
+//!    region's binarization can never drift from its parent's. If Otsu
+//!    returns `hi_value == -1` ("no opinion", only reachable on a degenerate
+//!    page) we fall back to a fixed `pixel < 128` split, same as
+//!    `line_segment.rs`. [`xy_cut`] selects the binarization mode via
+//!    [`XyCutParams::binarize_mode`] — [`BinarizeMode::Otsu`] is the default,
+//!    byte-identical to this crate's behaviour before that field existed; the
+//!    opt-in adaptive [`BinarizeMode::Sauvola`] is also selectable, for
+//!    source pages a single global threshold under-serves (uneven
+//!    illumination, aged scans).
 //!
 //! 2. **Both profiles, every level.** For the current rect we compute BOTH the
 //!    vertical (per-column) and horizontal (per-row) ink profiles. A profile bin
@@ -142,6 +145,13 @@ pub struct XyCutParams {
     /// keeps thin rules and descenders from opening spurious valleys). Raise it
     /// to ignore light speckle when projecting.
     pub ink_threshold_frac: f32,
+    /// Segmentation binarization mode (see [`binarize_page_with`]). Default
+    /// [`BinarizeMode::Otsu`] — a single global threshold, byte-identical to
+    /// this crate's behaviour before this field existed. Set
+    /// [`BinarizeMode::Sauvola`] to opt into the adaptive per-pixel threshold
+    /// for source pages a single global split under-serves (uneven
+    /// illumination, aged scans).
+    pub binarize_mode: BinarizeMode,
 }
 
 impl Default for XyCutParams {
@@ -151,6 +161,7 @@ impl Default for XyCutParams {
             min_region_px: 24,
             max_depth: 6,
             ink_threshold_frac: 0.0,
+            binarize_mode: BinarizeMode::default(),
         }
     }
 }
@@ -167,7 +178,7 @@ pub fn xy_cut(grey: &[u8], w: usize, h: usize, params: &XyCutParams) -> Vec<Page
     if w == 0 || h == 0 {
         return Vec::new();
     }
-    let binary = binarize_page(grey, w, h);
+    let binary = binarize_page_with(grey, w, h, params.binarize_mode);
     let root = PageRect {
         left: 0,
         top: 0,
@@ -180,14 +191,15 @@ pub fn xy_cut(grey: &[u8], w: usize, h: usize, params: &XyCutParams) -> Vec<Page
 }
 
 /// Segmentation binarization mode for [`binarize_page_with`]. The crate-wide
-/// default is [`BinarizeMode::Otsu`] — a single global threshold — and
-/// [`binarize_page`] (the helper [`xy_cut`] itself calls) is pinned to
-/// exactly that default, byte-for-byte, so this opt-in surface never changes
-/// existing behaviour on its own. [`BinarizeMode::Sauvola`] is the adaptive
-/// alternative (see [`sauvola_binarize`]): a per-pixel threshold from the
-/// local mean/stddev that survives unevenly-lit or aged scans a single
-/// global Otsu split washes out. Nothing in this crate selects `Sauvola`
-/// implicitly — a caller must construct it explicitly.
+/// default is [`BinarizeMode::Otsu`] — a single global threshold, and the
+/// value both this enum's [`Default`] and [`XyCutParams::binarize_mode`]
+/// resolve to, so this opt-in surface never changes existing behaviour on
+/// its own. [`BinarizeMode::Sauvola`] is the adaptive alternative (see
+/// [`sauvola_binarize`]): a per-pixel threshold from the local mean/stddev
+/// that survives unevenly-lit or aged scans a single global Otsu split
+/// washes out. Nothing in this crate selects `Sauvola` implicitly — a
+/// caller must construct it explicitly, e.g.
+/// `XyCutParams { binarize_mode: BinarizeMode::Sauvola { whsize: 16, k: 0.34 }, ..Default::default() }`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum BinarizeMode {
     /// Global Otsu threshold ([`otsu_threshold_gray`]), with the fixed
@@ -214,23 +226,14 @@ pub enum BinarizeMode {
 }
 
 /// Binarize the full page once into this crate's `0` = ink / `255` = background
-/// convention, using the crate-wide default ([`BinarizeMode::default`], i.e.
-/// [`BinarizeMode::Otsu`]) — byte-identical to this function's behaviour
-/// before [`BinarizeMode`] existed. Uses the page's own Otsu decision,
-/// falling back to a fixed `pixel < 128` split when Otsu declines to
-/// threshold (`hi_value == -1`; only reachable on a degenerate page — see
-/// `line_segment::row_ink_counts`).
-fn binarize_page(grey: &[u8], w: usize, h: usize) -> Vec<u8> {
-    binarize_page_with(grey, w, h, BinarizeMode::default())
-}
-
-/// Binarize the full page once into this crate's `0` = ink / `255` = background
-/// convention, under an explicit, opt-in [`BinarizeMode`].
+/// convention, under an explicit [`BinarizeMode`].
 ///
-/// [`BinarizeMode::Otsu`] is exactly [`binarize_page`]'s pre-existing body —
-/// global [`otsu_threshold_gray`] + [`threshold_rect_to_binary`], with the
-/// same `hi_value == -1` fixed-128 fallback — so selecting it, or the
-/// default, reproduces [`binarize_page`] byte-for-byte.
+/// [`BinarizeMode::Otsu`] — global [`otsu_threshold_gray`] +
+/// [`threshold_rect_to_binary`], with the `hi_value == -1` fixed-128
+/// fallback when Otsu declines to threshold (only reachable on a degenerate
+/// page — see `line_segment::row_ink_counts`) — is the crate-wide default
+/// and reproduces this crate's segmentation binarization exactly as it
+/// behaved before [`BinarizeMode`] existed.
 ///
 /// [`BinarizeMode::Sauvola`] runs [`sauvola_binarize`] and converts its own
 /// per-pixel foreground convention (`1` = black text, `0` = background) into
@@ -240,11 +243,14 @@ fn binarize_page(grey: &[u8], w: usize, h: usize) -> Vec<u8> {
 /// of panicking (mirroring the guard [`sauvola_binarize`] itself asserts
 /// on).
 ///
-/// This is the opt-in segmentation entry point: [`xy_cut`] and
-/// [`binarize_page`] are untouched and keep calling the `Otsu` path
-/// unconditionally. Threading this mode up to a document-level API (e.g.
-/// `LstmRecognizer::recognize_document`) is a deliberate follow-up, not done
-/// here.
+/// This is the segmentation entry point [`xy_cut`] calls with
+/// [`XyCutParams::binarize_mode`] — `Otsu` by default, so every existing
+/// caller that never touches the new field keeps its exact prior behaviour.
+/// [`LstmRecognizer::recognize_document`](crate::LstmRecognizer::recognize_document)'s
+/// own region/table-classification binarizer is a SEPARATE call graph (see
+/// [`LstmRecognizer::recognize_document_with_mode`](crate::LstmRecognizer::recognize_document_with_mode))
+/// that also forwards its `binarize_mode` here, but independently of any
+/// particular `xy_cut` caller.
 #[must_use]
 pub fn binarize_page_with(grey: &[u8], w: usize, h: usize, mode: BinarizeMode) -> Vec<u8> {
     match mode {
@@ -773,24 +779,73 @@ mod tests {
     }
 
     #[test]
-    fn binarize_page_matches_binarize_page_with_otsu_default() {
-        // binarize_page (the private helper `xy_cut` itself calls) must stay
-        // byte-identical to binarize_page_with's Otsu arm, and Otsu must stay
-        // BinarizeMode's default — the whole point of this opt-in wiring is
-        // that the pre-existing default path is untouched.
+    fn xy_cut_params_default_binarize_mode_is_otsu() {
+        // The whole point of this opt-in wiring is that a caller who never
+        // touches XyCutParams::binarize_mode gets the exact pre-existing
+        // (Otsu) behaviour: default() must resolve to Otsu, and binarizing
+        // through XyCutParams::default()'s mode must match an explicit
+        // BinarizeMode::Otsu call byte-for-byte.
+        assert_eq!(BinarizeMode::default(), BinarizeMode::Otsu);
+        assert_eq!(XyCutParams::default().binarize_mode, BinarizeMode::Otsu);
+
         let (w, h) = (100, 60);
         let mut g = page(w, h);
         fill(&mut g, w, 30, 70, 20, 40);
-        let via_private = binarize_page(&g, w, h);
+        let via_default_params = binarize_page_with(&g, w, h, XyCutParams::default().binarize_mode);
         let via_otsu = binarize_page_with(&g, w, h, BinarizeMode::Otsu);
-        let via_default = binarize_page_with(&g, w, h, BinarizeMode::default());
         assert_eq!(
-            via_private, via_otsu,
-            "binarize_page must equal binarize_page_with(.., BinarizeMode::Otsu)"
+            via_default_params, via_otsu,
+            "XyCutParams::default()'s mode must binarize identically to an explicit BinarizeMode::Otsu"
         );
-        assert_eq!(
-            via_otsu, via_default,
-            "BinarizeMode::default() must be Otsu"
+    }
+
+    #[test]
+    fn xy_cut_reacts_to_binarize_mode_selection() {
+        // Reuses the exact two-brightness-band fixture from
+        // `binarize_page_with_sauvola_differs_from_otsu_and_matches_direct_call`
+        // below (proven there to make Otsu and Sauvola disagree pixel-for-
+        // pixel): a dim top band (bg=60) and a bright bottom band (bg=200),
+        // each with its own small text patch ~20 levels darker than its OWN
+        // local background. A single global Otsu threshold can only split
+        // BETWEEN the two bands — erasing one band's internal
+        // patch-vs-background contrast entirely — while Sauvola's local
+        // mean/std preserves both patches. This is therefore a direct proof
+        // that `XyCutParams::binarize_mode` actually reaches `xy_cut`'s
+        // segmentation decision, not merely accepted-and-ignored.
+        let (w, h) = (40usize, 40usize);
+        let mut grey = vec![60u8; w * h];
+        for y in 20..40 {
+            for x in 0..40 {
+                grey[y * w + x] = 200;
+            }
+        }
+        for y in 5..11 {
+            for x in 5..11 {
+                grey[y * w + x] = 40;
+            }
+        }
+        for y in 25..31 {
+            for x in 25..31 {
+                grey[y * w + x] = 180;
+            }
+        }
+
+        let otsu_params = XyCutParams {
+            binarize_mode: BinarizeMode::Otsu,
+            ..XyCutParams::default()
+        };
+        let sauvola_params = XyCutParams {
+            binarize_mode: BinarizeMode::Sauvola { whsize: 8, k: 0.34 },
+            ..XyCutParams::default()
+        };
+        let otsu_leaves = xy_cut(&grey, w, h, &otsu_params);
+        let sauvola_leaves = xy_cut(&grey, w, h, &sauvola_params);
+        assert_ne!(
+            otsu_leaves, sauvola_leaves,
+            "xy_cut must actually use XyCutParams::binarize_mode: Otsu erases one \
+             band's internal contrast (a single global split), Sauvola preserves \
+             both patches, so the two modes must segment this page differently. \
+             otsu={otsu_leaves:?} sauvola={sauvola_leaves:?}"
         );
     }
 

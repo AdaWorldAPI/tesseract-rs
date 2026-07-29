@@ -13,14 +13,17 @@
 //!     -> pixApplyLocalThreshold  grey < t  => ON (black text)  (binarize.c:791)
 //! ```
 //!
-//! Why it matters: the layout-stage binarization today is global Otsu
+//! Why it matters: the layout-stage binarization defaults to global Otsu
 //! (`threshold.rs`), which annihilates unevenly-lit / aged scans (the
 //! ImproveQuality lesson). Sauvola is the adaptive alternative — a per-pixel
 //! threshold from the local mean and standard deviation, so a shadowed corner
 //! keeps its own threshold instead of going all-black. The recognizer LSTM
 //! still consumes grey (`image_input::from_grey_pix`); Sauvola feeds the
-//! *segmentation* stage (`xy_cut::binarize_page`), where a bad global threshold
-//! fragments the page.
+//! *segmentation* stage (`xy_cut::binarize_page_with`, selectable via
+//! `XyCutParams::binarize_mode` — see `xy_cut.rs`'s `BinarizeMode` docs) and
+//! `LstmRecognizer::recognize_document_with_mode`'s region/table
+//! classification pass, where a bad global threshold fragments the page.
+//! Otsu remains the default in both places; Sauvola is opt-in only.
 //!
 //! Fidelity notes (byte-parity depends on each):
 //! - the u32 accumulator is **wrapping** (`l_uint32` overflow); the 4-corner

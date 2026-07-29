@@ -110,8 +110,7 @@ fn resolution_grid_holds_the_8_7_0_pattern() {
                     for (i, cell) in cells.iter().enumerate() {
                         let (x, y) = (cell["x"].as_i64().unwrap(), cell["y"].as_i64().unwrap());
                         if cx >= x && cx < x + cw && cy >= y && cy < y + ch {
-                            per_cell[i]
-                                .push(word["text"].as_str().unwrap_or_default().to_string());
+                            per_cell[i].push(word["text"].as_str().unwrap_or_default().to_string());
                         }
                     }
                 }
