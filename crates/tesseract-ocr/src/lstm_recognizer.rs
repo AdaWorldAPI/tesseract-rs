@@ -973,6 +973,23 @@ impl LstmRecognizer {
             .map(|r| (r.left as i32, r.top as i32, r.right as i32, r.bottom as i32))
             .collect();
         let binary = Self::binarize_page_with(grey, w, h, binarize_mode);
+
+        // MEASURED font sizing. Replaces the statistical `xheight + ascrise -
+        // descdrop` fit, which is unstable on short rows — two table rows of
+        // the SAME printed size measured 24.7 vs 14.2 px (1.74x apart), a
+        // visible size jump in the rendered output. `attach_glyph_px` instead
+        // measures each glyph's real ink extent inside its char box against
+        // this binarized page and takes the per-line p90, which held at 12-13
+        // across every same-size body line of a real German document while
+        // still reading genuinely small text (`Kleine Schriftgröße`) at 9.
+        //
+        // Runs here, after `binary` exists, and writes ONLY into lines that
+        // already carry `DocLineMetrics` — it never fabricates metrics for a
+        // line that had none. Additive: the existing band-derived fields are
+        // untouched, and the renderer falls back to them when `glyph_px` is
+        // absent.
+        crate::structured::attach_glyph_px(&mut page, &lines, &binary, w as u32, h as u32);
+
         let figures = Self::region_figures(&binary, w, h);
         // A block is a TABLE when its FULL bbox (rules + column corridors, not
         // just the text-line union the region carries) clears decide_if_table.

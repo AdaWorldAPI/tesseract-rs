@@ -52,6 +52,11 @@
 //!   print-trained). See [`mean_word_confidence`].
 //! - `numeric_norm` appears only on words the numeric hardening pass changed;
 //!   `fields` only when a harvest ran. Consumers must ignore unknown keys.
+//! - `glyph_px` (per-line, alongside `xheight`/`ascrise`/`descdrop`/
+//!   `baseline` when present) is a DIRECT measured glyph ink-height in
+//!   pixels ([`attach_glyph_px`]), replacing a statistical fit — an ink
+//!   HEIGHT, not the body height the other four keys combine to. See
+//!   [`attach_glyph_px`]'s doc comment for the measurement pipeline.
 //!
 //! ## Numeric hardening — "eine 0 kann nie ein O sein"
 //!
@@ -97,9 +102,11 @@ pub struct DocLine {
 
 /// A [`DocLine`]'s typographic metrics in the DOM's own (top-down) frame —
 /// the renderer-facing conversion of
-/// [`LineMetrics`](crate::renderer::LineMetrics). Emitted into `doc.v1`
-/// as additive per-line keys (`xheight`/`ascrise`/`descdrop`/`baseline`);
-/// consumers must ignore unknown keys, so old readers are unaffected.
+/// [`LineMetrics`](crate::renderer::LineMetrics), plus (optionally) a
+/// DIRECT measured ink-height from [`attach_glyph_px`]. Emitted into
+/// `doc.v1` as additive per-line keys (`xheight`/`ascrise`/`descdrop`/
+/// `baseline`/`glyph_px`); consumers must ignore unknown keys, so old
+/// readers are unaffected.
 ///
 /// `xheight + ascrise - descdrop` (descdrop ≤ 0) is the full typographic
 /// body height — exactly what real Tesseract sizes fonts from
@@ -108,6 +115,15 @@ pub struct DocLine {
 /// points). The line's recognition-band `bbox` is deliberately TALLER than
 /// this (ascender/descender slack plus `kImagePadding`), which is why sizing
 /// text from the bbox alone overshoots.
+///
+/// [`glyph_px`](Self::glyph_px), when present, replaces that STATISTICAL fit
+/// with a MEASUREMENT — see [`attach_glyph_px`]'s doc comment for the full
+/// pipeline and why it exists (the fit above is unstable row-to-row: two
+/// identically-printed table rows measured `24.7` vs `14.2` px through it, a
+/// visible size jump in rendered output). It is an ink HEIGHT, a different
+/// quantity from the body height above by a documented scale factor — see
+/// the consumer (`tesseract-ocr-pdf`'s `GLYPH_PX_TO_FONT_PX`) for that
+/// conversion; this module never performs it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DocLineMetrics {
     /// x-height in pixels.
@@ -119,6 +135,12 @@ pub struct DocLineMetrics {
     /// Baseline y at the line's horizontal midpoint, TOP-DOWN image pixels
     /// (`page_height - bottom_up_baseline`).
     pub baseline: f32,
+    /// Measured glyph ink-height in pixels ([`attach_glyph_px`]) — `None`
+    /// until that pass runs ([`DocPage::from_line_words`] alone never
+    /// computes it). An ink HEIGHT, not the `xheight + ascrise - descdrop`
+    /// body height the other three fields combine to — see the struct doc
+    /// above.
+    pub glyph_px: Option<f32>,
 }
 
 /// One page of structured output — the unit [`render_json`] serializes.
@@ -158,6 +180,10 @@ impl DocPage {
                     descdrop: m.descdrop,
                     // Bottom-up page space → the DOM's top-down frame.
                     baseline: ph as f32 - m.baseline,
+                    // Never computed here -- [`attach_glyph_px`] is a
+                    // separate pass (it needs the original `LineWords`
+                    // char_boxes, which this DOM does not retain).
+                    glyph_px: None,
                 }),
                 bbox: crate::renderer::to_image_box(line.line_box, pw, ph),
                 words: line
@@ -702,6 +728,9 @@ fn render_doc(page: &DocPage, regions: &[EmitRegion], fields: &[HarvestedField])
                     ",\"xheight\":{:.1},\"ascrise\":{:.1},\"descdrop\":{:.1},\"baseline\":{:.1}",
                     m.xheight, m.ascrise, m.descdrop, m.baseline
                 ));
+                if let Some(g) = m.glyph_px {
+                    out.push_str(&format!(",\"glyph_px\":{g:.1}"));
+                }
             }
             out.push_str(",\"words\":[");
             for (wi, w) in line.words.iter().enumerate() {
@@ -1191,6 +1220,396 @@ pub fn harvest_fields(page: &DocPage, specs: &[FieldSpec]) -> Vec<HarvestedField
     out
 }
 
+// ---------------------------------------------------------------------------
+// Measured glyph-ink font sizing (`glyph_px`) — a direct measurement
+// replacing the statistical `xheight + ascrise - descdrop` fit
+// ---------------------------------------------------------------------------
+//
+// `xheight + ascrise - descdrop` is a STATISTICAL FIT over a row's blob
+// boxes (wave-3 `compute_block_xheight`) — measured unstable row-to-row:
+// two table rows printed at the SAME point size measured `24.7` vs `14.2`
+// px through it (1.74×), a visible size jump in rendered output.
+// [`tesseract_core::WordResult::char_boxes`] cannot fix this directly —
+// every char box in a line has EXACTLY the line-box height (they are CTC
+// timestep boundaries; `y` is just the line band copied, only `x` carries
+// real information) — so [`attach_glyph_px`] performs a NEW measurement
+// instead: the actual ink extent inside each char box's x-span, scanned
+// from the binarized page. Four stages, each a small helper below:
+//
+// 1. **Per-glyph ink height** ([`glyph_ink_heights`]) — for each word's
+//    char boxes, the topmost-to-bottommost row of ink within the box's
+//    x-span, over the line's own y-band.
+// 2. **Per-line size = the 90th percentile** ([`percentile_90`],
+//    [`line_raw_glyph_px`]) of those heights — NOT the median: the median
+//    is content-dependent (a lowercase-heavy line reads smaller than a
+//    digit-heavy one at the same point size), while p90 approximates
+//    cap/ascender height, which stays far more stable across ordinary body
+//    text.
+// 3. **Small-sample guard** ([`GLYPH_SAMPLE_MIN`],
+//    [`apply_small_sample_fallback`]) — a line with too few glyph samples
+//    falls back to the median of the other sufficiently-sampled lines in
+//    the same call's `lines` slice.
+// 4. **Bent-paper trend normalization** ([`TREND_R2_SIGNIFICANT`],
+//    [`fit_size_trend`], [`apply_trend_normalization`]) — a page
+//    photographed at a slight tilt/curl varies glyph size SMOOTHLY with
+//    `y`; real typography changes it in DISCRETE steps. A first-order trend
+//    `size ≈ a + b·y` (the same shape `crate::rectify::fit_shear_ramp` uses
+//    for shear, `slope(y) = m0 + m1·y`) is fit over the page's resolved
+//    per-line sizes, and its SMOOTH component is divided out ONLY when the
+//    fit is significant — a blanket per-line normalization would be WRONG:
+//    this crate's own falsifier document genuinely contains a smaller
+//    caption (`Kleine Schriftgröße`, p90 = 9 against a body of 12-13), and
+//    flattening that would destroy real typography, not just correct camera
+//    geometry.
+//
+// ## Why `DocLineMetrics`, not a new `DocLine` field
+//
+// `DocLine` is constructed via struct LITERAL (not a constructor function)
+// in `crate::page_furniture`'s test helpers, outside this file's scope —
+// adding a required field there would be a silent breaking change this
+// file has no way to fix. [`DocLineMetrics`], by contrast, is constructed
+// ONLY within this file ([`DocPage::from_line_words`] and this module's own
+// tests), so it is safe to extend. The measurement is therefore attached
+// only to lines that already carry a [`DocLineMetrics`] object; a line
+// without one (no row-metrics pipeline ran) already falls all the way back
+// to the bbox-height heuristic downstream (`tesseract-ocr-pdf`'s
+// `TEXT_HEIGHT_TO_FONTSIZE`) regardless of this change.
+//
+// ## Units — deliberately NOT `font_px`
+//
+// The value this pipeline produces and [`attach_glyph_px`] writes is a raw
+// ink HEIGHT (baseline to the top of the tallest ink in a glyph's own box),
+// not the `xheight + ascrise - descdrop` full body height `font_px`
+// elsewhere means — they are different quantities related by a scale
+// factor. That conversion lives in the CONSUMER
+// (`tesseract-ocr-pdf::layout::GLYPH_PX_TO_FONT_PX`), not here.
+//
+// ## Known residual — NOT fixed here
+//
+// A recognized rule glyph (e.g. `|` misread from a table's vertical
+// divider) spans the FULL cell height, inflating whichever line's p90 it
+// lands in. `crate::pageseg::decide_if_table` already computes a de-lined
+// page and discards it; wiring that de-lined page into this measurement
+// (rather than the ordinary binarized page) is future work, not attempted
+// here.
+
+/// Minimum measured glyph samples a line needs before its OWN p90 is
+/// trusted as-is. Below this, [`apply_small_sample_fallback`] replaces it
+/// with the median of the other sufficiently-sampled lines in the same
+/// call's line group (that group's "enclosing region").
+///
+/// Measured failure this guards against: a 7-glyph line (`"können,"`) gave
+/// p90 = 24 against an enclosing body of 12-13 px — with so few samples, a
+/// single unusually tall glyph (an ascender, a diacritic, or the rule-glyph
+/// inflation this section's docs describe above) dominates the percentile
+/// instead of being outvoted by the rest of the line. `10` is the pragmatic
+/// threshold the measurement pointed to ("~10 glyph samples" per the
+/// finding) — not a theoretically derived bound.
+const GLYPH_SAMPLE_MIN: usize = 10;
+
+/// Minimum variance-explained (R² — the squared Pearson correlation between
+/// a line's vertical position `y` and its resolved size) before
+/// [`apply_trend_normalization`] treats a page's fitted linear-in-`y` size
+/// trend as real geometric distortion (a bent/tilted photograph) rather
+/// than ordinary typographic variation (headings, captions, table cells at
+/// arbitrary page positions).
+///
+/// `0.5` — over HALF the size variance across the page must be explained by
+/// a straight line in `y` — is deliberately a high bar: this crate's own
+/// falsifier document genuinely contains a smaller-printed caption
+/// (`Kleine Schriftgröße`, p90 = 9 against a body of 12-13) that must
+/// SURVIVE untouched. A single same-page step change like that contributes
+/// little to R² (this module's own step-change test fixture measures
+/// R² ≈ 0.003 for exactly that shape, far below this floor), whereas a
+/// genuinely smooth camera-geometry gradient across MANY lines measures
+/// close to `1.0`.
+const TREND_R2_SIGNIFICANT: f32 = 0.5;
+
+/// The topmost-to-bottommost row of INK (binarized `0`) within each char
+/// box's x-span, scanned over the box's own y-extent converted to top-down
+/// image space via [`crate::renderer::to_image_box`] (the same conversion
+/// [`DocPage::from_line_words`] already applies to every box in this
+/// module). A char box with no ink anywhere in its span (a boxed space, or
+/// a degenerate/empty box) contributes NOTHING — not a zero-height sample,
+/// which would corrupt the percentile with a value no real glyph produces.
+///
+/// `binary` is `page_w * page_h` bytes, row-major, top-down, `0` = ink —
+/// this crate's bitonal convention throughout (`crate::xy_cut`'s module
+/// docs). A `binary` shorter than `page_w * page_h`, or a non-positive
+/// `page_w`/`page_h`, yields no samples (defensive; never hit on real
+/// recognizer output, where `binary` is always the very page the boxes came
+/// from).
+fn glyph_ink_heights(
+    char_boxes: &[(i32, i32, i32, i32)],
+    binary: &[u8],
+    page_w: i32,
+    page_h: i32,
+) -> Vec<f32> {
+    if page_w <= 0 || page_h <= 0 {
+        return Vec::new();
+    }
+    let bw = page_w as usize;
+    let bh = page_h as usize;
+    if binary.len() < bw * bh {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(char_boxes.len());
+    for &cb in char_boxes {
+        let (left, top, right, bottom) = crate::renderer::to_image_box(cb, page_w, page_h);
+        if right <= left || bottom <= top {
+            continue;
+        }
+        let x0 = (left as usize).min(bw);
+        let x1 = (right as usize).min(bw);
+        let y0 = (top as usize).min(bh);
+        let y1 = (bottom as usize).min(bh);
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+        let mut ink_top: Option<usize> = None;
+        let mut ink_bottom: Option<usize> = None;
+        for y in y0..y1 {
+            let row = &binary[y * bw + x0..y * bw + x1];
+            if row.contains(&0) {
+                if ink_top.is_none() {
+                    ink_top = Some(y);
+                }
+                ink_bottom = Some(y);
+            }
+        }
+        if let (Some(t), Some(b)) = (ink_top, ink_bottom) {
+            out.push((b - t + 1) as f32);
+        }
+    }
+    out
+}
+
+/// The 90th percentile of `heights` (linear interpolation between the two
+/// nearest ranks — the same convention as e.g. NumPy's default
+/// `percentile`) — see this section's module doc for why p90 rather than
+/// the median. Sorts `heights` in place. `None` on an empty slice.
+fn percentile_90(heights: &mut [f32]) -> Option<f32> {
+    if heights.is_empty() {
+        return None;
+    }
+    heights.sort_unstable_by(f32::total_cmp);
+    let rank = 0.9 * (heights.len() - 1) as f32;
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    let frac = rank - lo as f32;
+    Some(heights[lo] + frac * (heights[hi] - heights[lo]))
+}
+
+/// The median of `values` (average of the two middle elements on an even
+/// count). `None` on an empty slice.
+fn median(values: &[f32]) -> Option<f32> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable_by(f32::total_cmp);
+    let mid = sorted.len() / 2;
+    Some(if sorted.len().is_multiple_of(2) {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    })
+}
+
+/// One line's RAW glyph-ink measurement, before the small-sample fallback
+/// and trend normalization: its p90 ink height plus how many glyph samples
+/// backed it (the count [`GLYPH_SAMPLE_MIN`] gates on). `None` when the
+/// line has zero measurable samples at all (never hit on real recognizer
+/// output for a non-empty line, but kept total rather than panicking).
+fn line_raw_glyph_px(
+    line: &LineWords,
+    binary: &[u8],
+    page_w: i32,
+    page_h: i32,
+) -> Option<(f32, usize)> {
+    let mut heights: Vec<f32> = Vec::new();
+    for word in &line.words {
+        heights.extend(glyph_ink_heights(&word.char_boxes, binary, page_w, page_h));
+    }
+    let n = heights.len();
+    percentile_90(&mut heights).map(|p90| (p90, n))
+}
+
+/// Stage 3: replace an unreliable line's own p90 (fewer than
+/// [`GLYPH_SAMPLE_MIN`] samples) with the median of the OTHER
+/// sufficiently-sampled lines' p90 in the same `raw` slice — that slice's
+/// "enclosing region" (a caller may scope `raw` to one block/paragraph for
+/// a tighter fallback pool, or to a whole page as [`attach_glyph_px`]
+/// does). A line with `None` (zero measurable samples) stays `None`. When
+/// NO line in `raw` clears the threshold, an under-sampled line keeps its
+/// own p90 (nothing safer to fall back to).
+fn apply_small_sample_fallback(raw: &[Option<(f32, usize)>]) -> Vec<Option<f32>> {
+    let fallback_pool: Vec<f32> = raw
+        .iter()
+        .copied()
+        .filter_map(|r| match r {
+            Some((p90, n)) if n >= GLYPH_SAMPLE_MIN => Some(p90),
+            _ => None,
+        })
+        .collect();
+    raw.iter()
+        .copied()
+        .map(|r| match r {
+            Some((p90, n)) if n >= GLYPH_SAMPLE_MIN => Some(p90),
+            Some((p90, _)) => Some(median(&fallback_pool).unwrap_or(p90)),
+            None => None,
+        })
+        .collect()
+}
+
+/// A fitted `size(y) = a + b·y` trend over a page's resolved per-line
+/// sizes — the SAME first-order shape `crate::rectify::fit_shear_ramp` uses
+/// for shear, applied here to font size instead of baseline slope. `slope`
+/// and `mean_y` are enough to remove the smooth component
+/// (`size − slope·(y − mean_y)`, algebraically identical to
+/// `size − (a+b·y) + mean_size` since `a + b·mean_y == mean_size` for a
+/// least-squares fit through the mean point); `significant` is the
+/// [`TREND_R2_SIGNIFICANT`] gate — [`apply_trend_normalization`] checks it
+/// before applying the correction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SizeTrend {
+    slope: f32,
+    mean_y: f32,
+    significant: bool,
+}
+
+/// Least-squares fit of `size(y) = a + b·y` over `(y_center, size)`
+/// samples, plus the [`TREND_R2_SIGNIFICANT`] significance gate (R², the
+/// squared Pearson correlation between `y` and `size`). `None` when there
+/// are fewer than 2 samples (a line needs 2 points to define a trend) or
+/// every sample sits at the same `y` (degenerate — the slope is undefined,
+/// and there is no height variation to measure distortion from).
+fn fit_size_trend(samples: &[(f32, f32)]) -> Option<SizeTrend> {
+    let n = samples.len();
+    if n < 2 {
+        return None;
+    }
+    let n_f = n as f32;
+    let mean_y = samples.iter().map(|&(y, _)| y).sum::<f32>() / n_f;
+    let mean_s = samples.iter().map(|&(_, s)| s).sum::<f32>() / n_f;
+    let mut cov = 0.0f32;
+    let mut var_y = 0.0f32;
+    let mut var_s = 0.0f32;
+    for &(y, s) in samples {
+        let dy = y - mean_y;
+        let ds = s - mean_s;
+        cov += dy * ds;
+        var_y += dy * dy;
+        var_s += ds * ds;
+    }
+    if var_y <= f32::EPSILON {
+        return Some(SizeTrend {
+            slope: 0.0,
+            mean_y,
+            significant: false,
+        });
+    }
+    let slope = cov / var_y;
+    let r2 = if var_s > f32::EPSILON {
+        (cov * cov) / (var_y * var_s)
+    } else {
+        0.0
+    };
+    Some(SizeTrend {
+        slope,
+        mean_y,
+        significant: r2 >= TREND_R2_SIGNIFICANT,
+    })
+}
+
+/// Stage 4: apply [`fit_size_trend`]'s smooth-component removal to every
+/// `(y, size)` sample, but ONLY when the fit is [`SizeTrend::significant`]
+/// — otherwise every size passes through UNCHANGED (the safe default: an
+/// insignificant/step-like fit must never perturb real typography).
+fn apply_trend_normalization(samples: &[(f32, f32)]) -> Vec<f32> {
+    let trend = fit_size_trend(samples);
+    samples
+        .iter()
+        .map(|&(y, size)| match trend {
+            Some(t) if t.significant => size - t.slope * (y - t.mean_y),
+            _ => size,
+        })
+        .collect()
+}
+
+/// Measure and attach a DIRECT glyph-ink font-size estimate
+/// ([`DocLineMetrics::glyph_px`]) to every line in `page` that already
+/// carries [`DocLineMetrics`] — i.e. came through the row-metrics pipeline
+/// (`crate::renderer::LineMetrics`, wave-3 `compute_block_xheight`). Lines
+/// with `metrics: None` are left untouched — see this section's module doc
+/// ("Why `DocLineMetrics`, not a new `DocLine` field") for why.
+///
+/// Composes the four pipeline stages documented at the top of this
+/// section: [`line_raw_glyph_px`] (1+2) → [`apply_small_sample_fallback`]
+/// (3) → [`fit_size_trend`] + [`apply_trend_normalization`] (4).
+///
+/// ## Contract
+///
+/// `lines` MUST be the EXACT slice used to build `page` via
+/// [`DocPage::from_line_words`] (same order, same empty-line filtering) —
+/// only there do individual glyphs'
+/// [`tesseract_core::WordResult::char_boxes`] survive; [`DocWord`] retains
+/// only the union bbox. `binary` is the SAME `page_w × page_h` binarized
+/// page (`crate::xy_cut::binarize_page_with`) already used elsewhere in
+/// this crate's layout/table pipeline — this crate's bitonal convention
+/// throughout: `0` = ink, `255` = background. On any mismatch between
+/// `lines` and `page` (the wrong slice passed) this is a silent no-op — the
+/// same "safe no-op on insufficient/mismatched input" convention
+/// `crate::rectify::auto_rectify` uses — rather than a panic on what is,
+/// from a caller's perspective, a wiring bug elsewhere.
+pub fn attach_glyph_px(
+    page: &mut DocPage,
+    lines: &[LineWords],
+    binary: &[u8],
+    page_w: u32,
+    page_h: u32,
+) {
+    let pw = page_w as i32;
+    let ph = page_h as i32;
+    let non_empty: Vec<&LineWords> = lines.iter().filter(|l| !l.words.is_empty()).collect();
+    if non_empty.len() != page.lines.len() {
+        return;
+    }
+
+    // Stages 1+2: every line's raw (p90, sample_count) -- computed for ALL
+    // lines (not just the ones that will end up written, i.e. those with
+    // Some(metrics)) so the stage-3/4 statistics below see the page's whole
+    // real signal, not an artificially shrunk one.
+    let raw: Vec<Option<(f32, usize)>> = non_empty
+        .iter()
+        .map(|line| line_raw_glyph_px(line, binary, pw, ph))
+        .collect();
+    let resolved = apply_small_sample_fallback(&raw);
+
+    // Stage 4, over the lines that have a resolved size: each line's own
+    // top-down vertical center is the `y` the trend fits against.
+    let y_centers: Vec<f32> = page
+        .lines
+        .iter()
+        .map(|l| (l.bbox.1 + l.bbox.3) as f32 / 2.0)
+        .collect();
+    let mut indices: Vec<usize> = Vec::new();
+    let mut samples: Vec<(f32, f32)> = Vec::new();
+    for (i, size) in resolved.iter().enumerate() {
+        if let Some(size) = size {
+            indices.push(i);
+            samples.push((y_centers[i], *size));
+        }
+    }
+    let normalized = apply_trend_normalization(&samples);
+
+    for (idx, size) in indices.into_iter().zip(normalized) {
+        if let Some(m) = &mut page.lines[idx].metrics {
+            m.glyph_px = Some(size);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1259,6 +1678,7 @@ mod tests {
                 ascrise: 4.0,
                 descdrop: -3.0,
                 baseline: 37.5,
+                glyph_px: None,
             }),
             "bottom-up baseline must convert to top-down"
         );
@@ -2002,5 +2422,213 @@ mod tests {
         assert_eq!(w.bbox, (0, 0, 4, 10));
         assert_eq!(w.conf, 99.0); // 100 + 5*(-0.2)
         assert_eq!(w.numeric_norm, None);
+    }
+
+    // --- Measured glyph-ink font sizing (glyph_px) --------------------------
+
+    /// [`glyph_ink_heights`] measures the REAL ink extent, not the char
+    /// box's own height: the box spans the full page height (10 rows,
+    /// top-down `[0,10)`), but ink is only drawn in rows `[4,7)` — a
+    /// falsifier against a naive "just return the box height" bug, which
+    /// would report `10.0` here instead of the correct `3.0`. A second,
+    /// all-background char box in the same call contributes NOTHING (an
+    /// empty result entry, not a spurious `0.0` sample).
+    #[test]
+    fn glyph_ink_heights_measures_real_ink_and_skips_empty_boxes() {
+        let (pw, ph) = (10i32, 10i32);
+        let mut binary = vec![255u8; (pw * ph) as usize];
+        // Top-down rows 4,5,6 (3 rows), columns 3,4,5 -- ink.
+        for y in 4..7usize {
+            for x in 3..6usize {
+                binary[y * pw as usize + x] = 0;
+            }
+        }
+        // char box 1 (TBOX left,bottom,right,top): spans the FULL page
+        // height (bottom=0 -> top-down bottom=10; top=10 -> top-down
+        // top=0), columns [3,6) -- to_image_box -> top-down (3,0,6,10).
+        // char box 2: an entirely background column, [7,9).
+        let heights = glyph_ink_heights(&[(3, 0, 6, 10), (7, 0, 9, 10)], &binary, pw, ph);
+        assert_eq!(
+            heights,
+            vec![3.0],
+            "must measure the 3-row ink extent, not the 10-row box height; \
+             the background box must contribute nothing at all"
+        );
+    }
+
+    /// A known, hand-computable vector: `[1..=10]`, scrambled order (proving
+    /// the function sorts rather than assuming sorted input). Linear
+    /// interpolation: `rank = 0.9*(10-1) = 8.1`, between index 8 (value 9)
+    /// and index 9 (value 10), `frac=0.1` -> `9 + 0.1*(10-9) = 9.1`.
+    #[test]
+    fn percentile_90_matches_a_known_vector() {
+        let mut heights = vec![7.0, 2.0, 9.0, 4.0, 10.0, 1.0, 8.0, 5.0, 3.0, 6.0];
+        let got = percentile_90(&mut heights).expect("non-empty");
+        assert!((got - 9.1).abs() < 1e-4, "p90 = {got}, expected ~9.1");
+        assert_eq!(percentile_90(&mut []), None);
+    }
+
+    /// The measured failure the guard exists for: a 7-sample line (below
+    /// [`GLYPH_SAMPLE_MIN`]) that measured an aberrant `24.0` must NOT keep
+    /// that value -- it must fall back to the median of the OTHER,
+    /// sufficiently-sampled lines (`{12.0, 13.0}` -> median `12.5`), while
+    /// those well-sampled lines keep their own p90 untouched. A line
+    /// exactly AT the threshold is trusted as-is (boundary check); a `None`
+    /// (zero measurable samples) stays `None`.
+    #[test]
+    fn small_sample_fallback_triggers_below_threshold() {
+        let raw = vec![
+            Some((12.0, 12)),
+            Some((24.0, 7)), // 7 < GLYPH_SAMPLE_MIN -- must not be trusted
+            Some((13.0, 15)),
+        ];
+        let resolved = apply_small_sample_fallback(&raw);
+        assert_eq!(
+            resolved[0],
+            Some(12.0),
+            "well-sampled line keeps its own p90"
+        );
+        assert_eq!(
+            resolved[2],
+            Some(13.0),
+            "well-sampled line keeps its own p90"
+        );
+        assert_eq!(
+            resolved[1],
+            Some(12.5),
+            "under-sampled line must fall back to the median of the OTHER \
+             lines (12.5), not its own aberrant 24.0"
+        );
+
+        // Boundary: exactly GLYPH_SAMPLE_MIN samples is trusted as-is.
+        let at_threshold = vec![Some((99.0, GLYPH_SAMPLE_MIN))];
+        assert_eq!(apply_small_sample_fallback(&at_threshold), vec![Some(99.0)]);
+
+        // A line with zero measurable samples stays None.
+        let with_none = vec![None, Some((10.0, 20))];
+        assert_eq!(apply_small_sample_fallback(&with_none)[0], None);
+    }
+
+    /// Fixture A of the important pair: 10 lines whose size is PERFECTLY
+    /// linear in `y` (`12.0 + 0.005*y`) -- the bent-paper camera-geometry
+    /// signature. The fit must be judged significant (R² ≈ 1.0) and its
+    /// smooth component fully divided out, so every line converges to the
+    /// page's mean size regardless of its own `y`.
+    #[test]
+    fn trend_normalization_flattens_a_smooth_ramp() {
+        let samples: Vec<(f32, f32)> = (0..10)
+            .map(|i| {
+                let y = (i * 100) as f32;
+                (y, 12.0 + 0.005 * y)
+            })
+            .collect();
+        let mean = samples.iter().map(|&(_, s)| s).sum::<f32>() / samples.len() as f32;
+        let normalized = apply_trend_normalization(&samples);
+        for (i, &v) in normalized.iter().enumerate() {
+            assert!(
+                (v - mean).abs() < 1e-2,
+                "line {i}: a perfectly smooth ramp must flatten to ~{mean}, got {v}"
+            );
+        }
+    }
+
+    /// Fixture B of the important pair: 10 lines, 9 at a consistent body
+    /// size (`12.0`) and ONE genuinely smaller `Kleine Schriftgröße`-style
+    /// caption (`9.0`) at an ARBITRARY `y` -- uncorrelated with position
+    /// (R² ≈ 0.003, far below [`TREND_R2_SIGNIFICANT`]), so the fit must be
+    /// judged NOT significant and every size must survive completely
+    /// UNCHANGED -- a blanket normalization would incorrectly flatten the
+    /// real typographic step.
+    #[test]
+    fn trend_normalization_leaves_a_step_change_intact() {
+        let sizes = [12.0f32, 12.0, 12.0, 12.0, 9.0, 12.0, 12.0, 12.0, 12.0, 12.0];
+        let samples: Vec<(f32, f32)> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| ((i * 100) as f32, s))
+            .collect();
+        let normalized = apply_trend_normalization(&samples);
+        assert_eq!(
+            normalized,
+            sizes.to_vec(),
+            "a step change uncorrelated with y must survive untouched, \
+             not be smoothed toward the body size"
+        );
+    }
+
+    /// End-to-end through the public entry point: builds a page with one
+    /// line that already carries [`DocLineMetrics`] (the row-metrics
+    /// pipeline ran) and one that does not, both with the SAME 12
+    /// one-pixel-wide char boxes over an identical 6-row ink band (so every
+    /// glyph sample is unambiguously `6.0` and `n=12 >= GLYPH_SAMPLE_MIN`,
+    /// keeping this test focused on the metrics-gating behaviour rather
+    /// than the measurement/fallback/trend arithmetic already covered
+    /// above). Only the line that started with `Some(metrics)` may receive
+    /// `glyph_px`; the other must stay `None` -- never fabricated.
+    #[test]
+    fn attach_glyph_px_only_writes_lines_that_already_carry_metrics() {
+        use crate::renderer::{LineMetrics, LineWords};
+        use tesseract_core::dawg::PermuterType;
+        use tesseract_core::WordResult;
+
+        // 12 one-pixel-wide char boxes (TBOX order) sharing the ink band
+        // that maps to top-down image rows [10,16) -- 6 rows.
+        let char_boxes: Vec<(i32, i32, i32, i32)> = (0..12).map(|i| (i, 4, i + 1, 10)).collect();
+        let word = WordResult {
+            unichar_ids: vec![1; 12],
+            certs: vec![0.0; 12],
+            ratings: vec![0.0; 12],
+            char_boxes,
+            permuter: PermuterType::TopChoicePerm,
+            space_certainty: 0.0,
+            leading_space: false,
+        };
+        let metrics = LineMetrics {
+            xheight: 5.0,
+            ascrise: 2.0,
+            descdrop: -1.0,
+            baseline: 5.0,
+        };
+        let with_metrics = LineWords {
+            words: vec![word.clone()],
+            line_box: (0, 4, 12, 10),
+            metrics: Some(metrics),
+        };
+        let without_metrics = LineWords {
+            words: vec![word],
+            line_box: (0, 4, 12, 10),
+            metrics: None,
+        };
+        let lines = vec![with_metrics, without_metrics];
+
+        let (pw, ph) = (20u32, 20u32);
+        let mut binary = vec![255u8; (pw * ph) as usize];
+        for y in 10..16usize {
+            for x in 0..12usize {
+                binary[y * pw as usize + x] = 0;
+            }
+        }
+
+        let charset =
+            tesseract_core::CharSet::load_from_str("2\nNULL 0 Common 0\na 3 0 a Left a a\n")
+                .expect("charset");
+        let mut page = DocPage::from_line_words(&lines, &charset, pw, ph);
+        assert_eq!(page.lines.len(), 2);
+        assert!(page.lines[0].metrics.is_some());
+        assert!(page.lines[1].metrics.is_none());
+
+        attach_glyph_px(&mut page, &lines, &binary, pw, ph);
+
+        let g0 = page.lines[0]
+            .metrics
+            .as_ref()
+            .and_then(|m| m.glyph_px)
+            .expect("line with existing metrics must receive glyph_px");
+        assert!((g0 - 6.0).abs() < 1e-4, "measured ink height: {g0}");
+        assert!(
+            page.lines[1].metrics.is_none(),
+            "a line with no pre-existing metrics must be left untouched, \
+             not fabricated"
+        );
     }
 }

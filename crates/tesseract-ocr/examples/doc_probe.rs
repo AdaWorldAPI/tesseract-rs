@@ -134,6 +134,12 @@ fn main() {
                             .join(" ")
                     })
                     .unwrap_or_else(|| t.to_string());
+                if let Some(gp) = line["glyph_px"].as_f64() {
+                    println!(
+                        "   GLYPH_PX {gp:6.1}   {}",
+                        words.chars().take(34).collect::<String>()
+                    );
+                }
                 if let Some(xh) = line["xheight"].as_f64() {
                     let (asc, desc) = (
                         line["ascrise"].as_f64().unwrap_or(0.0),
