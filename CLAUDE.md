@@ -64,6 +64,48 @@ Each leaf is proven this way (the `/tmp` artifacts are ephemeral — rebuild the
    unicharset_dump -- <unicharset> {properties|script|other_case}`; `diff` the two.
    eng data = a trained `eng.lstm-unicharset` (`combine_tessdata -u`).
 
+## Model allocation policy (standing rule — set it BEFORE spawning, not per call)
+
+Mirrors lance-graph's own Model Policy, which this repo lacked. The split that
+matters is **grindwork vs accumulation**, and for a byte-parity transcode it has
+a sharp, repo-specific edge:
+
+- **Orchestrator / main thread: Opus.** Every decision that composes evidence
+  across sources: wave sequencing, what a precision audit implies, whether a
+  measurement means what it appears to mean, whether to flip a default, reading
+  a review finding for whether it is actually right. **Also all central gating**
+  — `cargo fmt` / `clippy -D warnings` / the full scoped test suite run ONCE
+  (never per agent), plus every `git commit` / `push`.
+- **Sonnet subagents: bounded transcription against a written spec.** Port THIS
+  C function given THIS audit; harvest THIS call graph; thread THIS flag through
+  THESE call sites; build THIS oracle arm. One source in, one shape out.
+- **Never Haiku** for any subagent here — the quality floor is Sonnet regardless
+  of how mechanical the task looks.
+
+**Declare the allocation up front, in the plan, not implicitly at each spawn.**
+Consistency is not the same as policy: a session can spawn every agent at the
+right tier and still leave no rule behind, so the next session re-derives it.
+
+**Every Sonnet worker brief MUST carry, verbatim:**
+- Do NOT run `cargo build/check/test/clippy/fmt` — not once. `tesseract-core`
+  path-deps the lance-graph workspace, and per-agent compiles both blow up the
+  shared `target/` and produce spurious cross-agent failures. The orchestrator
+  compiles centrally (see Iron rule 1).
+- Do NOT run `git commit/push/checkout/restore/reset/clean/worktree`.
+- The exact file scope, and which files another agent owns concurrently.
+- "Do not claim it compiles or that tests pass — you did not run it."
+
+**Fan out on DISJOINT files only.** Two agents in one module is a lost-write
+race. When a shared file must change (a `mod` line, a re-export), the
+**orchestrator** makes that edit after the agents land — this session held
+`lib.rs` back for exactly that reason and avoided a clobber.
+
+**What the orchestrator must NOT delegate**, because this session shows each
+being missed by a competent agent working correctly inside its own scope: is the
+oracle running the operation under test; is a null result real or a wiring
+artifact; does a "tidy" refactor silently change a default; is a passing diff
+comparing two empty outputs.
+
 ## Iron rules (learned this arc — do not relearn the hard way)
 
 1. **NEVER `cargo --all` / `--all-targets` / `cargo fmt --all` from this repo.**
