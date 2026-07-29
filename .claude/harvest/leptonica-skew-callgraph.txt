@@ -1,0 +1,1039 @@
+LEPTONICA SKEW-DETECTION + ROTATION TRANSCODE MANIFEST
+========================================================
+Wave: page deskew (pixFindSkew* family + pixRotate* family)
+Generated: 2026-07-29 (bounded harvest, no Rust written, no cargo run)
+
+STEP 0 — SOURCE ACQUISITION
+============================
+In-container lib version (ground truth to match): `pkg-config --modversion lept` = 1.82.0
+
+Attempt 1 (upstream tag) — SUCCEEDED, used for this whole manifest:
+  git clone --depth 1 --branch 1.82.0 https://github.com/DanBloomberg/leptonica.git /tmp/leptonica-src
+  -> cloned clean, HEAD detached at f4138265b390f1921b9891d6669674d3157887d8
+  -> confirmed version: src/allheaders.h:31-33
+       #define LIBLEPT_MAJOR_VERSION   1
+       #define LIBLEPT_MINOR_VERSION   82
+       #define LIBLEPT_PATCH_VERSION   0
+  ZERO VERSION SKEW: 1.82.0 (source) == 1.82.0 (installed lib). Attempts 2/3 not needed.
+
+Files read IN FULL (no skimming) from /tmp/leptonica-src/src/:
+  skew.c          1247 lines  (ARM A — assigned)
+  rotate.c         598 lines  (ARM B dispatch — assigned)
+  rotateam.c      1132 lines  (ARM B area-map — assigned)
+  rotateshear.c    498 lines  (ARM B shear wrapper — assigned)
+  rotateorth.c     715 lines  (ARM B lossless 90/180 — assigned)
+  shear.c          854 lines  (NOT in the assigned list — see note below, read in full anyway)
+  pix3.c (2 excerpts: pixZero ~1794-1855, pixCountPixelsByRow ~2135-2168)
+  numafunc1.c (3 excerpts: numaGetMin, numaGetMax, numaFitMax)
+
+*** IMPORTANT DEVIATION FROM THE ASSIGNED FILE LIST ***
+skew.c's sweep loop calls `pixVShearCorner()` / `pixVShearCenter()`, and rotate.c's
+shear dispatch (`pixRotateShearCenter` -> `pixRotateShear` -> `pixRotate2Shear` /
+`pixRotate3Shear` / `pixRotateShearIP`) calls `pixHShear()` / `pixVShear()` /
+`pixHShearIP()` / `pixVShearIP()`. NONE of these live in rotateshear.c — they are
+all defined in **shear.c**, a file not in the assigned set of 5. Since the task
+explicitly asks "how rotation is applied DURING the sweep" (ARM A) and "the exact
+shear amounts" (ARM B binary path), shear.c is unavoidably on both critical paths
+and was read in full. Treat shear.c as a required 6th file for this wave, not an
+optional extra.
+
+
+STEP 1 — CALL GRAPHS
+======================
+
+ARM A — SKEW DETECTION
+------------------------
+Entry chain (as specified):
+  pixFindSkew(pixs, &angle, &conf)
+    -> pixFindSkewSweepAndSearch(pixs, &angle, &conf, DefaultSweepReduction=4,
+                                  DefaultBsReduction=2, DefaultSweepRange=7.0,
+                                  DefaultSweepDelta=1.0, DefaultMinbsDelta=0.01)
+       [skew.c:374-396, thin wrapper supplying all 5 default-constant args]
+    -> pixFindSkewSweepAndSearchScore(pixs,&angle,&conf,pendscore=NULL,
+                                        redsweep,redsearch,sweepcenter=0.0,
+                                        sweeprange,sweepdelta,minbsdelta)
+       [skew.c:562-575, thin wrapper]
+    -> pixFindSkewSweepAndSearchScorePivot(..., pivot=L_SHEAR_ABOUT_CORNER)
+       [skew.c:616-633, thin wrapper — THIS is the actual algorithm, skew.c:665-973]
+
+Default constants (all file-scope `static const`, skew.c:105-134):
+  DefaultSweepRange        = 7.0      l_float32  degrees   (skew.c:106)
+  DefaultSweepDelta        = 1.0      l_float32  degrees   (skew.c:107)
+  DefaultMinbsDelta        = 0.01     l_float32  degrees   (skew.c:113)
+  DefaultSweepReduction    = 4        l_int32              (skew.c:116)
+  DefaultBsReduction       = 2        l_int32              (skew.c:117)
+  MinDeskewAngle           = 0.1      l_float32  degrees   (skew.c:120) [pixDeskewGeneral only]
+  MinAllowedConfidence     = 3.0      l_float32            (skew.c:123) [pixDeskewGeneral only]
+  MinValidMaxscore         = 10000    l_int32              (skew.c:126)
+  MinscoreThreshFactor     = 0.000002 l_float32            (skew.c:131)
+  DefaultBinaryThreshold   = 130      l_int32              (skew.c:134) [pixDeskewGeneral only]
+
+pixFindSkewSweepAndSearchScorePivot algorithm (skew.c:665-973), step by step:
+
+  1. Validate: pixs 1bpp; redsweep/redsearch in {1,2,4,8}; redsearch<=redsweep;
+     pivot in {L_SHEAR_ABOUT_CORNER, L_SHEAR_ABOUT_CENTER}.
+  2. deg2rad = 3.1415926535 / 180.  [NOTE: hardcoded literal, NOT `M_PI`; l_float32
+     local but RHS computed as f64 literal division then narrowed on assign — see
+     Step 4 precision audit]
+  3. Build TWO reduced copies of pixs for two different resolutions:
+       pixsch (search/binary-search resolution) = reduce by `redsearch` via
+         pixReduceRankBinaryCascade(pixs, 1,0,0,0)   if redsearch==2
+         pixReduceRankBinaryCascade(pixs, 1,1,0,0)   if redsearch==4
+         pixReduceRankBinaryCascade(pixs, 1,1,2,0)   if redsearch==8
+         pixClone(pixs)                              if redsearch==1
+       [skew.c:711-719 — level args are POSITIONAL literals, not computed]
+     pixZero(pixsch, &bzero); if bzero -> destroy + return 1 (real image-empty
+       error path; skew.c:721-725).
+     pixsw (sweep resolution) = further-reduce pixsch by `ratio=redsweep/redsearch`:
+         ratio==1 -> clone pixsch
+         ratio==2 -> pixReduceRankBinaryCascade(pixsch, 1,0,0,0)
+         ratio==4 -> pixReduceRankBinaryCascade(pixsch, 1,2,0,0)   <- NOTE: (1,2,0,0)
+                     not (1,1,0,0) — asymmetric vs the redsearch==4 case above
+         ratio==8 -> pixReduceRankBinaryCascade(pixsch, 1,2,2,0)   <- NOTE: (1,2,2,0)
+       [skew.c:727-738]
+     Default call from pixFindSkew: redsweep=4, redsearch=2 => ratio=2 => pixsw is
+     pixsch reduced ONE more time by pixReduceRankBinaryCascade(pixsch,1,0,0,0).
+  4. pixt1 = pixCreateTemplate(pixsw); pixt2 = (ratio==1) ? clone(pixt1) :
+     pixCreateTemplate(pixsch).  [scratch buffers for the shear-then-score loop]
+  5. SWEEP (coarse): nangles = (l_int32)((2*sweeprange)/sweepdelta + 1).
+     rangeleft = sweepcenter - sweeprange.
+     for i in 0..nangles: theta = rangeleft + i*sweepdelta (degrees);
+       shear pixsw into pixt1 at deg2rad*theta via pivot-selected shear fn
+       (pixVShearCorner or pixVShearCenter, both L_BRING_IN_WHITE);
+       score = pixFindDifferentialSquareSum(pixt1);
+       append (theta,score) to (natheta,nascore).
+     Find (maxscore,maxindex) via **numaGetMax** (RAW max — no quadratic fit
+     here; contrast with the separate, NOT-on-this-path, pixFindSkewSweep()
+     which uses numaFitMax instead. pixFindSkew() never calls pixFindSkewSweep().)
+     maxangle = natheta[maxindex].
+     GUARD: if maxindex==0 or maxindex==n-1 ("max found at sweep edge"):
+       L_WARNING + `goto cleanup`. **`ret` is still 0 at this point** (set at
+       skew.c:709, never reassigned in this branch) — function returns 0 (=OK)
+       with *pangle and *pconf left at their function-entry-initialized 0.0
+       (skew.c:692-694). This is a SILENT DEGENERATE SUCCESS, not an error
+       return — callers see "0 = OK, angle=0, conf=0", which downstream
+       (pixDeskewGeneral) harmlessly treats as "don't rotate" since
+       |0| < MinDeskewAngle. Must replicate this exact non-error-but-null
+       return, not translate it to an Err/None.
+  6. BINARY SEARCH (fine, on pixsch/pixt2): re-empty the numas. Seed 3 points:
+       bsearchscore[2] = score at centerangle (=maxangle)
+       bsearchscore[0] = score at centerangle - sweepdelta
+       bsearchscore[4] = score at centerangle + sweepdelta
+     (shear via same pivot selection, L_BRING_IN_WHITE, on pixsch into pixt2).
+     Then: delta = 0.5*sweepdelta; while delta >= minbsdelta:
+       score at (centerangle-delta) -> bsearchscore[1]
+       score at (centerangle+delta) -> bsearchscore[3]
+       find max of {bsearchscore[1],[2],[3]} only (indices 1..3, i.e. the
+         "center three" — deliberately excludes bsearchscore[0] and [4], per
+         the comment "the maximum must be in the center three values")
+       re-seed bsearchscore[0]/[2]/[4] = the neighbor-triple around that max
+         (lefttemp=bsearchscore[maxindex-1], righttemp=bsearchscore[maxindex+1])
+       centerangle += delta*(maxindex-2)   [maxindex in {1,2,3} => shift in
+         {-delta,0,+delta}]
+       delta *= 0.5
+     *pangle = centerangle (final).  *pendscore = bsearchscore[2] if requested.
+  7. CONFIDENCE: numaGetMin(nascore,&minscore,&minloc) over the FULL history of
+     scores gathered during binary search (nascore was re-populated starting at
+     step 6, so this min is over the binary-search samples only, NOT the sweep
+     samples — the sweep's nascore was already destroyed by numaEmpty at the
+     top of step 6).
+     width,height = dimensions of pixsch (the SEARCH-resolution image, not pixsw).
+     minthresh = MinscoreThreshFactor * width * width * height   [f32 arithmetic;
+       width/height are l_int32, promoted to f32 for the multiply against the
+       f32 constant — see precision audit].
+     *pconf = (minscore > minthresh) ? maxscore/minscore : 0.0
+       [maxscore here is the LAST value of the loop-local `maxscore` from the
+        final binary-search iteration's 3-way compare, effectively == the last
+        bsearchscore[2] before the final reseed — trace exactly from the C,
+        do not assume it equals bsearchscore[2] after loop exit without
+        checking]
+     THEN: zero out *pconf again if EITHER:
+       centerangle > rangeleft + 2*sweeprange - sweepdelta   (too close to the
+         right sweep edge), OR
+       centerangle < rangeleft + sweepdelta                  (too close to the
+         left sweep edge), OR
+       maxscore < MinValidMaxscore (10000)
+     [skew.c:937-942 — three-way OR, all three independently zero the confidence]
+  8. Return 0 on success. Return 1 only on: pixZero-detected-empty (early, before
+     pixsw made), or allocation failures (`!pixsch||!pixsw`, `!pixt1||!pixt2`,
+     `!natheta||!nascore`) — all defensive/OOM paths, not reachable via ordinary
+     image content.
+
+Return semantics summary (pixFindSkew, degrees, NOT radians):
+  "The angle returned is the negative of the skew angent of the image. It is
+  the angle required for deskew. Clockwise rotations are positive angles."
+  [skew.c:369-371, doc comment, verbatim]. Callers must do `deg2rad*angle`
+  before feeding pixRotate (see pixDeskewGeneral, skew.c:324,346).
+  conf = ratio of max/min score, zero-clamped per the two threshold checks
+  above; "Values between 3.0 and 6.0 are common" per doc (skew.c:612).
+
+Rotation applied DURING the sweep (the ARM A <-> ARM B coupling):
+  NOT pixRotate / pixRotateAM* / pixRotateShear* at all. It is always
+  `pixVShearCorner(pixt, pix, deg2rad*theta, L_BRING_IN_WHITE)` (pivot=corner,
+  the default from pixFindSkewSweepAndSearchScore) or
+  `pixVShearCenter(pixt, pix, deg2rad*theta, L_BRING_IN_WHITE)` (only if the
+  caller reaches into pixFindSkewSweepAndSearchScorePivot directly with
+  pivot=L_SHEAR_ABOUT_CENTER — pixFindSkew never does this).
+  pixVShearCorner/pixVShearCenter are one-line wrappers over pixVShear
+  (shear.c:370-382, 432-444) — see shear.c section below for the actual
+  per-column rasterop-shift algorithm. Always L_BRING_IN_WHITE (bring in
+  background, never black) — the sweep never tests L_BRING_IN_BLACK.
+  Interpolation: NONE — this is a discrete-rasterop integer shear (whole-pixel
+  column shifts), not an area-mapped/interpolated shear. (pixVShearLI, the
+  linear-interpolated variant, exists in shear.c but is NEVER called anywhere
+  in this call graph.)
+
+Composition / auxiliary functions in skew.c NOT on the pixFindSkew() path
+(present in the file, but reachable only via separate public entry points):
+  - pixFindSkewSweep()              — standalone simpler sweep-only entry,
+    uses numaFitMax (quadratic Lagrangian interpolation over 3 points) instead
+    of raw numaGetMax. NOT called by pixFindSkew(). SKIP (see Step 3).
+  - pixFindSkewOrthogonalRange()    — tries both 0 deg and 90 deg orientations,
+    calls pixFindSkewSweepAndSearchScorePivot twice + pixRotateOrth(pixs,1).
+    Auxiliary/optional entry, not part of the pixFindSkew()/pixDeskew() chain.
+    SKIP for this wave (candidate for a LATER "rotate-90-candidates" wave).
+  - pixFindNormalizedSquareSum()    — statistics helper, not called anywhere
+    in the skew/rotate call graph. SKIP.
+
+
+ARM B — ROTATION
+------------------
+Entry: pixRotate(pixs, angle_radians, type, incolor, width, height)   [rotate.c:100-197]
+
+Constants (rotate.c:63-65, ALL l_float32, radians):
+  MinAngleToRotate  = 0.001   (~0.057 deg) — below this, pixRotate returns a
+                                clone (no-op). Re-declared IDENTICALLY (same
+                                name, same value 0.001) as a separate static
+                                const in rotateam.c:150 and rotateshear.c:178
+                                (three independent TU-local copies of the same
+                                constant — not a bug, just C's lack of a
+                                shared-header constant here).
+  Max1BppShearAngle = 0.06    (~3.4 deg) — 1bpp-only threshold (see dispatch).
+                                Re-declared as `MaxTwoShearAngle` in
+                                rotateshear.c:179 with the SAME value 0.06.
+  LimitShearAngle   = 0.35    (~20 deg) — d>1 SHEAR-vs-SAMPLING threshold.
+                                Re-declared as `MaxThreeShearAngle` in
+                                rotateshear.c:180 with the SAME value 0.35.
+  (rotateshear.c also has MaxShearAngle=0.50 (~28.6 deg), an absolute ceiling
+   above which pixRotateShear/pixRotate2Shear/pixRotate3Shear return NULL with
+   an L_ERROR — this is a hard error case, not a dispatch redirect.)
+
+Dispatch logic inside pixRotate() (rotate.c:113-196), IN ORDER:
+  1. Validate type in {L_ROTATE_AREA_MAP, L_ROTATE_SHEAR, L_ROTATE_SAMPLING};
+     incolor in {L_BRING_IN_WHITE, L_BRING_IN_BLACK}.
+  2. if |angle| < MinAngleToRotate (0.001 rad): return pixClone(pixs) — full
+     stop, no further processing at all (not even embedding).
+  3. TYPE OVERRIDE (this happens BEFORE anything else, and can silently change
+     the caller's requested `type`):
+       if pixGetDepth(pixs) == 1:
+         if |angle| > Max1BppShearAngle (0.06 rad):  type := L_ROTATE_SAMPLING
+         else:                                        type := L_ROTATE_SHEAR
+         (This UNCONDITIONALLY overrides ANY requested type for 1bpp images —
+          even a caller-requested L_ROTATE_AREA_MAP becomes SHEAR or SAMPLING.
+          AREA_MAP is never used for 1bpp pixels through this entry point.)
+       else if |angle| > LimitShearAngle (0.35 rad) AND type == L_ROTATE_SHEAR:
+         type := L_ROTATE_SAMPLING
+         (Only overrides an explicit SHEAR request; an AREA_MAP request for
+          d>1 is NEVER overridden regardless of angle magnitude.)
+  4. Colormap: if cmap present AND type==AREA_MAP, pixRemoveColormap (based on
+     src); else just clone. If cmap survives (non-AREA_MAP path) and no
+     embedding requested (width==0), pixcmapAddBlackOrWhite is called to make
+     sure `incolor`'s color exists in the map.
+  5. pixEmbedForRotation(pix1, angle, incolor, width, height) — expands canvas
+     if width/height (ORIGINAL dims) are nonzero (see formula below). This is
+     a NO-OP (returns clone) when width==0 (the deskew composition functions
+     pass width=height=0, so embedding is SKIPPED for the wave's actual
+     use-case — see Step 6 composition entries).
+  6. If type==AREA_MAP and resulting depth < 8: pixConvertTo8(pix2, FALSE) up
+     first (area mapping requires >=8bpp).
+  7. Final dispatch (on the POSSIBLY-OVERRIDDEN type):
+       L_ROTATE_SHEAR     -> pixRotateShearCenter(pix3, angle, incolor)
+       L_ROTATE_SAMPLING  -> pixRotateBySampling(pix3, w/2, h/2, angle, incolor)
+                              [rotate.c:323-425, fully read, no interpolation,
+                               nearest-neighbor via inverse-rotation coordinate
+                               mapping; SKIP for our GREY 8bpp OCR use-case
+                               since realistic skew angles (<7 deg sweep range,
+                               <20 deg LimitShearAngle) never reach SAMPLING
+                               for d>1 unless the caller explicitly asked for
+                               shear at >20deg; see Step 3.]
+       L_ROTATE_AREA_MAP  -> fillval computed (255 if d==8 & BRING_IN_WHITE,
+                              0xffffff00 if d==32 & BRING_IN_WHITE, else 0);
+                              d==8  -> pixRotateAMGray(pix3, angle, fillval)
+                              d==32 -> pixRotateAMColor(pix3, angle, fillval)
+                                        [SKIP — colour, not needed for grey OCR]
+
+pixEmbedForRotation() exact math (rotate.c:242-299) — relevant IF a consumer
+ever passes nonzero width/height (the deskew compositions in this manifest do
+NOT, but a future canvas-expanding variant might):
+  maxside = (l_int32)(sqrt((l_float64)(width*width) + (l_float64)(height*height)) + 0.5)
+  if current w,h both >= maxside: return clone (already big enough)
+  else: cosa=cos(angle) [f64], sina=sin(angle) [f64], fw=(f64)w, fh=(f64)h
+        w1 = (l_int32)(|fw*cosa - fh*sina| + 0.5)
+        w2 = (l_int32)(|-fw*cosa - fh*sina| + 0.5)
+        h1 = (l_int32)(|fw*sina + fh*cosa| + 0.5)
+        h2 = (l_int32)(|-fw*sina + fh*cosa| + 0.5)
+        wnew = max(w, w1, w2); hnew = max(h, h1, h2)
+        allocate wnew x hnew, fill with incolor, rasterop-paste original centered.
+  See Step 4 precision audit for the width*width int-overflow risk and the
+  round-half-up (+0.5, applied AFTER abs()) convention used here.
+
+GREY 8bpp AREA-MAP PATH — pixRotateAMGray / pixRotateAMGrayCorner
+(rotateam.c:288-317 wrapper, :391-448 `rotateAMGrayLow` kernel;
+ :584-613 wrapper, :683-736 `rotateAMGrayCornerLow` kernel):
+
+  Both wrappers: validate 8bpp, |angle|<MinAngleToRotate(0.001 rad)->clone,
+  allocate pixd via pixCreateTemplate(pixs), call the static Low kernel.
+
+  rotateAMGrayLow (about image CENTER):
+    xcen=w/2; wm2=w-2; ycen=h/2; hm2=h-2
+    sina = 16. * sin(angle);  cosa = 16. * cos(angle);   [l_float32 locals —
+      SEE precision audit: RHS computed in f64 then narrowed to f32 on assign]
+    for each dest pixel (i=row,j=col):
+      xdif = xcen - j;  ydif = ycen - i
+      xpm = (l_int32)(-xdif*cosa - ydif*sina)   [f32 arithmetic; C truncates
+                                                   toward zero on the cast]
+      ypm = (l_int32)(-ydif*cosa + xdif*sina)
+      xp = xcen + (xpm >> 4);  yp = ycen + (ypm >> 4)     [arithmetic right
+                                                             shift, sign-
+                                                             extending]
+      xf = xpm & 0x0f;  yf = ypm & 0x0f                    [low 4 bits, always
+                                                             0..15 regardless
+                                                             of xpm's sign,
+                                                             twos-complement AND]
+      if xp<0 || yp<0 || xp>wm2 || yp>hm2: SET_DATA_BYTE(lined,j,grayval); continue
+        [NOTE: valid xp range is [0, w-2] not [0,w-1] — the rightmost AND
+         bottommost 1-pixel margin is ALWAYS treated as off-edge, because the
+         bilinear read always needs xp+1/yp+1 too]
+      v00=(16-xf)*(16-yf)*src[yp][xp]
+      v10=xf*(16-yf)*src[yp][xp+1]
+      v01=(16-xf)*yf*src[yp+1][xp]
+      v11=xf*yf*src[yp+1][xp+1]
+      dst[i][j] = (v00+v01+v10+v11+128) / 256          [integer arithmetic,
+        16x16=256 subpixel area-weighting, +128 = round-half-up before the
+        /256 integer division; v00..v11 fit in l_int32, no overflow risk:
+        max term = 16*16*255 = 65280, sum of 4 <= 261120, fits comfortably]
+
+  rotateAMGrayCornerLow (about UL CORNER, i.e. pivot at (0,0), no xcen/ycen
+  offset applied to the source-position formula):
+    wm2=w-2; hm2=h-2; sina=16.*sin(angle); cosa=16.*cos(angle)  [same f32-
+      truncation precision note applies]
+    for each dest pixel (i=row,j=col):
+      xpm = (l_int32)(j*cosa + i*sina)
+      ypm = (l_int32)(i*cosa - j*sina)
+      xp = xpm>>4; yp=ypm>>4; xf=xpm&0xf; yf=ypm&0xf
+      [same off-edge test xp<0||yp<0||xp>wm2||yp>hm2 -> grayval fill]
+      [same v00..v11 bilinear blend, same (..+128)/256]
+
+  Both kernels are pure per-pixel loops, no cross-pixel state — trivially
+  parallelizable, and (given ndarray is this repo's compute backend for
+  other pixel-loop leaves) a natural SIMD/rayon candidate LATER, but the
+  byte-parity leaf itself should be scalar-and-simple first, matching the
+  established "prove scalar first" pattern in every prior leaf.
+
+BINARY 3-SHEAR PATH — pixRotateShear -> pixRotate2Shear / pixRotate3Shear
+(rotateshear.c:207-233, :261-304, :338-386; the underlying pixHShear/pixVShear/
+ pixHShearIP/pixVShearIP kernels are in shear.c, see next section):
+
+  pixRotateShear(pixs, xcen, ycen, angle, incolor):
+    |angle| > MaxShearAngle (0.50 rad, ~28.6 deg): L_ERROR, return NULL (hard
+      stop — this is NOT a redirect to sampling/AM, it is an actual failure
+      the caller must handle)
+    |angle| < MinAngleToRotate (0.001 rad): return clone
+    |angle| <= MaxTwoShearAngle (0.06 rad, ~3.4 deg): pixRotate2Shear (2-shear)
+    else (0.06 < |angle| <= 0.50):                    pixRotate3Shear (3-shear)
+      [MaxThreeShearAngle=0.35 only produces a WARNING if exceeded, it does
+       NOT redirect — pixRotate3Shear will still attempt the 3-shear compose
+       for angles in (0.35, 0.50], just louder about it]
+
+  pixRotate2Shear (angle <= 0.06 rad, i.e. the REALISTIC common case for
+  post-deskew-detection correction, since MinDeskewAngle gate + typical real
+  document skew rarely exceeds a few degrees):
+    x' = x + tan(angle)*(y - ycen)      [pixHShear about y=ycen]
+    y' = y + tan(angle)*(x - xcen)      [pixVShear about x=xcen, applied to
+                                          the H-sheared result]
+    Exactly: pix1 = pixHShear(NULL, pixs, ycen, angle, incolor);
+             pixd  = pixVShear(NULL, pix1, xcen, angle, incolor).
+    Alpha (32bpp only) rotated separately — SKIP, colour-only.
+
+  pixRotate3Shear (angle in (0.06, 0.50] rad):
+    hangle = atan(sin(angle))     [NOT angle/2 for the middle shear — the
+                                    classic Paeth 3-shear decomposition:
+                                    y'=y+tan(angle/2)*(x-xcen)   [1st Vshear, half-angle]
+                                    x'=x+sin(angle)*(y-ycen)     [Hshear, hangle=atan(sin(angle))]
+                                    y'=y+tan(angle/2)*(x-xcen)   [2nd Vshear, half-angle again]
+    Exactly: pixd = pixVShear(NULL, pixs, xcen, angle/2., incolor);
+             pix1 = pixHShear(NULL, pixd, ycen, hangle, incolor);
+             pixVShear(pixd, pix1, xcen, angle/2., incolor);   [in-place onto pixd]
+    Reference cited in the C doc comment: Alan Paeth, "A Fast Algorithm for
+    General Raster Rotation," Graphics Interface '86, pp.77-81 (1986); also
+    Graphics Gems (Glassner, ed.), 1990, p.179.
+    Alpha (32bpp) rotated separately — SKIP.
+
+  pixRotateShearIP / pixRotateShearCenterIP (in-place 3-shear only, no 2-shear
+  in-place variant exists) — same hangle=atan(sin(angle)) formula, applied via
+  pixHShearIP/pixVShearIP (row/col in-place shift-and-refill, no separate dest
+  buffer). Only used if a consumer explicitly wants in-place rotation; the
+  deskew composition entries (Step 1/6) always use the non-IP pixRotate(),
+  so IP is a lower-priority variant for this wave. Note it is NOT reachable
+  from pixRotate() at all — pixRotate() always uses pixRotateShearCenter (the
+  non-IP path) for its L_ROTATE_SHEAR dispatch arm.
+
+  pixRotateShearCenter/pixRotateShearCenterIP are trivial wrappers pinning
+  xcen=w/2, ycen=h/2 (rotateshear.c:463-475, 486-498).
+
+
+shear.c — pixHShear / pixVShear (REQUIRED, not in original 5-file list)
+--------------------------------------------------------------------------
+Constant: MinDiffFromHalfPi = 0.04 rad (shear.c:64) — angle-normalization
+  guard only (keeps tan() finite near +-pi/2), unrelated to MinAngleToRotate.
+
+normalizeAngleForShear(radang, mindif) [shear.c:831-854]:
+  pi2 = 3.14159265/2.0   [NOTE: yet another hardcoded pi literal, slightly
+    different digit count than skew.c's `3.1415926535` — see precision audit]
+  if radang < -pi2 or > pi2: radang -= (l_int32)(radang/pi2)*pi2  [range-fold,
+    NOT a true modulo — uses C integer-truncating division, so this is only
+    a partial fold for |radang| up to a few multiples of pi2; for the actual
+    skew/rotate use-cases here, angle is always pre-clamped to well within
+    +-pi/2 by the callers, so this branch is realistically dead code on our
+    path, but must still be transcribed faithfully since it's reachable in
+    principle]
+  if radang > pi2-mindif: L_WARNING, radang = pi2-mindif  [clamp]
+  if radang < -pi2+mindif: L_WARNING, radang = -pi2+mindif
+
+pixHShear(pixd, pixs, yloc, radang, incolor) [shear.c:116-195] — the actual
+kernel behind pixHShearCorner/pixHShearCenter/(pixRotate2Shear/3Shear's H leg):
+  in-place special case (pixd==pixs, no cmap) delegates to pixHShearIP.
+  cmap + in-place: copies first, recurses (avoids in-place-with-cmap).
+  radang = normalizeAngleForShear(...); if radang==0.0 or tan(radang)==0.0:
+    return pixCopy(pixd,pixs) [exact zero test, NOT an epsilon test — see
+    Step 1's note on this being a DIFFERENT gate than MinAngleToRotate]
+  pixSetBlackOrWhite(pixd, incolor)   [background fill BEFORE the shifted
+    rows are pasted in]
+  sign = L_SIGN(radang) [-1 if <0, else +1 — note L_SIGN(0)=+1 per macro,
+    though the zero case already returned above so this never fires at 0]
+  tanangle = tan(radang); invangle = |1/tanangle|
+  inityincr = (l_int32)(invangle/2.); yincr=(l_int32)invangle  [truncating casts]
+  ONE central band [yloc-inityincr, yloc+inityincr) copied with ZERO horizontal
+    shift (pixRasterop straight copy, no offset) — this is the "dead space"
+    the file-header doc comment describes (half the shear angle's worth of
+    unshifted rows straddling the pivot line).
+  Then walks OUTWARD from the center band in both directions (two separate
+  for-loops, y increasing above yloc / y decreasing below), each iteration
+  computing a growing horizontal shift `hshift` and pasting a horizontal
+  BAND of rows (not one row at a time — band height = yincr, growing) via
+  pixRasterop(pixd, -sign*hshift, y, w, yincr, PIX_SRC, pixs, 0, y). The
+  shift AMOUNT is quantized per-band (all rows in one band get the SAME
+  integer horizontal offset), which is exactly the "shear lines" artifact
+  the file's top-of-file doc comment describes ("Jaggies are created on
+  edges of straight lines").
+  This ENTIRE algorithm reduces to: "copy horizontal bands of pixs into pixd
+  at row-dependent, band-quantized integer x-offsets, background-filled
+  elsewhere" — i.e. a discrete approximation of continuous shear via
+  rectangle-copy (rasterop), NOT a per-pixel transform loop like the AM-gray
+  kernels above. See Step 3's HAVE/NEW-LEAF note: THIS is exactly the kind of
+  "clip to intersection, copy rect" operation this repo's own
+  `leptonica-rop-callgraph.txt` (from the morph.rs wave) already documents
+  the pixRasterop semantics for.
+
+pixVShear — the exact vertical-axis mirror of pixHShear (shear.c:237-316):
+  same structure with x/y and w/h swapped: bands are VERTICAL strips (width
+  xincr, full height h) pasted at row-dependent vertical offsets. Central
+  band [xloc-initxincr, xloc+initxincr) copied with zero vertical shift, then
+  walks outward left/right growing vshift.
+
+pixHShearIP / pixVShearIP (shear.c:470-598) — same math (identical
+  tanangle/invangle/inityincr/yincr derivation) but via pixRasteropHip /
+  pixRasteropVip (in-place horizontal/vertical shift-in-place + fill, no
+  second buffer) instead of pixRasterop into a fresh pixd. Requires no
+  colormap (checked, errors out otherwise). These are what
+  pixRotateShearIP / pixRotateShearCenterIP actually call.
+
+pixHShearLI / pixVShearLI (shear.c:628-825) — linear-interpolated variants
+  (64-way subpixel interpolation along one axis only, 8/32bpp/cmap). NEVER
+  called anywhere in the skew/rotate call graph traced above (not by
+  pixFindSkew*, not by pixRotate*, not by pixRotateShear*). SKIP — dead code
+  for this wave (only ever called from warper.c, unrelated to deskew).
+
+
+STEP 6 — THE ACTUAL CONSUMER-FACING COMPOSITION (ties ARM A + ARM B together)
+==============================================================================
+This is what a real caller uses; it's the API surface this wave should
+probably actually expose, not the raw sweep/search/rotate primitives alone.
+
+pixDeskewGeneral(pixs, redsweep, sweeprange, sweepdelta, redsearch, thresh,
+                  &angle, &conf)  [skew.c:289-351]:
+  1. Default-fill any zero params (redsweep->4, sweeprange->7.0, sweepdelta->1.0,
+     redsearch->2, thresh->130) exactly as the individual defaults above.
+  2. deg2rad = 3.1415926535/180.
+  3. Binarize: `depth==1 ? clone : pixConvertTo1(pixs, thresh)`   [fixed-
+     threshold binarize, NOT Otsu — pixel value vs `thresh`; this repo's
+     existing binarize.rs (Sauvola) and xy_cut.rs::binarize_page (Otsu) are
+     BOTH more sophisticated than what leptonica does here. See Step 3 — this
+     specific fixed-threshold step is a candidate SKIP if the consumer feeds
+     an already-binarized buffer to skew-detection directly.]
+  4. ret = pixFindSkewSweepAndSearch(pixb, &angle, &conf, redsweep, redsearch,
+                                       sweeprange, sweepdelta, DefaultMinbsDelta)
+     [NOTE: always uses the DEFAULT minbsdelta=0.01, not a caller-supplied one
+      — pixDeskewGeneral has no minbsdelta parameter at all]
+  5. destroy pixb. If ret!=0: return clone of ORIGINAL pixs (not pixb).
+  6. GATE: if |angle| < MinDeskewAngle (0.1 deg) OR conf < MinAllowedConfidence
+     (3.0): return clone of ORIGINAL pixs (do not rotate).
+  7. Otherwise: pixRotate(pixs, deg2rad*angle, L_ROTATE_AREA_MAP,
+     L_BRING_IN_WHITE, 0, 0) — **on the ORIGINAL pixs** (not the binarized
+     copy), width=height=0 so pixEmbedForRotation is a no-op clone-through.
+     This confirms: for an 8bpp grey input, the correction rotation is ALWAYS
+     attempted via AREA_MAP (pixRotateAMGray), since d==8 and the angle
+     magnitude that survives the gate above (>0.1deg) is virtually always
+     well under LimitShearAngle(20deg) for real scanned pages — this is
+     exactly why the task frames pixRotateAMGray/AMGrayCorner as "the path we
+     need." SAMPLING is only reachable here if the true skew angle exceeds
+     20 degrees, essentially never for a real deskew correction.
+     If pixRotate returns NULL: falls back to clone of pixs (defensive).
+
+pixDeskew(pixs, redsearch) = pixDeskewGeneral(pixs, 0,0.0,0.0, redsearch, 0,
+  NULL, NULL)  [skew.c:209-223] — all-defaults, discard angle/conf outputs.
+
+pixFindSkewAndDeskew(pixs, redsearch, &angle, &conf) = same but returns the
+  angle/conf too [skew.c:245-261].
+
+pixDeskewBoth(pixs, redsearch) [skew.c:166-189]:
+  pix1 = pixDeskew(pixs, redsearch)               [catches horizontal-ish skew]
+  pix2 = pixRotate90(pix1, 1)                     [lossless CW 90, rotateorth.c]
+  pix3 = pixDeskew(pix2, redsearch)                [catches the ORTHOGONAL skew
+                                                     component, since the
+                                                     differential-square-sum
+                                                     detector is more sensitive
+                                                     to horizontal banding]
+  pix4 = pixRotate90(pix3, -1)                    [lossless CCW 90, undo]
+  return pix4.
+  This is a real, if slightly odd, 2-pass detector: it cannot detect skew that
+  is simultaneously present in both axes in one pass, hence the 90-degree
+  round-trip. pixRotate90 (rotateorth.c:165-377) is exact/lossless (byte
+  reshuffle, no interpolation) for any depth including 8bpp — fully read,
+  transcription is a pure index-remap, no float math at all in the depth==8
+  case (rotateorth.c:222-232 CW branch / :310-320 CCW branch for d==8).
+
+
+STEP 3 — LEAF CLASSIFICATION (HAVE / NEW-LEAF / SKIP)
+========================================================
+Checked against: crates/tesseract-ocr/src/{morph.rs,pageseg.rs,xy_cut.rs,
+image_input.rs,binarize.rs,binreduce.rs,stats.rs,conncomp.rs,rectify.rs,
+segment.rs,structured.rs} and crates/tesseract-recognizer/src/*.rs.
+
+  Function                          | Tag       | Notes
+  -----------------------------------|-----------|---------------------------
+  pixReduceRankBinaryCascade         | HAVE      | `binreduce.rs::reduce_rank_
+                                      |           | binary_cascade(&buf,w,h,
+                                      |           | [u32;4])` — signature/arg-
+                                      |           | order EXACTLY matches the
+                                      |           | 4 positional C level args
+                                      |           | (verified: skew.c's calls
+                                      |           | (1,0,0,0)/(1,1,0,0)/
+                                      |           | (1,1,2,0)/(1,2,0,0)/
+                                      |           | (1,2,2,0) all fit the
+                                      |           | existing fn's contract —
+                                      |           | 0=truncate cascade, 1..4
+                                      |           | =rank threshold). Zero new
+                                      |           | code needed for this leaf.
+  pixReduceRankBinary2 (inner)        | HAVE      | `binreduce.rs::
+                                      |           | reduce_rank_binary2` (the
+                                      |           | single-stage primitive the
+                                      |           | cascade above calls).
+  pixRotateOrth / pixRotate90 (d=8)  | NEW-LEAF  | Not present anywhere in the
+                                      |           | grep'd files. Small (index
+                                      |           | remap only for 8bpp, ~15
+                                      |           | lines); needed by
+                                      |           | pixDeskewBoth. No float
+                                      |           | math at all for d==8.
+  pixVShearCorner/Center             | NEW-LEAF  | Thin wrappers over pixVShear
+                                      |           | (below); trivial once
+                                      |           | pixVShear exists.
+  pixHShear / pixVShear (rasterop-   | NEW-LEAF  | Core shear kernel. NOT
+    band-copy kernel)                |           | present as a standalone
+                                      |           | primitive, BUT the exact
+                                      |           | "clip-to-intersection rect
+                                      |           | copy" behavior this needs
+                                      |           | is ALREADY the proven
+                                      |           | pattern in morph.rs's
+                                      |           | dilate_rect/erode_rect
+                                      |           | (per this repo's own
+                                      |           | `.claude/harvest/
+                                      |           | leptonica-rop-callgraph.
+                                      |           | txt`, banked from the
+                                      |           | morph wave). Follow that
+                                      |           | precedent exactly — do NOT
+                                      |           | re-derive rasterop clip
+                                      |           | logic from scratch.
+  pixHShearIP / pixVShearIP          | NEW-LEAF  | Same band-shift math as
+                                      |           | above but in-place (shift
+                                      |           | + refill, one buffer). Only
+                                      |           | needed if pixRotateShearIP
+                                      |           | is wanted; the deskew
+                                      |           | compositions (Step 6) never
+                                      |           | use IP. LOWER PRIORITY —
+                                      |           | could be deferred entirely
+                                      |           | for v1 of this wave.
+  pixHShearLI / pixVShearLI          | SKIP      | Dead code on this call
+                                      |           | graph (only warper.c calls
+                                      |           | them upstream); linear-
+                                      |           | interp shear is not used
+                                      |           | by deskew at all.
+  pixRotateAMGray / rotateAMGrayLow  | NEW-LEAF  | THE core grey-rotation
+                                      |           | kernel this wave exists
+                                      |           | for. ~35 lines, pure
+                                      |           | per-pixel loop, no cross-
+                                      |           | pixel state. See precision
+                                      |           | audit for the f32-
+                                      |           | truncation gotcha.
+  pixRotateAMGrayCorner /             | NEW-LEAF  | Corner-pivot sibling of the
+    rotateAMGrayCornerLow            |           | above; near-identical, no
+                                      |           | xcen/ycen offset.
+  pixRotateAMColor / *Fast            | SKIP      | 32bpp colour-only; grey
+                                      |           | OCR pipeline never touches
+                                      |           | colour. Also SKIP the
+                                      |           | 16-case switch fast-path
+                                      |           | approximation (explicitly
+                                      |           | lower quality per its own
+                                      |           | doc comment).
+  pixRotate2Shear / pixRotate3Shear  | NEW-LEAF  | Composition of pixHShear+
+                                      |           | pixVShear (2 or 3 calls +
+                                      |           | the hangle=atan(sin(angle))
+                                      |           | formula for 3-shear).
+                                      |           | Small once the shear
+                                      |           | kernel exists.
+  pixRotateShear / pixRotateShearCenter | NEW-LEAF | Thin angle-magnitude
+                                      |           | dispatch (2-shear vs
+                                      |           | 3-shear vs hard error);
+                                      |           | trivial once the two
+                                      |           | callees exist.
+  pixRotateShearIP/CenterIP           | NEW-LEAF  | Optional/deferred (see
+                                      |           | pixHShearIP note above).
+  pixRotate (top dispatch)            | NEW-LEAF  | The depth/angle-based type-
+                                      |           | override logic (Step 2) —
+                                      |           | small (~40 lines of actual
+                                      |           | branching) but is the glue
+                                      |           | every composition entry
+                                      |           | needs. For a v1 scoped to
+                                      |           | "grey 8bpp deskew
+                                      |           | correction", this can be
+                                      |           | radically simplified since
+                                      |           | d is always 8 and type is
+                                      |           | always effectively
+                                      |           | AREA_MAP for realistic
+                                      |           | angles (see Step 6 note) —
+                                      |           | but if full fidelity is
+                                      |           | wanted, transcribe the
+                                      |           | whole dispatch.
+  pixRotateBySampling                 | SKIP (v1) | Only reached for d>1 at
+                                      |           | angle>20deg (LimitShear
+                                      |           | Angle) with an explicit
+                                      |           | SHEAR request, or for 1bpp
+                                      |           | at angle>3.4deg
+                                      |           | (Max1BppShearAngle). Real
+                                      |           | deskew-correction angles
+                                      |           | never reach this for grey
+                                      |           | 8bpp. Candidate for a later
+                                      |           | wave if 1bpp-path fidelity
+                                      |           | or extreme-angle support is
+                                      |           | ever wanted.
+  pixEmbedForRotation                 | SKIP (v1) | Only fires for nonzero
+                                      |           | width/height args; the
+                                      |           | deskew composition (Step 6)
+                                      |           | always passes 0,0. Needed
+                                      |           | ONLY if a future canvas-
+                                      |           | expanding rotate is wanted
+                                      |           | (cf. this repo's existing,
+                                      |           | UNRELATED, `rectify.rs`
+                                      |           | canvas-expansion logic for
+                                      |           | keystone correction — a
+                                      |           | DIFFERENT margin problem,
+                                      |           | do not conflate the two).
+  pixRotateBinaryNice                 | SKIP      | Not on the pixFindSkew/
+                                      |           | pixDeskew*/pixRotate chain
+                                      |           | at all (standalone "nicer
+                                      |           | but slower" 1bpp rotator
+                                      |           | using blur+AM+sharpen+
+                                      |           | rethreshold). Never called
+                                      |           | by anything in this
+                                      |           | manifest.
+  pixRotateWithAlpha                  | SKIP      | 32bpp-rgba-only, unrelated
+                                      |           | to grey OCR deskew.
+  pixFindSkewOrthogonalRange           | SKIP      | Auxiliary entry, not
+                                      |           | called by pixFindSkew().
+                                      |           | See Step 1.
+  pixFindSkewSweep (standalone)        | SKIP      | Not called by pixFindSkew
+                                      |           | (uses numaFitMax instead
+                                      |           | of numaGetMax — a
+                                      |           | DIFFERENT, unused-here,
+                                      |           | algorithm variant).
+  pixFindNormalizedSquareSum           | SKIP      | Not on the call graph.
+  pixFindDifferentialSquareSum         | NEW-LEAF  | THE scoring function.
+                                      |           | Needs pixCountPixelsByRow
+                                      |           | (below) + a simple
+                                      |           | differential-square-sum
+                                      |           | loop with the nskip/skiph
+                                      |           | edge-trim logic (skew.c:
+                                      |           | 1133-1146). ~15 lines once
+                                      |           | the row-sum exists.
+  pixCountPixelsByRow                  | NEW-LEAF  | Trivial on this crate's
+                                      |           | byte-per-pixel binary
+                                      |           | convention (0=ON per
+                                      |           | binreduce.rs's documented
+                                      |           | convention) — just count
+                                      |           | zero-valued bytes per row.
+                                      |           | No lookup-table bit-trick
+                                      |           | needed (that's leptonica's
+                                      |           | packed-bit speed device,
+                                      |           | not a behavior to
+                                      |           | replicate — same "behavior
+                                      |           | not bit-trick" standard
+                                      |           | already established for
+                                      |           | reduce_rank_binary2 and
+                                      |           | conncomp.rs's raster walk).
+  pixZero                              | NEW-LEAF  | Trivial: "all bytes ==
+                                      |           | 255 (background)?" one-
+                                      |           | liner on this crate's
+                                      |           | convention.
+  pixCreateTemplate                    | N/A       | Not a distinct leaf —
+                                      |           | folds into whichever
+                                      |           | function allocates its
+                                      |           | output buffer (a
+                                      |           | same-size zero/255-filled
+                                      |           | Vec<u8>). No separate
+                                      |           | function needed.
+  pixSetBlackOrWhite                   | N/A       | Same — folds into buffer
+                                      |           | initialization (fill with
+                                      |           | 0 or 255 depending on
+                                      |           | incolor). Not a distinct
+                                      |           | leaf.
+  numaGetMax / numaGetMin              | NEW-LEAF  | Trivial linear-scan
+                                      |           | max/min-with-index over a
+                                      |           | Vec<f32>; strict `>`/`<`
+                                      |           | comparisons (first-
+                                      |           | occurrence wins on ties —
+                                      |           | numafunc1.c:453-524,
+                                      |           | verified exact bodies).
+                                      |           | Almost certainly just
+                                      |           | inline iterator code, not
+                                      |           | worth a dedicated module.
+  numaFitMax                           | SKIP      | Only used by the SKIP'd
+                                      |           | pixFindSkewSweep, not on
+                                      |           | the pixFindSkew() path.
+  pixConvertTo1(pixs,thresh) fixed-    | SKIP (v1) | Only used inside
+    threshold binarize                |           | pixDeskewGeneral's own
+                                      |           | grey->1bpp step (thresh=
+                                      |           | 130 default). This repo
+                                      |           | already has BOTH Otsu
+                                      |           | (xy_cut.rs::binarize_page)
+                                      |           | and Sauvola (binarize.rs)
+                                      |           | binarizers, either of
+                                      |           | which is a reasonable, if
+                                      |           | not bit-identical,
+                                      |           | substitute for skew-
+                                      |           | DETECTION purposes (the
+                                      |           | detector only needs A
+                                      |           | binary image, not
+                                      |           | leptonica's SPECIFIC
+                                      |           | fixed-threshold one). If
+                                      |           | bit-exact
+                                      |           | pixDeskewGeneral parity is
+                                      |           | ever required, this is a
+                                      |           | ~5-line NEW-LEAF (pixel <
+                                      |           | thresh -> ON), trivial,
+                                      |           | just not needed for a v1
+                                      |           | that already binarizes
+                                      |           | upstream in the existing
+                                      |           | pipeline.
+
+Rough NEW-LEAF line-count estimate for a v1 scoped to "grey 8bpp deskew,
+corner-pivot sweep, AREA_MAP correction, no embedding, no IP variants":
+  pixCountPixelsByRow + pixZero + pixFindDifferentialSquareSum  ~35 lines
+  numaGetMax/numaGetMin (inline)                                ~15 lines
+  pixHShear/pixVShear (band-rasterop kernel, shared code)       ~90 lines
+  pixVShearCorner/Center (thin wrappers)                        ~10 lines
+  pixFindSkewSweepAndSearchScorePivot (the full algorithm)     ~140 lines
+  pixRotateAMGray + Corner (both kernels)                       ~90 lines
+  pixRotate2Shear/3Shear/RotateShear (dispatch+compose)         ~60 lines
+  pixRotate (simplified grey-only dispatch)                     ~40 lines
+  pixRotate90 (d=8 only)                                        ~20 lines
+  pixDeskewGeneral/pixDeskew/pixDeskewBoth (composition)         ~60 lines
+  --------------------------------------------------------------------
+  Total                                                        ~560 lines
+  (comparable in size to the already-shipped rectify.rs wave; NOT a small leaf)
+
+
+STEP 4 — PRECISION AUDIT (every f32/f64/int-width site that matters)
+=======================================================================
+
+  1. skew.c:324 `deg2rad = 3.1415926535 / 180.;`
+     `deg2rad` is declared `l_float32` (skew.c:300). RHS is TWO f64 literals
+     divided in f64, THEN narrowed to f32 on assignment. Re-declared
+     IDENTICALLY at skew.c:443 (pixFindSkewSweep, SKIP'd) and skew.c:708
+     (pixFindSkewSweepAndSearchScorePivot, the ACTUAL path) — same exact
+     literal digit string both times. Rust must compute
+     `(3.1415926535_f64 / 180.0_f64) as f32`, NOT
+     `3.1415926535_f32 / 180.0_f32` — these can differ in the last bit.
+
+  2. shear.c:840 `pi2 = 3.14159265 / 2.0;` inside normalizeAngleForShear —
+     a DIFFERENT pi literal (`3.14159265`, one fewer digit than skew.c's
+     `3.1415926535`) used for a DIFFERENT purpose (angle range-folding
+     guard, not degree/radian conversion). Do not conflate the two literals
+     or assume they're meant to be the same precision — they are textually
+     different constants in the C source, both approximating pi but to
+     different digit counts, and each must be reproduced with ITS OWN exact
+     literal, not a shared `std::f32::consts::PI` or `std::f64::consts::PI`
+     (which would be MORE precise than either C literal and could diverge in
+     the last bit for edge-of-range angles near +-pi/2).
+
+  3. rotateam.c:412-413 (rotateAMGrayLow) and :702-703
+     (rotateAMGrayCornerLow): `sina = 16. * sin(angle); cosa = 16. * cos(angle);`
+     — `sina`/`cosa` are DECLARED `l_float32` (rotateam.c:406, :698), but the
+     RHS `16. * sin(angle)` is computed in f64 (the `16.` literal is a C
+     double, `sin()` takes/returns double, `angle` (l_float32 param) is
+     promoted to double for the call) and ONLY THEN narrowed/rounded to f32
+     on assignment. This is the SAME "compute-in-f64-then-truncate-once"
+     pattern already flagged as a gotcha for pixScale's area-map corners in
+     this repo's own CLAUDE.md history — except here it's inverted in
+     structure: pixScale keeps f64 all the way through its corner formula,
+     while THIS kernel truncates to f32 ONCE up front and then runs the
+     ENTIRE per-pixel inner loop (`xpm = (l_int32)(-xdif*cosa - ydif*sina)`
+     etc.) in f32 precision (because C's usual arithmetic conversions promote
+     the `l_int32 xdif`/`ydif` operands to match the `l_float32` cosa/sina,
+     not up to double). Rust must replicate BOTH halves exactly:
+       `let cosa = (16.0_f64 * f64::from(angle).cos()) as f32;`
+       `let sina = (16.0_f64 * f64::from(angle).sin()) as f32;`
+       ... then do the per-pixel `xpm`/`ypm` arithmetic in f32 (e.g.
+       `let xpm = (-(xdif as f32) * cosa - (ydif as f32) * sina) as i32;`).
+     Getting either half wrong (all-f32 sina/cosa computation, OR promoting
+     the per-pixel loop to f64) risks last-bit divergence from the C oracle
+     on SOME angles, even though most angles will happen to match either way
+     — this is exactly the kind of silent, hard-to-detect drift a byte-parity
+     harness across MANY angles (not just one) is needed to catch.
+
+  4. rotateam.c per-pixel casts `(l_int32)(...)` (e.g. rotateam.c:349-350,
+     420-421, 641-642, 708-709): C `(l_int32)` cast on a float TRUNCATES
+     TOWARD ZERO, no rounding offset added (contrast with
+     pixEmbedForRotation's `+0.5` round-half-up convention, item 6 below).
+     Rust's `as i32` on an f32/f64 ALSO truncates toward zero for in-range
+     finite values (differs from C only in its defined, saturating behavior
+     for out-of-range/NaN inputs, which should never occur here given the
+     bounded pixel-index arithmetic) — so a direct `as i32` is correct here,
+     but do NOT reflexively add a `+0.5` "for rounding" the way one might
+     copy from the embed-sizing code area — that would introduce a real
+     divergence.
+
+  5. rotateam.c:351/423 etc. `xp = xcen + (xpm >> 4);` — arithmetic
+     (sign-extending) right shift on a possibly-negative `l_int32`. C's `>>`
+     on signed negative operands is formally implementation-defined, but
+     GCC/clang (and therefore the actual built liblept.so we're matching)
+     both implement it as arithmetic shift. Rust's `>>` on `i32` IS
+     arithmetic shift by language guarantee — so `xpm >> 4` transcribes
+     directly with no adjustment needed. (Flagging this only because it's
+     the kind of operator a careless transcode might "fix" by inserting an
+     unsigned shift or manual sign-correction that isn't actually needed.)
+
+  6. rotate.c:264-279 (pixEmbedForRotation, SKIP'd for v1 but documented for
+     completness / a future wave): `l_float64 sina, cosa, fw, fh;` — ALL
+     declared f64 here (unlike rotateam.c's f32 locals) and angle/w/h are
+     promoted UP to f64 for cos/sin and the multiplies, so this whole
+     computation stays in f64 throughout, THEN each of w1/w2/h1/h2 rounds via
+     `(l_int32)(L_ABS(...) + 0.5)` — abs first, then +0.5, then truncate —
+     i.e. round-half-up on a always-non-negative value (no negative-rounding
+     ambiguity possible). This is a DIFFERENT rounding convention than the
+     AM-gray kernel's plain truncate-toward-zero (item 4) — do not conflate
+     the two; if this function is ever ported, use `(x.abs() + 0.5) as i32`,
+     not the AM kernel's `x as i32`.
+
+  7. rotate.c:264-265 `maxside = (l_int32)(sqrt((l_float64)(width*width) +
+     (l_float64)(height*height)) + 0.5);` — `width*width` and `height*height`
+     are computed in `l_int32 * l_int32` arithmetic (32-bit signed) BEFORE
+     the cast to f64 for the sqrt. For `width` or `height` > ~46340, this
+     square overflows a 32-bit signed int (implementation-defined/UB in C,
+     but in practice wraps on twos-complement GCC with `-fwrapv` or silently
+     produces a nonsensical value otherwise). This is a PRE-EXISTING
+     dormant bug/risk in the C original, not something to "fix" — but if
+     ported literally with Rust's checked/panicking-on-overflow-in-debug
+     `i32` multiply, a debug build would PANIC where the C code would
+     silently misbehave. Recommend either (a) explicitly widen to i64/f64
+     BEFORE squaring in the Rust port (arguably an intentional, disclosed
+     deviation — flag it as such if chosen), or (b) use `wrapping_mul` to
+     byte-match the C UB exactly for parity-testing purposes. This only
+     matters at all if pixEmbedForRotation is ever implemented (SKIP'd for
+     v1 since width=height=0 is always passed by the deskew compositions,
+     which take the embedding no-op branch entirely).
+
+  8. skew.c:924 `minthresh = MinscoreThreshFactor * width * width * height;`
+     — `MinscoreThreshFactor` is `l_float32` (0.000002), `width`/`height` are
+     `l_int32` (from `pixGetWidth/pixGetHeight` on `pixsch`). C's usual
+     arithmetic conversions promote the `l_int32` operands to `l_float32` to
+     match the float literal's type (NOT to double), so this ENTIRE product
+     is computed in f32 precision. For realistic page dimensions (width up
+     to a few thousand pixels), `width*width*height` can reach ~10^10-10^11
+     in magnitude before the 0.000002 scaling — f32 has ~7 decimal digits of
+     precision, so intermediate rounding here is real and must be replicated
+     as `(width as f32) * (width as f32) * (height as f32) *
+     MINSCORE_THRESH_FACTOR` (left-to-right, all f32), NOT computed in f64
+     and then narrowed, and NOT reordered (floating multiply is not strictly
+     associative, so `width*width*height` vs `height*width*width` could
+     differ in the last few bits — transcribe the EXACT left-to-right order
+     `MinscoreThreshFactor * width * width * height` as C evaluates it).
+
+  9. skew.c:1138-1140 (pixFindDifferentialSquareSum):
+     `skiph = (l_int32)(0.05 * w);` — `0.05` is a C double literal, `w` is
+     `l_int32` promoted to double, product computed in f64, THEN truncated
+     (toward zero) to `l_int32`. This is a DIFFERENT precision path than
+     item 8 (here it genuinely IS f64 since there's no f32-typed operand to
+     force the narrower conversion) — `(0.05_f64 * w as f64) as i32` in Rust.
+     `skip = L_MIN(h/10, skiph)` — pure integer arithmetic (`h/10` is integer
+     division, truncating), no float involved.
+     `nskip = L_MAX(skip/2, 1)` — same, pure integer.
+
+  10. NUMA score/angle values throughout skew.c are `l_float32` end-to-end
+      (NUMA arrays are f32-backed in leptonica) — the differential-square-sum
+      accumulation (`sum += diff*diff` at skew.c:1150) is a SEQUENTIAL f32
+      accumulation over up to a few thousand terms (one per image row); Rust
+      must accumulate in `f32` with the SAME iteration order (row 0 to row
+      h-1, skipping nskip at each end) to match — an `f64` accumulator
+      (tempting for "more precision") would NOT match the C oracle bit-for-
+      bit on images with enough rows for f32 rounding to accumulate
+      differently than f64-then-narrow would.
+
+  11. rotateshear.c's `hangle = atan(sin(angle));` (rotateshear.c:367,
+      pixRotate3Shear) and rotateshear.c:444 (pixRotateShearIP) — both
+      `angle`/`hangle` are `l_float32` locals; `atan`/`sin` are C double
+      functions, so `angle` promotes to double, `sin(angle)` returns double,
+      `atan(double)` returns double, narrowed to f32 `hangle` on assign.
+      Same "compute in f64, truncate once" pattern as item 3 — replicate as
+      `let hangle = f64::from(angle).sin().atan() as f32;`, not an all-f32
+      computation.
+
+
+STEP 5 — ORACLE PROPOSAL (sketch only, not built)
+====================================================
+Match the established style of `sauvola_oracle.cpp` / `pageseg_regions_oracle.cpp`
+banked in `.claude/harvest/oracles/`: `#include <leptonica/allheaders.h>`,
+build with `g++ -std=c++17 <file>.cpp -llept -o /tmp/<name>`, deterministic
+generated fixture (not a blank/uniform image — a prior wave explicitly learned
+"a uniform/blank fixture proves nothing"), dump plain-text rows the Rust side
+re-parses via `include_str!` in a test.
+
+Two oracles needed (one per arm), plus a THIRD combined one for the
+composition entry points:
+
+  1. `skew_find_oracle.cpp` — ARM A only.
+     Fixture: NOT blank. Needs a fixture with REAL horizontal structure for
+     the differential-square-sum detector to have signal at all (per skew.c's
+     own doc comment: "has maximum contributions from the baselines and
+     x-height lines of text... rejects background noise"). Build a
+     deterministic 1bpp raster of N horizontal "text-line-like" stripe bands
+     (e.g. 5px-on/7px-off repeating bands across most of the width, several
+     bands down the height — similar spirit to this repo's own
+     `pageseg_regions_oracle.cpp`'s "two columns of horizontal char-stripes"
+     fixture) THEN pre-rotate that binary image by a KNOWN small angle
+     (e.g. 2.5 degrees) using the C library's OWN pixRotate/pixRotateShear
+     (this is legitimate — we are testing pixFindSkew's ability to recover a
+     known-injected angle, and using the library's own rotator to inject it
+     is standard practice and unambiguous since we are diffing OUR
+     transcoded detector against the ORACLE's detector on the SAME rotated
+     image, not testing the rotator here). Call the REAL
+     `pixFindSkewSweepAndSearchScorePivot` (both pivot values) with several
+     `(redsweep,redsearch)` combos including the true default (4,2). Dump:
+     recovered angle, conf, and (for a deeper falsifier) the raw
+     (theta,score) arrays from the coarse sweep AND the final 3/5-point
+     binary-search scores, so a Rust-side bug in the search/refine logic
+     (not just the final angle) is caught, not just masked by an
+     approximately-correct final answer.
+     A rotation of AT LEAST a few degrees (not <0.5deg) is needed so the
+     recovered angle is unambiguously distinguishable from 0 and from
+     sweep-edge noise — but must stay well under sweeprange(7deg) so it
+     doesn't trip the "max found at sweep edge" degenerate-success path
+     (unless a SEPARATE fixture is deliberately built to exercise THAT path,
+     which is worth a dedicated small test given how surprising its
+     return-0-with-angle-0 semantics are — see Step 1 item under "GUARD").
+
+  2. `rotate_am_gray_oracle.cpp` — ARM B grey path only, decoupled from ARM A.
+     Fixture: a deterministic 8bpp grey gradient/checkerboard-ish pattern (NOT
+     flat) so area-map interpolation has non-trivial sub-pixel blending to
+     get right (a flat image would make every v00..v11 term identical,
+     hiding any indexing/interpolation-weight bug). Call the REAL
+     `pixRotateAMGray` AND `pixRotateAMGrayCorner` directly (bypass pixRotate's
+     dispatch entirely for this oracle — test the KERNEL, not the dispatch)
+     across several angles spanning small (~1deg), medium (~10deg), and
+     near-the-8bpp-realistic-limit (~19deg, just under LimitShearAngle) to
+     stress the `xpm`/`ypm` fixed-point math and the off-edge fill path at
+     different shear severities. Dump every output pixel value (small fixture,
+     e.g. 40x30, so a full dump is cheap and gives a per-pixel diff, not just
+     an aggregate checksum — needed to localize an off-by-one in the wm2/hm2
+     edge test or the 16-subpixel weighting if the byte-parity test ever
+     goes red).
+     ALSO exercise `pixRotate2Shear`/`pixRotate3Shear` directly (8bpp input,
+     since shear works on any depth) at angles that hit BOTH branches
+     (<=0.06 rad and >0.06 rad) to nail the hangle=atan(sin(angle)) 3-shear
+     formula independently of the AM path.
+
+  3. `deskew_composition_oracle.cpp` — the full pixDeskewGeneral/pixDeskew/
+     pixDeskewBoth round-trip, dumping BOTH the reported (angle,conf) AND a
+     full pixel dump of the corrected output, on the SAME injected-rotation
+     fixture as oracle 1 but supplied as an 8bpp GREY image (not pre-
+     binarized) so the fixed-threshold-130 binarize-for-detection step
+     (skew.c:327-331) is actually exercised end-to-end, and the final
+     AREA_MAP correction runs on the grey original per the Step 6 trace.
+     This is the falsifier that would catch a seam bug between ARM A's
+     detected angle and ARM B's degrees-to-radians conversion / rotation
+     application (e.g. a sign error in "the angle is the negative of the
+     skew angle" — a class of bug that a per-arm-only test could miss if
+     both arms happened to have a compensating sign error).
+
+None of these fixtures should be blank/uniform (explicit prior-wave lesson,
+repeated verbatim in the task prompt) — every one above has real, deliberately
+non-trivial structure (stripes, a pre-injected known rotation, a non-flat grey
+gradient) specifically chosen to make each of the falsifiers above ACTUALLY
+capable of failing if the corresponding Rust logic is wrong.
+
+
+OPEN QUESTIONS / BIGGEST RISKS FOR WHOEVER PICKS UP THIS WAVE
+================================================================
+1. Scope decision needed: is IP-variant support (pixRotateShearIP, in-place
+   3-shear) actually wanted for v1? The deskew composition entries never use
+   it — recommend deferring pixHShearIP/pixVShearIP/pixRotateShearIP entirely
+   unless a specific consumer need surfaces.
+2. Scope decision needed: is bit-exact `pixConvertTo1(pixs,130)` binarization
+   worth adding as a dedicated leaf, or is reusing the existing Otsu/Sauvola
+   binarizer acceptable for skew DETECTION (the detector's OWN gate,
+   `MinValidMaxscore`/`MinscoreThreshFactor`/`MinAllowedConfidence`, was
+   tuned against leptonica's specific fixed-threshold binarization — a
+   different binarizer could shift the pixel counts enough to change WHICH
+   images clear the confidence gate, even if it never changes the underlying
+   detected ANGLE much). This is a genuine behavioral-fidelity question, not
+   just a style choice — recommend a probe (run both binarizers on the same
+   real scanned page, compare pixFindSkew's angle/conf output) before
+   deciding, rather than assuming Otsu is "close enough."
+3. The single sharpest correctness risk is the f32-truncation-then-f32-loop
+   pattern in `rotateAMGrayLow`/`rotateAMGrayCornerLow` (precision audit item
+   3) — it is easy to write a Rust version that LOOKS right, passes a coarse
+   eyeball check, and even matches the C oracle on MOST test angles, while
+   still diverging by ±1 grey level on a minority of pixels at specific
+   angles where the f64-vs-f32 rounding boundary falls differently. The
+   oracle in Step 5 item 2 is deliberately designed to catch this (multiple
+   angles, non-flat fixture, full per-pixel dump) — do not shortcut it to a
+   single angle or a flat fixture.
+4. `pixFindSkewSweepAndSearchScorePivot`'s "max found at sweep edge" path
+   (Step 1, the GUARD note) returns SUCCESS (0) with angle=0/conf=0 rather
+   than an error — if this gets translated into a Rust `Option`/`Result` type
+   during the actual port, make sure the None/Err case is reserved for the
+   TRUE error paths (allocation failure, all-zero image) and the sweep-edge
+   case returns `Some((0.0, 0.0))` or equivalent, matching the C function's
+   actual return-value contract, not the more "obvious" choice of treating
+   every non-full-success path as an error.
+5. Confirm which convention `tesseract-ocr`'s GREY buffers use (0=black
+   literal intensity vs any inversion) before writing `rotateAMGrayLow` —
+   this manifest assumes (based on the general pattern of image_input.rs's
+   grey-pixel handling referenced in CLAUDE.md, e.g. "ComputeBlackWhite") that
+   grey buffers carry RAW 0-255 leptonica-native intensity with NO inversion
+   (unlike the BINARY 0=ink/255=background convention documented in
+   binreduce.rs, which is a DIFFERENT buffer type). This should be verified
+   against `image_input.rs`'s actual doc comments before implementation,
+   since getting this backwards would silently invert every rotated grey
+   image's fill-color semantics (`grayval` for off-edge pixels) without
+   necessarily breaking any byte-parity test that only checks IN-BOUNDS
+   interpolated pixels on a fixture with no rotation-exposed edges.

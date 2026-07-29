@@ -135,8 +135,8 @@ fn resolution_grid_holds_the_8_7_0_pattern() {
             .join(" ")
     );
 
-    // Multi-column reading order: 16 cells × 6 lines each. A merged
-    // across-the-gutter reading would produce ~12 full-width lines instead.
+    // Multi-column reading order: 16 cells × 3 lines each. A merged
+    // across-the-gutter reading would produce ~6 full-width lines instead.
     assert!(
         line_count >= 44,
         "expected ~48 per-cell lines (16 cells x 3), got {line_count} \

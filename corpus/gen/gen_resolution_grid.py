@@ -50,7 +50,7 @@ from PIL import Image, ImageDraw, ImageFont
 FONT_PATH = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
 FONT_PX = 22
 
-# Authored here (license-clean): six short dictionary-word lines, ASCII-only
+# Authored here (license-clean): three short dictionary-word lines, ASCII-only
 # (WinAnsi-safe for the searchable-PDF overlay CI).
 # Three lines keeps the whole 16-cell grid inside a CI-viable runtime
 # (recognition cost is ~linear in total lines: 16 cells x 3 lines).

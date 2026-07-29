@@ -211,6 +211,30 @@ The eng.lstm front-end: `Input → [C3,3Ft16] (Convolve+Reconfig) → Mp3,3 (Max
 
 ### Phase C — completeness (C2 is a B3 prereq; C1/C3 are the deferred accuracy waves)
 
+> **⚠ STATUS CORRECTION (2026-07-29).** The C1 and C2 bullets below are the
+> ORIGINAL SCOPING and are **stale as status** — both have since SHIPPED. They
+> are kept unedited as the record of what was scoped; read them as history, not
+> as open work. Verified in `crates/tesseract-core/src/recodebeam.rs`:
+>
+> - **C1 — dict / LM beam: SHIPPED.** `continue_dawg` (:969, citing
+>   `recodebeam.cpp:1057-1136`), `push_initial_dawg_if_better` (:1130), the
+>   `is_dawg` beam indexing (`beam_index`/`is_dawg_from_index`, :158-175, used
+>   at :703 and :1378-1383), and the `dict: Option<DictLite>` /
+>   `dict_ratio` / `cert_offset` / `worst_dict_cert` scoring fields (:361-372)
+>   are all present, over `DictLite::def_letter_is_okay`. The production beam
+>   params captured live from the CLI (`dict_ratio=2.25`, `cert_offset=-0.085`,
+>   `worst_dict_cert=-25/7`) are recorded in the CTC correction note in
+>   `CLAUDE.md`; the dict arm has a golden anchor at
+>   `corpus/golden/lines/line36.dict.tsv`.
+> - **C2 — `ExtractBestPathAsUnicharIds`: SHIPPED.**
+>   `extract_best_path_as_unichar_ids` (:1500) returns
+>   `(unichar_ids, certs, ratings, xcoords)` as scoped, and the `certainty`
+>   field the bullet asks to "re-add when C2 lands" is back on `RecodeNode`
+>   (:219).
+>
+> **Genuinely still open in Phase C: C3 only** (plus the deferred sub-leaves
+> listed at the end of this section).
+
 - **C1 — dict / language-model beam.** The dawg machinery skipped in 7b:
   `ContinueDawg`, `PushInitialDawgIfBetter`, `DawgPositionVector`, the
   `is_dawg` beams, `worst_dict_cert`/`dict_ratio` scoring (`recodebeam.cpp:1057-
