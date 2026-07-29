@@ -15,8 +15,9 @@
 //
 // Arms (argv[1]):
 //   findskew  <pgm> <thresh>
-//   sweep     <pgm> <thresh> <redsweep> <sweeprange> <sweepdelta>
-//   dss       <pgm> <thresh> <angle_deg>
+//   sweep     <pgm> <thresh> <redsweep> <redsearch> <sweepcenter> <sweeprange>
+//             <sweepdelta> <minbsdelta> <pivot 1=corner|2=center>
+//   dss       <pgm> <thresh> <angle_deg> <pivot 1=corner|2=center>
 //   rotamgray <pgm> <angle_deg> <grayval>
 //   deskew    <pgm> <redsearch>
 //
@@ -122,21 +123,48 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  // ── ARM 2: pixFindSkewSweep — the sweep half alone, explicit params. ──────
-  // Isolates the coarse sweep from the refinement search, so a Rust
-  // discrepancy can be localized to one of the two halves instead of only
-  // being visible in the composed answer.
+  // ── ARM 2: the REAL sweep-and-search, with explicit parameters. ──────────
+  //
+  // ⚠ CORRECTED (codex P1 on PR #58). This arm previously called
+  // `pixFindSkewSweep` — the standalone sweep-only API. That was WRONG as a
+  // D4 oracle for two compounding reasons:
+  //   (a) it is NOT on `pixFindSkew`'s call path at all (the manifest's own
+  //       STEP 3 classifies it SKIP for exactly that reason), and
+  //   (b) it refines its coarse maximum with `numaFitMax`, whereas the
+  //       targeted `pixFindSkewSweepAndSearchScorePivot` takes the RAW coarse
+  //       maximum and then does a binary-search refinement.
+  // So its output could neither isolate nor validate the algorithm D4 is
+  // transcoding: a real sweep/search discrepancy would be invisible here, or
+  // worse, misdiagnosed as a scoring bug. Always exercise the entry point the
+  // production path actually reaches.
+  //
+  // `pendscore` is dumped too — it is the raw objective at the returned
+  // angle, which lets a failing angle diff be split into "the score function
+  // differs" vs "the search walked differently over the same scores".
   if (!strcmp(arm, "sweep")) {
-    if (argc < 7) { fprintf(stderr, "sweep needs <thresh> <redsweep> <range> <delta>\n"); return 2; }
+    if (argc < 11) {
+      fprintf(stderr,
+              "sweep needs <thresh> <redsweep> <redsearch> <sweepcenter> "
+              "<sweeprange> <sweepdelta> <minbsdelta> <pivot 1=corner|2=center>\n");
+      return 2;
+    }
     PIX* pixg = read_grey(path);
     if (!pixg) return 1;
     PIX* pixb = to_binary(pixg, atoi(argv[3]));
-    l_float32 angle = 0.0f;
-    l_int32 rc = pixFindSkewSweep(pixb, &angle, atoi(argv[4]),
-                                  static_cast<l_float32>(atof(argv[5])),
-                                  static_cast<l_float32>(atof(argv[6])));
+    l_float32 angle = 0.0f, conf = 0.0f, endscore = 0.0f;
+    l_int32 rc = pixFindSkewSweepAndSearchScorePivot(
+        pixb, &angle, &conf, &endscore,
+        atoi(argv[4]),                                   // redsweep
+        atoi(argv[5]),                                   // redsearch
+        static_cast<l_float32>(atof(argv[6])),           // sweepcenter
+        static_cast<l_float32>(atof(argv[7])),           // sweeprange
+        static_cast<l_float32>(atof(argv[8])),           // sweepdelta
+        static_cast<l_float32>(atof(argv[9])),           // minbsdelta
+        atoi(argv[10]));                                 // pivot
     printf("rc\t%d\n", rc);
     print_f32("angle", angle);
+    print_f32("conf", conf);
+    print_f32("endscore", endscore);
     pixDestroy(&pixg);
     pixDestroy(&pixb);
     return 0;
@@ -148,20 +176,43 @@ int main(int argc, char** argv) {
   // falsifier of the whole detector: if the score function matches pointwise,
   // any remaining angle discrepancy is in the search strategy, not the metric.
   // It also pins the angle SIGN convention empirically.
+  //
+  // ⚠ CORRECTED (codex P1 on PR #58). This arm previously prepared `pixr`
+  // with `pixRotateShearCenter` — a COMPOSED two/three-shear *rotation*. The
+  // sweep does not do that: it applies a SINGLE vertical shear
+  // (`pixVShearCorner` / `pixVShearCenter`, selected by its `pivot`
+  // argument). Those produce different pixels, hence different scores, so the
+  // old arm was actively harmful as a D3 gate — a CORRECT single-vertical-
+  // shear transcode would have failed it, while an implementation of the
+  // wrong operation could have passed. The rule this cost: an oracle must
+  // reproduce the operation under test, not merely something in its
+  // neighbourhood that "also rotates".
   if (!strcmp(arm, "dss")) {
-    if (argc < 5) { fprintf(stderr, "dss needs <thresh> <angle_deg>\n"); return 2; }
+    if (argc < 6) {
+      fprintf(stderr, "dss needs <thresh> <angle_deg> <pivot 1=corner|2=center>\n");
+      return 2;
+    }
     PIX* pixg = read_grey(path);
     if (!pixg) return 1;
     PIX* pixb = to_binary(pixg, atoi(argv[3]));
     l_float32 deg = static_cast<l_float32>(atof(argv[4]));
-    l_float32 rad = deg * 3.14159265358979323846f / 180.0f;
-    // Shear-rotate about the center, matching what the sweep does internally
-    // to score a candidate angle on 1bpp.
-    PIX* pixr = pixRotateShearCenter(pixb, rad, L_BRING_IN_WHITE);
+    l_int32 pivot = atoi(argv[5]);
+    // skew.c's own degree->radian constant: an f64 division narrowed to f32
+    // on assignment (audit §1). Reproduced exactly rather than via a shared
+    // PI constant, which would be MORE precise than the C literal and can
+    // differ in the last bit.
+    l_float32 deg2rad = static_cast<l_float32>(3.1415926535 / 180.);
+    l_float32 rad = deg * deg2rad;
+    // The SINGLE vertical shear the sweep actually scores, pivot-selected.
+    PIX* pixr = (pivot == L_SHEAR_ABOUT_CORNER)
+                    ? pixVShearCorner(nullptr, pixb, rad, L_BRING_IN_WHITE)
+                    : pixVShearCenter(nullptr, pixb, rad, L_BRING_IN_WHITE);
+    if (!pixr) { fprintf(stderr, "vshear failed\n"); return 1; }
     l_float32 sum = 0.0f;
     l_int32 rc = pixFindDifferentialSquareSum(pixr, &sum);
     printf("rc\t%d\n", rc);
     print_f32("deg", deg);
+    printf("pivot\t%d\n", pivot);
     print_f32("sum", sum);
     pixDestroy(&pixg);
     pixDestroy(&pixb);
