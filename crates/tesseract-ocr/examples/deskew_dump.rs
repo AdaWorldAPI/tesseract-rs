@@ -1,14 +1,19 @@
-//! Byte-parity dump CLI for the deskew wave's three leaves shipped in
+//! Byte-parity dump CLI for the deskew wave's leaves shipped in
 //! `tesseract_ocr::deskew` (D1 `rotate90_grey`, D2
-//! `find_differential_square_sum`, D5 `rotate_am_gray`/`rotate_am_gray_corner`).
-//! Output mirrors `.claude/harvest/oracles/skew_oracle.cpp`'s own
-//! `print_f32`/`dump_pix` helpers exactly, so it is directly `diff`-able
-//! against that oracle's stdout.
+//! `find_differential_square_sum`, D3 `v_shear_corner`/`v_shear_center`, D4
+//! `find_skew_sweep_and_search_score_pivot`, D5
+//! `rotate_am_gray`/`rotate_am_gray_corner`). Output mirrors
+//! `.claude/harvest/oracles/skew_oracle.cpp`'s own `print_f32`/`dump_pix`
+//! helpers exactly, so it is directly `diff`-able against that oracle's
+//! stdout.
 //!
 //! ## Arms
 //! ```text
 //!   deskew_dump rot90           <pgm> <direction>
-//!   deskew_dump dss             <pgm> <thresh> <angle_deg>
+//!   deskew_dump dss             <pgm> <thresh> <angle_deg> <pivot 1=corner|2=center>
+//!   deskew_dump vshear          <pgm> <thresh> <angle_deg> <pivot 1=corner|2=center>
+//!   deskew_dump sweep           <pgm> <thresh> <redsweep> <redsearch> <sweepcenter>
+//!                               <sweeprange> <sweepdelta> <minbsdelta> <pivot 1=corner|2=center>
 //!   deskew_dump rotamgray       <pgm> <angle_deg> <grayval>
 //!   deskew_dump rotamgraycorner <pgm> <angle_deg> <grayval>
 //! ```
@@ -18,26 +23,46 @@
 //! `pixRotate90` through its own `dump_pix` helper. **Verified byte-identical
 //! both directions on a full 512×720 page.**
 //!
-//! ## `dss` — a real scope seam, read before trusting a diff
-//! The oracle's `dss` arm does MORE than this crate's `find_differential_
-//! square_sum`: it binarizes, applies a **single vertical shear**
-//! (`pixVShearCorner` / `pixVShearCenter`, pivot-selected — leaf D3, NOT
-//! shipped here), THEN scores the sheared result. This arm only binarizes +
-//! scores, so it is comparable to the oracle ONLY where that shear is a
-//! no-op: `angle_deg = 0.0`, at which **both pivots return the identical sum
-//! (verified: 258022 on `page_01`)**, confirming the shear contributes
-//! nothing there. **Verified byte-identical at angle 0.**
+//! ## `dss` — now the REAL D2+D3 end-to-end falsifier, at any angle
+//! D3 (`v_shear_corner`/`v_shear_center`) is shipped, so this arm now
+//! reproduces the oracle's `dss` arm EXACTLY: binarize, apply the SINGLE
+//! vertical shear the sweep actually performs (`v_shear_corner`/
+//! `v_shear_center`, pivot-selected, using [`skew_deg_to_rad`] —
+//! `skew.c`'s OWN `deg2rad`, NOT [`oracle_deg_to_rad`]), THEN score with
+//! `find_differential_square_sum`. Previously this arm only binarized +
+//! scored (comparable to the oracle ONLY at `angle_deg = 0.0`, where the
+//! shear is a no-op) — that limitation is closed now that D3 exists, and the
+//! signature grew a REQUIRED 4th `<pivot>` argument to match the oracle's own
+//! `dss` signature exactly (`<pgm> <thresh> <angle_deg> <pivot
+//! 1=corner|2=center>`).
 //!
-//! To exercise D2 at other effective angles, pre-rotate the INPUT PGM
-//! externally and pass `angle_deg = 0.0` to BOTH sides — `deg` is pure
-//! pass-through metadata here, never a rotation trigger. Do not read a `dss`
-//! diff at nonzero `angle_deg` as D2 parity evidence until D3 lands and this
-//! arm is extended to call it.
+//! ## `vshear` — D3's raw sheared-buffer dump (diagnostic; no oracle arm yet)
+//! Dumps the FULL sheared 1bpp buffer via [`dump_pix`], polarity-flipped to
+//! leptonica's native convention (`1 = ON`, vs this crate's `0 = ON` — see
+//! [`threshold_to_binary`]'s own boundary-flip precedent). **No oracle-side
+//! counterpart exists for this arm yet** (`skew_oracle.cpp` has no matching
+//! per-pixel `vshear` dump — only the scalar-scoring `dss` arm exercises
+//! `pixVShearCorner`/`pixVShearCenter`), so there is nothing to `diff` this
+//! against mechanically today. It exists for manual/visual inspection and as
+//! the natural extension point for a future oracle arm. **The real
+//! byte-parity evidence for D3 is the updated `dss` arm above** — it already
+//! reproduces the oracle's OWN `pixVShearCorner`/`pixVShearCenter` +
+//! `pixFindDifferentialSquareSum` composition end-to-end, at any angle, and
+//! IS diffable today.
 //!
-//! (The oracle originally used `pixRotateShearCenter` here — a COMPOSED
-//! two/three-shear rotation, not the single shear the sweep performs. A
-//! correct D3 would have FAILED that arm while a wrong one could have
-//! passed; corrected per codex P1 on PR #58.)
+//! ## `sweep` — the D4 detector, matching the oracle's `sweep` arm exactly
+//! Same positional signature as `skew_oracle.cpp`'s `sweep` arm (which itself
+//! calls the REAL `pixFindSkewSweepAndSearchScorePivot`, not the unrelated
+//! `pixFindSkewSweep`). Always prints `rc`/`angle`/`conf`/`endscore` in that
+//! order, even on `rc = 1` (matching the C's own contract of initializing all
+//! three outputs to `0.0` before any validation) — the Rust
+//! [`find_skew_sweep_and_search_score_pivot`] returning `None` maps to
+//! `rc = 1` with all three fields printed as `0.0`, never an omitted line.
+//!
+//! (The oracle originally used `pixRotateShearCenter` in its `dss` arm — a
+//! COMPOSED two/three-shear rotation, not the single shear the sweep
+//! performs. A correct D3 would have FAILED that arm while a wrong one could
+//! have passed; corrected per codex P1 on PR #58.)
 //!
 //! ## `rotamgray` / `rotamgraycorner` — the degrees→radians seam
 //! `rotate_am_gray`/`rotate_am_gray_corner` take RADIANS (matching
@@ -70,16 +95,21 @@
 //! cargo run -q -p tesseract-ocr --example deskew_dump -- rotamgray in.pgm 2.5 255 > /tmp/r_ramg.tsv
 //! diff /tmp/o_ramg.tsv /tmp/r_ramg.tsv
 //!
-//! /tmp/skew_oracle dss in.pgm 128 0 > /tmp/o_dss.tsv
-//! cargo run -q -p tesseract-ocr --example deskew_dump -- dss in.pgm 128 0 > /tmp/r_dss.tsv
+//! /tmp/skew_oracle dss in.pgm 128 2.5 1 > /tmp/o_dss.tsv
+//! cargo run -q -p tesseract-ocr --example deskew_dump -- dss in.pgm 128 2.5 1 > /tmp/r_dss.tsv
 //! diff /tmp/o_dss.tsv /tmp/r_dss.tsv
+//!
+//! /tmp/skew_oracle sweep in.pgm 128 4 2 0.0 7.0 1.0 0.01 1 > /tmp/o_sweep.tsv
+//! cargo run -q -p tesseract-ocr --example deskew_dump -- sweep in.pgm 128 4 2 0.0 7.0 1.0 0.01 1 > /tmp/r_sweep.tsv
+//! diff /tmp/o_sweep.tsv /tmp/r_sweep.tsv
 //! ```
 #![allow(clippy::print_stdout, reason = "dump CLI")]
 
 use std::path::Path;
 
 use tesseract_ocr::deskew::{
-    find_differential_square_sum, rotate90_grey, rotate_am_gray, rotate_am_gray_corner,
+    find_differential_square_sum, find_skew_sweep_and_search_score_pivot, rotate90_grey,
+    rotate_am_gray, rotate_am_gray_corner, v_shear_center, v_shear_corner, ShearPivot,
 };
 use tesseract_ocr::image_input::parse_pgm;
 
@@ -108,6 +138,40 @@ use tesseract_ocr::image_input::parse_pgm;
 /// literal, so it rounds to that same value at compile time.
 fn oracle_deg_to_rad(deg: f32) -> f32 {
     deg * core::f32::consts::PI / 180.0_f32
+}
+
+/// `skew.c`'s OWN degrees→radians conversion (`skew.c:708`,
+/// `pixFindSkewSweepAndSearchScorePivot`'s `deg2rad = 3.1415926535 / 180.`):
+/// an f64 division narrowed to f32 ONCE, then a plain f32 multiply against
+/// the degree value — reproduced identically by `skew_oracle.cpp`'s `dss`
+/// arm (`l_float32 deg2rad = static_cast<l_float32>(3.1415926535 / 180.);`).
+/// Textually distinct from [`oracle_deg_to_rad`] (used only by the
+/// `rotamgray`/`rotamgraycorner` arms, a DIFFERENT literal/precision
+/// belonging to `rotateam.c`'s own conversion) — do not merge the two. The
+/// `dss`, `vshear`, and `sweep` arms below all use THIS conversion, matching
+/// what `v_shear_corner`/`v_shear_center`/`find_skew_sweep_and_search_score_pivot`
+/// are actually driven by inside `skew.c`.
+///
+/// `3.1415926535` is NOT `f64::consts::PI` (`0x400921fb54411744` vs
+/// `0x400921fb54442d18`) — but the `as f32` discards the difference, so both
+/// spellings yield the identical f32 (verified by bit comparison). Written as
+/// the constant because clippy's `approx_constant` rejects the literal and
+/// this repo forbids `#[allow]`; the equality holds ONLY while this stays
+/// narrowed to f32. Same reasoning as `deskew.rs`'s two sites — see
+/// `.claude/plans/deskew-wave-v1.md` § "The pi-literal rule".
+fn skew_deg_to_rad(deg: f32) -> f32 {
+    let deg2rad = (core::f64::consts::PI / 180.0_f64) as f32;
+    deg * deg2rad
+}
+
+/// Parses a `<pivot 1=corner|2=center>` CLI argument, matching the oracle's
+/// own `L_SHEAR_ABOUT_CORNER`/`L_SHEAR_ABOUT_CENTER` numbering exactly.
+fn parse_pivot(s: &str) -> ShearPivot {
+    match s.parse::<i32>().expect("pivot") {
+        1 => ShearPivot::Corner,
+        2 => ShearPivot::Center,
+        other => panic!("pivot must be 1 (corner) or 2 (center), got {other}"),
+    }
 }
 
 /// Mirrors the oracle's `print_f32`: `"<label>\t0x<8-hex-digit bits>\t<decimal>"`.
@@ -216,7 +280,12 @@ fn threshold_to_binary(grey: &[u8], thresh: i32) -> Vec<u8> {
 fn usage() -> ! {
     eprintln!("usage:");
     eprintln!("  deskew_dump rot90           <pgm> <direction>");
-    eprintln!("  deskew_dump dss             <pgm> <thresh> <angle_deg>");
+    eprintln!("  deskew_dump dss             <pgm> <thresh> <angle_deg> <pivot 1=corner|2=center>");
+    eprintln!("  deskew_dump vshear          <pgm> <thresh> <angle_deg> <pivot 1=corner|2=center>");
+    eprintln!(
+        "  deskew_dump sweep           <pgm> <thresh> <redsweep> <redsearch> <sweepcenter> \
+         <sweeprange> <sweepdelta> <minbsdelta> <pivot 1=corner|2=center>"
+    );
     eprintln!("  deskew_dump rotamgray       <pgm> <angle_deg> <grayval>");
     eprintln!("  deskew_dump rotamgraycorner <pgm> <angle_deg> <grayval>");
     std::process::exit(2);
@@ -245,17 +314,94 @@ fn main() {
             dump_pix("rot90", &out, ow, oh);
         }
         "dss" => {
-            if args.len() < 5 {
+            if args.len() < 6 {
                 usage();
             }
             let (grey, w, h) = read_grey(&args[2]);
             let thresh: i32 = args[3].parse().expect("thresh");
             let deg: f32 = args[4].parse().expect("angle_deg");
+            let pivot = parse_pivot(&args[5]);
             let binary = threshold_to_binary(&grey, thresh);
-            let sum = find_differential_square_sum(&binary, w, h);
+            let rad = skew_deg_to_rad(deg);
+            let sheared = match pivot {
+                ShearPivot::Corner => v_shear_corner(&binary, w, h, rad, 255),
+                ShearPivot::Center => v_shear_center(&binary, w, h, rad, 255),
+            };
+            let sum = find_differential_square_sum(&sheared, w, h);
             println!("rc\t0");
             print_f32("deg", deg);
             print_f32("sum", sum);
+        }
+        "vshear" => {
+            if args.len() < 6 {
+                usage();
+            }
+            let (grey, w, h) = read_grey(&args[2]);
+            let thresh: i32 = args[3].parse().expect("thresh");
+            let deg: f32 = args[4].parse().expect("angle_deg");
+            let pivot = parse_pivot(&args[5]);
+            let binary = threshold_to_binary(&grey, thresh);
+            let rad = skew_deg_to_rad(deg);
+            let sheared = match pivot {
+                ShearPivot::Corner => v_shear_corner(&binary, w, h, rad, 255),
+                ShearPivot::Center => v_shear_center(&binary, w, h, rad, 255),
+            };
+            print_f32("deg", deg);
+            // Polarity flip for the dump ONLY: this crate's convention is
+            // 0=ON; leptonica's native 1bpp (what a `pixGetPixel` dump would
+            // show) is 1=ON. Convert at this output boundary -- see the
+            // module doc's `vshear` section and `threshold_to_binary`'s own
+            // boundary-flip precedent -- do NOT dump this crate's raw bytes
+            // as though they were leptonica bit values.
+            let lept_bits: Vec<u8> = sheared
+                .iter()
+                .map(|&b| if b == 0 { 1 } else { 0 })
+                .collect();
+            dump_pix("vshear", &lept_bits, w, h);
+        }
+        "sweep" => {
+            if args.len() < 11 {
+                usage();
+            }
+            let (grey, w, h) = read_grey(&args[2]);
+            let thresh: i32 = args[3].parse().expect("thresh");
+            let redsweep: u32 = args[4].parse().expect("redsweep");
+            let redsearch: u32 = args[5].parse().expect("redsearch");
+            let sweepcenter: f32 = args[6].parse().expect("sweepcenter");
+            let sweeprange: f32 = args[7].parse().expect("sweeprange");
+            let sweepdelta: f32 = args[8].parse().expect("sweepdelta");
+            let minbsdelta: f32 = args[9].parse().expect("minbsdelta");
+            let pivot = parse_pivot(&args[10]);
+            let binary = threshold_to_binary(&grey, thresh);
+            match find_skew_sweep_and_search_score_pivot(
+                &binary,
+                w,
+                h,
+                redsweep,
+                redsearch,
+                sweepcenter,
+                sweeprange,
+                sweepdelta,
+                minbsdelta,
+                pivot,
+            ) {
+                Some(result) => {
+                    println!("rc\t0");
+                    print_f32("angle", result.angle);
+                    print_f32("conf", result.conf);
+                    print_f32("endscore", result.endscore);
+                }
+                None => {
+                    // The C initializes *pangle=*pconf=*pendscore=0.0 BEFORE
+                    // any validation and never rewrites them on an error
+                    // path -- reproduce that exact output shape rather than
+                    // omitting the three lines.
+                    println!("rc\t1");
+                    print_f32("angle", 0.0);
+                    print_f32("conf", 0.0);
+                    print_f32("endscore", 0.0);
+                }
+            }
         }
         "rotamgray" => {
             if args.len() < 5 {

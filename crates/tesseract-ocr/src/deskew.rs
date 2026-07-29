@@ -6,21 +6,31 @@
 //! proven byte-identical against real liblept via
 //! `.claude/harvest/oracles/skew_oracle.cpp`.
 //!
-//! This is a DELIBERATELY PARTIAL slice of the full deskew wave
-//! (`.claude/plans/deskew-wave-v1.md`, leaves D1/D2/D5 of D1-D8). NOT here:
-//! the shear kernel (D3, `pixHShear`/`pixVShear`/`pixVShearCorner`/
-//! `pixVShearCenter`, `shear.c`), the sweep + binary-search detector (D4,
-//! `pixFindSkewSweepAndSearchScorePivot`, the thing that actually calls D3
-//! during its coarse sweep), and the `pixDeskewGeneral`/`pixDeskewBoth`
-//! composition (D6/D7, which calls D1 for its 90°-round-trip second pass).
-//! See the plan for the full sequencing and why the leaves split this way.
+//! This is a slice of the full deskew wave (`.claude/plans/deskew-wave-v1.md`,
+//! leaves D1/D2/D3/D4/D5 of D1-D8). NOT here: the
+//! `pixDeskewGeneral`/`pixDeskewBoth` composition (D6/D7, which calls D1 for
+//! its 90°-round-trip second pass) and the pipeline wiring (D8). See the plan
+//! for the full sequencing and why the leaves split this way.
 //!
 //! ## What's here
 //! - [`rotate90_grey`] — `pixRotate90`, d==8 only (`rotateorth.c:222-232` CW /
 //!   `:310-320` CCW): a pure index remap, no float math at all, lossless.
 //!   Needed by the not-yet-built D7 `pixDeskewBoth`'s 90°-round-trip.
 //! - [`find_differential_square_sum`] — `pixFindDifferentialSquareSum`
-//!   (`skew.c:1111-1155`): the score the not-yet-built D4 sweep maximizes.
+//!   (`skew.c:1111-1155`): the score the D4 sweep maximizes.
+//! - [`v_shear_corner`] / [`v_shear_center`] — `pixVShearCorner` /
+//!   `pixVShearCenter` (`shear.c:370-382` / `:432-444`, over the
+//!   `pixVShear` kernel at `shear.c:237-316`): the rasterop-band-copy
+//!   vertical shear the D4 sweep applies to every candidate angle before
+//!   scoring it. `pixHShear` (shear.c's OTHER half, used only by
+//!   `pixRotate2Shear`/`pixRotate3Shear`, a later/different leaf) is NOT
+//!   transcoded here — D4 never calls it.
+//! - [`find_skew_sweep_and_search_score_pivot`] — `pixFindSkewSweepAndSearchScorePivot`
+//!   (`skew.c:665-973`): the actual detector `pixFindSkew` calls (NOT the
+//!   standalone, quadratic-fit `pixFindSkewSweep`, which sits off
+//!   `pixFindSkew`'s call path entirely). Coarse sweep (raw max, [`v_shear_corner`]/
+//!   [`v_shear_center`] + [`find_differential_square_sum`]) then an
+//!   interval-halving binary search.
 //! - [`rotate_am_gray`] / [`rotate_am_gray_corner`] — `pixRotateAMGray` /
 //!   `pixRotateAMGrayCorner` (`rotateam.c:288-317` + `:391-448` low kernel;
 //!   `:584-613` + `:683-736` low kernel): the grey area-map rotation the
@@ -36,10 +46,11 @@
 //!   conversion needed at the grey boundary.
 //! - **Binary is flipped.** THIS CRATE'S binary buffers use `0 = ON`
 //!   (ink/foreground), matching `binreduce.rs`'s documented convention — the
-//!   OPPOSITE of leptonica's native `1 = ON`. [`find_differential_square_sum`]
-//!   takes a buffer in THIS crate's convention; convert at the caller
-//!   boundary (see [`find_differential_square_sum`]'s own docs), never
-//!   silently assume leptonica's polarity.
+//!   OPPOSITE of leptonica's native `1 = ON`. [`find_differential_square_sum`],
+//!   [`v_shear_corner`], and [`v_shear_center`] all take a buffer in THIS
+//!   crate's convention; convert at the caller boundary (see
+//!   [`find_differential_square_sum`]'s own docs), never silently assume
+//!   leptonica's polarity.
 //!
 //! ## Leptonica's area-map rotation CROPS — byte-parity means reproducing it
 //! `pixRotateAMGray`/`pixRotateAMGrayCorner` return the SAME `w × h` they
@@ -50,6 +61,8 @@
 //! convention, plus a dormant `i32` overflow risk at very large dimensions —
 //! see the plan's non-goals list) — it is its own future leaf, not folded in
 //! here as an "improvement."
+
+use crate::binreduce::reduce_rank_binary_cascade;
 
 /// `pixRotate90`, **d==8 only** (`rotateorth.c:165-377` is the full function;
 /// the 8bpp branches are `:222-232` clockwise / `:310-320` counter-clockwise).
@@ -173,6 +186,556 @@ pub fn find_differential_square_sum(binary: &[u8], w: usize, h: usize) -> f32 {
         i += 1;
     }
     sum
+}
+
+/// `MinDiffFromHalfPi` (`shear.c:64`) — the shear angle must not get closer
+/// than this (radians) to `±π/2` (`tan` blows up there); enforced by
+/// [`normalize_angle_for_shear`].
+const MIN_DIFF_FROM_HALF_PI: f32 = 0.04;
+
+/// `normalizeAngleForShear` (`shear.c:831-854`, `static` in C, hence private
+/// here too) — folds `radang` into `[-pi2, pi2]` (`pi2` computed from ITS OWN
+/// literal, `3.14159265/2.0`, a DIFFERENT digit count than `skew.c`'s
+/// `deg2rad` literal `3.1415926535` — see
+/// `.claude/harvest/leptonica-skew-callgraph.txt` STEP 4 item 2; never
+/// substitute a shared `PI` constant for either), then clamps within
+/// `mindif` of either edge.
+///
+/// # Precision
+/// `pi2 = (3.14159265_f64 / 2.0_f64) as f32` — an f64 division narrowed to
+/// f32 ONCE. The fold branch (`radang < -pi2 || radang > pi2`) is
+/// realistically dead code on this wave's angle range (always well inside
+/// `±pi/2`) but is transcribed faithfully since it is reachable in
+/// principle; its own arithmetic is plain f32 throughout (no double literal
+/// appears in that branch, unlike `pi2`'s own computation above it).
+fn normalize_angle_for_shear(radang: f32, mindif: f32) -> f32 {
+    // `shear.c:840`'s literal is `3.14159265` — which is NOT `f64::consts::PI`
+    // (`0x400921fb53c8d4f1` vs `0x400921fb54442d18`; audit §2 is right that the
+    // two differ in f64). Substituting the constant is nonetheless free HERE,
+    // and only here, **because of the `as f32`**: after the narrowing both
+    // spellings collapse to the identical f32 (verified by bit comparison, not
+    // assumed). Written as the constant because clippy's `approx_constant`
+    // rejects the literal and this repo forbids `#[allow]`.
+    //
+    // If a future change ever removes the `as f32` and keeps this in f64, the
+    // substitution silently becomes WRONG and only a parity diff would catch
+    // it. See `.claude/plans/deskew-wave-v1.md` § "The pi-literal rule".
+    let pi2 = (core::f64::consts::PI / 2.0_f64) as f32;
+    let mut radang = radang;
+    if radang < -pi2 || radang > pi2 {
+        // C integer-truncating division -- realistically dead code on this
+        // wave's angle range, transcribed faithfully regardless.
+        radang -= ((radang / pi2) as i32) as f32 * pi2;
+    }
+    if radang > pi2 - mindif {
+        radang = pi2 - mindif;
+    } else if radang < -pi2 + mindif {
+        radang = -pi2 + mindif;
+    }
+    radang
+}
+
+/// One column-band copy from `pixVShear`'s `pixRasterop` calls
+/// (`shear.c:288-313`): copies columns `[dx, dx+dw)` of `src` into the SAME
+/// columns of `dst`, each row shifted vertically by `dy`
+/// (`dst[row][x] = src[row - dy][x]`, only where `row - dy` is a valid
+/// source row) — unwritten destination cells keep whatever `dst` already
+/// held (the incolor fill, or an earlier band's copy).
+///
+/// This is `pixRasterop`'s clip-to-intersection behavior
+/// (`.claude/harvest/leptonica-rop-callgraph.txt`, the precedent `morph.rs`'s
+/// `dilate_rect`/`erode_rect` already follow) specialized to the ONE shape
+/// every call site in `pixVShear` actually uses: source column range equal
+/// to the destination's (`sx == dx`, never horizontally shifted), a
+/// full-height request (`dh == h`), and a zero-based source row (`sy == 0`)
+/// — algebraically verified equivalent to the general two-sided clip
+/// (`if (dx<0) {...}` / `dhangw` / `shangw`, mirrored for y) for exactly
+/// this parameter shape, not re-derived by guesswork.
+fn v_shear_copy_band(dst: &mut [u8], src: &[u8], w: i32, h: i32, dx: i32, dw: i32, dy: i32) {
+    if dw <= 0 {
+        return;
+    }
+    let x0 = dx.max(0);
+    let x1 = (dx + dw).min(w);
+    if x0 >= x1 {
+        return;
+    }
+    for row in 0..h {
+        let src_row = row - dy;
+        if src_row < 0 || src_row >= h {
+            continue;
+        }
+        for x in x0..x1 {
+            dst[(row * w + x) as usize] = src[(src_row * w + x) as usize];
+        }
+    }
+}
+
+/// `pixVShear` (`shear.c:237-316`), the `pixd == NULL` case only (D4 never
+/// reuses a caller-supplied destination buffer or shears in place; the `IP`
+/// variants — `pixVShearIP`, and by extension `pixRotateShearIP` — are an
+/// explicit v1 non-goal per `.claude/plans/deskew-wave-v1.md`). Pivots about
+/// the vertical line `x == xloc`: columns to the right shift downward for a
+/// positive angle, columns to the left shift upward.
+///
+/// `binary` is in THIS CRATE's convention (`0 = ON`, matching every other
+/// leaf in this module); `fill` is the raw byte used for the `incolor`
+/// background fill IN THIS CRATE's convention (`255` for `L_BRING_IN_WHITE`
+/// — the only value the D4 sweep ever passes; `0` for `L_BRING_IN_BLACK`,
+/// never exercised by the sweep), mirroring how [`rotate_am_gray`] takes
+/// `grayval` directly rather than an incolor enum.
+///
+/// # Precision (do not "improve" any of this)
+/// - `tanangle = tan(radang)`: `radang` (f32) promotes to f64 for the C
+///   `tan()` call, which returns f64, narrowed to f32 ONCE on assignment —
+///   `f64::from(radang).tan() as f32`, NOT `radang.tan()`.
+/// - `invangle = |1. / tanangle|`: `1.` is a C double literal, so `tanangle`
+///   (f32) promotes BACK to f64 for the division, narrowed to f32 ONCE again
+///   — `(1.0_f64 / f64::from(tanangle)).abs() as f32`. Two separate
+///   promote-compute-narrow steps, not one.
+/// - `initxincr = (l_int32)(invangle / 2.)`: dividing by exactly 2 is exact
+///   in any binary floating-point precision (halves the exponent, mantissa
+///   untouched, no underflow at these magnitudes), so computing this via f64
+///   (as C's `2.` literal forces) or plain f32 gives the bit-identical
+///   truncated integer either way — written here as f64 to mirror the C
+///   promotion exactly, not because the precision matters at this one site.
+/// - The per-band `xincr` formulas (`(l_int32)(invangle * (vshift ± 0.5) +
+///   0.5) - (...)`) promote `vshift` (i32) to f64 via the `0.5` double
+///   literal, multiply by `invangle` (f32, promoted to f64 to match), add
+///   `0.5` (f64), THEN truncate toward zero to i32 — computed here entirely
+///   in f64 before the final cast, matching C's promotion chain.
+/// - `sign = L_SIGN(radang)` (`environ.h:253`, `(x<0)?-1:1`) and every
+///   subsequent `sign*vshift` combination are PURE INTEGER arithmetic in the
+///   C (`sign`, `vshift`, `xincr`, `x`, `xloc` are all `l_int32`) — no float
+///   at all once `invangle`/`tanangle` are fixed.
+///
+/// # Panics
+/// Panics if `binary.len() != w * h`.
+fn v_shear(binary: &[u8], w: usize, h: usize, xloc: i32, radang: f32, fill: u8) -> Vec<u8> {
+    assert_eq!(binary.len(), w * h, "binary buffer is not w·h");
+    let (wi, hi) = (w as i32, h as i32);
+
+    let radang = normalize_angle_for_shear(radang, MIN_DIFF_FROM_HALF_PI);
+    if radang == 0.0 || f64::from(radang).tan() == 0.0 {
+        return binary.to_vec();
+    }
+
+    let mut out = vec![fill; w * h];
+
+    let sign: i32 = if radang < 0.0 { -1 } else { 1 };
+    let tanangle: f32 = f64::from(radang).tan() as f32;
+    let invangle: f32 = (1.0_f64 / f64::from(tanangle)).abs() as f32;
+    let initxincr = (f64::from(invangle) / 2.0_f64) as i32;
+
+    // Central band: columns [xloc-initxincr, xloc+initxincr), zero shift.
+    v_shear_copy_band(&mut out, binary, wi, hi, xloc - initxincr, 2 * initxincr, 0);
+
+    // Walk rightward (increasing x), growing vshift.
+    let mut vshift = 1i32;
+    let mut x = xloc + initxincr;
+    while x < wi {
+        let mut xincr = (f64::from(invangle) * (f64::from(vshift) + 0.5) + 0.5) as i32 - (x - xloc);
+        if wi - x < xincr {
+            xincr = wi - x; // reduce for last one if req'd
+        }
+        v_shear_copy_band(&mut out, binary, wi, hi, x, xincr, sign * vshift);
+        x += xincr;
+        vshift += 1;
+    }
+
+    // Walk leftward (decreasing x), vshift growing more negative.
+    let mut vshift = -1i32;
+    let mut x = xloc - initxincr;
+    while x > 0 {
+        let mut xincr = (x - xloc) - (f64::from(invangle) * (f64::from(vshift) - 0.5) + 0.5) as i32;
+        if x < xincr {
+            xincr = x; // reduce for last one if req'd
+        }
+        v_shear_copy_band(&mut out, binary, wi, hi, x - xincr, xincr, sign * vshift);
+        x -= xincr;
+        vshift -= 1;
+    }
+
+    out
+}
+
+/// `pixVShearCorner` (`shear.c:370-382`) — [`v_shear`] pivoted at
+/// `xloc = 0` (the UL corner). The pivot the D4 sweep uses by default (and
+/// the only one `pixFindSkew`'s real call chain ever reaches).
+///
+/// # Panics
+/// Panics if `binary.len() != w * h`.
+#[must_use]
+pub fn v_shear_corner(binary: &[u8], w: usize, h: usize, radang: f32, fill: u8) -> Vec<u8> {
+    v_shear(binary, w, h, 0, radang, fill)
+}
+
+/// `pixVShearCenter` (`shear.c:432-444`) — [`v_shear`] pivoted at
+/// `xloc = w / 2` (`pixGetWidth(pixs) / 2`, integer division). Only reached
+/// through `pixFindSkewSweepAndSearchScorePivot`'s explicit
+/// `L_SHEAR_ABOUT_CENTER` — `pixFindSkew` itself never selects it.
+///
+/// # Panics
+/// Panics if `binary.len() != w * h`.
+#[must_use]
+pub fn v_shear_center(binary: &[u8], w: usize, h: usize, radang: f32, fill: u8) -> Vec<u8> {
+    let xloc = (w as i32) / 2;
+    v_shear(binary, w, h, xloc, radang, fill)
+}
+
+/// `pixZero` (`pix3.c`, ~1794-1855) — true iff every pixel is background
+/// (this crate's convention: byte `255`). Only the "is the whole image
+/// empty" query [`find_skew_sweep_and_search_score_pivot`] needs is
+/// implemented here; not a public leaf of its own (mirrors
+/// `count_pixels_by_row`'s precedent — a NEW-LEAF per the manifest that
+/// nonetheless stays private, being purely a prerequisite).
+fn pix_zero(binary: &[u8]) -> bool {
+    binary.iter().all(|&b| b == 255)
+}
+
+/// `numaGetMax` (`numafunc1.c:495-527`) — linear scan, sentinel-seeded
+/// exactly as the C (`maxval = -1000000000.`), strict `>` comparison so the
+/// FIRST occurrence of the maximum wins on ties. `None` for an empty slice
+/// (the C errors on `numaGetCount(na)==0`).
+fn numa_get_max(scores: &[f32]) -> Option<(f32, usize)> {
+    if scores.is_empty() {
+        return None;
+    }
+    let mut maxval = -1_000_000_000.0_f32;
+    let mut imaxloc = 0usize;
+    for (i, &val) in scores.iter().enumerate() {
+        if val > maxval {
+            maxval = val;
+            imaxloc = i;
+        }
+    }
+    Some((maxval, imaxloc))
+}
+
+/// `numaGetMin` (`numafunc1.c:452-484`) — the minimum-seeking mirror of
+/// [`numa_get_max`] (`minval = +1000000000.`, strict `<`).
+fn numa_get_min(scores: &[f32]) -> Option<(f32, usize)> {
+    if scores.is_empty() {
+        return None;
+    }
+    let mut minval = 1_000_000_000.0_f32;
+    let mut iminloc = 0usize;
+    for (i, &val) in scores.iter().enumerate() {
+        if val < minval {
+            minval = val;
+            iminloc = i;
+        }
+    }
+    Some((minval, iminloc))
+}
+
+/// `L_SHEAR_ABOUT_CORNER` / `L_SHEAR_ABOUT_CENTER` — which fixed point
+/// [`find_skew_sweep_and_search_score_pivot`]'s vertical shear pivots about
+/// (`skew.c`'s own doc: corner discriminates small angles better; center
+/// loses less image at large angles). `pixFindSkew`'s real call chain always
+/// uses `Corner`; `Center` exists only for direct callers of
+/// `pixFindSkewSweepAndSearchScorePivot`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShearPivot {
+    /// `L_SHEAR_ABOUT_CORNER` — pivot at the UL corner (`xloc = 0`).
+    Corner,
+    /// `L_SHEAR_ABOUT_CENTER` — pivot at the image center (`xloc = w / 2`).
+    Center,
+}
+
+/// Dispatches to [`v_shear_corner`] or [`v_shear_center`] by [`ShearPivot`].
+fn shear_pivot(
+    pivot: ShearPivot,
+    binary: &[u8],
+    w: usize,
+    h: usize,
+    radang: f32,
+    fill: u8,
+) -> Vec<u8> {
+    match pivot {
+        ShearPivot::Corner => v_shear_corner(binary, w, h, radang, fill),
+        ShearPivot::Center => v_shear_center(binary, w, h, radang, fill),
+    }
+}
+
+/// `MinscoreThreshFactor` (`skew.c:131`) — scales `width² · height` into the
+/// minimum-score threshold gating [`find_skew_sweep_and_search_score_pivot`]'s
+/// confidence.
+const MINSCORE_THRESH_FACTOR: f32 = 0.000_002;
+
+/// `MinValidMaxscore` (`skew.c:126`) — below this, confidence is forced to
+/// `0.0` regardless of the max/min ratio.
+const MIN_VALID_MAXSCORE: f32 = 10_000.0;
+
+/// Result of [`find_skew_sweep_and_search_score_pivot`]: `angle` (degrees —
+/// "the negative of the skew angle... the angle required for deskew,
+/// clockwise rotations are positive", `skew.c:369-371` verbatim), `conf`
+/// (confidence, `0.0` when not trustworthy), `endscore` (the objective at
+/// the returned angle — `pendscore` in the C API).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SkewResult {
+    /// Angle required to deskew, in degrees.
+    pub angle: f32,
+    /// Confidence (ratio of max/min score); `0.0` when not trustworthy.
+    pub conf: f32,
+    /// The objective (`find_differential_square_sum`'s score) at `angle`.
+    pub endscore: f32,
+}
+
+/// `pixFindSkewSweepAndSearchScorePivot` (`skew.c:665-973`) — D4, the real
+/// detector `pixFindSkew` ultimately calls (NOT the standalone, quadratic-fit
+/// `pixFindSkewSweep`, which sits off `pixFindSkew`'s call path entirely —
+/// see the manifest's STEP 1). A coarse sweep, scored by
+/// [`find_differential_square_sum`] on a [`v_shear_corner`]/
+/// [`v_shear_center`]-sheared, rank-reduced copy of `binary`, its RAW
+/// maximum taken via [`numa_get_max`] (no quadratic fit), followed by an
+/// interval-halving binary search at a finer reduction.
+///
+/// `binary` is in THIS CRATE's convention (`0 = ON`); `w`/`h` are its
+/// dimensions. `redsweep`/`redsearch` must each be `1 | 2 | 4 | 8`, with
+/// `redsearch <= redsweep`.
+///
+/// # Return contract — read before treating `None` as "the angle is 0"
+/// The C returns `l_ok` (`0` = OK, `1` = error) and unconditionally
+/// initializes `*pangle = *pconf = *pendscore = 0.0` at entry, before any
+/// validation. Two DIFFERENT outcomes both look like "zeroes" and must NOT
+/// collapse into the same Rust variant (manifest STEP 1's GUARD note, STEP 4
+/// item 4):
+///
+/// - **`None`** — the TRUE error paths only: invalid `redsweep`/`redsearch`,
+///   `redsearch > redsweep`, `pixZero`-detected all-background `binary`, or a
+///   downstream rank reduction failing (mirrors the C's `!pixsch || !pixsw`
+///   check).
+/// - **`Some(SkewResult { angle: 0.0, conf: 0.0, endscore: 0.0 })`** — "max
+///   found at sweep edge". A SILENT DEGENERATE **SUCCESS** in the C (`ret` is
+///   never reassigned off its initial `0`) — returning `None` here would
+///   misrepresent the C's own contract.
+///
+/// # Precision (do not "improve" any of this)
+/// - `deg2rad = (3.1415926535_f64 / 180.0_f64) as f32` — an f64 division
+///   narrowed to f32 ONCE; textually distinct from `shear.c`'s `pi2` literal
+///   (one fewer digit, a different purpose) — never substitute a shared
+///   `PI` constant for either.
+/// - `nangles = ((2.0_f64 * sweeprange) / sweepdelta + 1.0) as i32` —
+///   entirely f64 (`2.` is a C double literal, forcing the whole chain).
+/// - `minthresh = MINSCORE_THRESH_FACTOR * width * width * height`, computed
+///   **entirely in f32, left to right** (`width`/`height` are `pixsch`'s —
+///   the SEARCH-resolution image's — dimensions, promoted to f32 to match
+///   the f32 literal, NOT f64) — floating multiply is not associative; do
+///   not reorder, and do not compute in f64 and narrow after.
+/// - The `maxscore` used for both the confidence ratio and the
+///   `< MIN_VALID_MAXSCORE` gate is whatever a SINGLE mutable binding last
+///   held across BOTH phases: the sweep's [`numa_get_max`] result, UNLESS the
+///   binary-search loop executes at least once, in which case it is that
+///   loop's last 3-way local max. The default parameters
+///   (`sweepdelta=1.0`, `minbsdelta=0.01`) always run the loop at least once,
+///   which is why this carry-over is easy to miss.
+#[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "faithful transcode of pixFindSkewSweepAndSearchScorePivot's full parameter list"
+)]
+pub fn find_skew_sweep_and_search_score_pivot(
+    binary: &[u8],
+    w: usize,
+    h: usize,
+    redsweep: u32,
+    redsearch: u32,
+    sweepcenter: f32,
+    sweeprange: f32,
+    sweepdelta: f32,
+    minbsdelta: f32,
+    pivot: ShearPivot,
+) -> Option<SkewResult> {
+    assert_eq!(binary.len(), w * h, "binary buffer is not w·h");
+    let reduction_ok = |r: u32| matches!(r, 1 | 2 | 4 | 8);
+    if !reduction_ok(redsweep) || !reduction_ok(redsearch) || redsearch > redsweep {
+        return None;
+    }
+
+    // `deg2rad = 3.1415926535 / 180.` (skew.c) — an f64 division narrowed to
+    // f32 ONCE. That literal is NOT `f64::consts::PI` either
+    // (`0x400921fb54411744` vs `0x400921fb54442d18`), but as at
+    // `normalize_angle_for_shear`'s `pi2`, the `as f32` discards the
+    // difference: both spellings give the identical f32 (verified by bit
+    // comparison). Constant rather than literal only because clippy's
+    // `approx_constant` rejects the latter; the equality holds ONLY while this
+    // stays narrowed to f32.
+    let deg2rad = (core::f64::consts::PI / 180.0_f64) as f32;
+
+    // Reduced image for the binary search (pixsch).
+    let (sch_buf, sch_w, sch_h) = match redsearch {
+        1 => (binary.to_vec(), w, h),
+        2 => reduce_rank_binary_cascade(binary, w, h, [1, 0, 0, 0])?,
+        4 => reduce_rank_binary_cascade(binary, w, h, [1, 1, 0, 0])?,
+        _ => reduce_rank_binary_cascade(binary, w, h, [1, 1, 2, 0])?, // 8
+    };
+    if pix_zero(&sch_buf) {
+        return None;
+    }
+
+    // Further-reduced image for the coarse sweep (pixsw). ratio is always in
+    // {1,2,4,8} given the validated redsweep/redsearch above.
+    let ratio = redsweep / redsearch;
+    let (sw_buf, sw_w, sw_h) = match ratio {
+        1 => (sch_buf.clone(), sch_w, sch_h),
+        2 => reduce_rank_binary_cascade(&sch_buf, sch_w, sch_h, [1, 0, 0, 0])?,
+        // NOTE: asymmetric vs redsearch==4's [1,1,0,0] above -- verified
+        // against skew.c:733-737, not a transcription slip.
+        4 => reduce_rank_binary_cascade(&sch_buf, sch_w, sch_h, [1, 2, 0, 0])?,
+        _ => reduce_rank_binary_cascade(&sch_buf, sch_w, sch_h, [1, 2, 2, 0])?, // 8
+    };
+
+    // nangles = (l_int32)((2.*sweeprange)/sweepdelta + 1) -- f64 throughout.
+    let nangles = ((2.0_f64 * f64::from(sweeprange)) / f64::from(sweepdelta) + 1.0) as i32;
+    if nangles <= 0 {
+        return None;
+    }
+    let nangles = nangles as usize;
+
+    // ---- Sweep (coarse), on pixsw. ----
+    let rangeleft = sweepcenter - sweeprange;
+    let mut natheta: Vec<f32> = Vec::with_capacity(nangles);
+    let mut nascore: Vec<f32> = Vec::with_capacity(nangles);
+    for i in 0..nangles {
+        let theta = rangeleft + (i as f32) * sweepdelta;
+        let sheared = shear_pivot(pivot, &sw_buf, sw_w, sw_h, deg2rad * theta, 255);
+        nascore.push(find_differential_square_sum(&sheared, sw_w, sw_h));
+        natheta.push(theta);
+    }
+
+    let (mut maxscore, maxindex) = numa_get_max(&nascore)?;
+    let maxangle = natheta[maxindex];
+
+    // "max found at sweep edge" -- silent degenerate SUCCESS, not an error.
+    let n = natheta.len();
+    if maxindex == 0 || maxindex == n - 1 {
+        return Some(SkewResult {
+            angle: 0.0,
+            conf: 0.0,
+            endscore: 0.0,
+        });
+    }
+
+    // ---- Binary search (fine), on pixsch. Fresh arrays -- the sweep's are
+    // done with (mirrors the C's numaEmpty-and-reuse). ----
+    let mut centerangle = maxangle;
+    let mut bsearchscore = [0.0_f32; 5];
+    bsearchscore[2] = find_differential_square_sum(
+        &shear_pivot(pivot, &sch_buf, sch_w, sch_h, deg2rad * centerangle, 255),
+        sch_w,
+        sch_h,
+    );
+    bsearchscore[0] = find_differential_square_sum(
+        &shear_pivot(
+            pivot,
+            &sch_buf,
+            sch_w,
+            sch_h,
+            deg2rad * (centerangle - sweepdelta),
+            255,
+        ),
+        sch_w,
+        sch_h,
+    );
+    bsearchscore[4] = find_differential_square_sum(
+        &shear_pivot(
+            pivot,
+            &sch_buf,
+            sch_w,
+            sch_h,
+            deg2rad * (centerangle + sweepdelta),
+            255,
+        ),
+        sch_w,
+        sch_h,
+    );
+
+    let mut natheta: Vec<f32> = vec![
+        centerangle,
+        centerangle - sweepdelta,
+        centerangle + sweepdelta,
+    ];
+    let mut nascore: Vec<f32> = vec![bsearchscore[2], bsearchscore[0], bsearchscore[4]];
+
+    let mut delta = 0.5_f32 * sweepdelta;
+    while delta >= minbsdelta {
+        let leftcenterangle = centerangle - delta;
+        bsearchscore[1] = find_differential_square_sum(
+            &shear_pivot(
+                pivot,
+                &sch_buf,
+                sch_w,
+                sch_h,
+                deg2rad * leftcenterangle,
+                255,
+            ),
+            sch_w,
+            sch_h,
+        );
+        nascore.push(bsearchscore[1]);
+        natheta.push(leftcenterangle);
+
+        let rightcenterangle = centerangle + delta;
+        bsearchscore[3] = find_differential_square_sum(
+            &shear_pivot(
+                pivot,
+                &sch_buf,
+                sch_w,
+                sch_h,
+                deg2rad * rightcenterangle,
+                255,
+            ),
+            sch_w,
+            sch_h,
+        );
+        nascore.push(bsearchscore[3]);
+        natheta.push(rightcenterangle);
+
+        // Max of the CENTER THREE (indices 1..=3) only -- 0 and 4 excluded.
+        maxscore = bsearchscore[1];
+        let mut maxindex = 1usize;
+        for (i, &score) in bsearchscore.iter().enumerate().take(4).skip(2) {
+            if score > maxscore {
+                maxscore = score;
+                maxindex = i;
+            }
+        }
+
+        let lefttemp = bsearchscore[maxindex - 1];
+        let righttemp = bsearchscore[maxindex + 1];
+        bsearchscore[2] = maxscore;
+        bsearchscore[0] = lefttemp;
+        bsearchscore[4] = righttemp;
+
+        centerangle += delta * ((maxindex as i32 - 2) as f32);
+        delta *= 0.5;
+    }
+
+    let angle = centerangle;
+    let endscore = bsearchscore[2];
+
+    let (minscore, _minloc) = numa_get_min(&nascore)?;
+    let width = sch_w as f32;
+    let height = sch_h as f32;
+    let minthresh = MINSCORE_THRESH_FACTOR * width * width * height;
+    let mut conf = if minscore > minthresh {
+        maxscore / minscore
+    } else {
+        0.0
+    };
+    if centerangle > rangeleft + 2.0_f32 * sweeprange - sweepdelta
+        || centerangle < rangeleft + sweepdelta
+        || maxscore < MIN_VALID_MAXSCORE
+    {
+        conf = 0.0;
+    }
+
+    Some(SkewResult {
+        angle,
+        conf,
+        endscore,
+    })
 }
 
 /// `MinAngleToRotate` (`rotateam.c:150`) — below this magnitude (radians,
@@ -463,6 +1026,243 @@ mod tests {
     #[should_panic(expected = "not w·h")]
     fn dss_rejects_mismatched_length() {
         let _ = find_differential_square_sum(&[255u8; 3], 2, 2);
+    }
+
+    // ---- D3: v_shear_corner / v_shear_center -------------------------------
+    //
+    // These are structural / self-consistency checks, not oracle diffs --
+    // see `.claude/harvest/oracles/skew_oracle.cpp`'s `dss`/`vshear` arms
+    // (via `deskew_dump.rs`) for the real byte-parity evidence across many
+    // angles. Every assertion here is chosen to hold REGARDLESS of any
+    // f32/f64 precision subtlety in the shear math itself (see
+    // `rotate_am_gray_uniform_field_stays_uniform`'s identical framing for
+    // D5): a wrong-but-non-panicking shear could still, in principle, pass
+    // some of these, which is exactly why they are a sanity net and not a
+    // substitute for the oracle.
+
+    #[test]
+    fn v_shear_zero_angle_is_identity_for_both_pivots() {
+        let (w, h) = (12usize, 9usize);
+        let binary: Vec<u8> = (0..(w * h) as u8)
+            .map(|v| if v % 3 == 0 { 0 } else { 255 })
+            .collect();
+        assert_eq!(
+            v_shear_corner(&binary, w, h, 0.0, 255),
+            binary,
+            "corner, zero angle"
+        );
+        assert_eq!(
+            v_shear_center(&binary, w, h, 0.0, 255),
+            binary,
+            "center, zero angle"
+        );
+    }
+
+    #[test]
+    fn v_shear_uniform_field_stays_uniform() {
+        // Every written pixel is copied from a source that is uniformly
+        // `fill`, and every unwritten pixel was initialized to `fill` too --
+        // so the whole output must equal `fill` everywhere, at any angle,
+        // for both pivots. This holds independent of the shear's own
+        // indexing/timing correctness (it is a property of the fill value,
+        // not the angle), so -- as with D5's analogous test -- it is a
+        // correctness sanity check, not a substitute for the oracle diff.
+        let (w, h) = (16usize, 20usize);
+        let fill = 255u8;
+        let binary = vec![fill; w * h];
+        for &deg in &[2.0_f32, 15.0, 45.0, -30.0] {
+            let rad = deg.to_radians();
+            let out = v_shear_corner(&binary, w, h, rad, fill);
+            assert!(
+                out.iter().all(|&b| b == fill),
+                "corner must stay uniform at {deg} degrees"
+            );
+            let out_center = v_shear_center(&binary, w, h, rad, fill);
+            assert!(
+                out_center.iter().all(|&b| b == fill),
+                "center must stay uniform at {deg} degrees"
+            );
+        }
+    }
+
+    #[test]
+    fn v_shear_corner_pivots_at_xloc_zero() {
+        let (w, h) = (14usize, 11usize);
+        let binary: Vec<u8> = (0..(w * h) as u8)
+            .map(|v| if v % 5 == 0 { 0 } else { 255 })
+            .collect();
+        let rad = 12.0_f32.to_radians();
+        assert_eq!(
+            v_shear_corner(&binary, w, h, rad, 255),
+            v_shear(&binary, w, h, 0, rad, 255)
+        );
+    }
+
+    #[test]
+    fn v_shear_center_pivots_at_width_over_two() {
+        let (w, h) = (14usize, 11usize);
+        let binary: Vec<u8> = (0..(w * h) as u8)
+            .map(|v| if v % 5 == 0 { 0 } else { 255 })
+            .collect();
+        let rad = 12.0_f32.to_radians();
+        assert_eq!(
+            v_shear_center(&binary, w, h, rad, 255),
+            v_shear(&binary, w, h, (w as i32) / 2, rad, 255)
+        );
+    }
+
+    #[test]
+    fn v_shear_output_keeps_input_dimensions() {
+        let (w, h) = (17usize, 13usize);
+        let binary = vec![255u8; w * h];
+        let out = v_shear_corner(&binary, w, h, 8.0_f32.to_radians(), 255);
+        assert_eq!(out.len(), w * h);
+        let out_center = v_shear_center(&binary, w, h, 8.0_f32.to_radians(), 255);
+        assert_eq!(out_center.len(), w * h);
+    }
+
+    #[test]
+    #[should_panic(expected = "not w·h")]
+    fn v_shear_corner_rejects_mismatched_length() {
+        let _ = v_shear_corner(&[255u8; 3], 2, 2, 1.0, 255);
+    }
+
+    #[test]
+    #[should_panic(expected = "not w·h")]
+    fn v_shear_center_rejects_mismatched_length() {
+        let _ = v_shear_center(&[255u8; 3], 2, 2, 1.0, 255);
+    }
+
+    // ---- D4: find_skew_sweep_and_search_score_pivot ------------------------
+
+    #[test]
+    fn find_skew_rejects_invalid_reduction_factors() {
+        let binary = vec![0u8; 10 * 10];
+        assert!(find_skew_sweep_and_search_score_pivot(
+            &binary,
+            10,
+            10,
+            3, // not in {1,2,4,8}
+            1,
+            0.0,
+            5.0,
+            1.0,
+            0.01,
+            ShearPivot::Corner,
+        )
+        .is_none());
+        assert!(find_skew_sweep_and_search_score_pivot(
+            &binary,
+            10,
+            10,
+            1,
+            2, // redsearch > redsweep
+            0.0,
+            5.0,
+            1.0,
+            0.01,
+            ShearPivot::Corner,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn find_skew_rejects_all_background_image() {
+        // This crate's convention: 255 = background everywhere = pixZero.
+        let binary = vec![255u8; 10 * 10];
+        assert!(find_skew_sweep_and_search_score_pivot(
+            &binary,
+            10,
+            10,
+            1,
+            1,
+            0.0,
+            5.0,
+            1.0,
+            0.01,
+            ShearPivot::Corner,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn find_skew_returns_degenerate_success_when_max_is_at_sweep_edge() {
+        // sweeprange=0.0 forces nangles=(l_int32)((2.*0.)/sweepdelta+1)=1
+        // regardless of sweepdelta, so the single sampled angle is ALWAYS
+        // both the first and last element -- the "max found at sweep edge"
+        // guard ALWAYS fires here, independent of the fixture's content (as
+        // long as it is not all-background, which would hit the EARLIER
+        // pixZero check instead).
+        let (w, h) = (10usize, 10usize);
+        let mut binary = vec![255u8; w * h];
+        binary[0] = 0; // just needs some non-background content.
+        let result = find_skew_sweep_and_search_score_pivot(
+            &binary,
+            w,
+            h,
+            1,
+            1,
+            0.0,
+            0.0,
+            1.0,
+            0.01,
+            ShearPivot::Corner,
+        );
+        assert_eq!(
+            result,
+            Some(SkewResult {
+                angle: 0.0,
+                conf: 0.0,
+                endscore: 0.0,
+            })
+        );
+    }
+
+    #[test]
+    fn find_skew_runs_to_completion_on_a_banded_fixture() {
+        // Horizontal banding (2 rows on, 2 off) gives the differential
+        // square sum real row-to-row signal to work with, and is far from
+        // all-background. redsweep=redsearch=1 skips
+        // reduce_rank_binary_cascade entirely (ratio=1 on both legs), which
+        // removes a whole class of "did the reduction leave a workable
+        // image" uncertainty from this smoke test.
+        let (w, h) = (20usize, 24usize);
+        let mut binary = vec![255u8; w * h];
+        for y in 0..h {
+            if y % 4 < 2 {
+                for x in 0..w {
+                    binary[y * w + x] = 0;
+                }
+            }
+        }
+        let result = find_skew_sweep_and_search_score_pivot(
+            &binary,
+            w,
+            h,
+            1,
+            1,
+            0.0,
+            5.0,
+            1.0,
+            0.05,
+            ShearPivot::Corner,
+        )
+        .expect("valid, non-degenerate params on a non-empty image must return Some");
+        assert!(
+            result.angle.is_finite(),
+            "angle must be finite: {}",
+            result.angle
+        );
+        assert!(
+            result.conf >= 0.0 && result.conf.is_finite(),
+            "conf must be finite and non-negative: {}",
+            result.conf
+        );
+        assert!(
+            result.endscore.is_finite(),
+            "endscore must be finite: {}",
+            result.endscore
+        );
     }
 
     // ---- D5: rotate_am_gray / rotate_am_gray_corner -----------------------
