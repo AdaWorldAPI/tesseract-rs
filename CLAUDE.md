@@ -920,6 +920,59 @@ Worth naming: **DeepSeek-OCR's "contexts optical compression" is this workspace'
 own thesis in a different medium** — it compresses the input representation,
 bgz-tensor compresses the computation; they compose.
 
+## ★ AS-IS BOUNDARY (2026-07-29) — the reasoning layer is NOT wired, and that is the line
+
+**Operator observation, verified: lance-graph's NARS reasoning and per-sentence
+SPO/SoA capabilities are not used by this pipeline at all.** This version is
+finalized AS-IS with that gap explicit, not implicit. Do not let a future
+session rediscover it by accident.
+
+**What is actually imported** — every `lance_graph_contract::` module this
+workspace touches: `dawg`, `facet`, `network`, `ogar_codebook`, `unichar`,
+`unicharcompress`, `unicharset`. **All seven are content/codec.** Zero
+reasoning surfaces. A grep for `nars` / `TruthValue` / `SoaEnvelope` /
+`BindSpace` / `Belief` across `crates/*/src` returns **nothing** (earlier
+apparent hits were substring noise — `corresponds`, `response`,
+`XyTranspose`).
+
+**And `doc.v1` — explicitly designed as "the OPTIONAL seed a consumer feeds
+via OGAR" — is consumed only by RENDERERS**: `tesseract-ocr-pdf`,
+`tesseract-ocr-python`, `tesseract-ocr-web`. Nothing reasons over it. The
+capability exists on both sides of that seam and the wire between them is
+dead.
+
+### The cost split — three pieces, NOT one (this is the part worth knowing)
+
+The architecture doc reads as if "use lance-graph's reasoning" is a single
+heavy decision. Measured, it is three, and two are cheap:
+
+| piece | where | cost to reach from here |
+|---|---|---|
+| **`NarsTruth`** (frequency/confidence pair) | `lance-graph-contract/src/exploration.rs:89` | **Free.** Zero-dep contract crate, already a dependency. Per-word `mean_conf` is already computed — attaching a truth value to recognized content costs nothing architecturally. |
+| **Per-sentence SPO** (6-state PoS FSM → triples) | `crates/deepnsm` (lance-graph, workspace-EXCLUDED) | **Cheap.** Its path deps are `ndarray` + `lance-graph-contract` — **both already in this tree** (`tesseract-recognizer` deps ndarray; `tesseract-core` deps the contract). No new heavy dependency. Note the old "0 deps" claim for deepnsm is stale — it has two path deps, both already satisfied here. |
+| **NARS *reasoning*** — belief arena, revision, the 5 tactics (RCR/TR/CAS/ASC/CR) | `lance-graph-planner/src/nars/{belief,tactics,truth,inference}.rs` | **The real boundary.** Lives in the planner, which pulls `serde`/`serde_yml`/`tokio`/`tracing` — outside this crate's dep set and against the lean-binary proposition. This is the piece that genuinely belongs downstream or in the opt-in OGAR image. |
+
+### Why this matters for what to build next
+
+The dict beam (C1) already does **lexical** correction via DAWG — a word that
+is misrecognized into another *real* word passes today, because nothing checks
+whether it makes *sense*. That is precisely the gap NARS revision over
+accumulated beliefs would close, and it is invisible to every metric this repo
+currently has (CER against a known transcript cannot see it either, since the
+fixture text is the ground truth).
+
+So the AS-IS line is: **recognition is byte-parity faithful and now measured;
+reasoning over what was recognized is absent by design, not by oversight.**
+The two cheap pieces above are the natural first step if that changes — and
+they land inside the standalone binary, which is why they are worth
+distinguishing from the third.
+
+Cross-ref: the operator-set boundary already recorded above ("tesseract-rs =
+faithful recognition → rich doc.v1; the JSON is the OPTIONAL seed … Store /
+graph / KV / PDF-from-data are NOT tesseract-rs concerns") — that ruling stands.
+This section records that the *consumer side of it has never been built*, which
+the ruling itself does not say.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the
