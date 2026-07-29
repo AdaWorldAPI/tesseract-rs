@@ -2,8 +2,9 @@
 //! connector target.
 //!
 //! Three real routes plus a spec endpoint:
-//! - `POST /api/v1/recognize`      — binary or `{content_base64, lang}` JSON in,
-//!   `tesseract-rs/doc.v1` JSON out (`RecognizeDocument` in the connector).
+//! - `POST /api/v1/recognize`      — binary or `{content_base64, lang, rectify}`
+//!   JSON in, `tesseract-rs/doc.v1` JSON out (`RecognizeDocument` in the
+//!   connector).
 //! - `POST /api/v1/pdf`            — same input, searchable PDF out (default;
 //!   `?mode=structured` switches to the structured reconstruction)
 //!   (`SearchablePdf` in the connector).
@@ -105,22 +106,28 @@ async fn require_api_key(headers: HeaderMap, req: Request, next: Next) -> Respon
 }
 
 // ===========================================================================
-// Request-body dispatch: raw binary OR `{content_base64, lang}` JSON
+// Request-body dispatch: raw binary OR `{content_base64, lang, rectify}` JSON
 // ===========================================================================
 
 /// The JSON alternate form's body shape (see `docs/SDK-PYTHON-AND-POWER-PLATFORM.md`
 /// §2). `lang` selects the model via [`crate::state::AppState::model`]
-/// (`"deu"` → German, anything else → English) — see [`decode_request_body`].
+/// (`"deu"` → German, anything else → English); `rectify` runs
+/// [`tesseract_ocr::rectify::auto_rectify`] before recognition when `true`
+/// (default `false` when absent — combined with the `?rectify=` query
+/// parameter via OR, not an override like `lang`, since a plain flag only
+/// needs either source to enable it) — see [`decode_request_body`].
 #[derive(Debug, Deserialize)]
 struct RecognizeJsonBody {
     content_base64: String,
     #[serde(default)]
     lang: Option<String>,
+    #[serde(default)]
+    rectify: bool,
 }
 
 /// `true` when the request declares a JSON content-type (ignoring any
 /// `; charset=...` parameter) — the signal that selects the
-/// `{content_base64, lang}` branch over the raw-binary branch.
+/// `{content_base64, lang, rectify}` branch over the raw-binary branch.
 fn is_json_content_type(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
@@ -135,32 +142,39 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// Decode `body` into raw image bytes + the requested language (if any) for
-/// the recognizer, dispatched by content-type:
+/// Decode `body` into raw image bytes + the requested language (if any) + the
+/// requested rectify flag for the recognizer, dispatched by content-type:
 /// - `application/json` — parsed as [`RecognizeJsonBody`]; `content_base64`
 ///   is base64-decoded (standard or URL-safe alphabet, padded or not), and
-///   `lang` (if present) is returned alongside.
+///   `lang`/`rectify` (if present) are returned alongside.
 /// - anything else (notably `application/octet-stream`, the shape Microsoft
 ///   Graph's "Get file content" produces) — the body IS the image bytes,
-///   verbatim, with no `lang` of its own (a binary POST has no body field for
-///   it — callers pass `?lang=` instead; see each handler).
+///   verbatim, with no `lang`/`rectify` of its own (a binary POST has no body
+///   field for either — callers pass `?lang=`/`?rectify=` instead; see each
+///   handler).
 ///
 /// `lang` selects the model via [`crate::state::AppState::model`] (`"deu"` →
 /// German, anything else → English, the pre-existing default) — never a hard
 /// error for an unrecognized value, same "forgiving field" rule the rest of
-/// this crate's request parsing uses.
+/// this crate's request parsing uses. `rectify` runs
+/// [`tesseract_ocr::rectify::auto_rectify`] before recognition — unlike
+/// `lang`, there is no "which source wins" precedence to pick between the
+/// body and the query parameter: each caller combines them with OR (`true`
+/// from either source is enough), since a plain flag has no competing values
+/// to choose between the way `"eng"` vs `"deu"` does.
 fn decode_request_body(
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<(Vec<u8>, Option<String>), String> {
+) -> Result<(Vec<u8>, Option<String>, bool), String> {
     if is_json_content_type(headers) {
         let parsed: RecognizeJsonBody = serde_json::from_slice(body).map_err(|e| {
             format!(
-                "invalid JSON body (expected {{\"content_base64\": \"...\", \"lang\": \"eng\"}}): {e}"
+                "invalid JSON body (expected {{\"content_base64\": \"...\", \"lang\": \"eng\", \
+                 \"rectify\": false}}): {e}"
             )
         })?;
         let bytes = decode_base64(parsed.content_base64.trim())?;
-        Ok((bytes, parsed.lang))
+        Ok((bytes, parsed.lang, parsed.rectify))
     } else if body.is_empty() {
         Err(
             "empty request body — send raw image bytes (application/octet-stream) or \
@@ -168,7 +182,7 @@ fn decode_request_body(
                 .to_string(),
         )
     } else {
-        Ok((body.to_vec(), None))
+        Ok((body.to_vec(), None, false))
     }
 }
 
@@ -218,25 +232,31 @@ fn doc_json_response(doc_json: String) -> Response {
 // Handlers
 // ===========================================================================
 
-/// `POST /api/v1/recognize` — binary or `{content_base64, lang}` JSON in,
-/// `tesseract-rs/doc.v1` JSON out. Same permit + `spawn_blocking` discipline
-/// as the HTML `/ocr` route (recognition is heavy synchronous CPU work; the
-/// permit bounds concurrent recognitions, `spawn_blocking` keeps the async
-/// executor free while it runs).
+/// `POST /api/v1/recognize` — binary or `{content_base64, lang, rectify}`
+/// JSON in, `tesseract-rs/doc.v1` JSON out. Same permit + `spawn_blocking`
+/// discipline as the HTML `/ocr` route (recognition is heavy synchronous CPU
+/// work; the permit bounds concurrent recognitions, `spawn_blocking` keeps
+/// the async executor free while it runs).
 ///
 /// `lang` comes from the JSON body's `lang` field when present; a binary POST
 /// (no body field for it) instead reads `?lang=` (`Query<LangQuery>`) — the
-/// JSON body wins if a caller somehow sends both.
+/// JSON body wins if a caller somehow sends both. `rectify` is the OR of the
+/// JSON body's own `rectify` field and `?rectify=true` (either source enabling
+/// it is enough — see [`decode_request_body`]'s doc comment for why this
+/// differs from `lang`'s override precedence).
 async fn recognize(
     State(state): State<Arc<AppState>>,
     Query(q): Query<LangQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let (bytes, body_lang) = match decode_request_body(&headers, &body) {
+    let (bytes, body_lang, body_rectify) = match decode_request_body(&headers, &body) {
         Ok(b) => b,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, e),
     };
+    // Computed before `q.lang` is moved out below — `q.wants_rectify()`
+    // borrows `q`, which a partial move would otherwise make unusable.
+    let rectify = body_rectify || q.wants_rectify();
     let lang = body_lang.or(q.lang);
 
     let permit = match state.recognize_permits.clone().acquire_owned().await {
@@ -246,7 +266,7 @@ async fn recognize(
     let st = state.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        ocr_image_bytes_json(&st, &bytes, lang.as_deref())
+        ocr_image_bytes_json(&st, &bytes, lang.as_deref(), rectify)
     })
     .await;
     match outcome {
@@ -273,7 +293,11 @@ async fn pdf_searchable_or_query(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    pdf_impl(state, &headers, &body, q.is_structured(), q.lang).await
+    // Computed before `q.lang` is moved out below — both borrow `q`, and a
+    // partial move would otherwise make it unusable for the second call.
+    let structured = q.is_structured();
+    let rectify = q.wants_rectify();
+    pdf_impl(state, &headers, &body, structured, q.lang, rectify).await
 }
 
 /// `POST /api/v1/pdf/structured` — `StructuredPdf` in the connector: a
@@ -287,26 +311,35 @@ async fn pdf_structured(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    pdf_impl(state, &headers, &body, true, q.lang).await
+    // Computed before `q.lang` is moved out below — see the identical note in
+    // `pdf_searchable_or_query`.
+    let rectify = q.wants_rectify();
+    pdf_impl(state, &headers, &body, true, q.lang, rectify).await
 }
 
 /// Shared body for [`pdf_searchable_or_query`] / [`pdf_structured`] — decode,
 /// acquire a recognition permit, render off the async runtime, respond.
 /// `query_lang` is the `?lang=` value (if any); the JSON body's own `lang`
 /// field (when the request is `application/json`) wins over it — same
-/// precedence as [`recognize`].
+/// precedence as [`recognize`]. `query_rectify` is `?rectify=true`'s value;
+/// it combines with the JSON body's own `rectify` field via OR rather than an
+/// override — again, same rule as [`recognize`] (see
+/// [`decode_request_body`]'s doc comment for why `rectify` doesn't need
+/// `lang`'s "which source wins" precedence).
 async fn pdf_impl(
     state: Arc<AppState>,
     headers: &HeaderMap,
     body: &[u8],
     structured: bool,
     query_lang: Option<String>,
+    query_rectify: bool,
 ) -> Response {
-    let (bytes, body_lang) = match decode_request_body(headers, body) {
+    let (bytes, body_lang, body_rectify) = match decode_request_body(headers, body) {
         Ok(b) => b,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, e),
     };
     let lang = body_lang.or(query_lang);
+    let rectify = body_rectify || query_rectify;
 
     let permit = match state.recognize_permits.clone().acquire_owned().await {
         Ok(p) => p,
@@ -315,9 +348,7 @@ async fn pdf_impl(
     let st = state.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        // rectify is not yet exposed on the machine API (HTML-demo-only for
-        // this pass — see tesseract_ocr::rectify's module docs).
-        build_pdf(&st, &bytes, structured, lang.as_deref(), false)
+        build_pdf(&st, &bytes, structured, lang.as_deref(), rectify)
     })
     .await;
     match outcome {
@@ -379,6 +410,10 @@ mod tests {
         assert_eq!(
             parsed["securityDefinitions"]["api_key"]["name"],
             "x-api-key"
+        );
+        assert_eq!(
+            parsed["definitions"]["RecognizeJsonBody"]["properties"]["rectify"]["type"],
+            "boolean"
         );
     }
 
@@ -635,5 +670,77 @@ mod tests {
         );
         let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert!(out.starts_with(b"%PDF-"));
+    }
+
+    /// `?rectify=true` on a binary body wires through to
+    /// [`crate::ocr::ocr_image_bytes_json`] without erroring —
+    /// `page_01.pgm` is a clean digital render, so
+    /// `tesseract_ocr::rectify::auto_rectify`'s no-op guarantee means this
+    /// must still return a normal `doc.v1` document, same as the plain
+    /// [`post_recognize_binary_returns_doc_v1_json`] case.
+    #[tokio::test]
+    async fn post_recognize_with_rectify_query_is_a_no_op_on_a_clean_page() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let dir = model_dir();
+        if !dir.join("eng.lstm").exists() {
+            eprintln!("skipping: corpus model absent");
+            return;
+        }
+        let state = Arc::new(AppState::load(&dir).expect("load model"));
+        let app = crate::routes::router(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/v1/recognize?rectify=true")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(page_01_bytes()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("{\"schema\":\"tesseract-rs/doc.v1\""));
+    }
+
+    /// Same as the query-parameter case above, but `rectify` arrives as the
+    /// JSON body's own field instead — exercises [`RecognizeJsonBody::rectify`]
+    /// end-to-end through [`decode_request_body`].
+    #[tokio::test]
+    async fn post_recognize_json_body_rectify_field_is_accepted() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let dir = model_dir();
+        if !dir.join("eng.lstm").exists() {
+            eprintln!("skipping: corpus model absent");
+            return;
+        }
+        let state = Arc::new(AppState::load(&dir).expect("load model"));
+        let app = crate::routes::router(state);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(page_01_bytes());
+        let body = serde_json::json!({ "content_base64": b64, "lang": "eng", "rectify": true })
+            .to_string();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/v1/recognize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("{\"schema\":\"tesseract-rs/doc.v1\""));
     }
 }

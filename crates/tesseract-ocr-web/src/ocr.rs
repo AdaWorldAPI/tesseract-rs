@@ -69,6 +69,12 @@ pub struct OcrOutcome {
     pub low_confidence: bool,
     /// Wall-clock recognition time in milliseconds (decode excluded).
     pub elapsed_ms: f64,
+    /// `true` when [`tesseract_ocr::rectify::auto_rectify`] actually changed
+    /// the page (it was requested AND the fitted ramp cleared
+    /// [`tesseract_ocr::rectify::ShearRamp::is_significant`]) — mirrors
+    /// [`OcrDebugOutcome::rectified`]'s honesty signal, since `auto_rectify`
+    /// is a safe no-op on an already-straight page.
+    pub rectified: bool,
 }
 
 /// The result of OCR-ing one uploaded/fetched image in JSON mode: the
@@ -94,6 +100,15 @@ pub struct OcrJsonOutcome {
     pub low_confidence: bool,
     /// Wall-clock recognition time in milliseconds (decode excluded).
     pub elapsed_ms: f64,
+    /// `true` when [`tesseract_ocr::rectify::auto_rectify`] actually changed
+    /// the page — mirrors [`OcrDebugOutcome::rectified`]'s honesty signal.
+    /// Consumed by the HTML `/ocr?format=json` result page; the machine API
+    /// (`POST /api/v1/recognize`) returns ONLY [`Self::json`] as its response
+    /// body, so this field does not (yet) reach API callers on the wire —
+    /// surfacing it there would mean either changing the `doc.v1` schema (a
+    /// cross-crate change, out of scope here) or adding a response header,
+    /// neither of which this pass does.
+    pub rectified: bool,
 }
 
 /// Decode `bytes` (PNG / JPEG / WebP / TIFF / GIF / BMP / PNM — via the `image`
@@ -151,7 +166,11 @@ fn decode_grey(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
 /// a user-safe error string.
 ///
 /// `lang` selects the model via [`AppState::model`] (`Some("deu")` → German,
-/// anything else → English, the pre-existing default).
+/// anything else → English, the pre-existing default). `rectify`, when
+/// `true`, runs [`tesseract_ocr::rectify::auto_rectify`] on the decoded grey
+/// page BEFORE recognition — the same opt-in preprocessing pass
+/// [`ocr_image_bytes_debug`] already exposes; see that function's doc comment
+/// for what it corrects and why it is always a safe no-op.
 ///
 /// This is heavy synchronous CPU work — callers MUST run it off the async
 /// runtime (via `spawn_blocking`); see [`crate::routes`].
@@ -159,8 +178,21 @@ pub fn ocr_image_bytes(
     state: &AppState,
     bytes: &[u8],
     lang: Option<&str>,
+    rectify: bool,
 ) -> Result<OcrOutcome, String> {
-    let (raw, w, h) = decode_grey(bytes)?;
+    let (decoded, w, decoded_h) = decode_grey(bytes)?;
+    // Same before/after comparison as ocr_image_bytes_debug: auto_rectify is
+    // a documented no-op when nothing significant is detected, so comparing
+    // rather than echoing the request flag is the honest way to report
+    // whether it did anything. Its canvas can grow/shrink — `h` MUST be
+    // rebound to the returned height for everything downstream.
+    let (raw, h, rectified) = if rectify {
+        let (out, out_h) = tesseract_ocr::rectify::auto_rectify(&decoded, w, decoded_h);
+        let changed = out_h != decoded_h || out != decoded;
+        (out, out_h, changed)
+    } else {
+        (decoded, decoded_h, false)
+    };
     let (_lang, model) = state.model(lang);
 
     let t0 = Instant::now();
@@ -189,6 +221,7 @@ pub fn ocr_image_bytes(
         mean_conf: mean.unwrap_or(-1.0),
         low_confidence: mean.is_some_and(|mc| mc < LOW_CONFIDENCE_THRESHOLD),
         elapsed_ms,
+        rectified,
     })
 }
 
@@ -204,13 +237,30 @@ pub fn ocr_image_bytes(
 /// `lang` selects the model via [`AppState::model`] (`Some("deu")` → German,
 /// anything else → English, the pre-existing default). The German-invoice
 /// field harvest itself runs regardless of `lang` — its label keys/regexes
-/// are a fixed spec, not a language switch.
+/// are a fixed spec, not a language switch. `rectify`, when `true`, runs
+/// [`tesseract_ocr::rectify::auto_rectify`] on the decoded grey page BEFORE
+/// recognition — the same opt-in preprocessing pass [`ocr_image_bytes_debug`]
+/// already exposes. This function is also the machine API's own entry point
+/// for it: `crate::api`'s `recognize` handler for `POST /api/v1/recognize`
+/// calls straight through to it. See [`ocr_image_bytes_debug`]'s doc comment
+/// for what the pass corrects and why it is always a safe no-op.
 pub fn ocr_image_bytes_json(
     state: &AppState,
     bytes: &[u8],
     lang: Option<&str>,
+    rectify: bool,
 ) -> Result<OcrJsonOutcome, String> {
-    let (raw, w, h) = decode_grey(bytes)?;
+    let (decoded, w, decoded_h) = decode_grey(bytes)?;
+    // Same before/after comparison as ocr_image_bytes_debug — see that
+    // function's doc comment for the full rationale (no-op honesty, height
+    // rebinding).
+    let (raw, h, rectified) = if rectify {
+        let (out, out_h) = tesseract_ocr::rectify::auto_rectify(&decoded, w, decoded_h);
+        let changed = out_h != decoded_h || out != decoded;
+        (out, out_h, changed)
+    } else {
+        (decoded, decoded_h, false)
+    };
     let (_lang, model) = state.model(lang);
 
     let t0 = Instant::now();
@@ -230,6 +280,7 @@ pub fn ocr_image_bytes_json(
         mean_conf: doc.mean_confidence.unwrap_or(-1.0),
         low_confidence: doc.low_confidence,
         elapsed_ms,
+        rectified,
     })
 }
 
