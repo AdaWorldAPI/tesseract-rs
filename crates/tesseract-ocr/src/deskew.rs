@@ -7,15 +7,15 @@
 //! `.claude/harvest/oracles/skew_oracle.cpp`.
 //!
 //! This is a slice of the full deskew wave (`.claude/plans/deskew-wave-v1.md`,
-//! leaves D1/D2/D3/D4/D5 of D1-D8). NOT here: the
-//! `pixDeskewGeneral`/`pixDeskewBoth` composition (D6/D7, which calls D1 for
-//! its 90°-round-trip second pass) and the pipeline wiring (D8). See the plan
-//! for the full sequencing and why the leaves split this way.
+//! leaves D1-D7 of D1-D8). NOT here: the pipeline wiring (D8 — whether
+//! deskew runs by default, and its composition with `rectify.rs`'s keystone
+//! correction). See the plan for the full sequencing and why the leaves
+//! split this way.
 //!
 //! ## What's here
 //! - [`rotate90_grey`] — `pixRotate90`, d==8 only (`rotateorth.c:222-232` CW /
 //!   `:310-320` CCW): a pure index remap, no float math at all, lossless.
-//!   Needed by the not-yet-built D7 `pixDeskewBoth`'s 90°-round-trip.
+//!   Used by [`deskew_both`]'s 90°-round-trip.
 //! - [`find_differential_square_sum`] — `pixFindDifferentialSquareSum`
 //!   (`skew.c:1111-1155`): the score the D4 sweep maximizes.
 //! - [`v_shear_corner`] / [`v_shear_center`] — `pixVShearCorner` /
@@ -37,6 +37,16 @@
 //!   recognizer actually wants for post-deskew correction — rotating in grey
 //!   preserves the antialiasing the LSTM input step depends on, whereas
 //!   rotating only the binary detector buffer would throw it away.
+//! - [`deskew_general`] — `pixDeskewGeneral` (`skew.c:289-351`): the D4/D5
+//!   composition — binarize (fixed threshold) for DETECTION only, run the
+//!   D4 sweep+search, gate on angle/confidence, then (if the gate clears)
+//!   rotate the ORIGINAL grey via [`rotate_am_gray`]. GREY input only — see
+//!   its own doc for exactly why the C's `depth == 1` branch is a deliberate
+//!   non-goal here, not an oversight.
+//! - [`deskew_both`] — `pixDeskewBoth` (`skew.c:166-189`): [`deskew_general`]
+//!   (with `pixDeskew`'s own all-default parameters) → [`rotate90_grey`]
+//!   clockwise → [`deskew_general`] again → [`rotate90_grey`]
+//!   counter-clockwise. Two passes because the D4 detector is directional.
 //!
 //! ## Two crate-convention notes that matter for every leaf here
 //! - **Grey is raw, unflipped.** 8bpp grey buffers in this crate are
@@ -884,6 +894,371 @@ pub fn rotate_am_gray_corner(grey: &[u8], w: usize, h: usize, angle: f32, grayva
     rotate_am_gray_corner_low(grey, w, h, angle, grayval)
 }
 
+/// `DefaultSweepRange` (`skew.c:106`) — degrees, half the D6/D7 sweep's full
+/// range about `sweepcenter = 0.0` (see
+/// [`find_skew_sweep_and_search_score_pivot`]).
+const DEFAULT_SWEEP_RANGE: f32 = 7.0;
+
+/// `DefaultSweepDelta` (`skew.c:107`) — degrees, the coarse sweep's angle
+/// step.
+const DEFAULT_SWEEP_DELTA: f32 = 1.0;
+
+/// `DefaultMinbsDelta` (`skew.c:113`) — degrees. [`deskew_general`] has no
+/// `minbsdelta` PARAMETER at all (unlike
+/// [`find_skew_sweep_and_search_score_pivot`], which does) — every call into
+/// D4 from this leaf uses this exact constant, never a caller-supplied
+/// value (verified against `skew.c:334-336`: the one call site passes
+/// `DefaultMinbsDelta` literally).
+const DEFAULT_MINBS_DELTA: f32 = 0.01;
+
+/// `DefaultSweepReduction` (`skew.c:116`).
+const DEFAULT_SWEEP_REDUCTION: u32 = 4;
+
+/// `DefaultBsReduction` (`skew.c:117`).
+const DEFAULT_BS_REDUCTION: u32 = 2;
+
+/// `DefaultBinaryThreshold` (`skew.c:134`) — the fixed threshold
+/// [`pix_convert_to_1`] uses when the caller passes `0`.
+const DEFAULT_BINARY_THRESHOLD: i32 = 130;
+
+/// `MinDeskewAngle` (`skew.c:120`) — DEGREES, compared directly against the
+/// D4 detector's own degree-valued `angle` (no radian conversion at this
+/// gate — the conversion only happens afterward, for the rotation itself).
+///
+/// Plain `f32` literal, not narrowed from an `f64` intermediate — unlike the
+/// `deg2rad`/`pi2` sites elsewhere in this module, this one does NOT need
+/// the "narrow once from f64" treatment: `0.1_f32` (Rust's direct
+/// decimal-to-f32 literal parse) and `(0.1_f64 as f32)` (C's
+/// decimal-to-double-then-narrow-to-float path for `static const l_float32
+/// MinDeskewAngle = 0.1;`) were checked bit-for-bit (via exact rational
+/// comparison against the surrounding f32 grid, not merely "commonly cited
+/// as safe") and agree: both round to `0x3dcccccd`. [`MIN_ALLOWED_CONFIDENCE`]
+/// was checked the same way (`0x40400000` either path) — the same
+/// discipline the plan's "pi-literal rule" applies to the `deg2rad`/`pi2`
+/// sites, just with the opposite conclusion (safe here, NOT safe there).
+const MIN_DESKEW_ANGLE: f32 = 0.1;
+
+/// `MinAllowedConfidence` (`skew.c:123`) — see [`MIN_DESKEW_ANGLE`]'s doc for
+/// why a plain `f32` literal is verified safe here.
+const MIN_ALLOWED_CONFIDENCE: f32 = 3.0;
+
+/// `pixConvertTo1(pixs, thresh)` (`pixconv.c:3025-3064`), specialized to
+/// THIS crate's always-8bpp-grey domain: for `d == 8`, `pixConvertTo1` is
+/// exactly `pixConvertTo8` (a no-op, since we are already 8bpp) followed by
+/// `pixThresholdToBinary(pixg, thresh)` (`grayquant.c:446-488`), whose own
+/// doc comment is verbatim: "If the source pixel is less than the threshold
+/// value, the dest will be 1 [ON]; otherwise, it will be 0 [background]"
+/// (`grayquant.c:438-439` — strict `<`, not `<=`, confirmed by reading
+/// `thresholdToBinaryLineLow`'s actual per-pixel comparison, not just the
+/// doc comment). THIS CRATE's binary convention inverts leptonica's bit
+/// (`0 = ON`, matching every other buffer in this module), so: `grey[i] <
+/// thresh -> 0 (ON)`, else `255 (background)`.
+///
+/// `pixThresholdToBinary` itself rejects `thresh < 0` or (for `d == 8`)
+/// `thresh > 256` as a defensive/error path, which would cascade a NULL
+/// through `pixConvertTo1` and ultimately surface as [`deskew_general`]'s
+/// own "D4 detector failed" outcome. NOT reproduced: every realistic caller
+/// passes `thresh == 0` (→ [`DEFAULT_BINARY_THRESHOLD`]) or a value in the
+/// sane `0..=255` range, no oracle fixture exercises an out-of-range value,
+/// and a plain `<` comparison is well-defined — and behaviourally IDENTICAL
+/// to the C for every value that would have been valid there — for any
+/// `i32`, so the stricter defensive rejection is not worth forcing an extra
+/// `Option` layer onto every caller of [`deskew_general`] for a path with no
+/// falsifier.
+fn pix_convert_to_1(grey: &[u8], thresh: i32) -> Vec<u8> {
+    grey.iter()
+        .map(|&g| if i32::from(g) < thresh { 0u8 } else { 255u8 })
+        .collect()
+}
+
+/// Result of [`deskew_general`]: the possibly-rotated grey buffer, plus the
+/// D4 detector's own `(angle, conf)`. `pixDeskewGeneral` makes `pangle`/
+/// `pconf` optional out-parameters (`NULL` to skip, as `pixDeskew` does);
+/// this Rust surface always returns them instead — the "`pixFindSkewAndDeskew`
+/// shape" (that function IS `pixDeskewGeneral` with both requested) — since
+/// they are computed internally regardless and a caller integrating this
+/// into a pipeline (the `rectify.rs` composition, or a table-detection
+/// front-end) will generally want to know whether/how much rotation
+/// happened, not just the corrected pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeskewResult {
+    /// The corrected grey buffer, or (below the gate, or on a D4-internal
+    /// failure) the UNCHANGED original. Same `w × h` as the input either
+    /// way — area-map rotation never expands the canvas (see the module
+    /// doc's "CROPS" section).
+    pub grey: Vec<u8>,
+    /// Width, in pixels. Never changes from the input's own `w`.
+    pub w: usize,
+    /// Height, in pixels. Never changes from the input's own `h`.
+    pub h: usize,
+    /// The angle required to deskew, in DEGREES ("the negative of the skew
+    /// angle... clockwise rotations are positive", `skew.c:369-371`
+    /// verbatim, D4's own return contract). `0.0` when D4 failed internally
+    /// (see [`deskew_general`]'s return-contract docs) — NOT necessarily
+    /// `0.0` merely because the page was left unrotated: below the
+    /// confidence/angle GATE, the REAL detected value is still reported,
+    /// exactly as `pixDeskewGeneral` writes `*pangle` unconditionally
+    /// before checking the gate.
+    pub angle: f32,
+    /// D4's confidence (ratio of max/min score). Same zero-vs-real
+    /// distinction as `angle` above.
+    pub conf: f32,
+}
+
+/// `pixDeskewGeneral` (`skew.c:289-351`) — D6, the full detect-then-correct
+/// composition: binarize `grey` at a FIXED threshold for detection only (the
+/// correction rotation, if any, runs on `grey` itself, never on this binary
+/// copy — `skew.c:326-331` builds `pixb` purely to feed the detector, and
+/// `skew.c:346-347` rotates `pixs`, not `pixb`), run the D4 sweep+search,
+/// then gate on the result: below [`MIN_DESKEW_ANGLE`] or
+/// [`MIN_ALLOWED_CONFIDENCE`], return the input unchanged; otherwise rotate
+/// via [`rotate_am_gray`] (center pivot — `skew.c`'s own `pixRotate` call
+/// uses `L_ROTATE_AREA_MAP`, and see this function's own docs below for why
+/// that dispatch collapses to exactly `rotate_am_gray` in this crate's
+/// always-grey domain).
+///
+/// `redsweep`/`sweeprange`/`sweepdelta`/`redsearch`/`thresh` all follow the
+/// C's own "`0` (or `0.0`) means use the default" convention
+/// (`skew.c:309-322`) — passing `0`/`0.0` for any of them is not itself an
+/// error.
+///
+/// # GREY input only — a deliberate scope decision, not an oversight
+/// The C's `pixDeskewGeneral` accepts "any depth" and special-cases
+/// `depth == 1` (clone straight through, no `pixConvertTo1` call). This Rust
+/// surface does not model that branch, for three compounding reasons:
+/// 1. This crate has no packed-1bpp/colormap `PIX`-equivalent input type —
+///    every other leaf in this module (and the wider crate: `image_input.rs`,
+///    `xy_cut.rs`) already treats "the page" as an 8bpp grey byte-per-pixel
+///    buffer, never a packed bitonal one.
+/// 2. `.claude/harvest/oracles/skew_oracle.cpp`'s own `deskew` arm always
+///    converts its input to 8bpp grey first (`read_grey` calls
+///    `pixConvertTo8`) — there is no byte-parity evidence for the
+///    `depth == 1` path at all, on either side.
+/// 3. Most importantly: for a genuinely 1bpp `pixs`, `pixRotate`'s OWN type
+///    dispatch (`rotate.c:113-196`,
+///    `.claude/harvest/leptonica-skew-callgraph.txt` ARM B step 3)
+///    UNCONDITIONALLY overrides `L_ROTATE_AREA_MAP` to `L_ROTATE_SHEAR` or
+///    `L_ROTATE_SAMPLING` for 1bpp input — AREA_MAP is never reachable for a
+///    1bpp `pixs` through this entry point at all. Both overrides route to
+///    primitives this wave does NOT ship: `pixRotateShear`/`pixRotate2Shear`/
+///    `pixRotate3Shear` need `pixHShear` (shear.c's OTHER axis — explicitly
+///    NOT transcoded here, see [`v_shear_corner`]'s own doc), and
+///    `pixRotateBySampling` is an explicit v1 non-goal in the plan.
+///    Supporting `depth == 1` faithfully is therefore blocked on leaves
+///    outside this task's scope, not merely skipped for convenience.
+///
+/// For an 8bpp grey `pixs` (this function's ENTIRE domain), none of
+/// `pixRotate`'s dispatch machinery ever diverges from `pixRotateAMGray`:
+/// there is no colormap concept to strip, `pixEmbedForRotation` is a no-op
+/// (width=height=0, exactly as `skew.c:346-347` itself always passes), the
+/// depth is already ≥ 8 so no `pixConvertTo8` promotion fires, and the
+/// depth-1 type-override branch never applies. `fillval` is always `255`
+/// (`skew.c` always passes `L_BRING_IN_WHITE`, and this crate's grey
+/// convention is unflipped — see the module doc). So the entire ARM B
+/// dispatch collapses to exactly one call: `rotate_am_gray(grey, w, h,
+/// deg2rad * angle, 255)`.
+///
+/// # Return contract
+/// `None` ONLY for `pixDeskewGeneral`'s OWN top-level validation failure:
+/// `redsweep`/`redsearch` not in `{0, 1, 2, 4}`. **This is a STRICT SUBSET
+/// of [`find_skew_sweep_and_search_score_pivot`]'s own `{1, 2, 4, 8}`** —
+/// verified against `skew.c:309-312` and `:317-320` directly, not assumed
+/// from D4's own range: `pixDeskewGeneral`/`pixDeskew`/`pixDeskewBoth`/
+/// `pixFindSkewAndDeskew` all reject `8` even though the underlying detector
+/// would happily accept it. See
+/// `deskew_general_rejects_redsweep_8_even_though_d4_itself_accepts_it`
+/// below, which pins this asymmetry as a locked contract.
+///
+/// `Some(DeskewResult { .. })` for every other outcome, including:
+/// - D4's own internal failure (all-background image, via `pixZero`) —
+///   `ret != 0` in the C. `angle`/`conf` are forced to `0.0`: the C
+///   initializes `*pangle = *pconf = 0.0` at `pixDeskewGeneral`'s OWN entry
+///   (`skew.c:305-306`), BEFORE calling D4 at all, and D4 itself ALSO
+///   unconditionally zeroes them at its own entry
+///   ([`find_skew_sweep_and_search_score_pivot`]'s own doc) — so this is the
+///   value the caller observes either way. The buffer is the UNCHANGED
+///   original (`return pixClone(pixs)`).
+/// - The gate not clearing (`|angle| < MIN_DESKEW_ANGLE` or
+///   `conf < MIN_ALLOWED_CONFIDENCE`) — the buffer is again the UNCHANGED
+///   original, but `angle`/`conf` are the REAL detected values (the C writes
+///   `*pangle = angle; *pconf = conf;` BEFORE this gate check, not after).
+///   D4's own "max found at sweep edge" degenerate-success case
+///   (`angle = 0.0, conf = 0.0`) flows through this SAME branch, since `0.0`
+///   trivially fails both gate conditions — no special-casing needed.
+/// - The gate clearing — the buffer is [`rotate_am_gray`]'s output.
+///
+/// # Panics
+/// Panics if `grey.len() != w * h`.
+#[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "faithful transcode of pixDeskewGeneral's full parameter list"
+)]
+pub fn deskew_general(
+    grey: &[u8],
+    w: usize,
+    h: usize,
+    redsweep: u32,
+    sweeprange: f32,
+    sweepdelta: f32,
+    redsearch: u32,
+    thresh: i32,
+) -> Option<DeskewResult> {
+    assert_eq!(grey.len(), w * h, "grey buffer is not w·h");
+
+    // "use 0 for default" -- resolved BEFORE validating, exactly as the C: a
+    // caller-supplied 0 is never itself the error; only a nonzero value
+    // outside {1,2,4} is (skew.c:309-312, :317-320).
+    let redsweep = if redsweep == 0 {
+        DEFAULT_SWEEP_REDUCTION
+    } else {
+        redsweep
+    };
+    if redsweep != 1 && redsweep != 2 && redsweep != 4 {
+        return None;
+    }
+    let sweeprange = if sweeprange == 0.0 {
+        DEFAULT_SWEEP_RANGE
+    } else {
+        sweeprange
+    };
+    let sweepdelta = if sweepdelta == 0.0 {
+        DEFAULT_SWEEP_DELTA
+    } else {
+        sweepdelta
+    };
+    let redsearch = if redsearch == 0 {
+        DEFAULT_BS_REDUCTION
+    } else {
+        redsearch
+    };
+    if redsearch != 1 && redsearch != 2 && redsearch != 4 {
+        return None;
+    }
+    let thresh = if thresh == 0 {
+        DEFAULT_BINARY_THRESHOLD
+    } else {
+        thresh
+    };
+
+    // deg2rad = 3.1415926535 / 180. -- the IDENTICAL literal/precision as
+    // D4's own (skew.c re-declares this exact literal at both call sites:
+    // line 324 here, line 708 in find_skew_sweep_and_search_score_pivot);
+    // the narrowing-equivalence argument is the one recorded there and in
+    // the plan's "pi-literal rule".
+    let deg2rad = (core::f64::consts::PI / 180.0_f64) as f32;
+
+    // Binarize for DETECTION only -- see this function's own doc for why
+    // the correction rotation below runs on `grey`, never on `binary`.
+    let binary = pix_convert_to_1(grey, thresh);
+
+    // sweepcenter=0.0 and pivot=Corner are not parameters ANYWHERE on this
+    // call chain -- pixFindSkewSweepAndSearch -> ...Score -> ...ScorePivot
+    // hardcodes both at every hop (skew.c:573, 629, 632). minbsdelta is
+    // likewise always DEFAULT_MINBS_DELTA (pixDeskewGeneral has no such
+    // parameter to forward).
+    let detected = find_skew_sweep_and_search_score_pivot(
+        &binary,
+        w,
+        h,
+        redsweep,
+        redsearch,
+        0.0,
+        sweeprange,
+        sweepdelta,
+        DEFAULT_MINBS_DELTA,
+        ShearPivot::Corner,
+    );
+
+    let Some(skew) = detected else {
+        // D4's own true-error path (pixZero-detected all-background image;
+        // never a redsweep/redsearch rejection, since we already validated
+        // {1,2,4} above, a strict subset of D4's own {1,2,4,8}). Mirrors
+        // skew.c's `ret != 0` branch.
+        return Some(DeskewResult {
+            grey: grey.to_vec(),
+            w,
+            h,
+            angle: 0.0,
+            conf: 0.0,
+        });
+    };
+    let (angle, conf) = (skew.angle, skew.conf);
+
+    if angle.abs() < MIN_DESKEW_ANGLE || conf < MIN_ALLOWED_CONFIDENCE {
+        return Some(DeskewResult {
+            grey: grey.to_vec(),
+            w,
+            h,
+            angle,
+            conf,
+        });
+    }
+
+    // pixRotate(pixs, deg2rad*angle, L_ROTATE_AREA_MAP, L_BRING_IN_WHITE, 0, 0)
+    // on the GREY original -- collapses to exactly this call in our
+    // always-8bpp-grey domain; see this function's own doc for the full
+    // dispatch-collapse argument.
+    let rotated = rotate_am_gray(grey, w, h, deg2rad * angle, 255);
+    Some(DeskewResult {
+        grey: rotated,
+        w,
+        h,
+        angle,
+        conf,
+    })
+}
+
+/// `pixDeskewBoth` (`skew.c:166-189`) — D7: [`deskew_general`] (with
+/// `pixDeskew`'s own all-default parameters, i.e. `redsweep = 0`,
+/// `sweeprange = 0.0`, `sweepdelta = 0.0`, `thresh = 0`, only `redsearch`
+/// threaded through — `skew.c:222`'s own `pixDeskewGeneral(pixs, 0, 0.0,
+/// 0.0, redsearch, 0, NULL, NULL)`) → [`rotate90_grey`] clockwise →
+/// [`deskew_general`] again (same defaults, same `redsearch`) →
+/// [`rotate90_grey`] counter-clockwise.
+///
+/// Two passes exist because the D4 differential-square-sum detector is
+/// directional (most sensitive to HORIZONTAL banding — text baselines and
+/// x-height lines): the 90-degree round trip lets the second pass see
+/// whatever skew component was orthogonal to what the first pass could
+/// detect, at the cost of two full detect-and-maybe-rotate cycles.
+///
+/// # Validation
+/// `redsearch` must be `0` (→ [`DEFAULT_BS_REDUCTION`]) or exactly `1`, `2`,
+/// or `4`. `pixDeskewBoth` validates this itself, ONCE, before ever calling
+/// `pixDeskew` (`skew.c:176-179`). This Rust version does not duplicate that
+/// upfront check — it forwards the raw `redsearch` straight through to BOTH
+/// [`deskew_general`] calls instead, via `?`. This is bit-identical, not
+/// merely convenient: since both calls use the SAME `redsearch` value, they
+/// can never validate differently from each other, so a check at either
+/// call site (or both) produces the identical `None`/`Some` outcome as
+/// `pixDeskewBoth`'s own single upfront check would have.
+///
+/// # Return
+/// `None` only for that validation failure. `Some((grey, w, h))` for every
+/// other outcome — matching `pixDeskewBoth`'s own signature exactly: no
+/// angle/conf out-parameters exist at this composition level in the C API
+/// at all (unlike [`deskew_general`], which exposes them per the
+/// `pixFindSkewAndDeskew` shape).
+///
+/// # Panics
+/// Panics if `grey.len() != w * h`.
+#[must_use]
+pub fn deskew_both(
+    grey: &[u8],
+    w: usize,
+    h: usize,
+    redsearch: u32,
+) -> Option<(Vec<u8>, usize, usize)> {
+    assert_eq!(grey.len(), w * h, "grey buffer is not w·h");
+
+    let pass1 = deskew_general(grey, w, h, 0, 0.0, 0.0, redsearch, 0)?;
+    let (rot1, rw1, rh1) = rotate90_grey(&pass1.grey, pass1.w, pass1.h, 1);
+    let pass2 = deskew_general(&rot1, rw1, rh1, 0, 0.0, 0.0, redsearch, 0)?;
+    let (rot2, rw2, rh2) = rotate90_grey(&pass2.grey, pass2.w, pass2.h, -1);
+    Some((rot2, rw2, rh2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1327,5 +1702,174 @@ mod tests {
     #[should_panic(expected = "not w·h")]
     fn rotate_am_gray_corner_rejects_mismatched_length() {
         let _ = rotate_am_gray_corner(&[1u8; 3], 2, 2, 1.0, 0);
+    }
+
+    // ---- D6: deskew_general -------------------------------------------------
+
+    #[test]
+    fn deskew_general_rejects_invalid_redsweep() {
+        let grey = vec![255u8; 10 * 10];
+        assert!(
+            deskew_general(&grey, 10, 10, 3, 5.0, 1.0, 1, 128).is_none(),
+            "redsweep=3 is not in {{0,1,2,4}}"
+        );
+    }
+
+    #[test]
+    fn deskew_general_rejects_invalid_redsearch() {
+        let grey = vec![255u8; 10 * 10];
+        assert!(
+            deskew_general(&grey, 10, 10, 1, 5.0, 1.0, 3, 128).is_none(),
+            "redsearch=3 is not in {{0,1,2,4}}"
+        );
+    }
+
+    #[test]
+    fn deskew_general_rejects_redsweep_8_even_though_d4_itself_accepts_it() {
+        // skew.c:311-312 -- pixDeskewGeneral validates redsweep against
+        // {1,2,4} ONLY, a STRICT subset of
+        // find_skew_sweep_and_search_score_pivot's own {1,2,4,8}
+        // (this module's own `matches!(r, 1 | 2 | 4 | 8)`). Pinned as a
+        // locked contract, not something to "helpfully" widen later.
+        let (w, h) = (32usize, 32usize);
+        let mut binary = vec![255u8; w * h];
+        for y in 0..h {
+            if y % 4 < 2 {
+                for x in 0..w {
+                    binary[y * w + x] = 0;
+                }
+            }
+        }
+        assert!(
+            find_skew_sweep_and_search_score_pivot(
+                &binary,
+                w,
+                h,
+                8,
+                1,
+                0.0,
+                5.0,
+                1.0,
+                0.01,
+                ShearPivot::Corner,
+            )
+            .is_some(),
+            "D4 itself accepts redsweep=8 on a non-empty image"
+        );
+
+        let grey = vec![200u8; w * h]; // any grey content; only redsweep is under test.
+        assert!(
+            deskew_general(&grey, w, h, 8, 5.0, 1.0, 1, 128).is_none(),
+            "pixDeskewGeneral's OWN validation rejects redsweep=8, unlike D4's"
+        );
+    }
+
+    #[test]
+    fn deskew_general_all_background_returns_unrotated_with_zero_angle_conf() {
+        // Uniform WHITE page, no ink anywhere. thresh=130 (default): every
+        // pixel is `255 < 130` == false, so the binarized copy is entirely
+        // background -- pixZero fires inside D4, which is D4's OWN true
+        // error path (None), mirroring pixDeskewGeneral's `ret != 0` branch:
+        // angle/conf forced to 0.0, buffer unchanged. redsearch=1 is used
+        // deliberately to bypass reduce_rank_binary_cascade entirely (its
+        // own branch is a direct `binary.to_vec()`), so this assertion does
+        // not depend on any behavior of the reduction cascade.
+        let (w, h) = (20usize, 16usize);
+        let grey = vec![255u8; w * h];
+        let result = deskew_general(&grey, w, h, 1, 5.0, 1.0, 1, 130)
+            .expect("valid redsweep/redsearch must not return None");
+        assert_eq!(
+            result.grey, grey,
+            "an all-background page must come back unrotated"
+        );
+        assert_eq!(result.w, w);
+        assert_eq!(result.h, h);
+        assert_eq!(result.angle, 0.0);
+        assert_eq!(result.conf, 0.0);
+    }
+
+    #[test]
+    fn deskew_general_runs_to_completion_on_a_banded_fixture() {
+        // Horizontal banding gives the detector real row-to-row signal
+        // (same spirit as find_skew_runs_to_completion_on_a_banded_fixture's
+        // own D4 smoke test) without needing to hand-verify the detector's
+        // exact numeric (angle, conf) output.
+        let (w, h) = (40usize, 48usize);
+        let mut grey = vec![255u8; w * h];
+        for y in 0..h {
+            if y % 8 < 3 {
+                for x in 0..w {
+                    grey[y * w + x] = 0;
+                }
+            }
+        }
+        let result = deskew_general(&grey, w, h, 1, 5.0, 1.0, 1, 128)
+            .expect("valid params on a non-empty image must return Some");
+        assert_eq!(
+            (result.w, result.h),
+            (w, h),
+            "area-map rotation never expands the canvas"
+        );
+        assert!(
+            result.angle.is_finite(),
+            "angle must be finite: {}",
+            result.angle
+        );
+        assert!(
+            result.conf.is_finite() && result.conf >= 0.0,
+            "conf must be finite and non-negative: {}",
+            result.conf
+        );
+        // The one direction of the gate that is unconditionally certain
+        // without re-deriving the detector's own numeric output by hand:
+        // BELOW the gate, pixDeskewGeneral's own branch is literally
+        // `return pixClone(pixs)` -- the original, untouched.
+        if result.angle.abs() < MIN_DESKEW_ANGLE || result.conf < MIN_ALLOWED_CONFIDENCE {
+            assert_eq!(
+                result.grey, grey,
+                "below the gate must return the ORIGINAL, unrotated"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not w·h")]
+    fn deskew_general_rejects_mismatched_length() {
+        let _ = deskew_general(&[1u8; 3], 2, 2, 1, 5.0, 1.0, 1, 128);
+    }
+
+    // ---- D7: deskew_both -----------------------------------------------------
+
+    #[test]
+    fn deskew_both_rejects_invalid_redsearch() {
+        let grey = vec![255u8; 10 * 10];
+        assert!(deskew_both(&grey, 10, 10, 8).is_none());
+        assert!(deskew_both(&grey, 10, 10, 3).is_none());
+    }
+
+    #[test]
+    fn deskew_both_all_background_round_trips_to_original_dimensions_and_content() {
+        // Deliberately non-square, so a forgotten w/h swap across the two
+        // rotate90 legs would actually be caught by the dimensions check
+        // (a square fixture could hide that bug entirely).
+        let (w, h) = (12usize, 20usize);
+        let grey = vec![255u8; w * h];
+        let (out, ow, oh) = deskew_both(&grey, w, h, 1)
+            .expect("valid redsearch on a well-formed image must not return None");
+        assert_eq!(
+            (ow, oh),
+            (w, h),
+            "two opposite 90-degree turns must restore the original dimensions"
+        );
+        assert_eq!(
+            out, grey,
+            "an all-background page must round-trip unchanged"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not w·h")]
+    fn deskew_both_rejects_mismatched_length() {
+        let _ = deskew_both(&[1u8; 3], 2, 2, 1);
     }
 }

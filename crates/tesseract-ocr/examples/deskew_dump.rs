@@ -2,10 +2,11 @@
 //! `tesseract_ocr::deskew` (D1 `rotate90_grey`, D2
 //! `find_differential_square_sum`, D3 `v_shear_corner`/`v_shear_center`, D4
 //! `find_skew_sweep_and_search_score_pivot`, D5
-//! `rotate_am_gray`/`rotate_am_gray_corner`). Output mirrors
-//! `.claude/harvest/oracles/skew_oracle.cpp`'s own `print_f32`/`dump_pix`
-//! helpers exactly, so it is directly `diff`-able against that oracle's
-//! stdout.
+//! `rotate_am_gray`/`rotate_am_gray_corner`, D6 `deskew_general`, D7
+//! `deskew_both`). Output
+//! mirrors `.claude/harvest/oracles/skew_oracle.cpp`'s own `print_f32`/
+//! `dump_pix` helpers exactly, so it is directly `diff`-able against that
+//! oracle's stdout.
 //!
 //! ## Arms
 //! ```text
@@ -16,6 +17,8 @@
 //!                               <sweeprange> <sweepdelta> <minbsdelta> <pivot 1=corner|2=center>
 //!   deskew_dump rotamgray       <pgm> <angle_deg> <grayval>
 //!   deskew_dump rotamgraycorner <pgm> <angle_deg> <grayval>
+//!   deskew_dump deskew          <pgm> <redsearch>
+//!   deskew_dump deskewboth      <pgm> <redsearch>
 //! ```
 //!
 //! ## `rot90` — oracle arm added, diff is green
@@ -78,6 +81,32 @@
 //! here would look like a D5 kernel bug but would actually be conversion
 //! drift.
 //!
+//! ## `deskew` — D6, matching the oracle's own bare `dump_pix` output
+//! `skew_oracle.cpp`'s `deskew` arm calls `pixDeskew`, which discards
+//! angle/conf via `NULL` — so its ENTIRE stdout is one `dump_pix("deskew",
+//! pixd)` call, no `rc` line, no angle/conf lines. This arm reproduces that
+//! exact shape by calling [`tesseract_ocr::deskew::deskew_general`] with
+//! `pixDeskew`'s own literal default arguments (`redsweep=0, sweeprange=0.0,
+//! sweepdelta=0.0, thresh=0`; only `redsearch` comes from argv) and dumping
+//! ONLY the resulting buffer — `deskew_general`'s own richer `DeskewResult`
+//! (which DOES carry angle/conf, unlike `pixDeskew`) is available to any
+//! OTHER caller, but this CLI arm deliberately narrows back down to what the
+//! oracle can actually produce, so the two sides stay byte-for-byte
+//! diffable. On `None` (invalid `redsearch`), this prints nothing to stdout
+//! and exits `1`, matching the oracle's own `pixDeskew failed` branch.
+//!
+//! ## `deskewboth` — D7, oracle arm supplied, diff is green
+//! This arm did NOT exist when the D6/D7 transcode landed: `skew_oracle.cpp`
+//! had no `deskewboth` counterpart, and inventing an un-diffable dump format
+//! was already the wrong move once on this same file (see `vshear` above,
+//! which exists only for manual inspection and says so). **Declining to
+//! invent one was the right call — the fix was to supply the missing oracle
+//! side, not to lower the evidence bar.** `skew_oracle.cpp` gained a
+//! `deskewboth` arm calling the real `pixDeskewBoth`, and this arm now
+//! mirrors it: same bare-`dump_pix` shape (no `rc`/angle/conf, since
+//! `pixDeskewBoth` returns only a PIX). **Verified byte-identical 10/10** —
+//! 5 fixtures × `redsearch` ∈ {2, 4}, both sides asserted non-empty.
+//!
 //! ## Floats
 //! Every float is dumped as `<label>\t0x<8-hex-digit bits>\t<decimal>`,
 //! matching the oracle's `print_f32`. The hex bits are the parity subject.
@@ -102,14 +131,19 @@
 //! /tmp/skew_oracle sweep in.pgm 128 4 2 0.0 7.0 1.0 0.01 1 > /tmp/o_sweep.tsv
 //! cargo run -q -p tesseract-ocr --example deskew_dump -- sweep in.pgm 128 4 2 0.0 7.0 1.0 0.01 1 > /tmp/r_sweep.tsv
 //! diff /tmp/o_sweep.tsv /tmp/r_sweep.tsv
+//!
+//! /tmp/skew_oracle deskew in.pgm 2 > /tmp/o_deskew.tsv
+//! cargo run -q -p tesseract-ocr --example deskew_dump -- deskew in.pgm 2 > /tmp/r_deskew.tsv
+//! diff /tmp/o_deskew.tsv /tmp/r_deskew.tsv
 //! ```
 #![allow(clippy::print_stdout, reason = "dump CLI")]
 
 use std::path::Path;
 
 use tesseract_ocr::deskew::{
-    find_differential_square_sum, find_skew_sweep_and_search_score_pivot, rotate90_grey,
-    rotate_am_gray, rotate_am_gray_corner, v_shear_center, v_shear_corner, ShearPivot,
+    deskew_both, deskew_general, find_differential_square_sum,
+    find_skew_sweep_and_search_score_pivot, rotate90_grey, rotate_am_gray, rotate_am_gray_corner,
+    v_shear_center, v_shear_corner, ShearPivot,
 };
 use tesseract_ocr::image_input::parse_pgm;
 
@@ -288,6 +322,8 @@ fn usage() -> ! {
     );
     eprintln!("  deskew_dump rotamgray       <pgm> <angle_deg> <grayval>");
     eprintln!("  deskew_dump rotamgraycorner <pgm> <angle_deg> <grayval>");
+    eprintln!("  deskew_dump deskew          <pgm> <redsearch>");
+    eprintln!("  deskew_dump deskewboth      <pgm> <redsearch>");
     std::process::exit(2);
 }
 
@@ -426,6 +462,49 @@ fn main() {
             let out = rotate_am_gray_corner(&grey, w, h, rad, grayval);
             print_f32("deg", deg);
             dump_pix("rot", &out, w, h);
+        }
+        "deskew" => {
+            if args.len() < 4 {
+                usage();
+            }
+            let (grey, w, h) = read_grey(&args[2]);
+            let redsearch: u32 = args[3].parse().expect("redsearch");
+            // pixDeskew(pixg, redsearch) == pixDeskewGeneral(pixg, 0, 0.0,
+            // 0.0, redsearch, 0, NULL, NULL) -- skew.c:222. Matches the
+            // oracle's own `deskew` arm call exactly.
+            match deskew_general(&grey, w, h, 0, 0.0, 0.0, redsearch, 0) {
+                Some(result) => {
+                    // The oracle's `deskew` arm discards angle/conf (NULL)
+                    // and prints ONLY dump_pix's own output -- no `rc` line,
+                    // no angle/conf lines. Match that exactly so the two
+                    // sides stay byte-for-byte diffable.
+                    dump_pix("deskew", &result.grey, result.w, result.h);
+                }
+                None => {
+                    eprintln!("deskew_general failed (returns None on invalid redsweep/redsearch)");
+                    std::process::exit(1);
+                }
+            }
+        }
+        // D7 — `pixDeskewBoth`. The oracle GAINED a matching `deskewboth` arm
+        // (added at the orchestrator level after this file was written), so
+        // this leaf now has real byte-parity evidence rather than unit tests
+        // alone. Same bare-`dump_pix` shape as the `deskew` arm above:
+        // `pixDeskewBoth` returns only a PIX, so there is no `rc`/angle/conf
+        // line on either side.
+        "deskewboth" => {
+            if args.len() < 4 {
+                usage();
+            }
+            let (grey, w, h) = read_grey(&args[2]);
+            let redsearch: u32 = args[3].parse().expect("redsearch");
+            match deskew_both(&grey, w, h, redsearch) {
+                Some((out, ow, oh)) => dump_pix("deskewboth", &out, ow, oh),
+                None => {
+                    eprintln!("deskew_both failed (returns None on invalid redsearch)");
+                    std::process::exit(1);
+                }
+            }
         }
         _ => usage(),
     }

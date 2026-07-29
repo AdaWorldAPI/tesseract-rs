@@ -22,6 +22,7 @@
 //   rotamgray <pgm> <angle_deg> <grayval>
 //   rotamgraycorner <pgm> <angle_deg> <grayval>
 //   deskew    <pgm> <redsearch>
+//   deskewboth <pgm> <redsearch>
 //
 // ── CONVENTIONS (get these wrong and every diff is noise) ────────────────────
 //
@@ -103,8 +104,9 @@ int main(int argc, char** argv) {
             "  %s rot90           <pgm> <direction 1=cw|-1=ccw>\n"
             "  %s rotamgray       <pgm> <angle_deg> <grayval>\n"
             "  %s rotamgraycorner <pgm> <angle_deg> <grayval>\n"
-            "  %s deskew          <pgm> <redsearch>\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+            "  %s deskew          <pgm> <redsearch>\n"
+            "  %s deskewboth      <pgm> <redsearch>\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 2;
   }
   const char* arm = argv[1];
@@ -298,6 +300,28 @@ int main(int argc, char** argv) {
     PIX* pixd = pixDeskew(pixg, atoi(argv[3]));
     if (!pixd) { fprintf(stderr, "pixDeskew failed (returns NULL on failure)\n"); return 1; }
     dump_pix("deskew", pixd);
+    pixDestroy(&pixg);
+    pixDestroy(&pixd);
+    return 0;
+  }
+
+  // ── ARM 6: pixDeskewBoth — the two-pass orthogonal composition (D7). ─────
+  // pixDeskew -> pixRotate90(+1) -> pixDeskew -> pixRotate90(-1). The 90°
+  // round trip exists because the differential-square-sum detector is
+  // DIRECTIONAL: one pass cannot see skew present in both axes at once.
+  //
+  // Added at the orchestrator level rather than by the transcode agent: the
+  // agent correctly refused to invent a dump format with no oracle to diff
+  // against (the `vshear` arm's own documented lesson). The right fix is to
+  // supply the missing oracle side, not to lower the evidence bar — D7 gets
+  // real byte-parity instead of unit tests alone.
+  if (!strcmp(arm, "deskewboth")) {
+    if (argc < 4) { fprintf(stderr, "deskewboth needs <redsearch>\n"); return 2; }
+    PIX* pixg = read_grey(path);
+    if (!pixg) return 1;
+    PIX* pixd = pixDeskewBoth(pixg, atoi(argv[3]));
+    if (!pixd) { fprintf(stderr, "pixDeskewBoth failed (returns NULL on failure)\n"); return 1; }
+    dump_pix("deskewboth", pixd);
     pixDestroy(&pixg);
     pixDestroy(&pixd);
     return 0;
