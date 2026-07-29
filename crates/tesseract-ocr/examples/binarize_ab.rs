@@ -1,17 +1,32 @@
 //! **The falsifying A/B probe** — the whole local-adaptive ladder (Otsu →
-//! Sauvola → Wolf-Jolion → Singh) under UNEVEN
-//! ILLUMINATION, the failure mode a local mean/std is supposed to
-//! survive and a single global Otsu threshold cannot (see `binarize.rs`'s
-//! module docs and the `xy_cut::BinarizeMode` doc comments). The existing
-//! rendered corpus (`corpus/pages/*.pgm`, `corpus/quality/resgrid.pgm`) is
-//! cleanly and evenly lit, so that advantage is invisible there;
-//! `corpus/gen/gen_uneven_light.py` degrades a real corpus page with a
-//! multiplicative illumination field (a linear gradient and a radial
-//! vignette, each at two strengths) to give the two modes something to
-//! actually disagree about.
+//! Sauvola → Wolf-Jolion → Singh) under TWO INDEPENDENT degradations, the
+//! failure modes a local mean/std is supposed to survive and a single
+//! global Otsu threshold cannot (see `binarize.rs`'s module docs and the
+//! `xy_cut::BinarizeMode` doc comments):
+//!
+//! - **Uneven illumination** (`uneven_*.pgm`, `gen_uneven_light.py`) — a
+//!   multiplicative field that shifts brightness but preserves LOCAL
+//!   contrast. Sauvola's home turf.
+//! - **Faded contrast** (`faded_*.pgm`, `gen_faded_contrast.py`, ADDED
+//!   2026-07-29) — a uniform compression of the whole page's dynamic range
+//!   toward mid-grey, which lowers local std EVERYWHERE rather than in one
+//!   region. This is what Wolf-Jolion's own claim is actually about: Sauvola's
+//!   FIXED `R = 128` denominator collapses when `s << 128` uniformly, and
+//!   Wolf's `s/max_s` normalization is built specifically to survive that.
+//!   The first run of this probe (uneven-only) found Wolf byte-identical to
+//!   Sauvola on every fixture — because uneven illumination never exercises
+//!   this failure mode at all. See `.claude/harvest/binarization-roadmap.md`
+//!   for the full account of that gap and why `faded_*` closes it.
+//!
+//! The existing rendered corpus (`corpus/pages/*.pgm`,
+//! `corpus/quality/resgrid.pgm`) is cleanly and evenly lit at full contrast,
+//! so neither degradation is visible there; both generators start from the
+//! same clean corpus page so `uneven_clean.pgm`'s Otsu recognition remains
+//! the one CER reference for every fixture in both families.
 //!
 //! ```sh
-//! python3 corpus/gen/gen_uneven_light.py   # writes corpus/quality/uneven_*.pgm
+//! python3 corpus/gen/gen_uneven_light.py     # writes corpus/quality/uneven_*.pgm
+//! python3 corpus/gen/gen_faded_contrast.py   # writes corpus/quality/faded_*.pgm
 //! cargo run -p tesseract-ocr --example binarize_ab
 //! ```
 //!
@@ -100,16 +115,26 @@ fn fail(context: &str, err: impl std::fmt::Display) -> ! {
 }
 
 /// The fixtures this probe measures, in report order: (label, filename under
-/// `corpus/quality/`, from `gen_uneven_light.py`). `clean` MUST be first —
-/// its own Otsu recognition is the CER reference text for every row (per
-/// the brief: "the clean page's Otsu reading is the reference text — that
-/// is the ground truth here, not an external transcript").
+/// `corpus/quality/`, from `gen_uneven_light.py` or `gen_faded_contrast.py`
+/// — see the module docs for which generator owns which fixture family).
+/// `clean` MUST be first — its own Otsu recognition is the CER reference
+/// text for every row, in BOTH families (per the brief: "the clean page's
+/// Otsu reading is the reference text — that is the ground truth here, not
+/// an external transcript").
 const FIXTURES: &[(&str, &str)] = &[
     ("clean", "uneven_clean.pgm"),
     ("linear_060", "uneven_linear_060.pgm"),
     ("linear_085", "uneven_linear_085.pgm"),
     ("vignette_060", "uneven_vignette_060.pgm"),
     ("vignette_085", "uneven_vignette_085.pgm"),
+    // Faded contrast (gen_faded_contrast.py) — a DIFFERENT axis of
+    // degradation from everything above: uniform dynamic-range compression
+    // rather than a spatial illumination field. This is the fixture family
+    // that can actually exercise Wolf-Jolion's claim (see the module docs).
+    // `_060`/`_085` mean the same "fraction of range lost" as the uneven_*
+    // tags, for direct magnitude comparison across the two families.
+    ("faded_060", "faded_060.pgm"),
+    ("faded_085", "faded_085.pgm"),
 ];
 
 /// The modes under test — the whole Niblack ladder this crate implements.
@@ -246,8 +271,10 @@ fn main() {
         _ => None,
     };
 
-    // Load every fixture up front; fail loudly (with a hint) if
-    // gen_uneven_light.py hasn't been run yet.
+    // Load every fixture up front; fail loudly (with a hint) if either
+    // generator hasn't been run yet. Both write into the same
+    // corpus/quality/ dir, and both are committed, so this only fires on a
+    // local checkout that skipped the fixtures.
     let pages: Vec<(&str, Vec<u8>, usize, usize)> = FIXTURES
         .iter()
         .map(|&(label, filename)| {
@@ -255,7 +282,8 @@ fn main() {
             let bytes = fs::read(&path).unwrap_or_else(|e| {
                 fail(
                     &format!(
-                        "read {} -- run `python3 corpus/gen/gen_uneven_light.py` first",
+                        "read {} -- run `python3 corpus/gen/gen_uneven_light.py` and \
+                         `python3 corpus/gen/gen_faded_contrast.py` first",
                         path.display()
                     ),
                     e,

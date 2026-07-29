@@ -309,20 +309,103 @@ stripe on a 200-grey field. Measured thresholds — Sauvola `t(ink)=136` (ink at
 CAUGHT), neither flooding the background. Two-sided on the same fixture, so it
 cannot pass if `wolf_binarize` were merely a second name for Sauvola.
 
-**Consequences, in priority order:**
+**Consequences, in priority order (§1-3 below are the ORIGINAL 2026-07-29
+findings; the faded-arm result that closes §1 follows immediately after):**
 
-1. **The fixture set needs a FADED arm.** `gen_uneven_light.py` multiplies by
-   an illumination field; a faded page needs the dynamic range COMPRESSED
-   (`grey → a + b·grey`, `b ≪ 1`). Until that exists, no page-scale evidence
-   for or against Wolf exists — the table above is silent on its actual claim.
-2. **Sauvola remains the default-flip candidate**, unchanged by this work.
-   Neither new rung beats it on evidence in hand.
+1. ~~**The fixture set needs a FADED arm.**~~ **CLOSED — see below.**
+   `gen_uneven_light.py` multiplies by an illumination field; a faded page
+   needs the dynamic range COMPRESSED (`grey → a + b·grey`, `b ≪ 1`).
+2. **Sauvola remains the default-flip candidate for MODERATE degradation** —
+   see below for why this needed a qualifier it didn't have before.
 3. **Singh's claim is COST, and cost was not measured here.** It is ~2× Sauvola's
    CER on these fixtures (0.0090 vs 0.0045 — about one character in 226) and
    loses one word on the clean page. Its selling point is window-size
    independence (paper Table 1: flat 0.19-0.25 s where Sauvola goes
    7.1→13.3 s), which this probe does not time. Judging Singh on CER alone
    would be judging it on the axis it does not compete on.
+
+---
+
+## The faded arm — built, measured, and the result is SHARPER than expected (2026-07-29)
+
+`corpus/gen/gen_faded_contrast.py` closes §1: `new = clamp(round(128 +
+b·(old−128)), 0, 255)`, a UNIFORM compression toward mid-grey (no `(x,y)`
+dependence — unlike the illumination field, print fade has no spatial
+pattern). `b` values mirror `gen_uneven_light.py`'s `STRENGTHS` exactly
+(`b = 1 − strength`), so `faded_060`/`faded_085` mean the same "60%/85% of
+range lost" as their `uneven_*` siblings. Verified: global pixel stdev drops
+36.5 (clean) → 14.6 (`faded_060`) → 5.4 (`faded_085`); deterministic
+(byte-identical across repeated runs, checked by hash).
+
+Extended `binarize_ab.rs`'s existing `FIXTURES` array (same harness, same
+CER reference — no new probe written). Full re-run, all 7 fixtures × 4 modes:
+
+| fixture | mode | words | CER |
+|---|---|---|---|
+| faded_060 | otsu / sauvola / wolf / singh | 42/42/42/42 | 0.0000/0.0000/0.0045/0.0045 |
+| **faded_085** | **otsu** | **42/42** | **0.0000** |
+| faded_085 | **sauvola** | **0/42** | **1.0000** |
+| faded_085 | **wolf** | **42/42** | **0.0045** |
+| faded_085 | **singh** | **42/42** | **0.0000** |
+
+**`faded_060` (moderate) breaks nothing** — all four modes read the full
+page. Only `faded_085` (severe, spread compressed to 38 grey levels)
+produces a real split, and the split is not the one a first guess predicts.
+
+### Otsu is FINE here — the naive "faded breaks global thresholding" story is wrong
+
+Measured page histogram (`faded_085.pgm`, 368,640 px): a spike of 355,298 px
+(96.4%) at grey 147 (background), a cluster of 4,624 px (1.25%) near grey 109
+(ink), antialiasing between. **A uniform monotonic compression preserves the
+histogram's bimodal SHAPE** — Otsu's threshold depends on that shape, not on
+the absolute contrast, so it still finds the valley and reads the page
+perfectly. Faded contrast alone does not defeat a global histogram threshold.
+
+### Sauvola specifically fails, and by exactly the mechanism the formula predicts
+
+Ink is SPARSE (1.25% of pixels), so almost every local window is nearly all
+background. Local mean `m` sits near 147; with `s ≪ 128` UNIFORMLY (not just
+regionally, as in the illumination fixtures), `t = m·(1−k·(1−s/128))`
+collapses toward `m·(1−k)` regardless of what a window actually contains. At
+`m≈147, k=0.34`: `t ≈ 97` — comfortably ABOVE the real ink value (109), so
+every ink pixel fails `grey < t` and reads as background. Not "degraded
+recognition" — the WHOLE PAGE returns zero words, confirmed independently by
+`ink_frac = 0.0000` (computed directly from `binarize_page_with`, entirely
+outside the OCR pipeline).
+
+### Wolf and Singh both recover, by two INDEPENDENT mechanisms
+
+Wolf's `max_s` renormalization was built for exactly this; Singh's per-pixel
+`∂ = I−m` has no fixed `R` to collapse in the first place, so it isn't even
+susceptible to the same failure mode. Two different fixes agreeing on one
+page is corroboration, not redundancy.
+
+### Pinned as a fast deterministic unit test, not left as a corpus-gated finding
+
+`binarize::tests::sauvola_fails_on_sparse_ink_at_faded_contrast_but_wolf_and_singh_recover`
+reproduces the same qualitative shape at unit scale (sparse ink block, not a
+full-height stripe — density is what drives the collapse here, contrast
+alone is not sufficient) at the REAL measured cluster centres (147/109, not
+round numbers). Measured thresholds confirm the hand-derivation exactly:
+`sauvola t(ink)=97` (above 109 → miss), `wolf t(ink)=135` (below → catch),
+`singh t(ink)=126` (below → catch). This complements
+`wolf_recovers_faint_ink_that_sauvola_misses` (a DENSE full-height stripe at
+a different mean level, 200/180) rather than duplicating it — sparse-vs-dense
+matters and both are now covered.
+
+### What this changes about "Sauvola remains the default-flip candidate"
+
+That conclusion isn't reversed, but it loses its unconditional phrasing. On
+MODERATE degradation (both `uneven_*` fixtures and `faded_060`) Sauvola is at
+least as good as everything else and beats Otsu by a wide margin — nothing
+here disturbs that. On SEVERE, uniformly low-contrast pages, Sauvola is not
+merely worse than Wolf/Singh, it is **catastrophically, silently wrong** —
+zero output with no error, which is a worse failure mode than Otsu's own
+partial-word degradation on the same class of input. A production default
+that could hit `faded_085`-shaped input would need Wolf or Singh as a
+fallback, or at minimum a "zero words recognized" sentinel — not a decision
+to make from this measurement alone, but the asymmetry is now on record
+rather than assumed away.
 
 ## Implementation notes worth keeping
 
@@ -368,3 +451,14 @@ every integral already built — one extra reduction pass.
 cost, not quality, and cost is not currently a measured problem for us. It is
 the right rung when window size becomes a tuning burden; it is the wrong rung
 to build from a half-extracted PDF.
+
+> **⊘ HISTORICAL — both are now shipped, this ordering plan is obsolete.**
+> Written before implementation; kept for provenance (append-only), not as
+> current guidance. Both Wolf and Singh landed together (`crates/
+> tesseract-ocr/src/binarize.rs`), the equation was obtained (see above), and
+> the faded-arm measurement found Singh performing AT LEAST as well as Wolf
+> on the fixture that mattered (`faded_085`: wolf 42/42 words CER 0.0045,
+> singh 42/42 words CER 0.0000) — so "Singh second" never described a real
+> quality gap once both existed. For current status, defaults, and the
+> measured findings, see "SHIPPED + MEASURED" and "The faded arm" sections
+> above, both dated 2026-07-29.

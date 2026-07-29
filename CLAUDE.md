@@ -1151,6 +1151,53 @@ task.
 > already-SIMD is what makes a debug build slow, not what protects it.*
 > **Always cite the release row.**
 
+**★ The faded-contrast corpus arm SHIPPED — and Sauvola CATASTROPHICALLY
+fails where Wolf and Singh both recover (2026-07-29).** `.claude/harvest/
+binarization-roadmap.md` had filed this as the missing evidence: the
+existing `uneven_*.pgm` fixtures degrade illumination (a spatial field that
+preserves LOCAL contrast — Sauvola's home turf, which is why Wolf measured
+byte-identical to Sauvola on every one of them). `corpus/gen/
+gen_faded_contrast.py` is the different axis Wolf's own claim needs: uniform
+dynamic-range compression toward mid-grey (`128 + b·(old−128)`, no spatial
+pattern — a worn-toner/faded-print model, not a lighting model), `b` chosen
+to mirror `gen_uneven_light.py`'s magnitude vocabulary exactly. Extended
+`binarize_ab.rs`'s existing `FIXTURES` array — same harness, same CER
+reference, no new probe.
+
+Result on the severe fixture (`faded_085`, spread compressed to 38 grey
+levels): **otsu 42/42 words, wolf 42/42, singh 42/42 — sauvola 0/42, CER
+1.0, `ink_frac = 0.0000`.** Not degraded — the WHOLE PAGE returns empty
+under Sauvola.
+
+**The mechanism is not the naive one, and that's the useful part.** The page
+histogram is a 96.4% spike at grey 147 (background) plus a 1.25% cluster at
+grey 109 (ink) — a uniform monotonic compression preserves that bimodal
+SHAPE, so **Otsu is fine**; global thresholding does not care about absolute
+contrast, only histogram shape. Sauvola fails because ink is SPARSE: nearly
+every local window is almost all background, local mean sits near 147, and
+`s ≪ 128` UNIFORMLY collapses `t = m·(1−k·(1−s/128))` toward `m·(1−k) ≈ 97`
+— above the real ink value (109) — regardless of window content. Wolf's
+`max_s` renormalization and Singh's fixed-`R`-free `∂` formula both sidestep
+this by construction, independently.
+
+Pinned as a FAST unit test, not left corpus-gated:
+`binarize::tests::sauvola_fails_on_sparse_ink_at_faded_contrast_but_wolf_and_singh_recover`
+reproduces the shape at the real measured cluster centres (147/109); measured
+thresholds match the hand-derivation exactly (`sauvola t=97` above ink, `wolf
+t=135` and `singh t=126` both below). Complements (does not duplicate)
+`wolf_recovers_faint_ink_that_sauvola_misses` — that one is a DENSE
+full-height stripe at a different mean (200/180); density, not just
+contrast, drives this failure mode, and now both are covered.
+
+**Consequence for "Sauvola remains the default-flip candidate":** still true
+on moderate degradation (unchanged — `faded_060` breaks nothing, all four
+modes read the page perfectly), but the claim loses its unconditional
+phrasing. On severe uniform-low-contrast input Sauvola isn't just
+outperformed, it fails **silently and completely** — a worse failure mode
+than Otsu's own partial-word degradation on the same input class. Not a
+default-flip decision by itself; the asymmetry is now measured and on
+record rather than assumed away.
+
 **★ Two "blocked" deferrals were never data-blocked (2026-07-29).** Both
 falsifying fixtures are now committed (`corpus/model/README.md` § "Falsifier
 fixtures" carries provenance, histograms, SHA256s, and the
