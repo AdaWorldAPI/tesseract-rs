@@ -973,6 +973,38 @@ graph / KV / PDF-from-data are NOT tesseract-rs concerns") — that ruling stand
 This section records that the *consumer side of it has never been built*, which
 the ruling itself does not say.
 
+### The intended consumer, and the ONE structural gap in the seam
+
+Operator intent (2026-07-29): **`lance-graph-arm-discovery` consumes this
+`doc.v1` JSON to inhale the meaning of whole books.** That is credible rather
+than aspirational — lance-graph has already run the whole-book falsifier
+(`deepnsm-v2/examples/bible_wave.rs`: the entire KJV, 23,145 verses in ONE 64k
+tile, 31,327 triples over 606 subjects, and the finding that **63.3% of
+same-subject links reach beyond ±5**, which is what retired the ±5 window).
+What that arc lacks is a way in from *paper*; this crate is exactly that.
+
+**`doc.v1` is well shaped for it** — not flat text but
+`pages → regions(type) → lines → words`, with per-word bbox + `conf`, per-line
+measured metrics (`xheight`/`ascrise`/`descdrop`/`baseline`), `mean_conf`,
+quality/`low_confidence` flags, table cell grids, and a
+`key`/`value`/`numeric_norm`/`value_cents` field surface.
+
+**The gap is the unit of meaning: there is NO sentence.** `bible_wave` had
+**verses** — a pre-existing semantic segmentation the KJV supplies for free. A
+scanned book supplies no such thing. It supplies *lines*, which are a
+**typographic artifact**: a sentence spans several of them (hyphenated at the
+breaks), and one line can hold several sentences. `deepnsm`'s 6-state PoS FSM →
+SPO triples operates **per sentence**. So the seam's real work item is a
+lines→sentences assembly step (de-hyphenation, cross-line and cross-page
+joining, reading order), NOT the JSON handoff, which is already fine.
+
+**Prerequisite already shipped, by accident:** `recognize_page_blocks_words`
+(multi-column reading order). Sentence assembly is impossible if lines are read
+ACROSS a gutter — the 8-column sheet that used to read as 26 full-width lines
+would have produced nonsense sentences no PoS FSM could rescue. That fix turned
+out to be on the critical path for the reasoning arc, not just for layout
+fidelity.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the
