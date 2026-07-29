@@ -1032,10 +1032,49 @@ intrinsics":** (a) `tesseract-ocr` declares no `ndarray` dependency at all —
 only `tesseract-recognizer` does, which is where the invariant currently bites
 (`matmul_i8_to_i32`) — so reaching `ndarray::simd` means adding that dep and
 deciding whether it crosses the deliberate two-foundations split; (b) no
-measurement says binarization is hot. Sauvola on a 512×720 page is ~370k
-pixels of integral-image arithmetic against an LSTM forward that dominates the
-per-page cost. **Vectorize after profiling, through the polyfill, never
-before.**
+measurement said binarization was hot. **Vectorize after profiling, through
+the polyfill, never before.**
+
+**★ The profile now exists, and it answers the question NO for binarization
+(2026-07-29).** `examples/stage_timing.rs`, real 512×720 page, **release**:
+
+| stage | ms | % of one `recognize_document` |
+|---|---|---|
+| `binarize[otsu]` | 1.34 | 0.14% |
+| `binarize[sauvola]` | 4.73 | 0.50% |
+| `binarize[wolf]` | 5.18 | 0.54% |
+| `binarize[singh]` | 4.58 | 0.48% |
+| **`strip_borders`** | **91.87** | **9.65%** |
+| `recognize_document` | 951.92 | 100% |
+
+**Binarization is 0.14-0.54% of a page.** Making any of those loops
+*infinitely* fast buys half a percent — far less than the cost of the ndarray
+dependency edge and the two-foundations argument it would reopen. The
+deferral is now a measured decision, not an assumption. Do not revisit
+without a new measurement.
+
+**`strip_borders` at 9.65% is the only pixel stage that is even visible** —
+130× Sauvola's cost. Three things about it, in order: it is **opt-in and
+default-off**, so it costs zero today; it is **binary morphology** (two
+100-px opens, two seedfills, a subtract), which none of `simd_ops`'
+f32/f64/i8-arithmetic surface fits; and this crate stores one BYTE per pixel
+(0/255), not bitpacked — so the first-order lever is the *representation*
+(8× less memory traffic, and `popcnt`/`movemask`/`mask_blend` only become
+applicable once bitpacked), with the seedfill algorithm the likely real hot
+spot underneath. **SIMD is the second-order lever there, behind
+representation.** Not scheduled; recorded so it is not mistaken for a SIMD
+task.
+
+> **⚠ DEBUG PROFILES UNDERSTATE PIXEL STAGES — the opposite of the obvious
+> assumption, and I wrote the wrong direction down before measuring it.**
+> Debug→release speedup: `recognize_document` **55.7×**, `strip_borders`
+> 15.8×, `binarize[sauvola]` 11.4× — so Sauvola's share goes 0.10% (debug) →
+> 0.50% (release) and `strip_borders` 2.73% → 9.65%. The reason inverts the
+> intuition: `ndarray`'s SIMD is `#[inline(always)]` wrappers over intrinsics,
+> and in debug **nothing inlines**, so every lane op becomes a real function
+> call — far more punishing than what debug does to a plain slice loop. *Being
+> already-SIMD is what makes a debug build slow, not what protects it.*
+> **Always cite the release row.**
 
 **★ Two "blocked" deferrals were never data-blocked (2026-07-29).** Both
 falsifying fixtures are now committed (`corpus/model/README.md` § "Falsifier
