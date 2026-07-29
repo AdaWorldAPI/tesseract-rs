@@ -254,3 +254,168 @@ fn real_borderless_grid_measured() {
     assert_eq!(d.nhb, 0, "a borderless grid must have NO horizontal rules");
     assert_eq!(d.nvb, 0, "a borderless grid must have NO vertical rules");
 }
+
+// ─── EXPERIMENT: synthesize the border, then reuse the proven classifier ───
+
+/// Vertical ink projection → the whitespace corridors between text blobs.
+/// Returns `(gutters, ink_left, ink_right)` where each gutter is `(start, end)`.
+fn vertical_gutters(page: &[u8]) -> (Vec<(usize, usize)>, usize, usize) {
+    let mut has_ink = vec![false; W];
+    for y in 0..H {
+        for x in 0..W {
+            if page[y * W + x] < 128 {
+                has_ink[x] = true;
+            }
+        }
+    }
+    let ink_left = has_ink.iter().position(|&b| b).unwrap_or(0);
+    let ink_right = has_ink.iter().rposition(|&b| b).unwrap_or(W - 1);
+    let mut gutters = Vec::new();
+    let mut run: Option<usize> = None;
+    for (x, &inked) in has_ink
+        .iter()
+        .enumerate()
+        .take(ink_right + 1)
+        .skip(ink_left)
+    {
+        if inked {
+            if let Some(s) = run.take() {
+                gutters.push((s, x));
+            }
+        } else if run.is_none() {
+            run = Some(x);
+        }
+    }
+    (gutters, ink_left, ink_right)
+}
+
+/// Horizontal ink extent — the table's top and bottom.
+fn ink_rows(page: &[u8]) -> (usize, usize) {
+    let mut top = H;
+    let mut bot = 0;
+    for y in 0..H {
+        if (0..W).any(|x| page[y * W + x] < 128) {
+            top = top.min(y);
+            bot = bot.max(y);
+        }
+    }
+    (top, bot)
+}
+
+/// The operator's algorithm: derive the inter-column gutter width, normalize
+/// the OUTER margin to match it (half a gutter each side, so every column
+/// carries the same whitespace allowance), then draw the full invisible
+/// border — box plus one rule down each internal gutter.
+fn synthesize_border(page: &[u8]) -> (Vec<u8>, usize, usize, usize) {
+    let (gutters, ink_l, ink_r) = vertical_gutters(page);
+    let (ink_t, ink_b) = ink_rows(page);
+    // Separate COLUMN gutters from intra-cell glyph gaps. Both are runs of
+    // whitespace; only the wide ones are column boundaries. Median-relative,
+    // not an absolute px threshold, so it scales with font size.
+    let mut widths: Vec<usize> = gutters.iter().map(|(s, e)| e - s).collect();
+    widths.sort_unstable();
+    let median = widths.get(widths.len() / 2).copied().unwrap_or(0);
+    let gutters: Vec<(usize, usize)> = gutters
+        .into_iter()
+        .filter(|(s, e)| e - s >= (median * 2).max(1))
+        .collect();
+    let avg_gutter = if gutters.is_empty() {
+        0
+    } else {
+        gutters.iter().map(|(s, e)| e - s).sum::<usize>() / gutters.len()
+    };
+    // left indent + right indent == one average internal gutter.
+    let half = avg_gutter / 2;
+    let (bl, br) = (ink_l.saturating_sub(half), (ink_r + half).min(W - 1));
+    let (bt, bb) = (ink_t.saturating_sub(half), (ink_b + half).min(H - 1));
+
+    let mut out = page.to_vec();
+    let rule = 3usize;
+    let draw_v = |x: usize, o: &mut Vec<u8>| {
+        for y in bt..=bb {
+            for xx in x..(x + rule).min(W) {
+                o[y * W + xx] = 0;
+            }
+        }
+    };
+    draw_v(bl, &mut out);
+    draw_v(br.saturating_sub(rule), &mut out);
+    for (s, e) in &gutters {
+        draw_v((s + e) / 2, &mut out);
+    }
+    for y in [bt, bb.saturating_sub(rule)] {
+        for yy in y..(y + rule).min(H) {
+            for x in bl..=br {
+                out[yy * W + x] = 0;
+            }
+        }
+    }
+    (out, avg_gutter, gutters.len(), half)
+}
+
+/// **Operator-proposed algorithm, measured: synthesize the border, then reuse
+/// the classifier already proven byte-parity.**
+///
+/// The defect this addresses: a borderless page can only score on the
+/// whitespace pair (`nvw>3`, `nvw>6`), and `nvw` scales with COLUMN COUNT, so
+/// a 4-column lab report (`nvw=1`) cannot reach the threshold while an
+/// 8-column grid (`nvw=17`) sails past. The signal proxies width, not
+/// tableness.
+///
+/// The algorithm, in the operator's own framing: take the n text blobs,
+/// measure the whitespace between them, use that same margin as the outer
+/// indent (so left + right together equal one average internal gutter), and
+/// draw an invisible border.
+///
+/// Measured on the 4-column borderless fixture:
+///
+/// ```text
+///   derived: 3 internal gutters, avg width 45px, outer margin 22px each side
+///   BEFORE: nhb=0 nvb=0 nvw=1 score=0 -> table=false
+///   AFTER : nhb=2 nvb=5 nvw=1 score=2 -> table=TRUE
+/// ```
+///
+/// **What makes it work is that it does NOT repair `nvw`** — that stays at 1.
+/// It supplies the *rule* signal instead (`nhb=2` from the box's top/bottom,
+/// `nvb=5` from its sides plus one rule per internal gutter), converting a
+/// borderless table into a ruled one so the existing, unmodified
+/// `decide_if_table` classifies it. No threshold is retuned and no
+/// byte-parity leaf is touched.
+///
+/// **The load-bearing detail is the gutter filter.** A first pass without it
+/// found 39 "gutters" averaging 7px — the gaps between GLYPHS inside a cell —
+/// and drew a rule between nearly every character. It still scored 2, but for
+/// the wrong reason (the outer box alone supplies both conditions), which
+/// would have looked like success while measuring nothing. The filter is
+/// median-relative rather than an absolute pixel count, so it scales with
+/// font size: column gutters are the outliers, glyph gaps are the median.
+///
+/// Reported, not asserted as a shipped behaviour — this validates the
+/// mechanism on one fixture. Generalizing it needs the same treatment on
+/// `resgrid` (8-col, already detected) to confirm it does not FALSELY promote
+/// ordinary multi-column prose, which is the obvious failure mode.
+#[test]
+fn synthesized_border_makes_borderless_table_detectable() {
+    let borderless = table_page(false);
+    let before = decide(&borderless);
+    let (bordered, avg_gutter, n_gutters, half) = synthesize_border(&borderless);
+    let after = decide(&bordered);
+
+    eprintln!("derived: {n_gutters} internal gutters, avg width {avg_gutter}px, outer margin {half}px each side");
+    eprintln!(
+        "  BEFORE: nhb={} nvb={} nvw={} score={} -> table={}",
+        before.nhb,
+        before.nvb,
+        before.nvw,
+        before.score,
+        before.score >= pageseg::TABLE_SCORE_THRESHOLD
+    );
+    eprintln!(
+        "  AFTER : nhb={} nvb={} nvw={} score={} -> table={}",
+        after.nhb,
+        after.nvb,
+        after.nvw,
+        after.score,
+        after.score >= pageseg::TABLE_SCORE_THRESHOLD
+    );
+}
