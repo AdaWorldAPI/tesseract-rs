@@ -1768,19 +1768,52 @@ ships its own input is worth extracting rather than reproducing by guesswork.
   |---|---|---|
   | Otsu vs Sauvola | smallest ink feature lost to a global threshold | **identical** (conf 99.348 / 99.339) |
   | dict vs no-dict | punc-DAWG beam suppresses a low-evidence glyph | **identical** |
-  | crop widened +60 px | line band clips the line-final period | **0 recovered** |
+  | crop widened +60 px | line band clips the line-final period | **0 recovered** ⚠ FALSE NEGATIVE |
   | `makerow` plain text | `DocPage`/`doc.v1` assembly drops it | **also 0** — upstream of the DOM |
 
-  What makes it specific and strange: **commas survive at full count in every
-  arm.** A comma is barely larger than a period *and* descends below the
-  baseline, so neither a size story nor a vertical-clipping story explains
-  periods vanishing while commas do not. `corpus/pages/page_01.pgm` DOES yield
-  `night.`/`door.`/`rack.`, so it is input-dependent. Cause NOT yet isolated —
-  the remaining suspects are the line-crop *geometry* handed to the LSTM
-  (oracle uses its own `--psm 1` segmentation, estimating 336 dpi) and the CTC
-  decode itself. Reproduce with
-  `cargo run -p tesseract-ocr --example period_probe --release -- page.pgm`
-  against `tesseract page.pgm out --psm 1 -l eng`.
+  > **⚠ THE CROP ROW WAS A FALSE NEGATIVE — MY PROBE'S FAULT, AND THE
+  > CROPPING HYPOTHESIS WAS RIGHT ALL ALONG.** The +60 px window reached past
+  > the column gutter and pulled in a stray `—`, so the text ended `"...her. —"`
+  > and my `ends_with('.')` check scored it as "no period" — while the period
+  > was in fact recovered. Operator caught the reasoning error: I was comparing
+  > glyph SIZE (comma ≈ period) when the systematic difference is POSITION —
+  > commas sit mid-line and are inside the crop no matter where it ends;
+  > periods sit line-final, exactly at the cut. This is the
+  > "a null result is a claim about the measurement apparatus until proven
+  > otherwise" rule, violated in the same session that quotes it.
+
+  **ROOT CAUSE (measured, every link):**
+
+  1. A period at book scale is **5-6 px tall** (measured blobs: 5×5 … 6×6,
+     22-26 ink px, sitting at baseline).
+  2. `blob_filter.rs:201` — `if height < TEXTORD_MAX_NOISE_SIZE` (**7**) →
+     the period goes to `FilteredBlobs::noise`.
+  3. **Nothing in this crate consumes `FilteredBlobs::noise`** (`grep '\.noise'`
+     outside `blob_filter.rs` returns nothing). It is populated and dropped.
+  4. So `make_rows` never sees it; the row's ink bbox stops at the last
+     full-height glyph (x=800 on the reference line).
+  5. `makerow_row_crops` crops that bbox + `kImagePadding = 4` → right edge
+     ≈ 804, and the period spans 803..808 — **sliced in half**, so the LSTM
+     never sees a whole one.
+  6. **Commas descend below the baseline**, clear the `h >= 7` bar, land in
+     `blobs`, and are mid-line regardless — which is exactly why commas
+     survive at 42/42 while periods vanish.
+
+  Proof, `examples/ink_probe.rs` on the reference page: 8 lines carry
+  unrecognized ink right of the last word; re-recognizing from a crop widened
+  just past that ink recovers a period on **7 of 8** — matching the oracle's
+  **7** line-final periods exactly. (The 8th is a 19×51 blob: the drop cap,
+  the separate defect below.) The single-line ladder is unambiguous:
+  `crop→x=800 "…close by her"` vs `crop→x=812 "…close by her."` — **12 px**.
+
+  **Why the oracle differs with the SAME constant:** libtesseract retains
+  `TO_BLOCK::noise_blobs` and re-inserts them downstream; this transcode ported
+  the *classification* but not the *re-insertion*, so noise is terminal here.
+  That missing step is the fix, and it is real transcode work (needs its own
+  oracle + golden re-pin), deliberately NOT attempted as a drive-by.
+
+  Reproduce: `cargo run -p tesseract-ocr --example ink_probe --release -- page.pgm`
+  and `--example period_probe` against `tesseract page.pgm out --psm 1 -l eng`.
 - **The drop-cap initial is dropped** — "Alice" recognizes as "ice", under both
   binarization modes. Almost certainly line-band segmentation (a drop cap spans
   several line heights, so `makerow`'s row finder assigns it to no row, or
