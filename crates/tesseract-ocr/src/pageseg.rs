@@ -681,6 +681,50 @@ pub fn decide_if_table(binary: &[u8], w: usize, h: usize) -> TableDecision {
     }
 }
 
+/// Crop `binary` at `region` and test it against [`decide_if_table`],
+/// clearing [`TABLE_SCORE_THRESHOLD`] — the shared table-classification
+/// primitive. `binary` is the FULL page's binarization, `w`/`h` its full
+/// dimensions; `region` is `(left, top, right, bottom)` in the SAME crate
+/// convention `xy_cut::PageRect` uses (top-down, right/bottom exclusive).
+///
+/// Regions smaller than 100 px on either side score `0` and return `false`
+/// without cropping — [`decide_if_table`] can hold no `o100` structural line
+/// below that size, so this is a cheap, correct short-circuit rather than an
+/// approximation.
+///
+/// This is THE table decision, called from two places that must agree:
+/// [`crate::lstm_recognizer::LstmRecognizer`]'s post-hoc region classifier
+/// (labelling an already-final block for `build_regions`), and
+/// [`crate::xy_cut::xy_cut_table_aware`]'s recursive splitter (deciding
+/// WHETHER to keep splitting a candidate rect at all, before it ever becomes
+/// a final block). A block that would be labelled `Table` after the fact but
+/// was already fragmented into per-column leaves before that label could
+/// apply is exactly the defect `xy_cut_table_aware` exists to prevent — see
+/// its own docs.
+///
+/// **Scope note (inherited from [`decide_if_table`]):** targets leptonica's
+/// ~75-300 ppi structural-line scale; runs on the region crop at the page's
+/// own resolution, not yet ppi-exact (the deskew wave's `pixPrepare1bpp`
+/// front-end is the gap — see `deskew-wave-v1.md`).
+#[must_use]
+pub fn region_is_table(binary: &[u8], w: usize, h: usize, region: (i32, i32, i32, i32)) -> bool {
+    let (l, t, r, b) = region;
+    let l = l.max(0) as usize;
+    let t = t.max(0) as usize;
+    let r = (r.max(0) as usize).min(w);
+    let b = (b.max(0) as usize).min(h);
+    let (cw, ch) = (r.saturating_sub(l), b.saturating_sub(t));
+    if cw < 100 || ch < 100 {
+        return false;
+    }
+    let mut crop = vec![255u8; cw * ch];
+    for y in 0..ch {
+        let row = (t + y) * w + l;
+        crop[y * cw..(y + 1) * cw].copy_from_slice(&binary[row..row + cw]);
+    }
+    decide_if_table(&crop, cw, ch).score >= TABLE_SCORE_THRESHOLD
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

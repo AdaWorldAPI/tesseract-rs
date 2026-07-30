@@ -58,8 +58,9 @@ pub use network::{InputShape, NetError, Network, Node, ReverseKind};
 pub use page_furniture::{detect_page_furniture, PageFurniture};
 pub use pageseg::{
     decide_if_table, gen_textblock_mask, gen_textline_mask, generate_halftone_mask,
-    get_regions_binary, strip_borders, strip_borders_grey, strip_borders_page, HalftoneMask,
-    Regions, TableDecision, TextlineMask, MIN_HEIGHT, MIN_WIDTH, TABLE_SCORE_THRESHOLD,
+    get_regions_binary, region_is_table, strip_borders, strip_borders_grey, strip_borders_page,
+    HalftoneMask, Regions, TableDecision, TextlineMask, MIN_HEIGHT, MIN_WIDTH,
+    TABLE_SCORE_THRESHOLD,
 };
 pub use renderer::{render_hocr, render_text, render_tsv, LineMetrics, LineWords};
 pub use seedfill::seedfill_binary;
@@ -84,4 +85,4 @@ pub use threshold::{
     otsu_threshold_channels, otsu_threshold_gray, threshold_rect_to_binary,
     threshold_rect_to_binary_multi, OtsuChannel, OtsuResult, OtsuStatsResult, HISTOGRAM_SIZE,
 };
-pub use xy_cut::{xy_cut, BinarizeMode, PageRect, XyCutParams};
+pub use xy_cut::{xy_cut, xy_cut_table_aware, BinarizeMode, PageRect, XyCutParams};
