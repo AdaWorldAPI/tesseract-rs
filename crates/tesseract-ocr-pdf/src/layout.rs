@@ -9,7 +9,7 @@
 //!   image crops (`cm`+`Do`), invisible searchable text (`3 Tr`), painted
 //!   visible text (`0 Tr`), and stroked table rules (`re`+`S`). Reuses ALL of
 //!   `searchable_pdf.rs`'s helpers (`px_to_pt`, `prec`, `winansi_encode_str`,
-//!   `advance_width_1000em`, `escape_pdf_literal`, `embed_grey_image`) so the
+//!   `advance_width_1000em`, `embed_grey_image`) so the
 //!   `px→pt` / `Tz`-fit / WinAnsi math is byte-for-byte the same as before.
 //! - [`render_preview_html`] — the HTML projection. Every block becomes one
 //!   absolutely-positioned element at the SAME image-pixel bbox
@@ -48,8 +48,8 @@ use lopdf::{dictionary, Document, Object, ObjectId, Stream};
 use serde::Deserialize;
 
 use crate::searchable_pdf::{
-    advance_width_1000em, embed_grey_image, escape_pdf_literal, prec, px_to_pt, winansi_encode_str,
-    PageOcr, RenderReport, SearchablePdfError,
+    advance_width_1000em, embed_grey_image, prec, px_to_pt, winansi_encode_str, PageOcr,
+    RenderReport, SearchablePdfError,
 };
 use crate::GreyImage;
 
@@ -346,10 +346,9 @@ fn emit_text_run(
     ops.push(Operation::new("Tz", vec![(prec(tz) as f32).into()]));
     ops.push(Operation::new(
         "Tj",
-        vec![Object::String(
-            escape_pdf_literal(&bytes),
-            lopdf::StringFormat::Literal,
-        )],
+        // RAW WinAnsi bytes — lopdf escapes a Literal string itself. Escaping
+        // here first would double-escape (see searchable_pdf.rs's note).
+        vec![Object::String(bytes, lopdf::StringFormat::Literal)],
     ));
     substitutions
 }

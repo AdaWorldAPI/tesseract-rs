@@ -1710,6 +1710,67 @@ still merges. Paired silence twin
 ragged single-column text gains no spurious vertical splits, and the
 pre-existing `thin_gutter_does_not_over_split` guard still passes.
 
+## ★ Two PDF-render bugs found in a real user PDF — double-escape + WinAnsi loss (2026-07-30)
+
+Both found by decompressing the content stream of a `structured` PDF the
+operator produced from a real two-column Alice scan, and both are **rendering**
+bugs (the recognition underneath was fine).
+
+**1. Literal strings were escaped TWICE.** `layout.rs`'s `emit_text_run` ran
+`escape_pdf_literal(&bytes)` and handed the result to
+`Object::String(_, StringFormat::Literal)` — but **lopdf escapes a Literal
+string itself** on serialization. Arithmetic: input `(` → manual escape `\(` →
+lopdf escapes THAT (`\`→`\\`, `(`→`\(`) → `\\\(`, which is exactly the
+three-backslash sequence found in the file, and which a viewer renders as the
+visible, wrong `\(`. The page showed `mind, \(as` and `stupid,\)`. Fix: hand the
+RAW WinAnsi bytes to `Object::String` and delete `escape_pdf_literal` (its only
+caller WAS the bug). Falsifier
+`pdf_literal_parens_are_escaped_exactly_once`; verified failing on the old code
+with `"mind, \\(as"` — character-for-character the operator's PDF.
+
+**2. WinAnsi `0x80..=0x9F` was dumped to `?`.** The v1 policy passed only
+`0x20..=0x7E` and `0xA0..=0xFF`, substituting `'?'` for everything else — and
+that excluded block is *exactly* where print typography lives (curly quotes, en/
+em dashes, ellipsis, bullet, dagger, OE/oe). An ordinary prose scan came back
+with `?and`, `book,?`, `conversations??` where the page plainly showed `“and`,
+`book,”`, `conversations?”`. Pure avoidable loss: the built-in Helvetica
+`/WinAnsiEncoding` font renders every one of those glyphs. Fix: `WINANSI_HIGH`,
+the 27-entry CP1252 map (PDF 32000-1 Annex D.2), leaving the five real CP1252
+holes (`0x81/0x8D/0x8F/0x90/0x9D`) substituting as before. The
+`HELVETICA_WINANSI_WIDTHS` entries for that block were **placeholders** under
+the old policy and are now real AFM advances — those bytes now reach the `Tz`
+horizontal-fit computation, so a placeholder width would mis-scale any line
+containing a curly quote. Falsifier
+`winansi_smart_typography_is_encoded_not_substituted`, with a paired
+can-it-still-substitute half (CJK → `?`, counted) so the report cannot go quiet
+about real loss.
+
+**Method note worth keeping: the operator's own PDF was the oracle.** The
+searchable PDF embeds the source raster, so the real page was recoverable —
+`zlib.decompress` of the `/Subtype/Image` stream (2550×3300 DeviceGray) → a PGM
+→ straight through this crate's own pipeline. A user-reported rendering bug that
+ships its own input is worth extracting rather than reproducing by guesswork.
+
+### Two findings from that page that are NOT these bugs, and NOT yet explained
+
+- **Periods are lost.** The recognized text has **2** `.` against **39** `,`,
+  4 `:` and 2 `;`, and **0 of 72 lines** end in a period, on ordinary English
+  prose. **NOT binarization** — `examples/period_probe.rs` measured Otsu vs
+  Sauvola *identical* (0 line-final periods both; conf 99.348 vs 99.339), which
+  kills the faded-scan hypothesis outright. **NOT the render path** — no
+  period-stripping exists in `layout.rs` and the period is already absent from
+  `doc.v1`. `corpus/pages/page_01.pgm` DOES yield `night.`/`door.`/`rack.`, so
+  it is input-dependent. Leading UNPROVEN hypothesis: the dict beam's punctuation
+  DAWG path (a period is the CTC decoder's lowest-evidence glyph); the next
+  probe is with-dict vs no-dict on the same page.
+- **The drop-cap initial is dropped** — "Alice" recognizes as "ice", under both
+  binarization modes. Almost certainly line-band segmentation (a drop cap spans
+  several line heights, so `makerow`'s row finder assigns it to no row, or
+  `filter_blobs` rejects it against the page's line-size estimate). The mirror
+  image of the period bug: that one loses the smallest glyph, this the largest.
+
+Both are recorded rather than guessed at — no fix is claimed for either.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the
