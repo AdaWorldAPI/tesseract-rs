@@ -511,19 +511,35 @@ fn stripping_borders_keeps_the_table_as_one_region_and_reduces_border_glyphs() {
          {stripped_shapes:?}"
     );
 
-    // Ingredient 3, REMAINING half — pinned two-sided, same discipline as
-    // before: the grid is not yet the full printed 4 columns. When
-    // `extract_table_grid`'s gap heuristic is tuned to separate the last
-    // two columns, THIS assertion fails — that is the signal to re-pin to 4
-    // and tell the extraction consumers (medcare-rs lab import, odoo-rs /
-    // woa-rs invoice lines) that region["cells"] is fully usable, not a
-    // signal that something broke.
+    // Ingredient 3, REMAINING half — CLOSED 2026-07-30, re-pinned 3 -> 4 as
+    // the previous pin's own instruction required ("if this is now 4, the
+    // remaining gap has closed — re-pin deliberately"). It measured
+    // `left: 4, right: 3` the moment the fix landed, which is the pin doing
+    // exactly its job.
+    //
+    // What closed it: `extract_table_grid` now BRIDGES a whitespace river
+    // fragmented by a stray token. Measured here (probe:
+    // `cargo run -p tesseract-ocr --release --example table_column_probe --
+    //  corpus/lab/lab_table_ruled.pgm strip`), the Einheit|Referenz gutter is
+    // 104 px against a 66 px bar but arrived as 57 + a 17 px sliver + 30, so
+    // BOTH fragments were rejected on width and the columns merged. The bar
+    // was never the binding constraint — the fragmentation was.
+    //
+    // Pinned against the fixture's own ground truth rather than a bare
+    // literal, so this cannot drift away from what the page actually prints.
+    let gt: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(corpus().join("lab/lab_table_ruled.gt.json")).unwrap(),
+    )
+    .unwrap();
+    // `table_shapes` reports `(rows, cols, cells)` with u64 counts, so keep the
+    // ground-truth read in the same type rather than casting either side.
+    let gt_cols = gt["cols"].as_u64().unwrap();
     assert_eq!(
-        stripped_cols, 3,
-        "measured 3 of the printed 4 columns recovered (extract_table_grid's \
-         gap heuristic still merges two columns on this fixture); if this \
-         is now 4, the remaining gap has closed — re-pin deliberately, \
-         do not just widen this assertion"
+        stripped_cols, gt_cols,
+        "stripped recovery must match the PRINTED column count ({gt_cols}); \
+         measured {stripped_cols}. A drop back to 3 means the river-bridging \
+         regressed; a jump above {gt_cols} means it now over-splits — both are \
+         real defects, neither is a reason to widen this assertion"
     );
 }
 

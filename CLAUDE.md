@@ -2171,3 +2171,90 @@ document-level claim.
 
 No Core change (all four files are tesseract-ocr / tesseract-ocr-pdf local) →
 this file + the commit are the record.
+
+## ★ Table column merge CLOSED — the gutter was FRAGMENTED, not too narrow (2026-07-30)
+
+The follow-up the ingredient-3 arc filed as "a genuinely different, narrower
+problem": `extract_table_grid` recovered **7x3 against the printed 7x4** on
+`corpus/lab/lab_table_ruled.pgm`. The standing description called it "a
+threshold-tuning question". **The measurement says that description was wrong**,
+and the probe that says so is now committed
+(`examples/table_column_probe.rs` — dumps every candidate river with its
+measured width against the bar actually applied, plus per-row word spans).
+
+### Two different failures, one per path — the summary had merged them
+
+- **Plain (un-stripped): NOT tunable.** Widest rejected river is **22 px against
+  the 66 px bar (0.33x)** — nowhere near. The Ergebnis|Einheit gutter is
+  *occupied* by spurious recognized border glyphs (`|`, `=`, `J`, `" —"` at
+  x=537..684), i.e. ingredient-1 border pollution. Lowering the bar to admit
+  22 px would also admit 18/17/13 px and shred every cell. Correctly still 3
+  columns after this fix.
+- **Stripped: a fragmented gutter.** Borders gone, and the Einheit|Referenz
+  gutter measures **57 px + a 17 px occupied sliver + 30 px**. Both fragments
+  fail the 66 px bar independently; the true gutter is **104 px**, comfortably
+  over it. The bar was never the binding constraint — the FRAGMENTATION was.
+
+### A hypothesis measured and FALSIFIED, which is why the probe exists
+
+First hypothesis: the river is the INTERSECTION of per-row gaps, so ragged
+(right-aligned numeric) column edges shrink it below the typical per-row gap —
+so use the per-row gap median instead. Measured, it **does not discriminate**:
+
+| river | intersection | per-row median | is it a real boundary? |
+|---|---|---|---|
+| 187..272 | 85 | 76 | YES |
+| 280..311 | 31 | **131** | no |
+| 487..597 | 110 | 137 | YES |
+| 872..929 | 57 | **107** | YES (the missed one) |
+| 946..976 | 30 | **107** | no |
+
+A false river scores 131 (higher than a true boundary's 76) and another scores
+107 (identical to the true missed one). Switching to per-row median would have
+ACCEPTED the false rivers and over-split. Recorded because the hypothesis was
+plausible, cheap to test, and wrong.
+
+### The fix: bridge fragments, judged against their neighbours
+
+Two adjacent rivers merge when the occupied sliver between them is narrower
+than **BOTH** of them (so a genuine block of text between two columns can never
+be bridged — it is wider than what flanks it) **and** narrower than one median
+word height (the interruption is on the scale of a stray glyph, not of
+content). Same correction shape as `xy_cut`'s gutter fallback and
+`noise_readmit_reach`: **judge a candidate by what is around it.**
+
+**PAIRS ONLY, deliberately.** Transitive bridging would let a run of ordinary
+word-space rivers chain into a spurious column — measured on the un-stripped
+page, chaining accumulated `22+3+5+9+13 = 52 px` from pure word spacing. Capping
+at one sliver bounds it at two fragments and leaves the un-stripped verdict
+unchanged.
+
+**Measured:** stripped `(7, 3, 21)` -> **`(7, 4, 28)`**, cells now aligned with
+the print (`Haemoglobin | $142 | = g/dl | 13.5 -17.5`). Plain unchanged at
+`(7, 3, 21)`. The pre-existing pin did its job exactly as its own comment
+instructed — it failed `left: 4, right: 3` the moment the fix landed — and is
+re-pinned against the fixture's `gt.json` `cols` rather than a bare literal, so
+it now fails in BOTH directions (regression to 3, or over-split above 4).
+
+> **⚠ I SHIPPED A VACUOUS FALSIFIER AND CAUGHT IT ONLY BY RUNNING THE
+> DISABLE-THE-FIX CHECK.** The first `..._bridges_a_gutter_fragmented_by_a_stray_token`
+> fixture put the stray token in ONE of four rows. With `support = 3`, three
+> rows still blank means the river **never fragments at all** — so the test
+> passed identically with bridging removed. It asserted the right thing about
+> the wrong input. Fixed by COMPUTING the geometry instead of eyeballing it
+> (`med_h=20 -> gap_min=40`; `support=3` so the sliver needs TWO occupied rows;
+> fragments 18+18 under the bar, bridged 44 over it) and re-verifying. Both
+> falsifiers are now confirmed real: disabling bridging fails the can-fire half,
+> removing the `sliver < med_h` guard fails the silence half — and independently
+> also fails the pre-existing `extract_table_grid_splits_columns_by_whitespace`,
+> corroborating that the guard is load-bearing. **The falsifier-auditor card in
+> `.claude/agents/` names this exact trap, and I still walked into it; the
+> disable-the-fix run is what makes the rule operational rather than aspirational.**
+
+### Still open on this fixture, and it is RECOGNITION, not structure
+
+The cell TEXT remains degraded (`14.2` -> `$142`, `0.9` -> `O09`, header ->
+`=—_—sO&Referenz`) at `mean_conf 91.47` — the confident-and-wrong quadrant.
+Structure is now right; the characters inside the cells are a separate defect
+on a deliberately hard fixture, and `collapsed_cells_still_report_high_confidence`
+already pins the honesty problem. Not conflated with this fix.
