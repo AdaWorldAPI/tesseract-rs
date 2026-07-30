@@ -1,5 +1,39 @@
 # Typography & Placement Improvement Plan
 
+> **STATUS: IMPLEMENTED 2026-07-30 — with Fix 1's DESIGN OVERRIDDEN.** Read this
+> box before the body; §3's Fix 1 is superseded.
+>
+> **What shipped, and why it differs from the plan.** Fix 1 below proposes
+> gating `table_blocks` behind `DocumentOptions::strip_borders`. Implementing it
+> revealed that would **break
+> `tests/lab_table_columns.rs::naive_pre_strip_destroys_table_detection`'s
+> precondition** (`!plain_shapes.is_empty()`, whose own message reads "or this
+> test measures nothing") and discard ruled-table detection that demonstrably
+> works. The plan reached the right SITE (`lstm_recognizer.rs:1269-1272`) and
+> the wrong REMEDY.
+>
+> **What shipped instead: narrow the EVIDENCE, do not switch the feature off.**
+> Only the whitespace half of `decide_if_table` is unreliable (`nvw>3`,
+> `nvw>6` — a wide multi-column TEXT page produces the same long corridors a
+> table does); the ruled half (`nhb>1`, `nvb>2`) is sound. So the default path
+> now additionally requires ruled evidence
+> (`TableDecision::has_ruled_evidence()`), while a `strip_borders` caller keeps
+> the bare leptonica verdict — necessarily, since stripping REMOVES the rules the
+> ruled conditions count. `decide_if_table` itself is byte-parity and untouched.
+>
+> Fix 2 (thread real metrics into `TableCell`, closing Findings A + C together)
+> shipped **as written**, including the shared `derive_text_metrics()` so the
+> line and cell paths cannot drift.
+>
+> **Measured after:** the repro page went from 2 of 5 regions / 69 of 72 lines
+> stamped `type=table` to **5 regions, all `type=text`, 0 tables**. Because
+> those lines now take the `TextBlock` path, which already consumed measured
+> metrics, **Fix 1 alone resolves the reported size/placement symptom on this
+> page**; Fix 2 is what protects a genuinely correct table's cells.
+>
+> Full record, falsifiers, and the fixture-validity lesson: `CLAUDE.md`
+> § "Table classification was ungated".
+
 > Scope: overlay/rendered font size, text/baseline placement, and table
 > structure adherence — across **both** render surfaces the user named: the
 > `/debug` side-by-side A|B HTML preview and the actual PDF outputs

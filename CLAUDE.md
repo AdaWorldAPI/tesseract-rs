@@ -2042,3 +2042,132 @@ PR is **lance-graph #556**.
 - `.claude/plans/tesseract-rs-ast-dll-codegen-v1.md` — codegen / adapter-body half.
 - `.claude/plans/tesseract-rs-receive-contract-v1.md` — the consume-the-Core contract.
 - `.claude/handovers/2026-06-16-*` — cpp-spo corpus + headstone exploration.
+
+## ★ Table classification was ungated — and the fix is ruled EVIDENCE, not an off switch (2026-07-30)
+
+**Reported symptom:** overlay text renders at roughly 25-40% of expected size,
+placement off, table structure not adhered to, in BOTH the `/debug` A|B preview
+and the PDF outputs. Root-caused to three coupled defects, all in the
+consumer-side synthesis/render layer; the byte-parity leaves are untouched.
+
+### The measured root cause
+
+`recognize_document_with_options` computes TWO things from `opts.strip_borders`,
+and the Ingredient-3 fix (2026-07-30, above) covered only the first:
+
+1. **SPLITTING** — `rec_blocks` (`lstm_recognizer.rs:1201-1205`) and the
+   classification-side `blocks` list (`:1241-1245`) both branch
+   `if opts.strip_borders { xy_cut_table_aware } else { xy_cut }`. Gated, as
+   documented.
+2. **LABELLING** — `table_blocks` (`:1269-1272`) mapped `block_is_table` over
+   every block with **no gate at all**. That boolean is what `build_regions`
+   stamps as `region.type`.
+
+So on the plain default path a real 2550x3300 two-column prose scan measured
+**2 of 5 regions and 69 of 72 lines stamped `type=table`** (`nhb = nvb = 0` —
+not one printed rule on the page; it scored on `nvw` alone). Those lines then
+rendered through `TableCell`, which **had no metrics field at all** and whose two
+render call sites hardcoded `None`, so they fell to `box_h * 0.5` sizing and a
+box-BOTTOM pen. `doc_probe` on that page: measured `font_px` median **48.0**
+against the fallback `guess=30.0` — **0.53-0.67x**, exactly the shrunk text
+reported.
+
+### The fix, and why the obvious one was wrong
+
+The plan's first draft said "gate classification behind `strip_borders`". **That
+was rejected after reading the tests**: it would have broken
+`naive_pre_strip_destroys_table_detection`'s precondition
+(`!plain_shapes.is_empty()` — "or this test measures nothing"), and thrown away
+ruled-table detection that demonstrably works.
+
+**Only the whitespace half of `decide_if_table` is unreliable.** Two of its four
+conditions count printed rules (`nhb>1`, `nvb>2`) and are sound; two count
+vertical whitespace (`nvw>3`, `nvw>6`) and cannot separate a table from wide
+multi-column text, because both genuinely have many long corridors
+(`corpus/quality/resgrid.pgm`: 8 columns of ordinary TEXT, zero rules,
+`nvw=17 score=2`). So the fix **narrows the evidence** instead of disabling the
+feature:
+
+- `TableDecision::has_ruled_evidence()` (new) — `nhb > 1 || nvb > 2`, a pure read
+  of already-computed counts. `decide_if_table` itself is byte-parity and
+  **unchanged**.
+- `pageseg::region_table_decision()` (new) — returns the full decision;
+  `region_is_table` now delegates to it, so the two can never disagree.
+- `block_is_table(..., require_ruled)`; call site passes `!opts.strip_borders`.
+
+`require_ruled = false` for a `strip_borders` caller is deliberate and load
+bearing: stripping REMOVES the rules the ruled conditions count, so requiring
+them there would defeat the feature — which is exactly what
+`naive_pre_strip_destroys_table_detection` measures.
+
+**Measured after:** the same page yields **5 regions, all `type=text`, 0 tables**
+(35 + 34 + 1 + 1 + 1 = 72 lines). With no table regions, those lines take the
+`TextBlock` path that already consumes measured metrics — so **Fix 1 alone
+resolves the reported size/placement symptom on this page**; the `TableCell`
+work below is what protects a genuinely correct table.
+
+### `TableCell` now carries the metrics its own row already computed
+
+A cell is by construction "one line's words in one column", so its typography IS
+that line's typography — nothing to re-derive. `structured::TableCell` gained
+`metrics: Option<DocLineMetrics>` (copied from `lines[row].metrics`), `doc.v1`
+emits the same additive per-cell keys lines already carry, and
+`tesseract-ocr-pdf` parses them into `TableCell::metrics` and passes them at both
+render call sites. The 3-tier size ladder (glyph_px -> band fit -> None) is now
+ONE shared `derive_text_metrics()` used by both the line and cell paths, so they
+cannot drift.
+
+### Falsifiers (each verified to fail on the pre-fix code)
+
+- `require_ruled_rejects_rule_free_multi_column_text_that_scores_on_whitespace_alone`
+  — two-sided on the new parameter, over a fixture that reproduces the exact
+  mechanism (rule-free text clearing the score on `nvw` alone).
+  **The fixture-validity guards did their job:** a first attempt used 6 px marks
+  and measured `nvw = 1`, because `decide_if_table`'s own `o8.1` noise-clean
+  ERASED every mark and left a blank page. Each constant is now chosen against a
+  specific step of the chain (mark width 12 > the `o8.1` open; run 12 << the
+  `o100.1` open so it never aliases to a rule; gutter 36 px so it survives the
+  `r1` reduce), and the `assert_eq!(nhb, 0)`/`assert_eq!(nvb, 0)` guards are what
+  caught it.
+- `block_is_table_detects_grid_not_paragraph` — extended to run under BOTH
+  strictness settings (a genuinely ruled grid must not pay for the gate).
+- `table_cell_uses_measured_metrics_not_the_box_fallback` — two-sided on BOTH
+  axes: `Tf` must be 48 and must NOT be 30.5; pen y must be the measured baseline
+  and must NOT be the box bottom; HTML must match (Klickwege parity).
+- `doc_v1_layout_parses_cell_metrics` — a cell WITH keys gets metrics, a legacy
+  cell WITHOUT them stays `None`, proving the parse reads keys rather than
+  fabricating a value.
+
+`quality_resolution_grid.rs` re-verified green with its real numbers printed
+(`0.000` x14, `0.023`, `0.814`) — unchanged, as expected, since recognition is
+upstream of classification and untouched. Goldens unchanged.
+
+> **⚠ A STALE TIMING CLAIM, corrected.** This file quotes `golden_pages` at 779 s
+> and the CER fence at ~500 s. Measured this session they are **9.4 s and 6.9 s**.
+> The tests genuinely ran (the fence printed its per-cell CER); the old figures
+> are simply stale. Worth knowing because a suspiciously fast gate is normally
+> the signature of a test SKIPPING, which is what prompted the check — the
+> right response was to re-run with `--nocapture` and read the real numbers
+> rather than to trust either the doc or the speed.
+
+### `.claude/agents/` — seven cards, the lessons written down
+
+New this session: `parity-oracle-smith`, `measurement-skeptic`,
+`falsifier-auditor`, `heuristic-gate-warden`, `render-typography-engineer`,
+`subagent-output-auditor`, `transcode-scope-warden`, plus a `README.md` index
+with the four rules that generalize past their own card. Each card leads with the
+RULE, then the measured incident that produced it, then a checklist. Provenance
+is the point: a rule without its incident gets ignored under pressure.
+
+`subagent-output-auditor` exists because of a failure IN this session: a
+4-agent verification workflow reported "completed, exit code 0" while one agent
+returned schema-VALID but content-FREE placeholder data (`{"claim_key": "test",
+"summary": "test", "file_citations": ["a.rs:1"]}`) and another died on
+`StructuredOutput retry cap (5) exceeded`, surfaced only in the `<failures>`
+block. The synthesizing agent cited both anyway. **A schema-valid response is not
+a content-valid response, and "completed" is a process status, not a quality
+one.** The plan doc now carries per-finding provenance notes rather than one
+document-level claim.
+
+No Core change (all four files are tesseract-ocr / tesseract-ocr-pdf local) →
+this file + the commit are the record.

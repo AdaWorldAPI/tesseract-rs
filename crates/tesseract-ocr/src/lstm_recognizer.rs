@@ -1266,9 +1266,18 @@ impl LstmRecognizer {
         let figures = Self::region_figures(&binary, w, h);
         // A block is a TABLE when its FULL bbox (rules + column corridors, not
         // just the text-line union the region carries) clears decide_if_table.
+        //
+        // `require_ruled = !opts.strip_borders` — the SAME opt-in rule that
+        // gates the two `xy_cut_table_aware` calls above, applied to the
+        // LABELLING half of table handling, which that fix left ungated. A
+        // caller who has not asked for table-specific handling must not have
+        // ordinary multi-column prose stamped `type=table` by the
+        // whitespace-only path (measured: 69 of 72 lines of a real two-column
+        // scan) — see `Self::block_is_table` for the full mechanism and why
+        // this narrows the EVIDENCE rather than switching detection off.
         let table_blocks: Vec<bool> = blocks
             .iter()
-            .map(|&blk| Self::block_is_table(&binary, w, h, blk))
+            .map(|&blk| Self::block_is_table(&binary, w, h, blk, !opts.strip_borders))
             .collect();
         let regions = crate::structured::build_regions(
             &page,
@@ -1362,8 +1371,57 @@ impl LstmRecognizer {
     /// document scales (table rules span whole columns, text words are short),
     /// but not yet ppi-exact. Blocks under 100 px in either dimension can hold
     /// no `o100` structural line, so they score 0 and are skipped.
-    fn block_is_table(binary: &[u8], w: usize, h: usize, block: (i32, i32, i32, i32)) -> bool {
-        crate::pageseg::region_is_table(binary, w, h, block)
+    ///
+    /// # `require_ruled` — the false-positive gate on the default path
+    ///
+    /// When `true`, a block must ALSO carry ruled evidence
+    /// ([`TableDecision::has_ruled_evidence`](crate::pageseg::TableDecision::has_ruled_evidence):
+    /// `nhb > 1` or `nvb > 2`) before it is called a table, on top of clearing
+    /// the score threshold.
+    ///
+    /// **Why, measured.** `decide_if_table` is byte-parity with leptonica and
+    /// stays untouched, but two of its four conditions count only VERTICAL
+    /// WHITESPACE, and that pair cannot discriminate a table from wide
+    /// multi-column prose — both genuinely have many long corridors. Measured
+    /// on a real 2550×3300 two-column scan through the plain
+    /// [`Self::recognize_document`] path: **2 of 5 regions and 69 of 72 lines
+    /// of ordinary flowing prose were stamped `type=table`**, because each
+    /// tall column block scores on `nvw` alone (`nhb = nvb = 0` — there is not
+    /// a single printed rule on the page). `corpus/quality/resgrid.pgm` is the
+    /// same shape at unit scale: 8 columns of ORDINARY TEXT, zero rules,
+    /// `nvw=17 score=2`.
+    ///
+    /// The ruled pair is the RELIABLE half — a block holding 2+ horizontal or
+    /// 3+ vertical `o100` structural lines really is tabular — so requiring it
+    /// kills the prose false positive **without disabling table detection**,
+    /// which is why this is a discrimination gate and not an on/off switch.
+    /// Turning classification off wholesale would also have broken
+    /// `tests/lab_table_columns.rs::naive_pre_strip_destroys_table_detection`,
+    /// whose precondition (`!plain_shapes.is_empty()`) legitimately depends on
+    /// a genuinely ruled fixture still being detected on the default path.
+    ///
+    /// `false` restores the bare `score >= TABLE_SCORE_THRESHOLD` verdict, and
+    /// is used when the caller has ALREADY signalled table intent via
+    /// [`DocumentOptions::strip_borders`] — the same "opt in before the
+    /// unreliable path is trusted" rule that gates `xy_cut_table_aware`. Note
+    /// that a `strip_borders` caller NEEDS the whitespace-only path: stripping
+    /// removes the very rules the ruled conditions count (see
+    /// `naive_pre_strip_destroys_table_detection`), so requiring ruled evidence
+    /// there would defeat the feature.
+    fn block_is_table(
+        binary: &[u8],
+        w: usize,
+        h: usize,
+        block: (i32, i32, i32, i32),
+        require_ruled: bool,
+    ) -> bool {
+        match crate::pageseg::region_table_decision(binary, w, h, block) {
+            Some(d) => {
+                d.score >= crate::pageseg::TABLE_SCORE_THRESHOLD
+                    && (!require_ruled || d.has_ruled_evidence())
+            }
+            None => false,
+        }
     }
 
     /// `LSTMRecognizer::SetRandomSeed` (`lstmrecognizer.h:287-291`): the exact
@@ -2158,17 +2216,107 @@ mod makerow_page_tests {
         }
 
         let binary = LstmRecognizer::binarize_page_with(&grey, w, h, BinarizeMode::Otsu);
+        // Checked under BOTH strictness settings: a genuinely RULED grid has
+        // real `nhb`/`nvb`, so requiring ruled evidence must not cost it.
+        for require_ruled in [false, true] {
+            assert!(
+                LstmRecognizer::block_is_table(&binary, w, h, (18, 18, 224, 236), require_ruled),
+                "ruled grid block → table (require_ruled={require_ruled})"
+            );
+            assert!(
+                !LstmRecognizer::block_is_table(&binary, w, h, (258, 18, 462, 262), require_ruled),
+                "paragraph block → not table (require_ruled={require_ruled})"
+            );
+            assert!(
+                !LstmRecognizer::block_is_table(&binary, w, h, (18, 18, 70, 70), require_ruled),
+                "block under 100 px is skipped (require_ruled={require_ruled})"
+            );
+        }
+    }
+
+    /// The `require_ruled` gate must actually DO something, and the input that
+    /// proves it is the measured false positive itself: a block of ordinary
+    /// multi-column TEXT with **zero printed rules** that nonetheless clears
+    /// `decide_if_table`'s score on the whitespace-only path.
+    ///
+    /// This is the two-sided falsifier for the default-path fix. `require_ruled
+    /// = false` (a `strip_borders` caller, who has signalled table intent) must
+    /// still call it a table — otherwise the gate is not a discrimination fix
+    /// but a disabled feature. `require_ruled = true` (the default path) must
+    /// not — otherwise the fix does nothing.
+    ///
+    /// The fixture reproduces the mechanism measured on a real 2550×3300
+    /// two-column scan (`nhb = nvb = 0`, high `nvw`, 69 of 72 prose lines
+    /// stamped `type=table`) at unit scale: 8 tall text columns separated by
+    /// wide, full-height whitespace corridors. The `assert_eq!(nhb, 0)` /
+    /// `assert_eq!(nvb, 0)` guards are load-bearing — without them a fixture
+    /// whose ink accidentally aliased to rules under the `o100.1` opening (a
+    /// real, previously-hit mistake: solid blocks measured `nhb = 14`) would
+    /// make this pass for entirely the wrong reason.
+    #[test]
+    fn require_ruled_rejects_rule_free_multi_column_text_that_scores_on_whitespace_alone() {
+        let (w, h) = (900usize, 400usize);
+        let mut grey = vec![255u8; w * h];
+        // 8 tall columns of glyph-sized marks, wide empty gutters between them.
+        // Sizes are picked against `decide_if_table`'s own morphology, not by
+        // eye — a first attempt with 6 px marks measured `nvw = 1` because the
+        // chain's `o8.1` noise-clean opening ERASED every mark and left a blank
+        // page (one big region, no corridors). Each constant below is chosen so
+        // the fixture survives the step that would otherwise destroy it:
+        //   - mark width 12 > the `o8.1` open (8) so the ink survives cleaning
+        //   - mark run 12 << the `o100.1` open (100) so it never aliases to a
+        //     horizontal RULE (keeps nhb = 0, asserted below)
+        //   - mark height 6 << the `o1.100` open (100) so it never aliases to a
+        //     vertical rule either (keeps nvb = 0)
+        //   - gutter 36 px, full page height: after the chain's `r1` 2x reduce
+        //     that is 18 wide (>= the width-5 bar) and 200 tall (>= the o1.100
+        //     bar), so each gutter counts toward nvw
+        //   - intra-column gaps 6 px -> 3 after reduce, BELOW the width-5 bar,
+        //     so they do not inflate nvw
+        for col in 0..8usize {
+            let x0 = 20 + col * 108;
+            let mut yb = 20;
+            while yb + 6 <= 380 {
+                for y in yb..yb + 6 {
+                    for x in x0..x0 + 72 {
+                        if (x - x0) % 18 < 12 {
+                            grey[y * w + x] = 0;
+                        }
+                    }
+                }
+                yb += 12;
+            }
+        }
+        let binary = LstmRecognizer::binarize_page_with(&grey, w, h, BinarizeMode::Otsu);
+        let block = (0i32, 0i32, w as i32, h as i32);
+        let d = crate::pageseg::region_table_decision(&binary, w, h, block)
+            .expect("block is well above the 100 px floor");
+
+        // The fixture must be genuinely RULE-FREE, or this test proves nothing.
+        assert_eq!(d.nhb, 0, "fixture aliased to horizontal rules: {d:?}");
+        assert_eq!(d.nvb, 0, "fixture aliased to vertical rules: {d:?}");
+        // ...and it must genuinely clear the score on whitespace alone, or the
+        // gate is never even consulted.
         assert!(
-            LstmRecognizer::block_is_table(&binary, w, h, (18, 18, 224, 236)),
-            "ruled grid block → table"
+            d.score >= crate::pageseg::TABLE_SCORE_THRESHOLD,
+            "fixture does not reproduce the false positive ({d:?}) — it must \
+             clear the threshold on nvw alone for this test to measure the gate"
         );
         assert!(
-            !LstmRecognizer::block_is_table(&binary, w, h, (258, 18, 462, 262)),
-            "paragraph block → not table"
+            !d.has_ruled_evidence(),
+            "a rule-free fixture must report no ruled evidence: {d:?}"
+        );
+
+        assert!(
+            LstmRecognizer::block_is_table(&binary, w, h, block, false),
+            "require_ruled=false must keep the bare leptonica verdict — a \
+             strip_borders caller NEEDS the whitespace-only path, since \
+             stripping removes the very rules the ruled conditions count"
         );
         assert!(
-            !LstmRecognizer::block_is_table(&binary, w, h, (18, 18, 70, 70)),
-            "block under 100 px is skipped"
+            !LstmRecognizer::block_is_table(&binary, w, h, block, true),
+            "require_ruled=true must reject rule-free multi-column TEXT ({d:?}) \
+             — this is the 69-of-72-prose-lines false positive"
         );
     }
 }
