@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
-# run_skew_parity.sh — byte-parity harness for the deskew wave (D1 / D2 / D5).
+# run_skew_parity.sh — byte-parity harness for the deskew wave (D1-D7).
 #
 # Diffs `.claude/harvest/oracles/skew_oracle.cpp` (liblept 1.82.0, the truth)
 # against `cargo run -p tesseract-ocr --example deskew_dump` (the transcode).
 # Sibling of run_unicharset_parity.sh; same contract — exit 0 == every arm
 # byte-identical, non-zero == a real divergence with the diff printed.
+#
+# History: this script originally covered D1/D2/D5 only. D3/D4/D6/D7 had
+# real byte-parity evidence — `deskew.rs`'s own doc comments narrate specific
+# verified diffs ("REAL D2+D3 end-to-end", "Verified byte-identical 10/10")
+# — but none of it was captured HERE, so CLAUDE.md's summary claim ("only
+# D1/D2/D5 green") went stale the moment those doc-comment diffs were run and
+# never re-run again. Per this repo's own falsifiability rule
+# ("a doc-comment claim is not a behaviour... a test must exercise the claim
+# or the claim must be labelled claimed, unverified"), that gap is now
+# closed: every leaf below is exercised by this ONE script, on committed
+# fixtures, every time it runs.
 #
 # Usage:
 #   .claude/harvest/oracles/run_skew_parity.sh [fixture.pgm]
@@ -62,15 +73,23 @@ diff_arm() {  # $1 = label, rest = argv for BOTH sides
 note "D1  rotate90 (exact: pure index remap)"
 for dir in 1 -1; do diff_arm "rot90 dir=$dir" rot90 "$FIXTURE" "$dir"; done
 
-# ── D2 — pixFindDifferentialSquareSum. ──────────────────────────────────────
+# ── D2+D3 — pixFindDifferentialSquareSum + pixVShearCorner/Center. ──────────
 #
-# ONLY diffable at angle 0 until D3 (the vertical shear) lands. The oracle's
-# dss arm is binarize -> vshear -> score; the Rust side is binarize -> score.
-# At angle 0 the shear is a verified no-op (both pivots return the identical
-# sum), so this isolates the SCORING function exactly. A nonzero angle here
-# would be comparing two different operations and is NOT D2 evidence.
-note "D2  differential square sum (angle 0 only — see comment)"
-for pivot in 1 2; do diff_arm "dss angle=0 pivot=$pivot" dss "$FIXTURE" "$THRESH" 0.0 "$pivot"; done
+# The oracle's `dss` arm is binarize -> vshear -> score; the Rust `dss` arm
+# (via [`crate::deskew::v_shear_corner`]/[`v_shear_center`] then
+# [`find_differential_square_sum`]) reproduces that SAME composition, so this
+# is real end-to-end evidence for D2 AND D3 together, at ANY angle — not just
+# angle=0. (Angle 0 alone would only prove the shear is a correctly-behaving
+# no-op there, which every implementation gets right trivially; it says
+# nothing about the shear's indexing at a real angle.) Dense: ±7° in 0.5°
+# steps, both pivots — 58 comparisons.
+note "D2+D3  differential square sum after vertical shear (dense angle sweep, both pivots)"
+for deg in $(python3 -c "
+for i in range(-14, 15):          # -7.0 .. +7.0 in 0.5 steps
+    print(f'{i*0.5:g}')
+"); do
+  for pivot in 1 2; do diff_arm "dss deg=$deg pivot=$pivot" dss "$FIXTURE" "$THRESH" "$deg" "$pivot"; done
+done
 
 # ── D5 — rotateAMGray, the precision trap. ──────────────────────────────────
 #
@@ -90,6 +109,54 @@ done
 note "D5c rotate_am_gray_corner — same trap, different per-pixel formula"
 for deg in 1 2.5 5 7.5 10 12.5 15 17.5 19; do
   diff_arm "rotamgraycorner deg=$deg" rotamgraycorner "$FIXTURE" "$deg" "$GRAYVAL"
+done
+
+# ── D4/D6/D7 fixtures — genuinely different skew magnitudes ─────────────────
+#
+# `$FIXTURE` alone is nearly straight (page_01.pgm's own baseline is
+# angle≈-0.14°), which barely exercises D4's interval-halving search — it
+# converges almost immediately near zero. `corpus/gen/gen_skew_fixtures.py`
+# (committed, deterministic, PIL-rotated from the SAME source page at
+# +1.5°/-2.5°/+5.0°, mirroring `deskew-wave-v1.md`'s own falsifier table)
+# supplies the magnitude spread the search logic actually needs to prove
+# itself against. Generation fidelity is not part of the parity chain —
+# once written to disk, both oracle and Rust read the identical committed
+# bytes; only the DETECTOR's output on those bytes is compared.
+SKEW_FIXTURES=("$FIXTURE")
+for f in corpus/quality/skew_p015.pgm corpus/quality/skew_m025.pgm corpus/quality/skew_p050.pgm; do
+  if [ -f "$f" ]; then
+    SKEW_FIXTURES+=("$f")
+  else
+    bad "missing $f -- run \`python3 corpus/gen/gen_skew_fixtures.py\` first"
+  fi
+done
+
+# ── D4 — pixFindSkewSweepAndSearchScorePivot, at pixFindSkew's OWN defaults.
+#
+# Parameters below are NOT invented: read directly from
+# `/tmp/leptonica-src/src/skew.c`'s `pixFindSkew` -> `...SweepAndSearch` ->
+# `...SweepAndSearchScore` -> `...SweepAndSearchScorePivot` call chain —
+# `DefaultSweepReduction=4`, `DefaultBsReduction=2`, `sweepcenter=0.0`,
+# `DefaultSweepRange=7.0`, `DefaultSweepDelta=1.0`, `DefaultMinbsDelta=0.01`,
+# `pivot=L_SHEAR_ABOUT_CORNER` (1). So this arm IS `pixFindSkew` itself, not
+# an approximation of it — verified by cross-checking the oracle's OWN
+# `findskew` output against its `sweep` output at these exact parameters
+# (bit-identical, both sides, every fixture below) before ever touching Rust.
+note "D4  find_skew_sweep_and_search_score_pivot — real skew magnitudes, pixFindSkew's own defaults"
+for f in "${SKEW_FIXTURES[@]}"; do
+  diff_arm "sweep $(basename "$f")" sweep "$f" "$THRESH" 4 2 0.0 7.0 1.0 0.01 1
+done
+
+# ── D6 — pixDeskewGeneral, via pixDeskew's own all-default call. ────────────
+note "D6  deskew_general — real skew magnitudes × redsearch {2,4}"
+for f in "${SKEW_FIXTURES[@]}"; do
+  for rs in 2 4; do diff_arm "deskew $(basename "$f") rs=$rs" deskew "$f" "$rs"; done
+done
+
+# ── D7 — pixDeskewBoth, the two-pass orthogonal composition. ────────────────
+note "D7  deskew_both — real skew magnitudes × redsearch {2,4}"
+for f in "${SKEW_FIXTURES[@]}"; do
+  for rs in 2 4; do diff_arm "deskewboth $(basename "$f") rs=$rs" deskewboth "$f" "$rs"; done
 done
 
 # ── verdict ─────────────────────────────────────────────────────────────────

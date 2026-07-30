@@ -851,6 +851,48 @@ Remaining: D3 (vertical shear), D4 (sweep+search), D6/D7
 (`pixDeskewGeneral`/`Both`), D8 (pipeline wiring — deskew runs BEFORE rectify, so
 a purely-rotated page must then measure `m0 ≈ 0`, a free falsifier).
 
+> **⚠ STALE-DOC CORRECTION (2026-07-30) — D3/D4/D6/D7 were already
+> implemented, and now have COMMITTED byte-parity, not narrated one-offs.**
+> The "Remaining" line above was already wrong the day it was measured
+> against the actual repo: `deskew.rs` shipped `v_shear_corner`/
+> `v_shear_center` (D3), `find_skew_sweep_and_search_score_pivot` (D4),
+> `deskew_general` (D6), and `deskew_both` (D7) with doc comments narrating
+> specific verified diffs — but `run_skew_parity.sh` never called any of
+> them, so nothing re-ran on drift and the summary line above went stale
+> the moment it was written. Exactly the failure mode the falsifiability
+> rule exists to catch: *"a doc-comment claim is not a behaviour... a test
+> must exercise the claim or the claim must be labelled claimed,
+> unverified."*
+>
+> Closed by extending `run_skew_parity.sh` itself — no new oracle arms
+> needed, `skew_oracle.cpp` already had `findskew`/`sweep`/`deskew`/
+> `deskewboth`, and `deskew_dump.rs` already had matching Rust arms; only
+> the harness never called them. Also added `corpus/gen/gen_skew_fixtures.py`
+> (committed, deterministic, PIL-rotated from `page_01.pgm` at +1.5°/-2.5°/
+> +5.0°, mirroring `deskew-wave-v1.md`'s own one-off falsifier table) —
+> `page_01.pgm` alone sits at angle≈-0.14°, too close to zero to exercise
+> D4's interval-halving search meaningfully.
+>
+> D4's parameters are not invented: read directly from
+> `/tmp/leptonica-src/src/skew.c`'s `pixFindSkew` call chain
+> (`DefaultSweepReduction=4, DefaultBsReduction=2, sweepcenter=0.0,
+> DefaultSweepRange=7.0, DefaultSweepDelta=1.0, DefaultMinbsDelta=0.01,
+> pivot=L_SHEAR_ABOUT_CORNER`) — verified by cross-checking the oracle's own
+> `findskew` output against its `sweep` output at exactly these parameters
+> (bit-identical) before Rust ever entered the comparison. D2+D3's `dss`
+> section was ALSO stale — it restricted itself to angle=0 with a comment
+> saying D3 "hasn't landed yet"; widened to a dense ±7°/0.5° sweep, both
+> pivots, since the arm has reproduced the oracle's real
+> shear-then-score composition at any angle since `deskew_dump.rs`'s own
+> (also-narrated, also-never-automated) verification.
+>
+> **Result, all in one script, 170/170:** D1 (2), D2+D3 dense sweep (58),
+> D5 (82: 82-angle sweep + corner variant), D4 (4 fixtures at real
+> `pixFindSkew` defaults), D6 (4 fixtures × redsearch{2,4} = 8), D7 (same,
+> 8). Every leaf D1-D7 now has real, re-runnable, committed byte-parity —
+> not "verified" in a doc comment that nothing re-checks. D8 (pipeline
+> wiring) is the only leaf actually remaining.
+
 **★ Binarization mode is selectable — and the measurement says DON'T flip the
 default yet (2026-07-29).** `BinarizeMode` now threads through
 `XyCutParams::binarize_mode` and `LstmRecognizer::recognize_document_with_mode`.
