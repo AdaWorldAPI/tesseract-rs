@@ -92,20 +92,32 @@
 //! all-256-entries table below, but kept total) skips the `Tz`/`Tj` pair for
 //! that word entirely rather than dividing by zero.
 //!
-//! ## WinAnsi encoding policy (v1)
+//! ## WinAnsi encoding policy
 //!
-//! The built-in `Helvetica`/`WinAnsiEncoding` font only has glyphs for
-//! `u+0000..=u+00FF` under the WinAnsi mapping, and this crate does not
-//! implement the (non-trivial, remapped) CP1252-vs-Latin1 code points
-//! `0x80..=0x9F`. The v1 policy, applied per `char`:
+//! Applied per `char` against the built-in `Helvetica`/`WinAnsiEncoding` font:
 //! - `'\u{20}'..='\u{7E}'` (ASCII) and `'\u{A0}'..='\u{FF}'` (Latin-1
 //!   supplement, identical to WinAnsi in this range) map directly to that
 //!   byte value.
-//! - Everything else (control characters, `0x80..=0x9F`, and any character
-//!   above `u+00FF`, e.g. CJK/Cyrillic/emoji) is **lossily substituted with
-//!   `'?'` (`0x3F`)** — flagged by [`render_searchable_pdf`] returning the
-//!   count of substituted characters per word in its report (see
+//! - The remapped CP1252 block `0x80..=0x9F` maps through [`WINANSI_HIGH`]
+//!   (PDF 32000-1:2008 Annex D.2) — curly quotes, en/em dashes, the ellipsis,
+//!   bullet, dagger, `OE`/`oe`, and the rest.
+//! - Everything else (control characters, the five CP1252 holes
+//!   `0x81`/`0x8D`/`0x8F`/`0x90`/`0x9D`, and any character above `u+00FF`
+//!   with no WinAnsi slot, e.g. CJK/Cyrillic/emoji) is **lossily substituted
+//!   with `'?'` (`0x3F`)** — flagged by [`render_searchable_pdf`] returning
+//!   the count of substituted characters per word in its report (see
 //!   [`RenderReport`]).
+//!
+//! > **Corrected 2026-07-30.** The original v1 policy excluded `0x80..=0x9F`
+//! > entirely ("this crate does not implement the … remapped CP1252-vs-Latin1
+//! > code points"), substituting `'?'` for all of it. That block is exactly
+//! > where real print typography lives, so an ordinary two-column scan came
+//! > back with `?and`, `book,?` and `conversations??` in place of `“and`,
+//! > `book,”` and `conversations?”` — avoidable loss, since the built-in font
+//! > renders every one of those glyphs. The [`HELVETICA_WINANSI_WIDTHS`]
+//! > entries for the block were placeholders under the old policy and are now
+//! > the real AFM advances, because these bytes now reach the `Tz`
+//! > horizontal-fit computation.
 
 use std::io::Write as _;
 
@@ -237,10 +249,12 @@ const HELVETICA_WINANSI_WIDTHS: [u16; 256] = [
     333,556,556,500,556,556,278,556,556,222,222,500,222,833,556,556,
     // 0x70..=0x7F
     556,556,333,500,278,556,500,722,500,500,500,334,260,334,584,0,
-    // 0x80..=0x9F: CP1252-specific block. Not produced by winansi_encode
-    // (see module docs); placeholder width (digit width, 556).
-    556,556,556,556,556,556,556,556,556,556,556,556,556,556,556,556,
-    556,556,556,556,556,556,556,556,556,556,556,556,556,556,556,556,
+    // 0x80..=0x9F: the CP1252 block (see WINANSI_HIGH). Real Helvetica AFM
+    // advances — these ARE emitted now, so a placeholder width here would
+    // mis-scale the `Tz` horizontal fit of any line containing a curly quote,
+    // dash or ellipsis. Undefined slots (0x81/0x8D/0x8F/0x90/0x9D) keep 556.
+    556,556,222,556,333,1000,556,556,333,1000,667,333,1000,556,611,556,
+    556,222,222,333,333,350,556,1000,333,1000,500,333,944,556,500,667,
     // 0xA0..=0xAF (Latin-1 supplement, identical to WinAnsi here)
     278,333,556,556,556,556,260,556,333,737,370,556,584,333,556,333,
     // 0xB0..=0xBF
@@ -255,16 +269,58 @@ const HELVETICA_WINANSI_WIDTHS: [u16; 256] = [
     556,556,556,556,556,556,556,584,556,556,556,556,556,500,556,500,
 ];
 
-/// Map one `char` to a WinAnsi byte per the v1 policy documented in the
-/// module docs' "WinAnsi encoding policy" section: ASCII and Latin-1
-/// supplement pass through directly, everything else lossily maps to `'?'`.
-/// Returns `(byte, was_substituted)`.
+/// The WinAnsi (CP1252) `0x80..=0x9F` block: the code points that are NOT
+/// Latin-1 in that range but ARE defined by `WinAnsiEncoding`
+/// (PDF 32000-1:2008 Annex D.2). This is exactly where the "smart" typography
+/// real print uses lives — curly quotes, en/em dashes, the ellipsis — so
+/// dropping it substituted a `'?'` for characters the built-in Helvetica
+/// `/WinAnsiEncoding` font can render perfectly well. Measured on a real
+/// two-column scan: every `“ ” ‘ ’` in the page came out as `?`.
+///
+/// `0x81`, `0x8D`, `0x8F`, `0x90` and `0x9D` are undefined in CP1252 and are
+/// deliberately absent — a char mapping there still substitutes.
+const WINANSI_HIGH: [(char, u8); 27] = [
+    ('\u{20AC}', 0x80), // Euro
+    ('\u{201A}', 0x82), // quotesinglbase
+    ('\u{0192}', 0x83), // florin
+    ('\u{201E}', 0x84), // quotedblbase
+    ('\u{2026}', 0x85), // ellipsis
+    ('\u{2020}', 0x86), // dagger
+    ('\u{2021}', 0x87), // daggerdbl
+    ('\u{02C6}', 0x88), // circumflex
+    ('\u{2030}', 0x89), // perthousand
+    ('\u{0160}', 0x8A), // Scaron
+    ('\u{2039}', 0x8B), // guilsinglleft
+    ('\u{0152}', 0x8C), // OE
+    ('\u{017D}', 0x8E), // Zcaron
+    ('\u{2018}', 0x91), // quoteleft
+    ('\u{2019}', 0x92), // quoteright
+    ('\u{201C}', 0x93), // quotedblleft
+    ('\u{201D}', 0x94), // quotedblright
+    ('\u{2022}', 0x95), // bullet
+    ('\u{2013}', 0x96), // endash
+    ('\u{2014}', 0x97), // emdash
+    ('\u{02DC}', 0x98), // tilde
+    ('\u{2122}', 0x99), // trademark
+    ('\u{0161}', 0x9A), // scaron
+    ('\u{203A}', 0x9B), // guilsinglright
+    ('\u{0153}', 0x9C), // oe
+    ('\u{017E}', 0x9E), // zcaron
+    ('\u{0178}', 0x9F), // Ydieresis
+];
+
+/// Map one `char` to a WinAnsi byte per the policy documented in the module
+/// docs' "WinAnsi encoding policy" section: ASCII, the Latin-1 supplement and
+/// the [`WINANSI_HIGH`] CP1252 block map directly; everything else lossily
+/// maps to `'?'`. Returns `(byte, was_substituted)`.
 fn winansi_encode(ch: char) -> (u8, bool) {
     let code = ch as u32;
     if (0x20..=0x7E).contains(&code) || (0xA0..=0xFF).contains(&code) {
-        (code as u8, false)
-    } else {
-        (b'?', true)
+        return (code as u8, false);
+    }
+    match WINANSI_HIGH.iter().find(|&&(c, _)| c == ch) {
+        Some(&(_, b)) => (b, false),
+        None => (b'?', true),
     }
 }
 
@@ -291,24 +347,13 @@ pub(crate) fn advance_width_1000em(bytes: &[u8]) -> u32 {
         .sum()
 }
 
-/// Escape a WinAnsi byte string for a PDF literal string (`(...)`) —
-/// PDF 32000-1:2008 §7.3.4.2: backslash and both parentheses must be
-/// backslash-escaped; every other byte (including all of `0x80..=0xFF`,
-/// which is exactly a WinAnsi-encoded byte, not UTF-8) passes through
-/// verbatim.
-pub(crate) fn escape_pdf_literal(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len() + 2);
-    for &b in bytes {
-        match b {
-            b'\\' | b'(' | b')' => {
-                out.push(b'\\');
-                out.push(b);
-            }
-            _ => out.push(b),
-        }
-    }
-    out
-}
+// NOTE: there is deliberately NO `escape_pdf_literal` helper here.
+// `lopdf` escapes `Object::String(_, StringFormat::Literal)` itself when it
+// serializes the content stream, so escaping the bytes before handing them
+// over escapes them TWICE. Measured on a real page: the text `(as` was
+// escaped to `\(as`, then lopdf escaped THAT (`\` → `\\`, `(` → `\(`),
+// emitting `\\\(as` — which a viewer renders as the visible, wrong `\(as`.
+// Hand the raw WinAnsi bytes to `Object::String` and let lopdf do it once.
 
 /// `px * 72.0 / dpi` — image pixels to PDF points at the given resolution.
 pub(crate) fn px_to_pt(px: f64, dpi: u32) -> f64 {
@@ -520,6 +565,71 @@ mod tests {
         // but not a PDF-validity or extraction failure).
         let extracted = crate::extract_text_layer(&pdf_bytes).expect("extract_text_layer");
         assert_eq!(extracted[0].as_deref().map(str::trim_end), Some("?"));
+    }
+
+    /// **The curly-quote falsifier.** WinAnsi's `0x80..=0x9F` block is where
+    /// real print typography lives — curly quotes, en/em dashes, the ellipsis.
+    /// The v1 policy dumped all of it to `'?'`, so a scan of ordinary printed
+    /// prose came back with `?and`, `book,?` and `conversations??` where the
+    /// page plainly showed `“and`, `book,”` and `conversations?”`. These
+    /// characters are renderable by the built-in Helvetica `/WinAnsiEncoding`
+    /// font, so substituting them was pure, avoidable loss.
+    #[test]
+    fn winansi_smart_typography_is_encoded_not_substituted() {
+        for (ch, expect) in [
+            ('\u{201C}', 0x93u8), // “
+            ('\u{201D}', 0x94),   // ”
+            ('\u{2018}', 0x91),   // ‘
+            ('\u{2019}', 0x92),   // ’
+            ('\u{2013}', 0x96),   // en dash
+            ('\u{2014}', 0x97),   // em dash
+            ('\u{2026}', 0x85),   // ellipsis
+        ] {
+            let (bytes, subs) = winansi_encode_str(&ch.to_string());
+            assert_eq!(
+                (bytes.as_slice(), subs),
+                (&[expect][..], 0),
+                "{ch:?} must encode to WinAnsi {expect:#04x} with NO substitution"
+            );
+        }
+
+        // Can-it-still-substitute twin: a genuinely unmappable character must
+        // still become '?' AND still be counted, or the report would go quiet
+        // about real loss.
+        let (bytes, subs) = winansi_encode_str("中");
+        assert_eq!((bytes.as_slice(), subs), (&b"?"[..], 1));
+
+        // The CP1252 holes stay unmapped — 0x81/0x8D/0x8F/0x90/0x9D are
+        // undefined, so nothing may silently claim those byte values.
+        let (_, subs) = winansi_encode_str("\u{FFFD}");
+        assert_eq!(subs, 1, "an undefined code point must still substitute");
+    }
+
+    /// **The double-escape falsifier.** `lopdf` escapes a `StringFormat::Literal`
+    /// string itself; escaping before handing it over emitted `\\\(` for a
+    /// single `(`, which viewers render as a visible, wrong `\(`. Measured on a
+    /// real page: `(as` rendered as `\(as`. Asserts the serialized content
+    /// stream carries EXACTLY one level of escaping.
+    #[test]
+    fn pdf_literal_parens_are_escaped_exactly_once() {
+        let page = PageOcr {
+            grey: synthetic_grey(400, 60),
+            words: vec![PlacedWord {
+                text: "mind, (as".to_string(),
+                box_: (5, 5, 300, 50),
+            }],
+        };
+        let (pdf_bytes, _) = render_searchable_pdf(&[page], 300).expect("render");
+        let extracted = crate::extract_text_layer(&pdf_bytes).expect("extract");
+        let got = extracted[0].as_deref().unwrap_or_default();
+        assert!(
+            got.contains("(as"),
+            "round-tripped text must carry a bare '(', got {got:?}"
+        );
+        assert!(
+            !got.contains(r"\("),
+            "a literal backslash leaked into the text — double-escaped: {got:?}"
+        );
     }
 
     #[test]
