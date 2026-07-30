@@ -502,19 +502,70 @@ pub fn extract_table_grid(lines: &[&DocLine]) -> TableGrid {
     let n_rows = lines.len() as u32;
     let support = if n_rows <= 1 { 1 } else { n_rows / 2 + 1 };
 
-    // Cuts at the midpoint of every cross-row whitespace river wide enough to be
-    // a column separator; the outer edges 0 and width bound the first/last cols.
-    let mut cuts: Vec<usize> = vec![0];
+    // Every maximal run where a MAJORITY of rows are blank: the raw rivers,
+    // before fragment-bridging.
+    let mut rivers: Vec<(usize, usize)> = Vec::new();
     let mut gap_start: Option<usize> = None;
     for (x, &g) in gap_rows.iter().enumerate() {
         if g < support {
             if let Some(s) = gap_start.take() {
-                if x - s >= gap_min {
-                    cuts.push((s + x) / 2);
-                }
+                rivers.push((s, x));
             }
         } else if gap_start.is_none() {
             gap_start = Some(x);
+        }
+    }
+    // A run still open at the right edge trails off the region rather than
+    // cutting between two columns, so it is deliberately dropped (unchanged
+    // from the pre-bridging behaviour, which only pushed on a blank->occupied
+    // transition).
+    let _ = gap_start;
+
+    // BRIDGE fragmented gutters. A real column gutter is often interrupted by
+    // ONE row's stray word edge (a right-aligned numeric column has very ragged
+    // left edges, and a single early-starting token is enough), which chops the
+    // river into fragments that are each below `gap_min` even though the gutter
+    // as a whole is far above it. Measured on the ruled lab fixture with borders
+    // stripped: the Einheit|Referenz gutter spans x=872..976 (104 px, vs a 66 px
+    // bar) but arrives as 57 px + a 17 px occupied sliver + 30 px, so BOTH
+    // fragments were rejected and the two columns merged.
+    //
+    // The rule is neighbourhood-relative, not another absolute: bridge two
+    // adjacent fragments when the sliver between them is narrower than BOTH of
+    // them (so a genuine block of text between two columns can never be
+    // bridged — it is wider than what flanks it) and narrower than one median
+    // word height (so the interruption is on the scale of a stray glyph, not of
+    // content). This is the same correction shape as `xy_cut`'s gutter fallback
+    // and `noise_readmit_reach`: judge a candidate by what is around it.
+    //
+    // PAIRS ONLY, deliberately: bridging transitively would let a run of small
+    // word-space rivers chain into a spurious column. Measured on the same
+    // fixture WITHOUT border stripping, transitive bridging accumulated
+    // 22+3+5+9+13 = 52 px from pure word spacing; capping at one sliver bounds
+    // that at two fragments and leaves the un-stripped page's verdict unchanged.
+    let mut bridged: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < rivers.len() {
+        let (s, e) = rivers[i];
+        if i + 1 < rivers.len() {
+            let (ns, ne) = rivers[i + 1];
+            let sliver = ns - e;
+            if sliver < (e - s).min(ne - ns) && sliver < med_h {
+                bridged.push((s, ne));
+                i += 2;
+                continue;
+            }
+        }
+        bridged.push((s, e));
+        i += 1;
+    }
+
+    // Cuts at the midpoint of every river wide enough to be a column separator;
+    // the outer edges 0 and width bound the first/last cols.
+    let mut cuts: Vec<usize> = vec![0];
+    for (s, e) in bridged {
+        if e - s >= gap_min {
+            cuts.push((s + e) / 2);
         }
     }
     cuts.push(width);
@@ -2475,6 +2526,136 @@ mod tests {
         assert!(json.contains("\"rows\":2"));
         assert!(json.contains("\"text\":\"5,00\""), "cell text emitted");
         assert!(json.contains("\"header\":true"), "row 0 flagged header");
+    }
+
+    /// A column gutter INTERRUPTED by one row's stray token is still one
+    /// gutter — the fragment-bridging rule, can-it-fire half.
+    ///
+    /// Measured mechanism (ruled lab fixture, borders stripped): the
+    /// Einheit|Referenz gutter spans 104 px against a 66 px bar, but a single
+    /// early-starting token in a minority of rows chops it into 57 px + a
+    /// 17 px sliver + 30 px, so BOTH fragments were rejected on width and the
+    /// two columns merged into one.
+    ///
+    /// Geometry is COMPUTED, not eyeballed: words are 20 px tall so
+    /// `med_h = 20` and `gap_min = 40`; 4 rows so `support = 3`, which means
+    /// the sliver must be occupied in at least TWO rows to break the river at
+    /// all (a stray in ONE row leaves 3 blank, still >= support, and the river
+    /// never fragments — a first draft of this test made exactly that mistake
+    /// and passed with the fix REMOVED, i.e. it was vacuous).
+    ///
+    /// Left column ends x=100; a 8 px stray sits at 118..126 in two of the
+    /// four rows; the right column starts x=144. Fragments are therefore
+    /// 18 px and 18 px — each BELOW the 40 px bar, so both are rejected
+    /// without bridging (1 column) — while the true gutter is
+    /// 18 + 8 + 18 = 44 px, above it (2 columns).
+    #[test]
+    fn extract_table_grid_bridges_a_gutter_fragmented_by_a_stray_token() {
+        let rows = [
+            dl(
+                (10, 10, 204, 30),
+                vec![
+                    dw("Alpha", (10, 10, 100, 30), 99.0),
+                    dw("111", (144, 10, 204, 30), 99.0),
+                ],
+            ),
+            dl(
+                (10, 40, 204, 60),
+                vec![
+                    dw("Beta", (10, 40, 100, 60), 99.0),
+                    dw("~", (118, 40, 126, 60), 40.0), // stray, row 1
+                    dw("222", (144, 40, 204, 60), 99.0),
+                ],
+            ),
+            dl(
+                (10, 70, 204, 90),
+                vec![
+                    dw("Gamma", (10, 70, 100, 90), 99.0),
+                    dw("~", (118, 70, 126, 90), 40.0), // stray, row 2
+                    dw("333", (144, 70, 204, 90), 99.0),
+                ],
+            ),
+            dl(
+                (10, 100, 204, 120),
+                vec![
+                    dw("Delta", (10, 100, 100, 120), 99.0),
+                    dw("444", (144, 100, 204, 120), 99.0),
+                ],
+            ),
+        ];
+        let line_refs: Vec<&DocLine> = rows.iter().collect();
+        let grid = extract_table_grid(&line_refs);
+        assert_eq!(
+            grid.cols,
+            2,
+            "a gutter split by a stray token is still ONE gutter (fragments \
+             18+18 both under the 40 bar, bridged 44 over it) — got {} cols, \
+             cells {:?}",
+            grid.cols,
+            grid.cells.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        for c in &grid.cells {
+            if c.text.contains("111") || c.text.contains("444") {
+                assert_eq!(c.col, 1, "values belong to the right-hand column");
+            }
+        }
+    }
+
+    /// The silence twin: bridging must NOT reach across real CONTENT.
+    ///
+    /// Same shape as the test above, but the thing between the two whitespace
+    /// runs is a genuine COLUMN of words rather than a stray token.
+    ///
+    /// Sized so it exercises the `sliver < med_h` guard SPECIFICALLY: the
+    /// middle column is 30 px wide against 40 px flanking runs, so the
+    /// `sliver < min(left, right)` guard would ALLOW the bridge (30 < 40) and
+    /// only the word-height guard blocks it (30 >= med_h = 20). Delete that
+    /// guard and this test fails — which is what makes it a falsifier rather
+    /// than a restatement of the rule.
+    #[test]
+    fn extract_table_grid_does_not_bridge_across_a_real_middle_column() {
+        let rows = [
+            dl(
+                (10, 10, 270, 30),
+                vec![
+                    dw("Alpha", (10, 10, 100, 30), 99.0),
+                    dw("Middle", (140, 10, 170, 30), 99.0),
+                    dw("111", (210, 10, 270, 30), 99.0),
+                ],
+            ),
+            dl(
+                (10, 40, 270, 60),
+                vec![
+                    dw("Beta", (10, 40, 100, 60), 99.0),
+                    dw("Center", (140, 40, 170, 60), 99.0),
+                    dw("222", (210, 40, 270, 60), 99.0),
+                ],
+            ),
+            dl(
+                (10, 70, 270, 90),
+                vec![
+                    dw("Gamma", (10, 70, 100, 90), 99.0),
+                    dw("Mitte", (140, 70, 170, 90), 99.0),
+                    dw("333", (210, 70, 270, 90), 99.0),
+                ],
+            ),
+        ];
+        let line_refs: Vec<&DocLine> = rows.iter().collect();
+        let grid = extract_table_grid(&line_refs);
+        assert_eq!(
+            grid.cols,
+            3,
+            "a real middle column must never be bridged over — got {} cols, \
+             cells {:?}",
+            grid.cols,
+            grid.cells.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert!(
+            grid.cells
+                .iter()
+                .any(|c| c.col == 1 && c.text.contains("Middle")),
+            "the middle column must survive as its own column"
+        );
     }
 
     #[test]
