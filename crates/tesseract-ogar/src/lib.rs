@@ -64,6 +64,16 @@ use tesseract_ocr_pdf::{GreyImage, PageOcr, PdfError, RenderReport, SearchablePd
 /// `tesseract_ocr::Network`'s tree directly.
 pub mod v3_facet;
 
+/// Sentence assembly over a recognized [`DocPage`] — the per-sentence text
+/// unit [`reasoning`] needs. See that module's docs for why this is a
+/// separate library layer, not a 15th OGAR capability.
+pub mod sentences;
+
+/// The reasoning layer: `deepnsm` SPO extraction + a NARS belief per
+/// assembled sentence. See the module docs for what's wired and what's
+/// deliberately not (the AS-IS BOUNDARY split from `tesseract-rs/CLAUDE.md`).
+pub mod reasoning;
+
 /// Every OCR capability this crate's [`OcrExecutor::execute`] handles, in the
 /// same order as [`ogar_vocab::ocr_actions::OCR_ACTION_NAMES`] — this
 /// crate's half of the exhaustiveness fuse (see the module docs).
@@ -647,6 +657,17 @@ impl OcrExecutor {
             code_range: self.recognizer.recoder.code_range(),
             dict_loaded: self.dict.is_some(),
         }
+    }
+
+    /// The loaded model's character set — what
+    /// [`DocPage::from_line_words`](tesseract_ocr::DocPage::from_line_words)
+    /// needs to turn [`OcrRequest::RecognizePageWords`]'s `LineWords` output
+    /// into a typed [`DocPage`], for a caller that wants the
+    /// [`crate::sentences`]/[`crate::reasoning`] surface rather than
+    /// [`OcrRequest::RecognizeDocument`]'s serialized `doc.v1` JSON string.
+    #[must_use]
+    pub fn charset(&self) -> &tesseract_core::CharSet {
+        &self.recognizer.charset
     }
 
     /// Execute one [`OcrRequest`], dispatching to the matching proven

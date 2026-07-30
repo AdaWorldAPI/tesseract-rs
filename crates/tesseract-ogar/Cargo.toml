@@ -22,6 +22,13 @@ tesseract-ocr-pdf = { path = "../tesseract-ocr-pdf" }
 # a transitive dep via `tesseract-ocr`; made direct because `v3_facet` calls
 # it. Path dep, fork-only policy (same as the two foundations above).
 tesseract-recognizer = { path = "../tesseract-recognizer" }
+# The `reasoning` module's SPO extraction (`Vocabulary` + `parser`, the
+# LOW-level API — not `DeepNsmEngine::load`, which additionally needs a
+# codebook/cam-codes binary pair this repo doesn't ship). Path deps are
+# `ndarray` + `lance-graph-contract`, both already satisfied transitively
+# in this workspace — genuinely cheap, not a new external dependency
+# surface. Sibling checkout, path dep, fork-only policy (same as above).
+deepnsm = { path = "../../../lance-graph/crates/deepnsm" }
 
 [features]
 # Pure-Rust encoded-image (PNG/JPEG/WebP/TIFF/GIF/BMP/PNM) → grey decode,

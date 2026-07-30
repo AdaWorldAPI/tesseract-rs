@@ -53,7 +53,12 @@ fn main() {
     );
 
     // ── 2. Load the executor from the bundled eng model ──────────────────────
-    let model = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/model");
+    // MODEL_DIR env override (same convention as tesseract-ocr-web's server —
+    // the Docker runtime image sets this), else the CARGO_MANIFEST_DIR-relative
+    // bundled corpus/model (unchanged local `cargo run` default).
+    let model = std::env::var("MODEL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/model"));
     if !model.join("eng.lstm").exists() {
         println!(
             "(model not present at {} — skipping the live run. The table above IS \
@@ -76,10 +81,11 @@ fn main() {
     )
     .expect("load the eng recognizer + dictionary from corpus/model");
 
-    // ── 3. The image (arg, or a bundled corpus page) ─────────────────────────
+    // ── 3. The image (CLI arg, DEMO_IMAGE env override, or a bundled page) ───
     let img = std::env::args()
         .nth(1)
         .map(PathBuf::from)
+        .or_else(|| std::env::var("DEMO_IMAGE").ok().map(PathBuf::from))
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pages/page_01.pgm")
         });
@@ -134,4 +140,71 @@ fn main() {
         "\n(Tip: the doc.v1 JSON above carries \"quality\":{{\"mean_conf\",\"low_confidence\"}} — \
          a low score flags handwriting / low-res / non-printed input instead of returning it silently.)"
     );
+
+    // ── 6. reasoning layer — sentence assembly + deepnsm SPO + NarsTruth ─────
+    // Not part of the OGAR-declared capability table above (see
+    // `reasoning.rs`'s module docs for why): a plain post-processing step a
+    // caller reaches for AFTER `recognize_page_words`, using the typed
+    // `DocPage` surface rather than `recognize_document`'s JSON string.
+    let words = match executor
+        .execute(OcrRequest::RecognizePageWords {
+            grey: &grey,
+            width: w,
+            height: h,
+            with_dict: true,
+        })
+        .expect("execute recognize_page_words")
+    {
+        OcrResponse::LineWordsOut(lines) => lines,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    let page =
+        tesseract_ocr::DocPage::from_line_words(&words, executor.charset(), w as u32, h as u32);
+    let sentences = tesseract_ogar::sentences::assemble_sentences(&page);
+    println!(
+        "\n== reasoning: {} sentence(s) assembled from {} recognized line(s) ==",
+        sentences.len(),
+        page.lines.len()
+    );
+
+    // DEEPNSM_VOCAB_DIR lets the Docker runtime point at its own copy of
+    // deepnsm's word_frequency/ CSVs (the sibling source path below only
+    // exists at BUILD time, inside the builder stage's /src layout).
+    let vocab_dir = std::env::var("DEEPNSM_VOCAB_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../lance-graph/crates/deepnsm/word_frequency")
+        });
+    if !vocab_dir.join("word_rank_lookup.csv").exists() {
+        println!(
+            "(deepnsm vocabulary not present at {} — skipping SPO extraction. \
+             Sentence text + bbox + mean_conf are still shown below.)",
+            vocab_dir.display()
+        );
+        for s in &sentences {
+            println!("  [{:>5.1}] {}", s.mean_conf, s.text);
+        }
+        return;
+    }
+    let reasoner = tesseract_ogar::reasoning::SentenceReasoner::from_vocab_dir(&vocab_dir)
+        .expect("load the deepnsm vocabulary");
+    for belief in reasoner.analyze(sentences) {
+        println!(
+            "  [{:>5.1} conf, {:.0}% coverage] {}",
+            belief.sentence.mean_conf,
+            belief.coverage * 100.0,
+            belief.sentence.text
+        );
+        for t in &belief.triples {
+            match &t.object {
+                Some(obj) => println!("      SPO: {} -> {} -> {}", t.subject, t.predicate, obj),
+                None => println!("      SP:  {} -> {}", t.subject, t.predicate),
+            }
+        }
+        println!(
+            "      belief: frequency={:.2} confidence={:.2}",
+            belief.truth.frequency, belief.truth.confidence
+        );
+    }
 }
