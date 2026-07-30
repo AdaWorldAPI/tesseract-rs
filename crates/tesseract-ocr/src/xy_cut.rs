@@ -186,7 +186,88 @@ pub fn xy_cut(grey: &[u8], w: usize, h: usize, params: &XyCutParams) -> Vec<Page
         bottom: h,
     };
     let mut out = Vec::new();
-    split_rect(&binary, w, root, params.max_depth, params, &mut out);
+    split_rect_inner(&binary, w, root, params.max_depth, params, None, &mut out);
+    out
+}
+
+/// [`xy_cut`], with ONE additional rule: a candidate rect that
+/// [`crate::pageseg::region_is_table`] classifies a table (evaluated against
+/// `table_binary`, NOT `grey`'s own binarization — see below) is emitted as
+/// ONE leaf, tightened to its ink bbox, WITHOUT further splitting — even
+/// though the table's own internal column gutters would otherwise trigger
+/// further vertical cuts exactly like any other whitespace-separated layout.
+///
+/// # Why this exists — the defect it closes
+///
+/// Plain [`xy_cut`] has no concept of "this whitespace gutter is a table
+/// column, not a paragraph break": once a table's borders are stripped (or
+/// even on the bare page — a table's internal corridors ARE genuine
+/// whitespace), recursive splitting treats each column as its own top-level
+/// leaf. `crate::lstm_recognizer::LstmRecognizer::recognize_page_blocks_words_with_mode`
+/// then recognizes each column-leaf INDEPENDENTLY, producing one text line
+/// per printed ROW **but only within that one column** — so
+/// `crate::structured::extract_table_grid`'s "rows ARE the recognized lines"
+/// assumption breaks: a real 7×4 table becomes ~28 single-column lines
+/// (column-major reading), because the table was fragmented before
+/// recognition ever ran, not because the grid-reconstruction logic is wrong.
+///
+/// Stopping the recursion at the table's own boundary keeps it as ONE full
+/// bbox, so the line-finder recognizes each printed row as ONE line spanning
+/// every column — exactly the shape `extract_table_grid`'s OWN
+/// whitespace-gap column splitter already expects and was built for.
+///
+/// # Why `table_binary` is a SEPARATE parameter from `grey`
+///
+/// The table DECISION (`region_is_table`, ultimately `decide_if_table`)
+/// counts printed rules (`nhb`/`nvb`) — real information that exists on the
+/// page AS PRINTED but is INTENTIONALLY erased from a border-stripped page
+/// (`crate::pageseg::strip_borders_grey`, used to keep those rules from
+/// being recognized as glyphs). If this function binarized `grey` itself for
+/// the table check, calling it on a stripped page would see zero rules and
+/// never detect a table at all — reproducing the exact coupling
+/// `DocumentOptions::strip_borders`'s own docs describe ("the borders are
+/// simultaneously what ruins the columns and what proves it is a table").
+/// `table_binary` therefore should almost always be the ORIGINAL page's
+/// binarization (via [`binarize_page_with`]), computed once by the caller,
+/// even when `grey` here is a stripped or otherwise-modified buffer used for
+/// the actual cut/segmentation decisions.
+///
+/// # Panics
+/// Panics if `table_binary.len() != w * h`.
+#[must_use]
+pub fn xy_cut_table_aware(
+    grey: &[u8],
+    w: usize,
+    h: usize,
+    params: &XyCutParams,
+    table_binary: &[u8],
+) -> Vec<PageRect> {
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    assert_eq!(
+        table_binary.len(),
+        w * h,
+        "table_binary must be the SAME w*h as grey — it is the ORIGINAL \
+         page's binarization, not a crop"
+    );
+    let binary = binarize_page_with(grey, w, h, params.binarize_mode);
+    let root = PageRect {
+        left: 0,
+        top: 0,
+        right: w,
+        bottom: h,
+    };
+    let mut out = Vec::new();
+    split_rect_inner(
+        &binary,
+        w,
+        root,
+        params.max_depth,
+        params,
+        Some(table_binary),
+        &mut out,
+    );
     out
 }
 
@@ -483,12 +564,23 @@ fn ink_bbox(binary: &[u8], w: usize, rect: PageRect) -> Option<PageRect> {
 /// The recursion core: cut `rect` at the thickest-valley axis, or emit it as a
 /// tightened leaf. Children are recursed in ascending cut-boundary order, giving
 /// the depth-first reading-order guarantee.
-fn split_rect(
+/// The recursive core shared by [`xy_cut`] and [`xy_cut_table_aware`].
+///
+/// `table_binary: None` reproduces [`xy_cut`]'s exact pre-existing recursion
+/// byte-for-byte — the table check below is skipped entirely, so this is a
+/// pure refactor from that caller's perspective (verified by the existing
+/// `xy_cut` test suite, unchanged). `Some(tb)` adds exactly one rule: before
+/// computing any cut on the CURRENT candidate `rect`, check whether `tb`
+/// (the caller's fixed reference — see [`xy_cut_table_aware`]'s docs for why
+/// it is not `binary`) classifies `rect` a table; if so, stop here and emit
+/// `rect` as one leaf, same as the depth-exhausted/too-small terminal cases.
+fn split_rect_inner(
     binary: &[u8],
     w: usize,
     rect: PageRect,
     depth: usize,
     params: &XyCutParams,
+    table_binary: Option<&[u8]>,
     out: &mut Vec<PageRect>,
 ) {
     // Termination guards: exhausted depth or a rect already too small to split.
@@ -497,6 +589,33 @@ fn split_rect(
             out.push(bb);
         }
         return;
+    }
+
+    // Table veto: a candidate rect already classified as a table stops
+    // recursing HERE, before any whitespace-gap cut decision is even made —
+    // its internal column gutters must not be treated as ordinary layout
+    // breaks. See `xy_cut_table_aware`'s docs for the full rationale.
+    //
+    // `h = tb.len() / w` is exact and safe: `w` is the recursion's ORIGINAL
+    // page width (invariant across every recursive call — only `rect`
+    // shrinks, `w` never does), never zero here (the `w == 0` page is
+    // rejected before recursion starts), and `table_binary`'s length is
+    // asserted `== w * h` by `xy_cut_table_aware` before this function is
+    // ever called.
+    if let Some(tb) = table_binary {
+        let h = tb.len() / w;
+        let region = (
+            rect.left as i32,
+            rect.top as i32,
+            rect.right as i32,
+            rect.bottom as i32,
+        );
+        if crate::pageseg::region_is_table(tb, w, h, region) {
+            if let Some(bb) = ink_bbox(binary, w, rect) {
+                out.push(bb);
+            }
+            return;
+        }
     }
 
     let col = column_ink_profile(binary, w, rect, params);
@@ -534,7 +653,7 @@ fn split_rect(
                 right: pair[1],
                 bottom: rect.bottom,
             };
-            split_rect(binary, w, child, depth - 1, params, out);
+            split_rect_inner(binary, w, child, depth - 1, params, table_binary, out);
         }
     } else {
         // Split the y-axis at each valley midpoint; recurse top→bottom.
@@ -550,7 +669,7 @@ fn split_rect(
                 right: rect.right,
                 bottom: pair[1],
             };
-            split_rect(binary, w, child, depth - 1, params, out);
+            split_rect_inner(binary, w, child, depth - 1, params, table_binary, out);
         }
     }
 }
@@ -632,6 +751,125 @@ mod tests {
                 right: 180,
                 bottom: 86
             }
+        );
+    }
+
+    /// A ruled grid — same shape as `pageseg.rs`'s own `table_fixture()`
+    /// (4 horizontal + 4 vertical rules, `o100`-survivable lengths, clears
+    /// [`crate::pageseg::TABLE_SCORE_THRESHOLD`]). Used ONLY as the
+    /// `table_binary` classification reference — see
+    /// `xy_cut_table_aware_keeps_a_ruled_table_as_one_leaf`'s own doc for why
+    /// the SEGMENTED buffer must be a different, rule-free fixture.
+    fn ruled_grid(w: usize, h: usize) -> Vec<u8> {
+        let mut buf = vec![255u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let hline = [20usize, 90, 160, 230]
+                    .iter()
+                    .any(|&r| y >= r && y < r + 2 && (20..220).contains(&x));
+                let vline = [20usize, 90, 160, 220]
+                    .iter()
+                    .any(|&c| x >= c && x < c + 2 && (20..232).contains(&y));
+                if hline || vline {
+                    buf[y * w + x] = 0;
+                }
+            }
+        }
+        buf
+    }
+
+    /// Ink blocks in the SAME cell positions `ruled_grid` lays out (three
+    /// columns × two rows), but with NO rules at all — what a table looks
+    /// like to the RECOGNIZER after `strip_borders` paints the rules to
+    /// background: real per-cell content, genuinely empty corridors between
+    /// columns, nothing bridging them.
+    fn ruled_grid_content_only(w: usize, h: usize) -> Vec<u8> {
+        let mut buf = vec![255u8; w * h];
+        for &(x0, x1) in &[(40usize, 70usize), (110, 140), (180, 210)] {
+            for &(y0, y1) in &[(40usize, 70usize), (110, 140)] {
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        buf[y * w + x] = 0;
+                    }
+                }
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn xy_cut_table_aware_keeps_a_ruled_table_as_one_leaf() {
+        // The measured real-world shape (`tests/lab_table_columns.rs`):
+        // `strip_borders` removes a table's printed rules from the buffer
+        // the RECOGNIZER segments, while the TABLE DECISION still reads the
+        // original, rule-intact page. A ruled grid with NO cell content is
+        // topologically CONNECTED (every corridor is bridged by a crossing
+        // rule), so it can never fragment in the first place — this is
+        // exactly what this test's own anti-vacuity check caught when first
+        // tried with rules present in BOTH buffers (`plain.len() == 1`
+        // already, before any veto). The two-buffer split below reproduces
+        // the real scenario instead: `content` (no rules, real per-cell
+        // ink) is what gets segmented; `table_binary` (rules, no cell
+        // content needed — `region_is_table` only counts structure) is what
+        // gets classified.
+        let (w, h) = (240, 280);
+        let table_binary = ruled_grid(w, h);
+        let content = ruled_grid_content_only(w, h);
+
+        // Anti-vacuity: PLAIN xy_cut on the CONTENT buffer must actually
+        // fragment into multiple leaves, or the veto below proves nothing.
+        let plain = xy_cut(&content, w, h, &XyCutParams::default());
+        assert!(
+            plain.len() > 1,
+            "fixture precondition failed: plain xy_cut must fragment the \
+             rule-free cell content into multiple leaves, or this test \
+             cannot show the veto doing anything (got {} leaf/leaves: \
+             {plain:?})",
+            plain.len()
+        );
+
+        let aware = xy_cut_table_aware(&content, w, h, &XyCutParams::default(), &table_binary);
+        assert_eq!(
+            aware.len(),
+            1,
+            "a table region must survive as ONE leaf, not fragment into \
+             per-column strips: {aware:?}"
+        );
+        // The single leaf must span (tightened to ink) the WHOLE content
+        // area, including the internal column corridors that have no ink
+        // of their own — a bounding box, not a trimmed union of the cells.
+        let bb = aware[0];
+        assert!(
+            bb.left <= 40 && bb.right >= 210,
+            "must span full width: {bb:?}"
+        );
+        assert!(
+            bb.top <= 40 && bb.bottom >= 140,
+            "must span full height: {bb:?}"
+        );
+    }
+
+    #[test]
+    fn xy_cut_table_aware_does_not_veto_ordinary_multi_column_prose() {
+        // The EXACT fixture `two_columns_wide_gutter_left_then_right` above
+        // uses — no rules, just two paragraph-shaped ink blocks. Passing
+        // this SAME buffer as `table_binary` must not change the result:
+        // ordinary prose must still split into its two columns. This is the
+        // anti-false-positive half — a veto that fires on everything would
+        // "pass" the table test above for the wrong reason.
+        let (w, h) = (200, 200);
+        let mut g = page(w, h);
+        let rows = [(40usize, 50usize), (52, 62), (64, 74), (76, 86)];
+        for &(y0, y1) in &rows {
+            fill(&mut g, w, 20, 80, y0, y1);
+            fill(&mut g, w, 120, 180, y0, y1);
+        }
+        let aware = xy_cut_table_aware(&g, w, h, &XyCutParams::default(), &g);
+        assert_eq!(
+            aware.len(),
+            2,
+            "ordinary two-column prose (no rules) must NOT be vetoed into \
+             one leaf: {aware:?}"
         );
     }
 

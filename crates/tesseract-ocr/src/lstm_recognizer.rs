@@ -850,13 +850,41 @@ impl LstmRecognizer {
         if blocks.len() <= 1 {
             return self.recognize_page_makerow_words_with_mode(grey, w, h, dict, binarize_mode);
         }
+        self.recognize_blocks_words(grey, w, h, dict, binarize_mode, &blocks)
+    }
+
+    /// The per-block crop → makerow → shift-back → no-content-loss-guard
+    /// body shared by [`Self::recognize_page_blocks_words_with_mode`] (plain
+    /// [`crate::xy_cut::xy_cut`] blocks) and
+    /// [`Self::recognize_document_with_options`]'s table-aware recognition
+    /// path ([`crate::xy_cut::xy_cut_table_aware`] blocks) — factored out so
+    /// the two callers cannot drift on this logic while differing only in
+    /// WHICH block list they hand it.
+    ///
+    /// `blocks` is assumed non-empty and pre-filtered to `len() > 1` by the
+    /// caller (the `<= 1` whole-page special case lives at each call site,
+    /// not here, since the two callers reach it via different block-finding
+    /// calls).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::recognize_page_blocks_words_with_mode`].
+    fn recognize_blocks_words(
+        &self,
+        grey: &[u8],
+        w: usize,
+        h: usize,
+        dict: Option<&DictLite>,
+        binarize_mode: BinarizeMode,
+        blocks: &[crate::xy_cut::PageRect],
+    ) -> Result<Vec<crate::renderer::LineWords>, RecognizerError> {
         let mut any_block_empty = false;
 
         // GetRectImage's kImagePadding (imagedata.h:39) — the same slack the
         // per-row crops get, so a block's edge glyphs keep their context.
         const PAD: usize = 4;
         let mut out: Vec<crate::renderer::LineWords> = Vec::new();
-        for blk in &blocks {
+        for blk in blocks {
             let left = blk.left.saturating_sub(PAD);
             let top = blk.top.saturating_sub(PAD);
             let right = (blk.right + PAD).min(w);
@@ -1045,8 +1073,51 @@ impl LstmRecognizer {
             std::borrow::Cow::Borrowed(&binary)
         };
 
-        let lines =
-            self.recognize_page_blocks_words_with_mode(recog_grey, w, h, dict, binarize_mode)?;
+        let xy_params = crate::xy_cut::XyCutParams {
+            binarize_mode,
+            ..crate::xy_cut::XyCutParams::default()
+        };
+
+        // Table-aware recognition (table ingredient 3): a plain `xy_cut` over
+        // `recog_grey` would fragment a table into one leaf PER COLUMN
+        // (internal gutters read as ordinary layout breaks), and each column
+        // then gets recognized independently — one line per printed ROW but
+        // only within that one column, so `extract_table_grid`'s "rows ARE
+        // the recognized lines" assumption breaks (measured: a real 7×4
+        // table becomes ~28×1, column-major). `xy_cut_table_aware` vetoes
+        // that fragmentation: a candidate rect that `region_is_table`
+        // classifies a table (checked against `binary` — the ORIGINAL page,
+        // never `recog_grey`, since a border-stripped page has no rules left
+        // for the table decision to count) is kept as ONE full-width leaf.
+        //
+        // GATED on `opts.strip_borders`, NOT unconditional — measured
+        // regression (`quality_resolution_grid.rs`): `decide_if_table`'s
+        // borderless (`nvw`-only) path, the SAME fragile regime
+        // `lab_table_grid.rs` already knew about, ALSO fires on an ordinary
+        // WIDE multi-column TEXT layout (the resolution grid's 8 columns —
+        // no table anywhere) purely because 8 separated columns produce
+        // enough long whitespace corridors to clear the same threshold a
+        // real table would. Running this unconditionally turned the 8×2
+        // grid's ~48 per-cell lines into 6 full-width-merged ones — the
+        // EXACT failure mode `recognize_page_blocks_words_with_mode`
+        // (module docs, `.claude/harvest/sauvola-vs-otsu-probe.md`) exists
+        // to prevent. Scoping this to `strip_borders` restores the plain,
+        // proven `xy_cut` for every caller that has not opted into
+        // table-specific handling — which is every existing caller of
+        // `recognize_document`/`recognize_document_with_mode` — while
+        // keeping the fix live for its actual, tested scenario: a caller
+        // who already opted in to border-stripping for tables also wants
+        // the resulting bare table treated as one region, not fragmented.
+        let rec_blocks = if opts.strip_borders {
+            crate::xy_cut::xy_cut_table_aware(recog_grey, w, h, &xy_params, &binary)
+        } else {
+            crate::xy_cut::xy_cut(recog_grey, w, h, &xy_params)
+        };
+        let lines = if rec_blocks.len() <= 1 {
+            self.recognize_page_makerow_words_with_mode(recog_grey, w, h, dict, binarize_mode)?
+        } else {
+            self.recognize_blocks_words(recog_grey, w, h, dict, binarize_mode, &rec_blocks)?
+        };
         let mut page =
             crate::structured::DocPage::from_line_words(&lines, &self.charset, w as u32, h as u32);
         crate::structured::harden_numeric_tokens(&mut page);
@@ -1060,14 +1131,31 @@ impl LstmRecognizer {
         // ("figure") regions from the byte-parity leptonica pixGetRegionsBinary
         // composition. All are parity-proven library layers.
         let furniture = crate::page_furniture::detect_page_furniture(&page);
-        let xy_params = crate::xy_cut::XyCutParams {
-            binarize_mode,
-            ..crate::xy_cut::XyCutParams::default()
-        };
-        let blocks: Vec<(i32, i32, i32, i32)> = crate::xy_cut::xy_cut(grey, w, h, &xy_params)
-            .into_iter()
-            .map(|r| (r.left as i32, r.top as i32, r.right as i32, r.bottom as i32))
-            .collect();
+
+        // Layout blocks — ALSO table-aware when `opts.strip_borders` is on
+        // (same gate as `rec_blocks` above, same reason — see its comment),
+        // and MUST agree with `rec_blocks` on where a table's bbox falls
+        // whenever both run table-aware: `build_regions` assigns each
+        // recognized line to a region by testing whether the line's CENTROID
+        // lands inside one of THESE `blocks`. A full-width recognized table
+        // line's centroid sits near the table's horizontal middle — if this
+        // list still fragmented the table into per-column blocks, that
+        // centroid would land in whichever single narrow column-block
+        // happens to contain the page's midpoint, silently dropping the
+        // other columns' worth of region-membership. Both calls share the
+        // same `binary` (original page) as the table-decision reference, so
+        // both make the identical table/no-table call at every candidate
+        // rect — `grey` (not `recog_grey`) is used here deliberately,
+        // unchanged from before this fix, since classification block
+        // BOUNDARIES for non-table regions are not part of this fix's scope.
+        let blocks: Vec<(i32, i32, i32, i32)> = if opts.strip_borders {
+            crate::xy_cut::xy_cut_table_aware(grey, w, h, &xy_params, &binary)
+        } else {
+            crate::xy_cut::xy_cut(grey, w, h, &xy_params)
+        }
+        .into_iter()
+        .map(|r| (r.left as i32, r.top as i32, r.right as i32, r.bottom as i32))
+        .collect();
 
         // MEASURED font sizing. Replaces the statistical `xheight + ascrise -
         // descdrop` fit, which is unstable on short rows — two table rows of
@@ -1185,22 +1273,7 @@ impl LstmRecognizer {
     /// but not yet ppi-exact. Blocks under 100 px in either dimension can hold
     /// no `o100` structural line, so they score 0 and are skipped.
     fn block_is_table(binary: &[u8], w: usize, h: usize, block: (i32, i32, i32, i32)) -> bool {
-        let (l, t, r, b) = block;
-        let l = l.max(0) as usize;
-        let t = t.max(0) as usize;
-        let r = (r.max(0) as usize).min(w);
-        let b = (b.max(0) as usize).min(h);
-        let (cw, ch) = (r.saturating_sub(l), b.saturating_sub(t));
-        if cw < 100 || ch < 100 {
-            return false;
-        }
-        let mut crop = vec![255u8; cw * ch];
-        for y in 0..ch {
-            let row = (t + y) * w + l;
-            crop[y * cw..(y + 1) * cw].copy_from_slice(&binary[row..row + cw]);
-        }
-        crate::pageseg::decide_if_table(&crop, cw, ch).score
-            >= crate::pageseg::TABLE_SCORE_THRESHOLD
+        crate::pageseg::region_is_table(binary, w, h, block)
     }
 
     /// `LSTMRecognizer::SetRandomSeed` (`lstmrecognizer.h:287-291`): the exact

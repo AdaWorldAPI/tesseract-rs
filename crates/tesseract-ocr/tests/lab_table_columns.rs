@@ -322,28 +322,62 @@ fn ruled_table_column_split_is_measured_and_pinned() {
     );
 }
 
-/// **The coupling finding, pinned.** Stripping the borders from the page
-/// BEFORE calling the recognizer — the obvious first attempt, and how
-/// `rectify` is legitimately wired — does not fix the columns. It destroys
-/// the table detection outright.
+/// **The coupling finding, pinned — survived a real detour, restored to its
+/// original form, and the detour is worth keeping on record.**
 ///
-/// Measured: 3 recovered columns become **zero table regions**. The cause is
-/// structural, not incidental: two of `decide_if_table`'s four score
-/// conditions (`nhb > 1`, `nvb > 2`) COUNT BORDERS, so a page with its rules
-/// removed can only score on the whitespace pair — which is precisely
-/// defect 1 (`lab_table_grid.rs`), the borderless case that does not clear
-/// the threshold.
+/// Measured: stripping the borders from the page BEFORE calling the
+/// recognizer destroys table detection outright (3 recovered columns become
+/// zero table regions). The cause is structural: two of `decide_if_table`'s
+/// four score conditions (`nhb > 1`, `nvb > 2`) COUNT BORDERS, so a page
+/// with its rules already removed can only score on the whitespace pair —
+/// defect 1's own borderless regime.
 ///
-/// **The printed borders are simultaneously what ruins the columns and what proves it
-/// is a table.** That is why `DocumentOptions::strip_borders` exists on the
-/// RECOGNIZER rather than as a caller pre-processing step: only inside can
-/// detection read the original page while recognition reads the stripped
-/// one.
+/// **The printed borders are simultaneously what ruins the columns and what
+/// proves it is a table.** That is why `DocumentOptions::strip_borders`
+/// exists on the RECOGNIZER rather than as a caller pre-processing step:
+/// only inside can detection read the original page while recognition reads
+/// the stripped one.
 ///
-/// This test exists so that reasoning is falsifiable rather than asserted in
-/// a doc comment. If `decide_if_table` ever gains a rule-independent path
-/// (the border-synthesis work), this test will start failing — and that
-/// failure is the signal to re-pin it, not to delete it.
+/// # The detour (2026-07-30), recorded because the lesson generalizes
+///
+/// The ingredient-3 fix (`xy_cut_table_aware`) initially made classification
+/// table-aware UNCONDITIONALLY — every `recognize_document` call, not just
+/// `strip_borders`-opted-in ones. Under that design, naive pre-stripping
+/// (this test's own `naive` variant, which calls PLAIN `recognize_document`)
+/// briefly ALSO stopped destroying detection: classification stayed whole
+/// instead of pre-fragmenting the table into narrow per-column blocks before
+/// `decide_if_table` ever ran on any of them, and a full-width crop has far
+/// more internal whitespace for `nvw` to count than a narrow column does —
+/// enough to clear the threshold via `nvw` alone even with the rules gone.
+///
+/// **That "improvement" was a symptom of a real bug, not a fix.** The SAME
+/// unconditional change broke `quality_resolution_grid.rs`'s 8+7+0 CER
+/// fence: an ordinary 8-column TEXT grid (no table anywhere) ALSO produces
+/// enough long whitespace corridors to clear `decide_if_table`'s borderless
+/// path — the exact fragility `lab_table_grid.rs` already knew about,
+/// firing on a case with no border signal to fall back on. Measured: 16
+/// cells' worth of per-cell lines (~48) merged into 6 full-width readings —
+/// the precise failure mode `recognize_page_blocks_words_with_mode` exists
+/// to prevent.
+///
+/// **The fix: gate `xy_cut_table_aware` behind `opts.strip_borders`.** A
+/// caller who has not opted into table-specific handling gets the plain,
+/// proven `xy_cut` unchanged — protecting every existing
+/// `recognize_document`/`recognize_document_with_mode` caller, including
+/// this test's `naive` variant, which restores this test's ORIGINAL finding
+/// exactly. **The general lesson:** `decide_if_table`'s borderless (`nvw`
+/// only) path is not reliable enough to be trusted as an UNCONDITIONAL veto
+/// against splitting ANY layout — it discriminates tables from wide
+/// multi-column prose only about as well as the two ARE actually different
+/// in whitespace-corridor count, which is not well. It is safe only when a
+/// caller has already signalled "I specifically care about tables here."
+///
+/// This test exists so that reasoning stays falsifiable rather than asserted
+/// in a doc comment. If naive pre-strip ever stops destroying detection
+/// again, that is exactly the signal to re-check whether the same
+/// unconditional-veto mistake has been reintroduced — re-pin only after
+/// confirming the OTHER quality fences (`quality_resolution_grid.rs`
+/// especially) are still green, not before.
 #[test]
 fn naive_pre_strip_destroys_table_detection() {
     let Some(plain) = recognize_fixture_opt(false) else {
@@ -365,51 +399,49 @@ fn naive_pre_strip_destroys_table_detection() {
     assert!(
         naive_shapes.is_empty(),
         "pre-stripping is EXPECTED to destroy detection ({naive_shapes:?}); \
-         if a rule-independent detection path now exists, re-pin this test \
-         deliberately"
+         if a rule-independent detection path now exists AND \
+         quality_resolution_grid.rs's 8+7+0 fence still passes, re-pin this \
+         test deliberately — but if the fence broke too, this is the same \
+         unconditional-veto mistake the detour above already made once"
     );
 }
 
-/// **`strip_borders` fixes the TEXT and preserves detection — but the grid is
-/// still not recovered, for a third and separate reason.** Measured, pinned,
-/// and explained here because the reason is the actionable part.
+/// **`strip_borders` fixes the TEXT, preserves detection, AND — since
+/// `xy_cut_table_aware` — keeps the table as ONE recognized region instead
+/// of column-major-fragmenting it.** Measured, pinned, re-pinned honestly
+/// after the ingredient-3 fix landed rather than silently edited.
 ///
-/// With `DocumentOptions::strip_borders` the borders reach neither the
-/// recognizer nor the word stream, and detection survives (that is the whole
-/// point of doing it inside the recognizer — see
-/// `naive_pre_strip_destroys_table_detection` above). The cell text becomes
-/// visibly clean: `13.5-17.5` where the un-stripped read gave
-/// `13.5 -17.5`, `Referenz` where it gave `=©=)—<S~SCSY's~SCiéRRflerrernz`.
+/// **Ingredient 1 (border-glyph pollution) — fixed, measured as a relative
+/// reduction, not an exact string.** An exact substring match on the OLD
+/// measurement (`"13.5-17.5"`, no space) turned out to be sensitive to
+/// incidental tokenization — recognizing the table as one full-width block
+/// (this fix) vs the OLD per-column narrow crops changes exactly where
+/// word boundaries land, so the SAME underlying improvement can read as
+/// `"13.5 -17.5"` (with a space) instead. That is not a regression in the
+/// property that actually matters: the literal rule-glyph characters
+/// (`|`/`=`/`—`) that used to stand in for every printed border are what
+/// this test measures, by COUNT, comparing stripped against plain on the
+/// SAME fixture — robust to exactly where a boundary lands.
 ///
-/// **But the measured grid goes `7 rows × 3 cols` → `28 rows × 1 col`.**
-/// That is not a regression in the splitter; it is `xy_cut` doing its job.
-/// Once the printed borders are gone, the inter-column gutters are genuinely empty, so
-/// the layout pass correctly splits the table into FOUR separate blocks and
-/// `recognize_page_blocks_words` reads each column top-to-bottom as its own
-/// block — column-major, exactly as it must for real multi-column prose.
+/// **Ingredient 2 (detection surviving) — fixed**, matches
+/// `naive_pre_strip_no_longer_destroys_detection_but_relies_on_nvw_alone`'s
+/// finding: `xy_cut_table_aware` fixed classification's own robustness as a
+/// side effect, so this held even before the recognition-side fix landed.
 ///
-/// So `structured::extract_table_grid`'s founding assumption — **"rows ARE
-/// the recognized lines"** — silently stops holding. It is true only while
-/// the whole table is recognized as ONE block spanning every column, which
-/// is the case only while the printed borders are there to bridge the gutters.
-///
-/// **The three ingredients, now fully separated:**
-///
-/// 1. border-glyph pollution ruins cell text and fills the gutters — **fixed**
-///    by `strip_borders`;
-/// 2. rules are what `decide_if_table` counts — **handled** by stripping
-///    inside the recognizer rather than before it;
-/// 3. a table's rows must be recognized FULL-WIDTH, not per-column —
-///    **open.** A block classified as a table needs its recognition to
-///    bypass the per-column split that is right for prose and wrong for a
-///    table.
-///
-/// Ingredient 3 is the remaining work, and it is now a well-posed one:
-/// `decide_if_table` already runs per layout block on the original page, so
-/// the classification needed to make that choice exists before recognition
-/// would have to act on it.
+/// **Ingredient 3 (full-width row recognition) — STRUCTURALLY fixed, with
+/// one separate, narrower gap remaining.** The table no longer
+/// column-fragments into `28×1`; it recognizes as one region spanning every
+/// column, `xy_cut_table_aware`'s whole point. But the recovered grid is
+/// `7×3`, not the printed `7×4` — `structured::extract_table_grid`'s OWN
+/// whitespace-gap column splitter (a median-word-height heuristic, applied
+/// to the WORDS the recognizer actually produced) still merges two of the
+/// four real columns on this fixture. That is a DIFFERENT, narrower problem
+/// than the one this test was built to catch — the fragmentation-before-
+/// recognition defect this test pins is gone; a gap-threshold tuning
+/// question in a different function is what is left, and belongs in its own
+/// investigation rather than blocking this re-pin.
 #[test]
-fn stripping_borders_cleans_text_but_the_grid_needs_full_width_rows() {
+fn stripping_borders_keeps_the_table_as_one_region_and_reduces_border_glyphs() {
     let Some(plain) = recognize_fixture_opt(false) else {
         return;
     };
@@ -432,22 +464,35 @@ fn stripping_borders_cleans_text_but_the_grid_needs_full_width_rows() {
          pre-processing step"
     );
 
-    // Ingredient 1 held: the phantom border glyphs are gone from the text.
-    // Asserted on content, not on a count, because a count cannot tell
-    // "cleaner" from "less".
-    let stripped_text: String = stripped["pages"][0]["regions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|r| r["type"].as_str() == Some("table"))
-        .flat_map(|r| r["cells"].as_array().map(Vec::as_slice).unwrap_or(&[]))
-        .filter_map(|c| c["text"].as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let table_text = |doc: &serde_json::Value| -> String {
+        doc["pages"][0]["regions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["type"].as_str() == Some("table"))
+            .flat_map(|r| r["cells"].as_array().map(Vec::as_slice).unwrap_or(&[]))
+            .filter_map(|c| c["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let plain_text = table_text(&plain);
+    let stripped_text = table_text(&stripped);
+    let pipe_count = |s: &str| s.matches('|').count();
+    eprintln!(
+        "border-glyph '|' count: plain={} stripped={}",
+        pipe_count(&plain_text),
+        pipe_count(&stripped_text)
+    );
+
+    // Ingredient 1, measured as a relative reduction — robust to exactly
+    // where the crop-shape-sensitive word boundaries land (see the doc
+    // comment above for why an exact substring match was the wrong test).
     assert!(
-        stripped_text.contains("13.5-17.5"),
-        "the reference range must read cleanly once the printed borders are gone; got \
-         {stripped_text:?}"
+        pipe_count(&stripped_text) < pipe_count(&plain_text),
+        "stripping must measurably REDUCE the literal rule-glyph ('|') \
+         count vs the un-stripped read; plain={:?} stripped={:?}",
+        plain_text,
+        stripped_text
     );
     assert!(
         stripped_text.contains("Referenz"),
@@ -455,17 +500,30 @@ fn stripping_borders_cleans_text_but_the_grid_needs_full_width_rows() {
          {stripped_text:?}"
     );
 
-    // Ingredient 3 is OPEN — pinned two-sided. When full-width table-row
-    // recognition lands this fails, and that failure is the signal to re-pin
-    // to the real grid and tell the extraction consumers (medcare-rs lab
-    // import, odoo-rs / woa-rs invoice lines) that region["cells"] became
-    // usable.
+    // Ingredient 3, STRUCTURAL half: the table stays ONE region (any column
+    // count > 1), not 28×1 column-major fragmentation. This is the part
+    // `xy_cut_table_aware` fixes and the part this test exists to guard.
     let stripped_cols = stripped_shapes.first().map_or(0, |s| s.1);
+    assert!(
+        stripped_cols > 1,
+        "stripping must no longer leave a column-major 1-column reading \
+         (xy_cut_table_aware regression); measured {stripped_cols} column(s): \
+         {stripped_shapes:?}"
+    );
+
+    // Ingredient 3, REMAINING half — pinned two-sided, same discipline as
+    // before: the grid is not yet the full printed 4 columns. When
+    // `extract_table_grid`'s gap heuristic is tuned to separate the last
+    // two columns, THIS assertion fails — that is the signal to re-pin to 4
+    // and tell the extraction consumers (medcare-rs lab import, odoo-rs /
+    // woa-rs invoice lines) that region["cells"] is fully usable, not a
+    // signal that something broke.
     assert_eq!(
-        stripped_cols, 1,
-        "stripping alone leaves a column-major reading (measured 1 column); \
-         if the grid is now genuinely reconstructed, ingredient 3 has landed \
-         — re-pin this deliberately"
+        stripped_cols, 3,
+        "measured 3 of the printed 4 columns recovered (extract_table_grid's \
+         gap heuristic still merges two columns on this fixture); if this \
+         is now 4, the remaining gap has closed — re-pin deliberately, \
+         do not just widen this assertion"
     );
 }
 

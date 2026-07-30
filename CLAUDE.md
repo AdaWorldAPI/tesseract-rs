@@ -1048,6 +1048,123 @@ All three states are pinned two-sided in `tests/lab_table_columns.rs`
 ingredient 3 lands the tests fail and force a deliberate re-pin rather than
 drifting.
 
+**★ Ingredient 3 STRUCTURALLY LANDED — `xy_cut_table_aware` (2026-07-30).**
+The root cause: TWO disconnected `xy_cut` calls existed inside
+`recognize_document_with_options`. `block_is_table` classified regions on the
+ORIGINAL page purely to LABEL them for `build_regions`, while
+`recognize_page_blocks_words_with_mode` ran its OWN separate `xy_cut` (on the
+STRIPPED page, once ingredient 2 landed) with zero table awareness — so a
+table's internal column gutters were split exactly like ordinary paragraph
+whitespace, before the table label could ever apply to what was left.
+
+Fixed at the SOURCE: `xy_cut::split_rect` refactored into
+`split_rect_inner(..., table_binary: Option<&[u8]>, ...)` — `None` reproduces
+`xy_cut` byte-for-byte (proven: all 28 pre-existing `xy_cut`/`pageseg` unit
+tests pass unchanged after the refactor, including three tests that assert
+EXACT leaf lists). `Some(tb)` adds one rule: before any cut decision on a
+candidate rect, check `pageseg::region_is_table(tb, ...)` (the SAME
+crop-then-`decide_if_table` logic `block_is_table` used, now shared — see
+below) — if it classifies a table, stop recursing and emit the WHOLE rect as
+one leaf. New public `xy_cut::xy_cut_table_aware(grey, w, h, params,
+table_binary)`; `table_binary` is deliberately a SEPARATE parameter from
+`grey` (always the ORIGINAL page's binarization) because the table decision
+needs the rule signal a stripped page no longer carries — reproducing the
+exact ingredient-1/ingredient-2 coupling one level up would defeat the point.
+
+`pageseg::region_is_table` is a new shared primitive (`block_is_table`
+delegates to it in one line) — the same call used by BOTH the
+recognition-side block list and the classification-side block list, both
+GATED (see below) on `DocumentOptions::strip_borders`. When both run
+table-aware together they MUST agree on where a table's bbox falls:
+`build_regions` assigns each recognized line to a region by testing whether
+the line's CENTROID falls inside a classification block, and a full-width
+line's centroid sitting near the table's horizontal middle would land in
+just ONE of several stale per-column classification blocks, silently
+dropping the others, if the two lists disagreed.
+
+> **⚠ A REAL REGRESSION, caught by the gate before it shipped, and the fix
+> is the more important finding.** The first landing made
+> `xy_cut_table_aware` UNCONDITIONAL — every `recognize_document` call, not
+> only `strip_borders`-opted-in ones. That broke
+> `quality_resolution_grid.rs`'s 8+7+0 CER fence: an 8-column TEXT grid (no
+> table anywhere) ALSO produces enough long whitespace corridors to clear
+> `decide_if_table`'s borderless (`nvw`-only) path — the SAME fragility
+> `lab_table_grid.rs` already knew about, now firing on ordinary
+> multi-column prose instead of a false table. Measured: 16 cells' worth of
+> per-cell lines (~48) merged into 6 full-width readings — the exact failure
+> mode `recognize_page_blocks_words_with_mode` exists to prevent.
+>
+> **The general lesson, worth keeping:** `decide_if_table`'s borderless path
+> is not reliable enough to be an UNCONDITIONAL veto against splitting ANY
+> layout — it cannot discriminate "table" from "wide multi-column text" by
+> whitespace-corridor count alone, because both genuinely have many long
+> corridors. It is safe only once a caller has ALREADY signalled "I
+> specifically care about tables here." **Fix: gate both
+> `xy_cut_table_aware` calls behind `opts.strip_borders`.** A caller who has
+> not opted into table handling gets the plain, proven `xy_cut` completely
+> unchanged — restoring `quality_resolution_grid.rs` to its exact `0.000 ×14,
+> 0.023, 0.814` pattern — while the fix stays live for the scenario it was
+> actually built and tested for: a caller who already opted into
+> border-stripping for tables also wants the resulting bare table treated as
+> one region.
+>
+> **A second consequence, also correct once understood:** gating means
+> `naive_pre_strip_destroys_table_detection` (the ORIGINAL name and
+> assertion) is right again — naive pre-stripping (calling PLAIN
+> `recognize_document`, which never sets `strip_borders`) goes back to
+> non-table-aware classification, so it destroys detection exactly as
+> originally measured. A brief unconditional-design detour had made this
+> test's finding look superseded; it was the detour that was wrong, not the
+> original finding. Re-pinned back, with the detour recorded in the test's
+> own doc comment rather than silently reverted.
+
+**Measured, real model, real fixture (`tests/lab_table_columns.rs`,
+re-pinned rather than silently edited — old names/assertions kept
+in git history, not deleted from the repo's memory):**
+
+- `naive_pre_strip_destroys_table_detection` — restored to its original
+  name and assertion (`naive_shapes.is_empty()`), now green again under the
+  gated design. Its own doc comment carries the detour above in full, so a
+  future session hitting the same "make it unconditional" temptation finds
+  the regression already on record.
+- `stripping_borders_keeps_the_table_as_one_region_and_reduces_border_glyphs`
+  — border-glyph `|` count: **11 (plain) → 0 (stripped)**. Grid: `1 col →
+  3 cols` (was `28×1` before this fix; still not the printed `4`, see
+  below). The exact-substring assertion from the original pinning
+  (`"13.5-17.5"`) turned out to be sensitive to incidental tokenization —
+  recognizing one full-width block vs the old per-column narrow crops
+  shifts exactly where word boundaries land, so the SAME improvement now
+  reads `"13.5 -17.5"` (with a space). Re-pinned to a relative-reduction
+  count instead of an exact string, which is robust to that.
+- `xy_cut::xy_cut_table_aware_keeps_a_ruled_table_as_one_leaf` /
+  `..._does_not_veto_ordinary_multi_column_prose` — new FAST unit-level
+  falsifiers, two-sided: a ruled grid survives as one leaf; ordinary
+  two-column prose (no rules) still splits normally. The first attempt at
+  the table fixture used rules alone with no cell content and measured
+  `plain.len() == 1` even WITHOUT the veto — a ruled grid with no content is
+  topologically connected (crossing rules bridge every corridor), so it can
+  never fragment regardless of any fix. Corrected to two buffers: cell
+  content only (segmented) + rules only (classification reference),
+  matching the real `recog_grey` vs `binary` split.
+- `lab_table_grid.rs::borderless_table_is_not_detected` — still green,
+  UNCHANGED. The anti-false-positive guarantee: this fix does not turn
+  table classification into a fires-on-everything guard.
+- `quality_resolution_grid.rs::resolution_grid_holds_the_8_7_0_pattern` —
+  the regression that caught the unconditional design, now green again
+  (exact `0.000` ×14, `0.023`, `0.814`), verified by re-running it after the
+  gate landed, not assumed.
+
+**What remains, and it is a genuinely different, narrower problem:**
+`structured::extract_table_grid`'s own whitespace-gap column splitter (a
+median-word-height heuristic over the words a full-width line actually
+contains) still merges two of the four real columns on this fixture — `7×3`
+recovered against the printed `7×4`. The STRUCTURAL defect this whole
+ingredient-3 arc was about — a table getting fragmented into per-column
+BLOCKS before recognition ever ran — is closed; what is left is a threshold-
+tuning question inside a different function, over words that already arrived
+correctly grouped into one full-width line. Filed as its own follow-up
+rather than conflated with this one.
+
 **★ SIMD status — nothing hand-rolled, and here is what the polyfill actually
 has (2026-07-29).** Checked because the invariant is easy to violate silently:
 **all SIMD must come from `ndarray::simd`** (`simd.rs` + `simd_ops.rs` >
