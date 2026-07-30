@@ -1539,6 +1539,76 @@ same session. Precedent that was manufactured and then appealed to. Fixture
 generation belongs in Rust (see `tests/lab_table_grid.rs` and `rectify.rs`'s
 synthetic pages for the pattern).
 
+## ★ Reasoning layer — the two cheap pieces from the AS-IS BOUNDARY are now WIRED (2026-07-30)
+
+The AS-IS BOUNDARY section above named three pieces and said only two were
+cheap: `NarsTruth` (free, zero-dep) and per-sentence SPO via `deepnsm`'s
+LOW-level `Vocabulary`+`parser` API (cheap — path deps `ndarray` +
+`lance-graph-contract`, both already satisfied). Both are now wired, as a
+plain post-processing library — **not a 15th OGAR capability** (the
+exhaustiveness fuse in `crates/tesseract-ogar/src/lib.rs` stays untouched;
+this is a caller reaches for AFTER getting a `DocPage`, no request/response
+variant).
+
+**`crates/tesseract-ogar/src/sentences.rs`** — `assemble_sentences(&DocPage)
+-> Vec<AssembledSentence>` closes the gap the AS-IS BOUNDARY section named:
+"lines are a typographic artifact… there is NO sentence." Joins lines
+(mirroring `renderer::render_text`'s exact `leading_space` convention),
+dehyphenates line-wraps (`compli-` + `cated` → `complicated`, no lookahead —
+documented limitation), splits on `.`/`!`/`?` with one targeted guard
+(a `.` flanked by digits, e.g. `13.5`, is never a sentence end). Consumer-side
+synthesis, not a transcode — same footing as `structured.rs`'s `doc.v1`. 8
+falsifiable tests (anti-vacuity throughout: proves splitting actually
+happens, proves dehyphenation actually fires, proves a standalone `-` does
+NOT dehyphenate, proves the decimal guard actually guards, proves trailing
+unterminated text is never silently dropped).
+
+**`crates/tesseract-ogar/src/reasoning.rs`** — `SentenceReasoner` loads the
+real `deepnsm/word_frequency/` COCA vocabulary (sibling path,
+`../../../lance-graph/crates/deepnsm/word_frequency`) and runs
+`Vocabulary::tokenize` → `Parser::parse_with_coverage` → SPO triples resolved
+back to lemma text. `sentence_nars_truth(mean_word_conf, coverage,
+token_count) -> NarsTruth` — this module's OWN construction (documented as
+such, not asserted as NARS canon): `frequency` = mean of OCR confidence and
+parse coverage (both independent [0,1] trust signals); `confidence` = the
+standard NARS evidence discount `w/(w+1)` over token count.
+
+**A real measured finding, not a wiring bug — recorded so it isn't
+mistaken for one.** `deepnsm`'s `Vocabulary::tokenize` assigns exactly ONE
+PoS per surface form, by that form's own overall COCA frequency, with NO
+sentence context. "The dog bites the man" tags `bites` as **Noun**
+(`word_forms.csv`'s noun-lemma row for "bites" has wordFreq 5275 vs the
+verb-lemma row's 1559 — a real corpus fact) and `SentenceReasoner::analyze`
+returns zero triples for it — not because the FSM is wrong (hand-built
+tokens with `bites` forced to `Verb` correctly yield `SPO(dog, bites, man)`)
+but because the PoS was already wrong before the parser saw it. Common
+English noun/verb homographs (`bite(s)`, `run(s)`, `sleep(s)`, `walk(s)`, …)
+are all affected. This is a structural limitation of context-free
+frequency-based tagging, not a quick fix (disambiguating "bites" needs the
+surrounding tokens — a PoS tagger in its own right) — out of scope for this
+wiring pass, documented in `reasoning.rs`'s module docs so a future session
+doesn't waste time re-diagnosing an empty `triples` list as a wiring bug.
+The end-to-end test uses "the dog sees the cat" instead ("sees" has no
+competing noun sense) — a genuine pass through the REAL `tokenize()` path,
+not hand-built tokens, so the wiring itself is honestly proven working.
+`coverage` is unaffected by this limitation (the word still counts as
+"resolved," just under the wrong PoS) and stays useful even when `triples`
+comes back empty. 9 tests (4 pure `sentence_nars_truth` unit tests +
+2 skip-gracefully-without-real-data integration tests, matching this crate's
+established `smoke_recognize_line_matches_proven_regression` pattern).
+
+**Deliberately NOT wired**: NARS *reasoning* (belief arena, revision, the 5
+tactics) — lives in `lance-graph-planner`, which pulls
+`serde`/`tokio`/`tracing`, outside this crate's lean dependency set. A caller
+needing revision-over-time across multiple documents reaches for
+`lance-graph-planner` directly, downstream of this module's output.
+
+No Core change (both new modules are tesseract-ogar-local, consuming
+`deepnsm` + `lance-graph-contract` as ordinary path deps) → this file + the
+commit are the record. Toolchain note: `deepnsm` path-deps `ndarray 0.17.2`
+which gates on rustc 1.95 (`rustup run 1.95 cargo …`), same as this crate's
+own existing toolchain-bump note elsewhere in this file.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the
