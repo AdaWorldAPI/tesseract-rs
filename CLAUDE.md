@@ -1609,6 +1609,47 @@ commit are the record. Toolchain note: `deepnsm` path-deps `ndarray 0.17.2`
 which gates on rustc 1.95 (`rustup run 1.95 cargo …`), same as this crate's
 own existing toolchain-bump note elsewhere in this file.
 
+**★ The Dockerfile — the second, heavier deployment image.**
+`crates/tesseract-ogar/Dockerfile` mirrors `tesseract-ocr-web/Dockerfile`'s
+two-stage shape (`rust:1.95-bookworm` builder → `debian:bookworm-slim`
+runtime, stripped release binary, non-root user) but trims the OPPOSITE
+crate: it clones a THIRD sibling (`OGAR`, alongside `lance-graph` +
+`ndarray`), keeps `tesseract-ogar` IN the workspace (only
+`tesseract-ocr-python` — the pyo3/maturin wheel crate — gets trimmed), and
+builds `tesseract-ogar`'s `ocr_demo` example instead of a web server. Still
+zero C OCR libraries at runtime; heavier only because it carries the OGAR +
+lance-graph + deepnsm source tree through the build, not because it links
+any new native library.
+
+`ocr_demo.rs` gained a step 6 exercising the new reasoning layer end-to-end
+(`recognize_page_words` → `DocPage::from_line_words` → `assemble_sentences`
+→ `SentenceReasoner::analyze`), which needed `OcrExecutor::charset()` (a new
+public getter, `lib.rs`) — the ONLY way an external caller reaches the
+`CharSet` `DocPage::from_line_words` needs, since `recognize_document`'s own
+`DocPage` construction uses a PRIVATE field. The model dir, demo image, and
+deepnsm vocab dir all gained env-var overrides (`MODEL_DIR` — reusing
+`tesseract-ocr-web`'s existing convention — plus new `DEMO_IMAGE` and
+`DEEPNSM_VOCAB_DIR`), each falling back to the pre-existing
+`CARGO_MANIFEST_DIR`-relative default so local `cargo run --example ocr_demo`
+behaviour is byte-for-byte unchanged for a caller who sets nothing.
+
+**No Docker daemon in this environment** (`docker` client present, no
+`dockerd` socket) — the Dockerfile itself was never run through
+`docker build`. Verified everything short of that: the exact `sed` trim
+command dry-run against the real root `Cargo.toml` (confirms it strips only
+`tesseract-ocr-python`, leaves `tesseract-ogar`); the release build
+(`cargo build --release -p tesseract-ogar --example ocr_demo`) against the
+real three-sibling checkout already present in this environment; and, most
+directly, the exact runtime scenario — the built binary run with `MODEL_DIR`
+/ `DEEPNSM_VOCAB_DIR` / `DEMO_IMAGE` pointed at FRESH COPIES of
+`corpus/model`, `deepnsm/word_frequency`, and `page_01.pgm` in an otherwise
+empty temp directory, with an emptied environment and a different cwd —
+reproducing exactly what the slim runtime stage does, short of the container
+boundary itself. Output was identical to the in-tree run. A real
+`docker build` should still be run once a Docker-capable environment is
+available, to catch anything specific to the container layer (base-image
+package availability, layer caching, etc.) that this simulation can't see.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the

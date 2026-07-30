@@ -659,6 +659,17 @@ impl OcrExecutor {
         }
     }
 
+    /// The loaded model's character set — what
+    /// [`DocPage::from_line_words`](tesseract_ocr::DocPage::from_line_words)
+    /// needs to turn [`OcrRequest::RecognizePageWords`]'s `LineWords` output
+    /// into a typed [`DocPage`], for a caller that wants the
+    /// [`crate::sentences`]/[`crate::reasoning`] surface rather than
+    /// [`OcrRequest::RecognizeDocument`]'s serialized `doc.v1` JSON string.
+    #[must_use]
+    pub fn charset(&self) -> &tesseract_core::CharSet {
+        &self.recognizer.charset
+    }
+
     /// Execute one [`OcrRequest`], dispatching to the matching proven
     /// [`tesseract_ocr`]/[`tesseract_ocr_pdf`] call. Pure dispatch — no
     /// logic beyond adapting parameter/return shapes lives here.
