@@ -1650,6 +1650,66 @@ boundary itself. Output was identical to the in-tree run. A real
 available, to catch anything specific to the container layer (base-image
 package availability, layer caching, etc.) that this simulation can't see.
 
+## ★ The multi-column gutter bug — xy_cut's threshold did not scale with column count (2026-07-30)
+
+**Reported from a real 8-column upload: every recognized line concatenated one
+line from all 8 columns** (`"Optical character recognition Optical character
+recognition …"` ×8), and the region overlay showed **6 full-width strips**
+instead of 8 columns. Not a recognition defect — a segmentation one, upstream
+of everything.
+
+**Root cause.** `axis_cuts` derives its gutter threshold as
+`gap_min = ceil(min_gap_frac × extent)` where `extent` is the CURRENT RECT's
+cut-axis extent — the **full page width** for the top-level column cut. That
+makes the absolute gutter requirement independent of how many columns the page
+has, while real gutters scale with **column** width (≈ `W/n`). Expressed
+against a column, the requirement therefore grows **linearly in `n`**: at
+`min_gap_frac = 0.015` a 2-column page needs a 3 %-of-column gutter, but an
+8-column page needs ~12 %. Past that point NO vertical cut is found at all, the
+page splits only horizontally, and every strip spans all `n` columns — so the
+line-finder reads straight across the gutters. (The operator notes the same
+failure in shipped commercial/printer OCR; the page-relative threshold is the
+standard XY-cut shortcut, and its failure only appears past ~4 columns, which
+most corpora never exercise.)
+
+**Why the existing 8+7+0 fence never caught it.** Measured with the new
+`examples/xy_gutter_probe.rs` on the committed `corpus/quality/resgrid.pgm`
+(3208 px, 8 columns): `gap_min = 49 px` against real gutters of **69-70 px** —
+it clears the bar by only **1.43×**, and `gap_min` is **35.5 % of one column
+band**. The fixture passes by luck of its generator's generous cell padding; a
+tighter grid of the same shape fails completely. Falsifier
+(`tight_gutters_on_a_wide_multi_column_page_still_split_into_columns`): 8
+columns, 16 px gutters, 1600 px page → **measured 1 leaf, expected 8** before
+the fix.
+
+**The fix — a strictly-additive second pass.** When the page-relative rule
+admits NOTHING, judge the valleys **against each other** instead of against the
+page: take the widest interior valley, keep the cluster within
+`GUTTER_CLUSTER_FRAC = 0.6` of it, and accept only if that cluster has **≥ 2**
+members (a real grid, not one ambiguous gap) AND the widest valley clears
+`GUTTER_MIN_COLUMN_FRAC = 0.05` of the **mean band it separates**. The gate on
+"pass 1 found nothing" means every page that splits today splits **identically**
+— confirmed: resgrid still yields exactly 8 regions, and the goldens +
+8+7+0 fence are untouched. Self-correcting property worth knowing: with FEWER
+valleys the mean band is LARGER, so the requirement gets *stricter* — leniency
+only arrives with the valley multiplicity that is itself the evidence of a grid.
+
+**Vertical axis ONLY** (`allow_gutter_fallback: bool`, `true` for `vcut`,
+`false` for `hcut`). The same page-relative scaling is "wrong" on Y too, but the
+permissive form must never go there: inter-line leading is typically 20-40 % of
+a line's own band height — a HIGHER ratio than a column gutter is of a column's
+width — so no width-ratio rule can separate "line gap" from "column gutter", and
+a Y-axis fallback would shred body text into one region per line. Suppressing
+line-splitting is the *correct, load-bearing* behaviour of the page-relative
+threshold on Y.
+
+Envelope, stated so it is checkable: the fallback admits a gutter ≥ 5 % of the
+mean band — at 8 columns on a 1600 px page, ≥ 10 px. A grid tighter than that
+still merges. Paired silence twin
+(`a_dense_single_column_page_gains_no_spurious_vertical_splits`) proves dense
+ragged single-column text gains no spurious vertical splits, and the
+pre-existing `thin_gutter_does_not_over_split` guard still passes.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the
