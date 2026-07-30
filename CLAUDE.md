@@ -1753,6 +1753,52 @@ ships its own input is worth extracting rather than reproducing by guesswork.
 
 ### Two findings from that page that are NOT these bugs, and NOT yet explained
 
+- **★★ FIXED (2026-07-30) — "must-consider" noise re-admission closes the
+  period gap to EXACT oracle parity.** Operator's design, and it is the same
+  correction as the `xy_cut` gutter fallback one layer up: **judge a blob by
+  what is around it, not by an absolute size.** A rejected-as-noise blob is
+  re-admitted to a row's CROP when it sits in the row's vertical ink band and
+  lies within **half the average centre-to-centre distance** of the row's ink —
+  a yardstick MEASURED from that row's own blobs, never derived from font size
+  or x-height, so it normalizes across DPI, point size and typeface with no
+  absolute constant. `make_rows` still never sees these blobs, so row
+  assignment, x-height and baseline fitting are untouched; only the crop widens.
+
+  | | line-final `.` | total `.` | commas |
+  |---|---|---|---|
+  | libtesseract 5.3.4 | 7 | 9 | 42 |
+  | before | 0 | 2 | 42 |
+  | **after** | **7** | **9** | **42** |
+
+  Not "improved" — landed **exactly** on the oracle's numbers.
+
+  **Centre-to-centre, not edge-to-edge, and that distinction is load-bearing:**
+  within-word gaps are 1-3 px and dominate the mean, so half the average GAP
+  lands at ~2 px and rejects a period sitting 3 px past the last letter —
+  measured, it recovered only **1 of 7**. The centre-to-centre step is the
+  glyph advance, and half of it is the same order of yardstick word-space
+  detection uses.
+
+  **The cost, stated rather than buried.** Nine golden pages moved, and every
+  changed line was machine-checked rather than eyeballed: **34 lines changed,
+  33 of them purely "gained a correct trailing period", 1 regression**
+  (`A cool` → `Acool`). That single exception is precisely the operator's
+  predicted worst case — "in worst case we pay for space detection, so what" —
+  and the trade is deliberate: a lost word space is recoverable downstream (and
+  normalizable in the OGAR doc-IR), a deleted period is not. The 8+7+0 CER
+  fence is **unmoved** and `golden_lines` is unchanged.
+
+  Note the old goldens were themselves WRONG — these are generated fixtures
+  whose authored text ends in periods, and 33 of those periods were missing
+  from the recorded anchor. The re-pin corrects the ANCHOR as much as the code,
+  which is the more uncomfortable half: a regression suite had been quietly
+  certifying the defect as expected behaviour.
+
+  Rule extracted as `noise_readmit_reach` with four falsifiers: it scales
+  exactly 2× with a 2× layout (proving no absolute constant leaked in), admits
+  a real 3 px line-final period, rejects a 200 px margin speck, and declines
+  entirely on a row with too few blobs to average.
+
 - **★ Periods are lost — and it is OUR parity gap, measured against the
   oracle.** Real `libtesseract` 5.3.4 on the identical file gets **9 periods
   (7 line-final)** and 42 commas; this crate gets **2 periods (0 line-final)**
@@ -1768,19 +1814,52 @@ ships its own input is worth extracting rather than reproducing by guesswork.
   |---|---|---|
   | Otsu vs Sauvola | smallest ink feature lost to a global threshold | **identical** (conf 99.348 / 99.339) |
   | dict vs no-dict | punc-DAWG beam suppresses a low-evidence glyph | **identical** |
-  | crop widened +60 px | line band clips the line-final period | **0 recovered** |
+  | crop widened +60 px | line band clips the line-final period | **0 recovered** ⚠ FALSE NEGATIVE |
   | `makerow` plain text | `DocPage`/`doc.v1` assembly drops it | **also 0** — upstream of the DOM |
 
-  What makes it specific and strange: **commas survive at full count in every
-  arm.** A comma is barely larger than a period *and* descends below the
-  baseline, so neither a size story nor a vertical-clipping story explains
-  periods vanishing while commas do not. `corpus/pages/page_01.pgm` DOES yield
-  `night.`/`door.`/`rack.`, so it is input-dependent. Cause NOT yet isolated —
-  the remaining suspects are the line-crop *geometry* handed to the LSTM
-  (oracle uses its own `--psm 1` segmentation, estimating 336 dpi) and the CTC
-  decode itself. Reproduce with
-  `cargo run -p tesseract-ocr --example period_probe --release -- page.pgm`
-  against `tesseract page.pgm out --psm 1 -l eng`.
+  > **⚠ THE CROP ROW WAS A FALSE NEGATIVE — MY PROBE'S FAULT, AND THE
+  > CROPPING HYPOTHESIS WAS RIGHT ALL ALONG.** The +60 px window reached past
+  > the column gutter and pulled in a stray `—`, so the text ended `"...her. —"`
+  > and my `ends_with('.')` check scored it as "no period" — while the period
+  > was in fact recovered. Operator caught the reasoning error: I was comparing
+  > glyph SIZE (comma ≈ period) when the systematic difference is POSITION —
+  > commas sit mid-line and are inside the crop no matter where it ends;
+  > periods sit line-final, exactly at the cut. This is the
+  > "a null result is a claim about the measurement apparatus until proven
+  > otherwise" rule, violated in the same session that quotes it.
+
+  **ROOT CAUSE (measured, every link):**
+
+  1. A period at book scale is **5-6 px tall** (measured blobs: 5×5 … 6×6,
+     22-26 ink px, sitting at baseline).
+  2. `blob_filter.rs:201` — `if height < TEXTORD_MAX_NOISE_SIZE` (**7**) →
+     the period goes to `FilteredBlobs::noise`.
+  3. **Nothing in this crate consumes `FilteredBlobs::noise`** (`grep '\.noise'`
+     outside `blob_filter.rs` returns nothing). It is populated and dropped.
+  4. So `make_rows` never sees it; the row's ink bbox stops at the last
+     full-height glyph (x=800 on the reference line).
+  5. `makerow_row_crops` crops that bbox + `kImagePadding = 4` → right edge
+     ≈ 804, and the period spans 803..808 — **sliced in half**, so the LSTM
+     never sees a whole one.
+  6. **Commas descend below the baseline**, clear the `h >= 7` bar, land in
+     `blobs`, and are mid-line regardless — which is exactly why commas
+     survive at 42/42 while periods vanish.
+
+  Proof, `examples/ink_probe.rs` on the reference page: 8 lines carry
+  unrecognized ink right of the last word; re-recognizing from a crop widened
+  just past that ink recovers a period on **7 of 8** — matching the oracle's
+  **7** line-final periods exactly. (The 8th is a 19×51 blob: the drop cap,
+  the separate defect below.) The single-line ladder is unambiguous:
+  `crop→x=800 "…close by her"` vs `crop→x=812 "…close by her."` — **12 px**.
+
+  **Why the oracle differs with the SAME constant:** libtesseract retains
+  `TO_BLOCK::noise_blobs` and re-inserts them downstream; this transcode ported
+  the *classification* but not the *re-insertion*, so noise is terminal here.
+  That missing step is the fix, and it is real transcode work (needs its own
+  oracle + golden re-pin), deliberately NOT attempted as a drive-by.
+
+  Reproduce: `cargo run -p tesseract-ocr --example ink_probe --release -- page.pgm`
+  and `--example period_probe` against `tesseract page.pgm out --psm 1 -l eng`.
 - **The drop-cap initial is dropped** — "Alice" recognizes as "ice", under both
   binarization modes. Almost certainly line-band segmentation (a drop cap spans
   several line heights, so `makerow`'s row finder assigns it to no row, or
