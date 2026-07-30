@@ -69,12 +69,18 @@ const OPENAPI_JSON: &str =
 /// liveness/capability probe Power Platform's "Test operation" step (and any
 /// external monitor) needs to work with no connection configured yet — gating
 /// either one defeats its purpose.
-pub fn router() -> Router<Arc<AppState>> {
+///
+/// Takes `state` explicitly (rather than only receiving it later via the
+/// outer router's `.with_state`) because [`require_api_key`] is layered on
+/// with [`middleware::from_fn_with_state`] — the gate reads
+/// [`AppState::api_key`] (cached once at startup), not a live
+/// `std::env::var` read per request; see that field's doc comment for why.
+pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let protected = Router::new()
         .route("/api/v1/recognize", post(recognize))
         .route("/api/v1/pdf", post(pdf_searchable_or_query))
         .route("/api/v1/pdf/structured", post(pdf_structured))
-        .layer(middleware::from_fn(require_api_key));
+        .layer(middleware::from_fn_with_state(state, require_api_key));
 
     Router::new()
         .merge(protected)
@@ -86,12 +92,12 @@ pub fn router() -> Router<Arc<AppState>> {
 // Auth — optional `x-api-key` gate, OFF by default (matches today's open demo)
 // ===========================================================================
 
-/// Pure authorization check, deliberately separated from env-var reading so
-/// it is unit-testable without mutating global process state: `std::env`
-/// mutation from inside a multithreaded test binary is a documented
-/// flakiness hazard (other tests in this same binary run concurrently and
-/// would observe the mutated var). Tests below exercise this function
-/// directly instead of setting `TESSERACT_API_KEY` and hitting the router.
+/// Pure authorization check, deliberately separated from state reading so it
+/// is unit-testable with no `AppState`/router at all. Tests below exercise
+/// this function directly for the decision-logic cases, and build their own
+/// local `AppState` (never a shared/global one) for the router-wiring cases —
+/// see [`AppState::api_key`](crate::state::AppState::api_key)'s doc comment
+/// for why a real deployment's config never touches `std::env` per request.
 fn is_authorized(configured_key: Option<&str>, provided_key: Option<&str>) -> bool {
     match configured_key {
         None | Some("") => true, // unset/empty => auth disabled, open like today
@@ -99,15 +105,19 @@ fn is_authorized(configured_key: Option<&str>, provided_key: Option<&str>) -> bo
     }
 }
 
-/// Gate `/api/v1/*` on `x-api-key` when `TESSERACT_API_KEY` is set in the
-/// environment; a request with a missing/mismatched header gets `401` before
-/// any recognition work starts. When the env var is unset (the default) the
-/// gate is a no-op — this is the honest, documented default; see
+/// Gate `/api/v1/*` on `x-api-key` when [`AppState::api_key`] is configured; a
+/// request with a missing/mismatched header gets `401` before any
+/// recognition work starts. When unset (the default) the gate is a no-op —
+/// this is the honest, documented default; see
 /// `integrations/power-platform/README.md` §3.
-async fn require_api_key(headers: HeaderMap, req: Request, next: Next) -> Response {
-    let configured = std::env::var("TESSERACT_API_KEY").ok();
+async fn require_api_key(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    req: Request,
+    next: Next,
+) -> Response {
     let provided = headers.get("x-api-key").and_then(|v| v.to_str().ok());
-    if is_authorized(configured.as_deref(), provided) {
+    if is_authorized(state.api_key.as_deref(), provided) {
         next.run(req).await
     } else {
         api_error(
@@ -378,8 +388,8 @@ async fn pdf_impl(
 
 /// The `GET /api/v1/health` response — which recognition models this
 /// instance actually loaded at startup (`eng` is always present; `deu` only
-/// when `MODEL_DIR` had its `deu.lstm*` components — see
-/// [`AppState`](crate::state::AppState)'s own doc comment). Reading this,
+/// when `MODEL_DIR` had its `deu.lstm*` components — see [`AppState`]'s own
+/// doc comment). Reading this,
 /// not just an HTTP `200`, is what lets a caller ask "can I request
 /// `lang=deu` here" before finding out the hard way via a silent English
 /// fallback.
@@ -550,12 +560,19 @@ mod tests {
             eprintln!("skipping: corpus model absent");
             return;
         }
-        // SAFETY (test-only): confirms the health route ignores
-        // TESSERACT_API_KEY even when a real deployment has it configured —
-        // exercised WITHOUT an x-api-key header below.
-        std::env::set_var("TESSERACT_API_KEY", "some-secret-configured-elsewhere");
-        let state = Arc::new(AppState::load(&dir).expect("load model"));
-        let app = crate::routes::router(state);
+        // Confirms the health route ignores a configured API key even when a
+        // real deployment has one set — exercised WITHOUT an x-api-key header
+        // below. Sets `api_key` directly on this test's OWN local `AppState`
+        // instead of `std::env::set_var("TESSERACT_API_KEY", ...)`: the
+        // latter mutates real process-global state that every OTHER
+        // `#[tokio::test]` in this binary shares, and `cargo test`'s default
+        // harness runs those concurrently on separate threads — a stray
+        // `TESSERACT_API_KEY` value observed mid-mutation by an unrelated
+        // gated-route test would flip its expected-200 into an actual 401.
+        // See `AppState::api_key`'s doc comment.
+        let mut state = AppState::load(&dir).expect("load model");
+        state.api_key = Some("some-secret-configured-elsewhere".to_string());
+        let app = crate::routes::router(Arc::new(state));
         let resp = app
             .oneshot(
                 HttpRequest::builder()
@@ -565,7 +582,6 @@ mod tests {
             )
             .await
             .unwrap();
-        std::env::remove_var("TESSERACT_API_KEY");
         assert_eq!(
             resp.status(),
             StatusCode::OK,

@@ -38,11 +38,12 @@
 //! - `plain_text` and `fields_map` are Power Automate/low-code ergonomics,
 //!   NOT new information — `plain_text` is every `words[].text` joined the
 //!   same way [`crate::render_text`] joins them (per-word `leading_space`,
-//!   `\n` between lines, covering every line regardless of region
-//!   classification), and `fields_map` is `fields` reshaped `key -> value`
-//!   (last write wins on a duplicate key). Both are always present, even
-//!   when empty (`""` / `{}`) — never `null`, never absent — so a
-//!   no-code caller never needs a null-check before reading them. See
+//!   a `\n` appended after every non-empty line INCLUDING the last one, an
+//!   empty line contributing nothing at all — covering every line regardless
+//!   of region classification), and `fields_map` is `fields` reshaped
+//!   `key -> value` (last write wins on a duplicate key). Both are always
+//!   present, even when empty (`""` / `{}`) — never `null`, never absent —
+//!   so a no-code caller never needs a null-check before reading them. See
 //!   [`render_doc`] for exactly where each is assembled.
 //! - `bbox` is always top-down image coordinates `[left, top, right, bottom]`
 //!   (the hOCR convention, via the same `PageIterator::BoundingBox` transcode
@@ -721,11 +722,14 @@ fn render_doc(page: &DocPage, regions: &[EmitRegion], fields: &[HarvestedField])
     // email" / "Post a message" without an Apply-to-each over regions/lines.
     // Independent of `regions` (covers every line in `page.lines`, including
     // any orphan a region classifier didn't place) — same per-word
-    // leading_space join and per-line '\n' separator as `render_text`.
+    // leading_space join and per-line '\n' separator as `render_text`
+    // (renderer.rs): a line with no words contributes nothing (no text, no
+    // separator), and every non-empty line gets a `\n` appended AFTER it,
+    // including the last one.
     out.push_str("\"plain_text\":\"");
-    for (li, line) in page.lines.iter().enumerate() {
-        if li > 0 {
-            out.push_str("\\n");
+    for line in &page.lines {
+        if line.words.is_empty() {
+            continue;
         }
         for w in &line.words {
             // Mirrors `render_text`'s exact per-word rule (renderer.rs):
@@ -738,6 +742,7 @@ fn render_doc(page: &DocPage, regions: &[EmitRegion], fields: &[HarvestedField])
             }
             out.push_str(&json_escape(&w.text));
         }
+        out.push_str("\\n");
     }
     out.push_str("\",");
 
@@ -1784,9 +1789,10 @@ mod tests {
         };
         let json = render_json(&page, &[]);
         assert!(
-            json.contains("\"plain_text\":\"The dog\\nruns.\","),
+            json.contains("\"plain_text\":\"The dog\\nruns.\\n\","),
             "plain_text must join both lines with a leading-space-respecting \
-             per-line text and a \\n separator: {json}"
+             per-line text, matching render_text's rule of a \\n appended \
+             after EVERY non-empty line including the last: {json}"
         );
     }
 
@@ -2146,7 +2152,7 @@ mod tests {
             "{\"schema\":\"tesseract-rs/doc.v1\",\"pages\":[{",
             "\"page\":1,\"width\":10,\"height\":10,",
             "\"quality\":{\"mean_conf\":100.00,\"low_confidence\":false},",
-            "\"plain_text\":\"a\",",
+            "\"plain_text\":\"a\\n\",",
             "\"regions\":[{\"type\":\"paragraph\",\"bbox\":[0,0,10,10],",
             "\"lines\":[{\"bbox\":[0,0,10,10],\"words\":[",
             "{\"text\":\"a\",\"bbox\":[0,0,4,10],\"conf\":100.00,\"leading_space\":false}",
