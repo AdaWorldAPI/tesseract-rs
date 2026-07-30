@@ -1753,16 +1753,34 @@ ships its own input is worth extracting rather than reproducing by guesswork.
 
 ### Two findings from that page that are NOT these bugs, and NOT yet explained
 
-- **Periods are lost.** The recognized text has **2** `.` against **39** `,`,
-  4 `:` and 2 `;`, and **0 of 72 lines** end in a period, on ordinary English
-  prose. **NOT binarization** — `examples/period_probe.rs` measured Otsu vs
-  Sauvola *identical* (0 line-final periods both; conf 99.348 vs 99.339), which
-  kills the faded-scan hypothesis outright. **NOT the render path** — no
-  period-stripping exists in `layout.rs` and the period is already absent from
-  `doc.v1`. `corpus/pages/page_01.pgm` DOES yield `night.`/`door.`/`rack.`, so
-  it is input-dependent. Leading UNPROVEN hypothesis: the dict beam's punctuation
-  DAWG path (a period is the CTC decoder's lowest-evidence glyph); the next
-  probe is with-dict vs no-dict on the same page.
+- **★ Periods are lost — and it is OUR parity gap, measured against the
+  oracle.** Real `libtesseract` 5.3.4 on the identical file gets **9 periods
+  (7 line-final)** and 42 commas; this crate gets **2 periods (0 line-final)**
+  and the same 42 commas. Commas match exactly, periods do not — so this is
+  **not** an `eng.lstm` limitation to be shrugged at, it is a recognition
+  divergence in a repo whose whole premise is byte-parity. (Oracle also retains
+  the drop cap, mangled to `Aitice`, where we drop it entirely.)
+
+  `examples/period_probe.rs` runs the four elimination arms; **all four came
+  back negative**, and the null results are the finding:
+
+  | arm | hypothesis | result |
+  |---|---|---|
+  | Otsu vs Sauvola | smallest ink feature lost to a global threshold | **identical** (conf 99.348 / 99.339) |
+  | dict vs no-dict | punc-DAWG beam suppresses a low-evidence glyph | **identical** |
+  | crop widened +60 px | line band clips the line-final period | **0 recovered** |
+  | `makerow` plain text | `DocPage`/`doc.v1` assembly drops it | **also 0** — upstream of the DOM |
+
+  What makes it specific and strange: **commas survive at full count in every
+  arm.** A comma is barely larger than a period *and* descends below the
+  baseline, so neither a size story nor a vertical-clipping story explains
+  periods vanishing while commas do not. `corpus/pages/page_01.pgm` DOES yield
+  `night.`/`door.`/`rack.`, so it is input-dependent. Cause NOT yet isolated —
+  the remaining suspects are the line-crop *geometry* handed to the LSTM
+  (oracle uses its own `--psm 1` segmentation, estimating 336 dpi) and the CTC
+  decode itself. Reproduce with
+  `cargo run -p tesseract-ocr --example period_probe --release -- page.pgm`
+  against `tesseract page.pgm out --psm 1 -l eng`.
 - **The drop-cap initial is dropped** — "Alice" recognizes as "ice", under both
   binarization modes. Almost certainly line-band segmentation (a drop cap spans
   several line heights, so `makerow`'s row finder assigns it to no row, or
