@@ -183,6 +183,44 @@ pub struct LstmRecognizer {
     pub recoder: UnicharCompress,
 }
 
+/// Half the average CENTRE-TO-CENTRE distance between a row's blobs — the
+/// yardstick that decides whether a blob `filter_blobs` rejected as noise is
+/// nonetheless plainly part of this line (see the call site in
+/// [`LstmRecognizer::makerow_row_crops`] for the defect this closes).
+///
+/// `blob_spans` are the row's `(left, right)` pairs in any order. Returns
+/// `None` when the row has fewer than two blobs, i.e. when there is no
+/// spacing to average and therefore no basis to judge anything by.
+///
+/// # Why centre-to-centre, and why half
+///
+/// Edge-to-edge GAPS do not work: within-word gaps are 1-3 px and dominate the
+/// mean, so half the average gap lands at ~2 px and rejects a period sitting
+/// 3 px past the last letter (measured on a real scan: 1 of 7 recovered).
+/// The centre-to-centre step is the glyph ADVANCE — "one character along" as
+/// the eye reads it — and half of it is the same order of yardstick word-space
+/// detection uses, which is also what bounds the worst case: misjudge it and
+/// you pay a word space, not a lost glyph.
+///
+/// Crucially this is MEASURED from the row's own blobs and never derived from
+/// a font-size or x-height estimate, so it normalizes across DPI, point size
+/// and typeface without any absolute pixel constant.
+fn noise_readmit_reach(blob_spans: &[(i32, i32)]) -> Option<f32> {
+    if blob_spans.len() < 2 {
+        return None;
+    }
+    let mut spans = blob_spans.to_vec();
+    spans.sort_unstable();
+    let steps: Vec<i32> = spans
+        .windows(2)
+        .map(|p| (((p[1].0 + p[1].1) - (p[0].0 + p[0].1)) / 2).max(0))
+        .collect();
+    if steps.is_empty() {
+        return None;
+    }
+    Some(steps.iter().sum::<i32>() as f32 / steps.len() as f32 / 2.0)
+}
+
 impl LstmRecognizer {
     /// `IsRecoding()` (`lstmrecognizer.h:91`): the recoder is a real compress
     /// codec, not a pass-through. eng: true (`training_flags & 64 != 0`).
@@ -580,6 +618,58 @@ impl LstmRecognizer {
                 bottom = bottom.min(b as f32);
                 top = top.max(t as f32);
             }
+
+            // ── "must-consider" noise re-admission ────────────────────────
+            // `filter_blobs` rejects any component shorter than
+            // `textord_max_noise_size` (7 px) as noise, and this port then
+            // DROPPED that list. A period is definitionally a tiny solid dot
+            // — 5-6 px tall at ordinary book scale — so it fails that
+            // ABSOLUTE bar at any normal scan resolution, forever. Measured
+            // consequence on a real two-column scan: 2 periods against 42
+            // commas, 0 of 72 lines ending in one, where libtesseract gets 9.
+            // (Commas descend below the baseline, clear h >= 7, and are
+            // mid-line anyway — which is exactly why they survived.)
+            //
+            // The fix judges a blob by WHAT IS AROUND IT instead of by an
+            // absolute size — the same correction the `xy_cut` column-gutter
+            // fallback makes one layer up. A rejected blob is re-admitted to
+            // this row's crop when it sits inside the row's vertical ink band
+            // AND lies within HALF THE AVERAGE INTER-BLOB DISTANCE of the
+            // row's ink. That distance is MEASURED from this row's own blob
+            // gaps, never derived from a font-size/x-height estimate, so it
+            // normalizes across DPI, point size and typeface on its own.
+            //
+            // Asymmetric by design: admitting a stray speck costs at most one
+            // spurious mark the CTC decoder usually swallows, and in the worst
+            // case reads as a word space — while rejecting a period deletes
+            // real content from every sentence on the page. This only widens
+            // the CROP; `make_rows` still never sees these blobs, so row
+            // assignment, x-height and baseline fitting are untouched.
+            if !block.noise.is_empty() && row.blobs.len() > 1 {
+                let spans: Vec<(i32, i32)> = row.blobs.iter().map(|&(l, _, r, _)| (l, r)).collect();
+                if let Some(reach) = noise_readmit_reach(&spans) {
+                    for &(nl, nb, nr, nt) in &block.noise {
+                        let vcenter = (nb + nt) as f32 / 2.0;
+                        if vcenter < bottom || vcenter > top {
+                            continue;
+                        }
+                        let dist = if nr < left {
+                            (left - nr) as f32
+                        } else if nl > right {
+                            (nl - right) as f32
+                        } else {
+                            0.0
+                        };
+                        if dist <= reach {
+                            left = left.min(nl);
+                            right = right.max(nr);
+                            bottom = bottom.min(nb as f32);
+                            top = top.max(nt as f32);
+                        }
+                    }
+                }
+            }
+
             // linerec.cpp:240-246 — extend to the typographic band.
             let mid_x = (left + right) as f32 / 2.0;
             let baseline = row.line_m() * mid_x + row.parallel_c();
@@ -2080,5 +2170,71 @@ mod makerow_page_tests {
             !LstmRecognizer::block_is_table(&binary, w, h, (18, 18, 70, 70)),
             "block under 100 px is skipped"
         );
+    }
+}
+
+#[cfg(test)]
+mod noise_readmit_tests {
+    use super::noise_readmit_reach;
+
+    /// The rule NORMALIZES: the same layout at 2x scale must yield exactly 2x
+    /// the reach, so no absolute pixel constant leaks in. This is the whole
+    /// point — `filter_blobs`'s `textord_max_noise_size = 7` is an ABSOLUTE
+    /// bar, which is why a period (definitionally a tiny solid dot) fails it
+    /// at every ordinary scan resolution.
+    #[test]
+    fn reach_scales_with_the_layout_not_with_an_absolute_constant() {
+        let small: Vec<(i32, i32)> = (0..8).map(|i| (i * 20, i * 20 + 14)).collect();
+        let large: Vec<(i32, i32)> = (0..8).map(|i| (i * 40, i * 40 + 28)).collect();
+        let rs = noise_readmit_reach(&small).expect("small");
+        let rl = noise_readmit_reach(&large).expect("large");
+        assert!(
+            (rl - rs * 2.0).abs() < 0.01,
+            "doubling the layout must double the reach: {rs} -> {rl}"
+        );
+        // 20 px pitch -> half-average = 10 px.
+        assert!(
+            (rs - 10.0).abs() < 0.01,
+            "20px pitch -> 10px reach, got {rs}"
+        );
+    }
+
+    /// Can-it-fire: a period sitting a few px past the last letter of a line
+    /// whose glyph advance is ~20 px must be INSIDE the reach. These are the
+    /// real measured numbers from the reference scan (last word ends at 800,
+    /// period ink at 803..808).
+    #[test]
+    fn a_real_line_final_period_is_within_reach() {
+        let spans: Vec<(i32, i32)> = (0..20).map(|i| (600 + i * 10, 600 + i * 10 + 7)).collect();
+        let reach = noise_readmit_reach(&spans).expect("reach");
+        let gap_to_period = 3.0_f32;
+        assert!(
+            gap_to_period <= reach,
+            "a period {gap_to_period} px past the last glyph must be within \
+             reach {reach} on a 10 px-advance line"
+        );
+    }
+
+    /// Can-it-stay-silent: a speck far out in the margin must NOT be admitted,
+    /// or the rule would drag page noise into every crop. Uses a genuinely
+    /// distant blob, not a degenerate empty input.
+    #[test]
+    fn a_distant_margin_speck_is_out_of_reach() {
+        let spans: Vec<(i32, i32)> = (0..20).map(|i| (600 + i * 10, 600 + i * 10 + 7)).collect();
+        let reach = noise_readmit_reach(&spans).expect("reach");
+        let far = 200.0_f32;
+        assert!(
+            far > reach,
+            "a speck {far} px out must be beyond reach {reach}"
+        );
+    }
+
+    /// No basis to judge by => no re-admission. A single-blob row has no
+    /// spacing to average, so the rule must decline rather than invent a
+    /// threshold.
+    #[test]
+    fn a_row_with_too_few_blobs_yields_no_reach() {
+        assert!(noise_readmit_reach(&[]).is_none());
+        assert!(noise_readmit_reach(&[(10, 20)]).is_none());
     }
 }

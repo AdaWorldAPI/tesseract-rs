@@ -1095,6 +1095,13 @@ pub struct ToBlockCtx {
     /// `noise_blobs`/`small_blobs`/`large_blobs` combined -- see module
     /// doc).
     pub blobs: Vec<(i32, i32, i32, i32)>,
+    /// Blobs `filter_blobs` rejected as noise (`TO_BLOCK::noise_blobs`),
+    /// `(left, bottom, right, top)` in y-up page space. RETAINED rather than
+    /// dropped so a row crop can re-admit the ones that are plainly part of a
+    /// line — see `LstmRecognizer::makerow_row_crops`'s half-average-distance
+    /// rule and the "must-consider" note there. Never fed to `make_rows`, so
+    /// row assignment and every existing measurement are untouched.
+    pub noise: Vec<(i32, i32, i32, i32)>,
     /// Rows, ALWAYS maintained in descending-`min_y()` order (topmost row
     /// first) by every function below -- the `TO_ROW_LIST` invariant
     /// [`assign_blobs_to_rows`]'s trailing bubble-sort step maintains.

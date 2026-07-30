@@ -145,6 +145,9 @@ fn seed_block(grey: &[u8], w: usize, h: usize, mode: BinarizeMode) -> ToBlockCtx
 
     ToBlockCtx {
         blobs: filtered.blobs,
+        // Retained, NOT dropped — see ToBlockCtx::noise. `make_rows` still
+        // only ever sees `blobs`, so segmentation itself is unchanged.
+        noise: filtered.noise,
         block_left: 0,
         line_spacing: filtered.line_spacing,
         line_size: filtered.line_size,

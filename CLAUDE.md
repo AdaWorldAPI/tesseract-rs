@@ -1753,6 +1753,52 @@ ships its own input is worth extracting rather than reproducing by guesswork.
 
 ### Two findings from that page that are NOT these bugs, and NOT yet explained
 
+- **★★ FIXED (2026-07-30) — "must-consider" noise re-admission closes the
+  period gap to EXACT oracle parity.** Operator's design, and it is the same
+  correction as the `xy_cut` gutter fallback one layer up: **judge a blob by
+  what is around it, not by an absolute size.** A rejected-as-noise blob is
+  re-admitted to a row's CROP when it sits in the row's vertical ink band and
+  lies within **half the average centre-to-centre distance** of the row's ink —
+  a yardstick MEASURED from that row's own blobs, never derived from font size
+  or x-height, so it normalizes across DPI, point size and typeface with no
+  absolute constant. `make_rows` still never sees these blobs, so row
+  assignment, x-height and baseline fitting are untouched; only the crop widens.
+
+  | | line-final `.` | total `.` | commas |
+  |---|---|---|---|
+  | libtesseract 5.3.4 | 7 | 9 | 42 |
+  | before | 0 | 2 | 42 |
+  | **after** | **7** | **9** | **42** |
+
+  Not "improved" — landed **exactly** on the oracle's numbers.
+
+  **Centre-to-centre, not edge-to-edge, and that distinction is load-bearing:**
+  within-word gaps are 1-3 px and dominate the mean, so half the average GAP
+  lands at ~2 px and rejects a period sitting 3 px past the last letter —
+  measured, it recovered only **1 of 7**. The centre-to-centre step is the
+  glyph advance, and half of it is the same order of yardstick word-space
+  detection uses.
+
+  **The cost, stated rather than buried.** Nine golden pages moved, and every
+  changed line was machine-checked rather than eyeballed: **34 lines changed,
+  33 of them purely "gained a correct trailing period", 1 regression**
+  (`A cool` → `Acool`). That single exception is precisely the operator's
+  predicted worst case — "in worst case we pay for space detection, so what" —
+  and the trade is deliberate: a lost word space is recoverable downstream (and
+  normalizable in the OGAR doc-IR), a deleted period is not. The 8+7+0 CER
+  fence is **unmoved** and `golden_lines` is unchanged.
+
+  Note the old goldens were themselves WRONG — these are generated fixtures
+  whose authored text ends in periods, and 33 of those periods were missing
+  from the recorded anchor. The re-pin corrects the ANCHOR as much as the code,
+  which is the more uncomfortable half: a regression suite had been quietly
+  certifying the defect as expected behaviour.
+
+  Rule extracted as `noise_readmit_reach` with four falsifiers: it scales
+  exactly 2× with a 2× layout (proving no absolute constant leaked in), admits
+  a real 3 px line-final period, rejects a 200 px margin speck, and declines
+  entirely on a row with too few blobs to average.
+
 - **★ Periods are lost — and it is OUR parity gap, measured against the
   oracle.** Real `libtesseract` 5.3.4 on the identical file gets **9 periods
   (7 line-final)** and 42 commas; this crate gets **2 periods (0 line-final)**
