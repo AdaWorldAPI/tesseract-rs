@@ -388,6 +388,22 @@ pub struct TableCell {
     pub conf: f32,
     /// `true` for the first row (the likely header).
     pub header: bool,
+    /// The metrics of the LINE this cell's row is, copied verbatim from
+    /// [`DocLine::metrics`] — `None` only when that line carried none.
+    ///
+    /// A cell is by construction "one line's words in one column", so its
+    /// typography is that line's typography; there is nothing to re-derive.
+    /// Carrying it here is what lets a renderer size and place a table cell
+    /// from MEASURED values instead of the crude box-height fallback.
+    ///
+    /// Before this existed, `tesseract-ocr-pdf` had no per-cell metrics to
+    /// read at all and hardcoded `None` at both render call sites, so EVERY
+    /// table cell in EVERY document — a correctly-classified table exactly as
+    /// much as a misclassified one — was sized at `box_height * 0.5` and had
+    /// its baseline anchored at the box BOTTOM rather than the real baseline.
+    /// Measured on one real line: `Tf` 30.5 where the metrics say 48, and the
+    /// pen 19.1 pt low.
+    pub metrics: Option<DocLineMetrics>,
 }
 
 /// The reconstructed grid of a [`RegionKind::Table`] region — rows are the
@@ -538,6 +554,9 @@ pub fn extract_table_grid(lines: &[&DocLine]) -> TableGrid {
                 text,
                 conf,
                 header: row == 0,
+                // A row IS a recognized line, so the line's own measured
+                // metrics are the cell's metrics — no re-derivation.
+                metrics: lines[row].metrics,
             });
         }
     }
@@ -560,7 +579,7 @@ fn emit_table_json(out: &mut String, grid: &TableGrid) {
             out.push(',');
         }
         out.push_str(&format!(
-            "{{\"row\":{},\"col\":{},\"bbox\":{},\"text\":\"{}\",\"conf\":{:.2},\"header\":{}}}",
+            "{{\"row\":{},\"col\":{},\"bbox\":{},\"text\":\"{}\",\"conf\":{:.2},\"header\":{}",
             c.row,
             c.col,
             json_bbox(c.bbox),
@@ -568,6 +587,21 @@ fn emit_table_json(out: &mut String, grid: &TableGrid) {
             c.conf,
             c.header
         ));
+        // Additive per-cell typographic keys, same shape and same 1dp
+        // rounding as the per-LINE keys emitted above (consumers ignore
+        // unknown keys). Present only when the row's line carried metrics,
+        // exactly mirroring the per-line emission's own condition — so a
+        // renderer's `Option<TextMetrics>` maps 1:1 onto their presence.
+        if let Some(m) = &c.metrics {
+            out.push_str(&format!(
+                ",\"xheight\":{:.1},\"ascrise\":{:.1},\"descdrop\":{:.1},\"baseline\":{:.1}",
+                m.xheight, m.ascrise, m.descdrop, m.baseline
+            ));
+            if let Some(g) = m.glyph_px {
+                out.push_str(&format!(",\"glyph_px\":{g:.1}"));
+            }
+        }
+        out.push('}');
     }
     out.push(']');
 }

@@ -399,6 +399,42 @@ pub struct TableDecision {
     pub score: i32,
 }
 
+impl TableDecision {
+    /// Whether either of the two RULED conditions carried — `nhb > 1` or
+    /// `nvb > 2`, the exact pair of the four that counts printed black lines.
+    ///
+    /// This splits the score by RELIABILITY, which the bare `score >=
+    /// TABLE_SCORE_THRESHOLD` test cannot express. The four conditions are not
+    /// equally trustworthy:
+    ///
+    /// - The **ruled** pair is sound. A region holding 2+ horizontal and/or 3+
+    ///   vertical `o100` structural lines really is tabular; ordinary prose has
+    ///   no printed rules at all, so it scores `nhb = nvb = 0`.
+    /// - The **whitespace** pair (`nvw > 3`, `nvw > 6`) cannot discriminate a
+    ///   table from wide multi-column text, because both genuinely have many
+    ///   long vertical corridors. Measured in this repo:
+    ///   `corpus/quality/resgrid.pgm` is 8 columns of ORDINARY TEXT with zero
+    ///   rules and scores `nhb=0 nvb=0 nvw=17 score=2` — a table by the bare
+    ///   threshold, and not a table in any real sense. A synthetic 4-column
+    ///   borderless grid scores `nvw=1 score=0`, so the whitespace path tracks
+    ///   column COUNT rather than tabularity (see
+    ///   `tests/lab_table_grid.rs::borderless_table_is_not_detected`).
+    ///
+    /// So a caller that has NOT signalled table intent should require ruled
+    /// evidence before trusting the verdict; a caller that has (this crate's
+    /// [`crate::DocumentOptions::strip_borders`]) may take the bare score.
+    /// See [`region_table_decision`] for the wiring and
+    /// `LstmRecognizer::block_is_table` for the policy.
+    ///
+    /// This is a pure read of already-computed counts — it changes nothing
+    /// about [`decide_if_table`] itself, which stays byte-parity with
+    /// leptonica's `pixDecideIfTable`.
+    #[must_use]
+    pub fn has_ruled_evidence(&self) -> bool {
+        self.nhb > 1 || self.nvb > 2
+    }
+}
+
 /// The table-classification threshold — leptonica requires 2 of the 4
 /// conditions (`pageseg.c`, `pixDecideIfTable`).
 pub const TABLE_SCORE_THRESHOLD: i32 = 2;
@@ -708,6 +744,32 @@ pub fn decide_if_table(binary: &[u8], w: usize, h: usize) -> TableDecision {
 /// front-end is the gap — see `deskew-wave-v1.md`).
 #[must_use]
 pub fn region_is_table(binary: &[u8], w: usize, h: usize, region: (i32, i32, i32, i32)) -> bool {
+    region_table_decision(binary, w, h, region).is_some_and(|d| d.score >= TABLE_SCORE_THRESHOLD)
+}
+
+/// The full [`TableDecision`] for `region`, or `None` when the region is
+/// below the 100 px minimum on either side (the same cheap short-circuit
+/// [`region_is_table`] documents — [`decide_if_table`] can hold no `o100`
+/// structural line below that size).
+///
+/// [`region_is_table`] is exactly this plus `score >= TABLE_SCORE_THRESHOLD`,
+/// so the two can never disagree. Use this variant when the verdict alone is
+/// not enough — specifically when the caller needs
+/// [`TableDecision::has_ruled_evidence`] to tell a genuinely ruled table from
+/// a wide multi-column TEXT layout that merely clears the same score on the
+/// unreliable `nvw`-only path.
+///
+/// Arguments match [`region_is_table`]: `binary` is the FULL page's
+/// binarization, `w`/`h` its full dimensions, `region` is
+/// `(left, top, right, bottom)` in the crate's top-down, right/bottom-exclusive
+/// convention.
+#[must_use]
+pub fn region_table_decision(
+    binary: &[u8],
+    w: usize,
+    h: usize,
+    region: (i32, i32, i32, i32),
+) -> Option<TableDecision> {
     let (l, t, r, b) = region;
     let l = l.max(0) as usize;
     let t = t.max(0) as usize;
@@ -715,14 +777,14 @@ pub fn region_is_table(binary: &[u8], w: usize, h: usize, region: (i32, i32, i32
     let b = (b.max(0) as usize).min(h);
     let (cw, ch) = (r.saturating_sub(l), b.saturating_sub(t));
     if cw < 100 || ch < 100 {
-        return false;
+        return None;
     }
     let mut crop = vec![255u8; cw * ch];
     for y in 0..ch {
         let row = (t + y) * w + l;
         crop[y * cw..(y + 1) * cw].copy_from_slice(&binary[row..row + cw]);
     }
-    decide_if_table(&crop, cw, ch).score >= TABLE_SCORE_THRESHOLD
+    Some(decide_if_table(&crop, cw, ch))
 }
 
 #[cfg(test)]

@@ -178,7 +178,10 @@ const GLYPH_PX_TO_FONT_PX: f32 = 4.0 / 3.0;
 
 /// A placed table: its outer bbox, grid dimensions, cells, and whether to
 /// stroke the cell/outer rectangles as visible rules.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is NOT derived: [`TableCell::metrics`] carries `f32`, the same
+/// no-`Eq` cascade `tesseract_ocr::structured::TableCell` documents.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableBlock {
     /// Top-down image-pixel bbox `(left, top, right, bottom)` of the whole
     /// table (the block's Klickwege-parity anchor).
@@ -193,8 +196,11 @@ pub struct TableBlock {
     pub rules: bool,
 }
 
-/// One table cell: its grid position, bbox, text, and header flag.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One table cell: its grid position, bbox, text, header flag, and the
+/// measured typography of the line its row is.
+///
+/// `Eq` is NOT derived — see [`TableCell::metrics`] (`f32`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableCell {
     /// 0-based row.
     pub row: usize,
@@ -206,6 +212,16 @@ pub struct TableCell {
     pub text: String,
     /// `true` for a header cell (rendered the same, marked for consumers).
     pub header: bool,
+    /// The measured typography of the line this cell's row IS, from `doc.v1`'s
+    /// additive per-cell `xheight`/`ascrise`/`descdrop`/`baseline`/`glyph_px`
+    /// keys, derived by the SAME [`derive_text_metrics`] the per-line path
+    /// uses so the two can never drift.
+    ///
+    /// `None` degrades to the [`TEXT_HEIGHT_TO_FONTSIZE`] box-height heuristic
+    /// and a box-bottom pen, exactly as before this field existed — which is
+    /// what EVERY table cell got unconditionally until it did, in any
+    /// document, a correctly-classified table as much as a misclassified one.
+    pub metrics: Option<TextMetrics>,
 }
 
 // ---------------------------------------------------------------------------
@@ -476,8 +492,18 @@ fn build_layout_content(page: &LayoutPage, dpi: u32) -> (Vec<u8>, usize) {
                 }
                 Block::Table(t) => {
                     for cell in &t.cells {
-                        substitutions +=
-                            emit_text_run(&mut ops, cell.bbox, &cell.text, dpi, page_h_pt, None);
+                        // Real measured metrics when the cell carries them
+                        // (see `TableCell::metrics`); `None` only for legacy
+                        // doc.v1 without the additive per-cell keys, which
+                        // then degrades exactly as every cell used to.
+                        substitutions += emit_text_run(
+                            &mut ops,
+                            cell.bbox,
+                            &cell.text,
+                            dpi,
+                            page_h_pt,
+                            cell.metrics.as_ref(),
+                        );
                     }
                 }
                 _ => {}
@@ -762,7 +788,9 @@ pub fn render_preview_html(doc: &LayoutDoc) -> String {
                         // parity anchor is the table's own bbox on the div above.
                         let (l, top) = (cl.saturating_sub(tl), ct.saturating_sub(tt));
                         let (w, h) = (cr.saturating_sub(cl), cb.saturating_sub(ct));
-                        let font_px = text_font_size_px(cell.bbox, None);
+                        // Klickwege parity: the HTML preview must size a
+                        // cell from the SAME metrics the PDF's `Tf` uses.
+                        let font_px = text_font_size_px(cell.bbox, cell.metrics.as_ref());
                         html.push_str(&format!(
                             "    <div class=\"cell\" style=\"left:{l}px;top:{top}px;\
                              width:{w}px;height:{h}px;font-size:{font_px}px;line-height:1\">{}</div>\n",
@@ -1031,6 +1059,20 @@ struct JsonCell {
     text: String,
     #[serde(default)]
     header: bool,
+    // The SAME additive measured-typography keys a line carries — a cell is
+    // one line's words in one column, so it carries that line's metrics
+    // verbatim. Absent in legacy doc.v1 (hence every `serde(default)`), in
+    // which case the renderer falls back exactly as it always did.
+    #[serde(default)]
+    xheight: Option<f32>,
+    #[serde(default)]
+    ascrise: Option<f32>,
+    #[serde(default)]
+    descdrop: Option<f32>,
+    #[serde(default)]
+    baseline: Option<f32>,
+    #[serde(default)]
+    glyph_px: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -1039,6 +1081,47 @@ struct JsonField {
     value: String,
     #[serde(default)]
     bbox: [i64; 4],
+}
+
+/// The ONE place `doc.v1`'s additive typography keys become a [`TextMetrics`].
+///
+/// Three-tier font-size preference, in order:
+/// 1. the measured glyph ink-height `glyph_px`, scaled by
+///    [`GLYPH_PX_TO_FONT_PX`], when present (the most reliable — the
+///    statistical band fit is unstable row-to-row);
+/// 2. else the band fit `xheight + ascrise - descdrop`, real Tesseract's own
+///    `row_height` (`ltrresultiterator.cpp:168-172`);
+/// 3. else `None` — the caller falls back to the [`TEXT_HEIGHT_TO_FONTSIZE`]
+///    box-height heuristic and a box-bottom pen.
+///
+/// `xheight` AND `baseline` are both required for any metrics at all: a size
+/// with no baseline cannot place the pen, and vice versa. `ascrise`/`descdrop`
+/// default to `0.0` when absent (font_px degrades to the bare x-height, still
+/// far better than band height).
+///
+/// Shared by the per-LINE and per-CELL paths deliberately: a cell is one
+/// line's words in one column and must be sized identically, and duplicating
+/// this ladder is how the two silently drift apart.
+fn derive_text_metrics(
+    xheight: Option<f32>,
+    ascrise: Option<f32>,
+    descdrop: Option<f32>,
+    baseline: Option<f32>,
+    glyph_px: Option<f32>,
+) -> Option<TextMetrics> {
+    match (xheight, baseline) {
+        (Some(xh), Some(bl)) => {
+            let band_font_px = xh + ascrise.unwrap_or(0.0) - descdrop.unwrap_or(0.0);
+            let font_px = glyph_px
+                .map(|g| g * GLYPH_PX_TO_FONT_PX)
+                .unwrap_or(band_font_px);
+            Some(TextMetrics {
+                font_px,
+                baseline_px: bl,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Clamp a signed `[l,t,r,b]` JSON bbox to a `u32` top-down tuple.
@@ -1133,6 +1216,9 @@ pub fn doc_v1_layout(doc_json: &str, page_rasters: &[GreyImage]) -> Result<Layou
                             bbox: to_u32_bbox(c.bbox),
                             text: c.text.clone(),
                             header: c.header,
+                            metrics: derive_text_metrics(
+                                c.xheight, c.ascrise, c.descdrop, c.baseline, c.glyph_px,
+                            ),
                         })
                         .collect();
                     blocks.push(Block::Table(TableBlock {
@@ -1166,21 +1252,13 @@ pub fn doc_v1_layout(doc_json: &str, page_rasters: &[GreyImage]) -> Result<Layou
                         // (no xheight/baseline at all) `metrics` stays `None`
                         // and the bbox-height heuristic downstream
                         // (TEXT_HEIGHT_TO_FONTSIZE) applies, exactly as before.
-                        let metrics = match (line.xheight, line.baseline) {
-                            (Some(xh), Some(bl)) => {
-                                let band_font_px =
-                                    xh + line.ascrise.unwrap_or(0.0) - line.descdrop.unwrap_or(0.0);
-                                let font_px = line
-                                    .glyph_px
-                                    .map(|g| g * GLYPH_PX_TO_FONT_PX)
-                                    .unwrap_or(band_font_px);
-                                Some(TextMetrics {
-                                    font_px,
-                                    baseline_px: bl,
-                                })
-                            }
-                            _ => None,
-                        };
+                        let metrics = derive_text_metrics(
+                            line.xheight,
+                            line.ascrise,
+                            line.descdrop,
+                            line.baseline,
+                            line.glyph_px,
+                        );
                         blocks.push(Block::Text(TextBlock {
                             bbox,
                             text,
@@ -1378,6 +1456,12 @@ mod tests {
                             bbox: (10, 55, 180, 90),
                             text: "X".to_string(),
                             header: true,
+                            // Deliberately None: this fixture pins Klickwege
+                            // bbox PLACEMENT, so it must keep exercising the
+                            // metrics-less fallback path unchanged. The
+                            // metrics-driven path has its own falsifier
+                            // (`table_cell_uses_measured_metrics_not_the_box_fallback`).
+                            metrics: None,
                         }],
                         rules: true,
                     }),
@@ -1690,6 +1774,125 @@ mod tests {
         assert!(
             html.contains("font-size:17px"),
             "HTML font-size must use the same measured value: {html}"
+        );
+    }
+
+    /// A TABLE CELL must be sized and placed from its own measured metrics,
+    /// exactly like an ordinary text line — the sibling of
+    /// [`measured_metrics_drive_font_size_and_baseline`] for
+    /// [`Block::Table`], and the falsifier for the defect where BOTH render
+    /// call sites hardcoded `None` for every cell in every document.
+    ///
+    /// Numbers mirror the real measured line that exposed this: a 61 px-tall
+    /// box whose own metrics say `font_px = 48` and whose real baseline sits
+    /// 19.1 px above the box bottom. Two-sided on BOTH axes, because the whole
+    /// bug is that the fallback silently substitutes for each:
+    ///
+    /// - `Tf` must be 48 (measured) and must NOT be 30.5 (`61 * 0.5`)
+    /// - pen y must be `700 - 554.9` (measured baseline) and must NOT be
+    ///   `700 - 574` (the box BOTTOM)
+    ///
+    /// The HTML preview must carry the same size (Klickwege parity), so the
+    /// two surfaces cannot drift.
+    #[test]
+    fn table_cell_uses_measured_metrics_not_the_box_fallback() {
+        let doc = LayoutDoc {
+            dpi: 72,
+            pages: vec![LayoutPage {
+                width: 1400,
+                height: 700,
+                background: None,
+                blocks: vec![Block::Table(TableBlock {
+                    bbox: (368, 513, 1110, 600),
+                    rows: 1,
+                    cols: 1,
+                    cells: vec![TableCell {
+                        row: 0,
+                        col: 0,
+                        bbox: (368, 513, 1110, 574), // height 61
+                        text: "ice was beginning".to_string(),
+                        header: false,
+                        metrics: Some(TextMetrics {
+                            font_px: 48.0,
+                            baseline_px: 554.9,
+                        }),
+                    }],
+                    rules: true,
+                })],
+            }],
+        };
+        let (pdf, _r) = render_pdf(&doc).expect("render");
+        let content = page_content(&pdf);
+
+        assert!(
+            ops(&content, "Tf")
+                .iter()
+                .any(|o| (num(o, 1) - 48.0).abs() < 1e-3),
+            "Tf must be the cell's measured font_px (48): {content:?}"
+        );
+        assert!(
+            !ops(&content, "Tf")
+                .iter()
+                .any(|o| (num(o, 1) - 30.5).abs() < 1e-3),
+            "Tf must NOT be the box-height fallback (61 * 0.5 = 30.5): {content:?}"
+        );
+        assert!(
+            ops(&content, "Tm")
+                .iter()
+                .any(|o| (num(o, 5) - (700.0 - 554.9)).abs() < 1e-3),
+            "pen y must sit on the measured baseline (700-554.9): {content:?}"
+        );
+        assert!(
+            !ops(&content, "Tm")
+                .iter()
+                .any(|o| (num(o, 5) - (700.0 - 574.0)).abs() < 1e-3),
+            "pen y must NOT be anchored at the box bottom (700-574): {content:?}"
+        );
+
+        let html = render_preview_html(&doc);
+        assert!(
+            html.contains("font-size:48px"),
+            "HTML cell font-size must use the same measured value: {html}"
+        );
+    }
+
+    /// `doc_v1_layout` must thread the additive per-CELL metric keys through
+    /// to [`TableCell::metrics`] — the JSON half of the fix above. Two-sided:
+    /// a cell carrying the keys gets metrics, a legacy cell without them stays
+    /// `None` (and so keeps the old fallback), proving the parse is reading
+    /// the keys rather than fabricating a value for every cell.
+    #[test]
+    fn doc_v1_layout_parses_cell_metrics() {
+        let json = r#"{
+          "schema": "tesseract-rs/doc.v1",
+          "pages": [{
+            "page": 1, "width": 300, "height": 200,
+            "regions": [
+              {"type": "table", "bbox": [5,5,200,60], "rows": 1, "cols": 2, "lines": [],
+               "cells": [
+                 {"row":0,"col":0,"bbox":[5,5,90,40],"text":"A","header":false,
+                  "xheight":10.0,"ascrise":4.0,"descdrop":-3.0,"baseline":30.0},
+                 {"row":0,"col":1,"bbox":[100,5,200,40],"text":"B","header":false}
+               ]}
+            ],
+            "fields": []
+          }]
+        }"#;
+        let doc = doc_v1_layout(json, &[]).expect("parse");
+        let Block::Table(t) = &doc.pages[0].blocks[0] else {
+            panic!("expected a table block, got {:?}", doc.pages[0].blocks[0]);
+        };
+        let m = t.cells[0].metrics.expect("cell 0 carries metric keys");
+        // font_px = xheight + ascrise - descdrop = 10 + 4 - (-3) = 17
+        assert!(
+            (m.font_px - 17.0).abs() < 1e-4,
+            "font_px must be the band fit (17), got {}",
+            m.font_px
+        );
+        assert!((m.baseline_px - 30.0).abs() < 1e-4);
+        assert!(
+            t.cells[1].metrics.is_none(),
+            "a cell without the keys must stay None, not inherit a value"
         );
     }
 
