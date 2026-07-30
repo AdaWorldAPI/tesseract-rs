@@ -458,6 +458,21 @@ fn row_ink_profile(binary: &[u8], w: usize, rect: PageRect, params: &XyCutParams
     profile
 }
 
+/// A fallback-pass valley must be at least this fraction of the WIDEST
+/// interior valley to join the accepted cluster — the "these all look like the
+/// same kind of separator" test. Real column gutters on one page are cut from
+/// the same typographic measure and come out near-identical; the 1-2 px
+/// accidental alignments that any ragged text block contains are an order of
+/// magnitude thinner (measured on `corpus/quality/resgrid.pgm`: real gutters
+/// 69-70 px against noise of 1-2 px, a 35× separation).
+const GUTTER_CLUSTER_FRAC: f32 = 0.6;
+
+/// A fallback-pass gutter must be at least this fraction of the MEAN BAND it
+/// separates. This is the principled form of the rule the page-relative
+/// threshold gets wrong: a separator earns its status by being wide relative to
+/// **the things it separates**, not relative to the whole page.
+const GUTTER_MIN_COLUMN_FRAC: f32 = 0.05;
+
 /// Given a 1-D ink profile along a cut axis, return the valid cut positions.
 ///
 /// Returns `None` when there is no ink or no confirmed cut; otherwise
@@ -465,21 +480,56 @@ fn row_ink_profile(binary: &[u8], w: usize, rect: PageRect, params: &XyCutParams
 /// valley midpoints (in bin coordinates relative to the rect) at which to split,
 /// ascending. A valley qualifies when it is (a) *interior* — a maximal empty run
 /// strictly between the first and last inked bin, (b) at least
-/// `ceil(min_gap_frac × extent)` (≥ 1) bins thick, and (c) not a sliver-maker:
+/// `ceil(min_gap_frac × extent)` (≥ 1) bins thick **or** admitted by the
+/// column-gutter fallback described below, and (c) not a sliver-maker:
 /// the inked runs immediately on both sides are each ≥ `min_region_px`.
+///
+/// # The column-gutter fallback (`allow_gutter_fallback`)
+///
+/// Rule (b)'s threshold is `ceil(min_gap_frac × extent)` where `extent` is the
+/// CURRENT RECT's cut-axis extent — the full page width for a top-level column
+/// cut. That makes the absolute gutter requirement independent of how many
+/// columns the page has, while real gutters scale with COLUMN width (≈ `W/n`).
+/// Expressed against a column the requirement therefore grows linearly in `n`:
+/// at `min_gap_frac = 0.015` a 2-column page needs a 3 %-of-column gutter, but
+/// an 8-column page needs ~12 %. Past that point NO vertical cut is found, the
+/// page splits only horizontally, and every emitted strip spans all `n` columns
+/// — so the line-finder reads straight across the gutters and concatenates one
+/// line from every column into a single line of output.
+///
+/// When rule (b) admits NOTHING and `allow_gutter_fallback` is set, a second
+/// pass judges the valleys against each other instead of against the page: take
+/// the widest interior valley, keep the cluster within [`GUTTER_CLUSTER_FRAC`]
+/// of it, and accept that cluster only if it has ≥ 2 members (a genuine
+/// multi-column grid, not one ambiguous gap) AND the widest valley clears
+/// [`GUTTER_MIN_COLUMN_FRAC`] of the mean band it separates. The pass is
+/// strictly additive — it cannot run at all unless the existing rule found
+/// nothing — so every page that splits today splits identically.
+///
+/// # Why only the vertical axis passes `true`
+///
+/// The same page-relative scaling is "wrong" on the Y axis too, but the
+/// permissive form MUST NOT be applied there: inter-line leading is typically
+/// 20-40 % of a line's own band height, a HIGHER ratio than a column gutter is
+/// of a column's width, so no width-ratio rule can separate "line gap" from
+/// "column gutter" — a Y-axis fallback would shred ordinary body text into
+/// one region per line. On the Y axis, suppressing line-splitting is the
+/// correct, load-bearing behaviour of the page-relative threshold, so the
+/// horizontal call site passes `false`.
 fn axis_cuts(
     inked: &[bool],
     min_gap_frac: f32,
     min_region_px: usize,
+    allow_gutter_fallback: bool,
 ) -> Option<(usize, Vec<usize>)> {
     let extent = inked.len();
     let first = inked.iter().position(|&b| b)?;
     let last = inked.iter().rposition(|&b| b)?;
     let gap_min = (min_gap_frac * extent as f32).ceil().max(1.0) as usize;
 
-    // (a)+(b): interior empty runs of sufficient thickness. Scanning only
-    // `first..=last` makes every run found interior by construction.
-    let mut candidates: Vec<(usize, usize)> = Vec::new();
+    // (a): every interior empty run. Scanning only `first..=last` makes every
+    // run found interior by construction.
+    let mut valleys: Vec<(usize, usize)> = Vec::new();
     let mut i = first;
     while i <= last {
         if inked[i] {
@@ -490,11 +540,32 @@ fn axis_cuts(
         while i <= last && !inked[i] {
             i += 1;
         }
-        let end = i; // exclusive
-        if end - start >= gap_min {
-            candidates.push((start, end));
+        valleys.push((start, i)); // end exclusive
+    }
+
+    // (b): runs of sufficient thickness, measured against the rect extent.
+    let mut candidates: Vec<(usize, usize)> = valleys
+        .iter()
+        .copied()
+        .filter(|&(s, e)| e - s >= gap_min)
+        .collect();
+
+    // (b'): the column-gutter fallback — see the doc comment. Strictly
+    // additive: gated on the page-relative pass having admitted nothing.
+    if candidates.is_empty() && allow_gutter_fallback {
+        if let Some(wmax) = valleys.iter().map(|&(s, e)| e - s).max() {
+            let cluster: Vec<(usize, usize)> = valleys
+                .iter()
+                .copied()
+                .filter(|&(s, e)| (e - s) as f32 >= GUTTER_CLUSTER_FRAC * wmax as f32)
+                .collect();
+            let mean_band = extent as f32 / (cluster.len() + 1) as f32;
+            if cluster.len() >= 2 && wmax as f32 >= GUTTER_MIN_COLUMN_FRAC * mean_band {
+                candidates = cluster;
+            }
         }
     }
+
     if candidates.is_empty() {
         return None;
     }
@@ -620,8 +691,11 @@ fn split_rect_inner(
 
     let col = column_ink_profile(binary, w, rect, params);
     let row = row_ink_profile(binary, w, rect, params);
-    let vcut = axis_cuts(&col, params.min_gap_frac, params.min_region_px);
-    let hcut = axis_cuts(&row, params.min_gap_frac, params.min_region_px);
+    // VERTICAL (column) cuts opt into the column-gutter fallback; HORIZONTAL
+    // (line) cuts must NOT — see `axis_cuts`'s doc comment, "Why only the
+    // vertical axis passes `true`".
+    let vcut = axis_cuts(&col, params.min_gap_frac, params.min_region_px, true);
+    let hcut = axis_cuts(&row, params.min_gap_frac, params.min_region_px, false);
 
     // Choose the axis with the thickest valid valley; tie → vertical.
     let choose_vertical = match (
@@ -1214,5 +1288,125 @@ mod tests {
             otsu, sauvola_fallback,
             "a too-small-for-window Sauvola request must fall back to Otsu byte-for-byte"
         );
+    }
+
+    /// Draw an `n_cols`-column grid of text-like lines: each column is a stack
+    /// of `n_lines` horizontal bars, columns separated by `gutter` px of
+    /// whitespace. Bars are drawn with a small random-ish right-edge ragged
+    /// margin so the column profile is not a perfect rectangle (real text is
+    /// ragged), but every gutter column stays ink-free at EVERY row — which is
+    /// what makes it a genuine column gutter rather than an accidental gap.
+    fn column_grid(
+        w: usize,
+        h: usize,
+        n_cols: usize,
+        gutter: usize,
+        n_lines: usize,
+    ) -> (Vec<u8>, usize, usize) {
+        let mut g = page(w, h);
+        let col_w = (w - gutter * (n_cols - 1)) / n_cols;
+        let line_h = 6usize;
+        let line_gap = 4usize;
+        let top = 8usize;
+        for c in 0..n_cols {
+            let x0 = c * (col_w + gutter);
+            for l in 0..n_lines {
+                let y0 = top + l * (line_h + line_gap);
+                let y1 = y0 + line_h;
+                if y1 + 4 > h {
+                    break;
+                }
+                // Ragged right edge: cycle the line's width so the block is
+                // not a perfect rectangle (mirrors real justified/ragged text).
+                let shrink = [0usize, 7, 3, 11, 5][l % 5];
+                let x1 = (x0 + col_w).saturating_sub(shrink);
+                fill(&mut g, w, x0, x1, y0, y1);
+            }
+        }
+        (g, w, h)
+    }
+
+    /// **The multi-column gutter falsifier.** A wide page of `n` columns whose
+    /// gutters are generous RELATIVE TO A COLUMN (the only scale that matters
+    /// typographically) but small relative to the whole PAGE must still split
+    /// into `n` column leaves.
+    ///
+    /// This is the defect measured on a real 8-column upload: `axis_cuts`
+    /// derived its gutter threshold as `ceil(min_gap_frac × extent)` where
+    /// `extent` is the CURRENT RECT's cut-axis extent — the full page width for
+    /// the top-level column cut. That makes the absolute gutter requirement
+    /// independent of how many columns the page has, while real gutters scale
+    /// with COLUMN width (≈ `W/n`). Expressed against a column, the requirement
+    /// therefore grows linearly in `n`: at `min_gap_frac = 0.015` a 2-column
+    /// page needs a 3 %-of-column gutter, but an 8-column page needs ~12 %.
+    /// Past that point NO vertical cut is found at all, the page splits only
+    /// horizontally, and every emitted strip spans all `n` columns — so the
+    /// line-finder reads straight across the gutters and concatenates one line
+    /// from every column into a single line of output.
+    ///
+    /// Measured on the committed `corpus/quality/resgrid.pgm` (3208 px wide,
+    /// 8 columns): `gap_min` = 49 px against real gutters of 69-70 px — it
+    /// clears the bar by only 1.43×, which is why the existing 8+7+0 CER fence
+    /// never caught this. The fixture below is the same layout class with the
+    /// gutter proportion tightened to a still-perfectly-legible 16 px on a
+    /// 1600 px page (8 % of a column, ~1.9 % of a page vs the 1.5 % nominal).
+    #[test]
+    fn tight_gutters_on_a_wide_multi_column_page_still_split_into_columns() {
+        let (w, h, n_cols, gutter) = (1600usize, 260usize, 8usize, 16usize);
+        let (g, w, h) = column_grid(w, h, n_cols, gutter, 13);
+        let params = XyCutParams::default();
+
+        // Anti-vacuity: the gutter must genuinely be BELOW the page-relative
+        // threshold, or this fixture would pass for the trivial reason and
+        // prove nothing about the defect.
+        let page_relative = (params.min_gap_frac * w as f32).ceil().max(1.0) as usize;
+        assert!(
+            gutter < page_relative,
+            "fixture must exercise the defect: gutter {gutter} px must be BELOW \
+             the page-relative threshold {page_relative} px, else the old rule \
+             would have accepted it anyway"
+        );
+
+        let leaves = xy_cut(&g, w, h, &params);
+        assert_eq!(
+            leaves.len(),
+            n_cols,
+            "a {n_cols}-column page with {gutter} px gutters must yield {n_cols} \
+             column leaves, not {} — merged leaves mean the line-finder will \
+             read ACROSS the gutters and concatenate all columns into one line",
+            leaves.len()
+        );
+        // Every leaf must be a COLUMN (tall and narrow), never a full-width
+        // strip: a full-width strip is the exact shape that produces the
+        // read-across-the-gutter output.
+        for lf in &leaves {
+            assert!(
+                lf.width() < w / 2,
+                "leaf {lf:?} spans {} px of a {w} px page — that is a full-width \
+                 strip, not a column",
+                lf.width()
+            );
+        }
+    }
+
+    /// The can-it-stay-silent twin. A DENSE SINGLE-COLUMN page of ragged text
+    /// must NOT gain spurious vertical splits: the fix must widen the gutter
+    /// rule only where a real regular column structure exists, never split a
+    /// paragraph on the accidental 1-2 px whitespace alignments that any ragged
+    /// text block contains. Without this, a rule permissive enough to fix the
+    /// 8-column case would shred ordinary body text into vertical slivers.
+    #[test]
+    fn a_dense_single_column_page_gains_no_spurious_vertical_splits() {
+        let (w, h) = (1600usize, 260usize);
+        let (g, w, h) = column_grid(w, h, 1, 0, 13);
+        let leaves = xy_cut(&g, w, h, &XyCutParams::default());
+        for lf in &leaves {
+            assert!(
+                lf.width() > w / 2,
+                "single-column page split vertically into a {} px sliver ({lf:?}) \
+                 — the gutter rule fired on accidental ragged-edge whitespace",
+                lf.width()
+            );
+        }
     }
 }
