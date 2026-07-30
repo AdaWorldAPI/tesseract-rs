@@ -109,10 +109,31 @@ fn main() {
             );
         }
     }
-    if hits == 0 {
-        println!("  NONE — so the drop cap is NOT in `large`, and mechanism (1) is");
-        println!("  ruled out. Look at row assignment (mechanism 2) instead.");
+    // Two DIFFERENT negatives, deliberately not conflated. Only an EMPTY
+    // `large` bucket rules mechanism (1) out; "nothing matched my shape
+    // heuristic" is a much weaker statement about this probe's own filter,
+    // and a drop cap can fail it while still sitting in `large` — a wide
+    // ornamental initial (aspect > 1.5), or one whose ink touches the text
+    // beside it and merges into a wider component. Reporting the weak result
+    // as the strong one would be this tool telling a future session to stop
+    // looking in the right place, which is precisely the failure mode a
+    // diagnostic exists to prevent.
+    if larges.is_empty() {
+        println!("  `large` is EMPTY, so the glyph is not in it — mechanism (1)");
+        println!("  is genuinely ruled out. Look at row assignment (mechanism 2).");
         return;
+    }
+    if hits == 0 {
+        println!(
+            "  NONE matched the SHAPE heuristic — but `large` is NOT empty \
+             ({} member(s) above),",
+            larges.len()
+        );
+        println!("  so mechanism (1) is NOT ruled out: the heuristic may simply be");
+        println!("  too narrow for this page's initial (wide ornamental caps, or a");
+        println!("  cap merged with adjacent ink, both fail the aspect test).");
+        println!("  Running the recognition arms on the TALLEST member anyway —");
+        println!("  read them, then judge; do not treat this as a negative result.");
     }
 
     // ---- recognition experiment on the tallest large-bucket member --------
