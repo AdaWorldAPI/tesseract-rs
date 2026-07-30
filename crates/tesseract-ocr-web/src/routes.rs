@@ -88,7 +88,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Verbose debug preview: A and B side by side + region overlays + stats
         // + an honest algorithms-used trace.
         .route("/debug", get(debug_get).post(debug_post))
-        .merge(crate::api::router())
+        .merge(crate::api::router(state.clone()))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD))
         .layer(RequestBodyLimitLayer::new(MAX_UPLOAD))
         .with_state(state)

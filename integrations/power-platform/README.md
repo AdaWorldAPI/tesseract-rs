@@ -1,9 +1,9 @@
 # tesseract-rs — Power Platform custom connector
 
 A Power Platform (Power Automate / Power Apps) **custom connector** fronting
-the `tesseract-ocr-web` server: three actions (recognize a document image,
-export a searchable PDF, export a structured PDF) plus the OpenAPI 2.0
-(Swagger) document the connector import reads. See
+the `tesseract-ocr-web` server: four actions (recognize a document image,
+export a searchable PDF, export a structured PDF, check server health) plus
+the OpenAPI 2.0 (Swagger) document the connector import reads. See
 `docs/SDK-PYTHON-AND-POWER-PLATFORM.md` §2 for the design this implements.
 
 No new recognition logic lives here — every action is a thin wrapper over
@@ -14,7 +14,7 @@ the connector is strictly the OpenAPI-over-the-existing-server layer.
 
 | File | What it is |
 |---|---|
-| `apiDefinition.swagger.json` | The OpenAPI 2.0 spec: 3 operations (`RecognizeDocument`, `SearchablePdf`, `StructuredPdf`) + the `doc.v1` response schema. Served live at `GET /openapi.json` on the running server — byte-identical to this file (compiled in via `include_str!`, so the two can never drift). |
+| `apiDefinition.swagger.json` | The OpenAPI 2.0 spec: 4 operations (`RecognizeDocument`, `SearchablePdf`, `StructuredPdf`, `HealthCheck`) + the `doc.v1` response schema. Served live at `GET /openapi.json` on the running server — byte-identical to this file (compiled in via `include_str!`, so the two can never drift). Every operation carries an `x-ms-summary` so the Power Automate action picker shows a friendly label instead of the raw `operationId`. |
 | `apiProperties.json` | Connector metadata: the `api_key` connection parameter (securestring) bound to the swagger's `api_key` security definition. |
 | `README.md` | This file. |
 
@@ -83,9 +83,13 @@ existing open HTML demo:
   a `{"error": "..."}` body. Give the same `<secret>` as the connection's API
   Key when you create the Power Platform connection.
 
-`GET /openapi.json` is never gated — the discovery document must stay
-fetchable without a key (Power Platform's importer, and anyone verifying the
-connector, needs to read it directly).
+`GET /openapi.json` and `GET /api/v1/health` are never gated — the discovery
+document must stay fetchable without a key (Power Platform's importer, and
+anyone verifying the connector, needs to read it directly), and the health
+check exists specifically so a connection can be verified BEFORE a key value
+has been entered (the swagger's `HealthCheck` operation carries its own
+`"security": []` override for exactly this reason — otherwise the connector
+UI would prompt for a key just to click "Test operation").
 
 **What this does NOT implement:** anything beyond a single shared-secret
 header compare — no per-caller keys, no rotation, no rate limiting. Put this
@@ -95,13 +99,33 @@ auth system. If you need finer-grained auth (Azure AD / Entra OAuth, per-user
 identity — see the design doc's alternative), that is a separate, unbuilt
 security scheme; this pass ships only the API-key gate.
 
-## 4. The three actions
+## 4. The four actions
 
 | operationId | Method + path | Input | Output |
 |---|---|---|---|
 | `RecognizeDocument` | `POST /api/v1/recognize` (optional `?lang=eng\|deu`, `?rectify=true` for a binary body) | binary image body (`application/octet-stream`) **or** `application/json` `{"content_base64": "...", "lang": "eng", "rectify": false}` | `tesseract-rs/doc.v1` JSON |
 | `SearchablePdf` | `POST /api/v1/pdf` (optional `?mode=searchable\|structured`, `?lang=eng\|deu`, `?rectify=true`) | same as above | `application/pdf` |
 | `StructuredPdf` | `POST /api/v1/pdf/structured` (optional `?lang=eng\|deu`, `?rectify=true`) | same as above | `application/pdf` (always the structured reconstruction) |
+| `HealthCheck` | `GET /api/v1/health` | none | `{"status": "ok", "models": ["eng", "deu"]}` |
+
+### `plain_text` / `fields_map` — reading `RecognizeDocument`'s output without an Apply-to-each
+
+`doc.v1`'s `regions`/`lines`/`words` tree and `fields` array are the complete,
+positional record (boxes, confidence, per-word detail) — but pulling one value
+out of an array in the Power Automate designer needs a `Filter array` + `First`
+expression, which is awkward for a flow that just wants "the text" or "the IBAN
+value". Two additive fields on each page exist purely for this:
+
+- **`plain_text`** — the whole page as one string. Pipe it straight into
+  *Send an email* / *Post a message* / *Create item* with no parsing step.
+- **`fields_map`** — the same values as `fields`, reshaped `key -> value`.
+  `body('RecognizeDocument')?['pages'][0]['fields_map']?['iban']` is a single
+  dynamic-content expression instead of a Filter-array-then-First over `fields`.
+
+Both are always present — `""` / `{}` on a page with no text/fields, never
+`null` — so a flow never needs a null-check before reading them. Neither
+carries new information; delete them from a client and nothing is lost, since
+everything in them is already derivable from `regions`/`fields`.
 
 Notes:
 

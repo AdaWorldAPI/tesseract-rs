@@ -1,10 +1,15 @@
 //! Machine-facing JSON/binary API surface — the Power Platform custom
 //! connector target.
 //!
-//! Three real routes plus a spec endpoint:
+//! Four real routes plus a spec endpoint:
 //! - `POST /api/v1/recognize`      — binary or `{content_base64, lang, rectify}`
 //!   JSON in, `tesseract-rs/doc.v1` JSON out (`RecognizeDocument` in the
-//!   connector).
+//!   connector). The `doc.v1` payload carries two Power-Automate-ergonomic
+//!   additive fields on top of the canonical schema —
+//!   [`tesseract_ocr::structured`]'s module docs cover the shape;
+//!   `page.plain_text` (the whole page as one string) and
+//!   `page.fields_map` (`fields`, reshaped `key -> value`) — see that
+//!   module's `render_doc` for exactly what each contains.
 //! - `POST /api/v1/pdf`            — same input, searchable PDF out (default;
 //!   `?mode=structured` switches to the structured reconstruction)
 //!   (`SearchablePdf` in the connector).
@@ -13,6 +18,9 @@
 //!   picker offers it as its own action (`StructuredPdf` in the connector;
 //!   OpenAPI 2.0 cannot express two `operationId`s on one path+method, so
 //!   this is a real second route, not just documentation).
+//! - `GET /api/v1/health`          — liveness + loaded-model probe, no auth,
+//!   no request body, no recognition work (`HealthCheck` in the connector —
+//!   the "Test operation" target).
 //! - `GET /openapi.json`           — the Swagger 2.0 document Power Platform
 //!   imports, served verbatim from `integrations/power-platform/apiDefinition.swagger.json`.
 //!
@@ -55,18 +63,28 @@ const OPENAPI_JSON: &str =
 /// upload-size layers (`DefaultBodyLimit` + `RequestBodyLimitLayer`) — those
 /// apply to every route below too.
 ///
-/// `/openapi.json` is deliberately OUTSIDE the API-key gate: it is the
-/// connector's own discovery document (what Power Platform's importer or a
-/// `paconn` invocation fetches), so it must be readable without a key.
-pub fn router() -> Router<Arc<AppState>> {
+/// `/openapi.json` and `/api/v1/health` are deliberately OUTSIDE the API-key
+/// gate: the former is the connector's own discovery document (what Power
+/// Platform's importer or a `paconn` invocation fetches), the latter is the
+/// liveness/capability probe Power Platform's "Test operation" step (and any
+/// external monitor) needs to work with no connection configured yet — gating
+/// either one defeats its purpose.
+///
+/// Takes `state` explicitly (rather than only receiving it later via the
+/// outer router's `.with_state`) because [`require_api_key`] is layered on
+/// with [`middleware::from_fn_with_state`] — the gate reads
+/// [`AppState::api_key`] (cached once at startup), not a live
+/// `std::env::var` read per request; see that field's doc comment for why.
+pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let protected = Router::new()
         .route("/api/v1/recognize", post(recognize))
         .route("/api/v1/pdf", post(pdf_searchable_or_query))
         .route("/api/v1/pdf/structured", post(pdf_structured))
-        .layer(middleware::from_fn(require_api_key));
+        .layer(middleware::from_fn_with_state(state, require_api_key));
 
     Router::new()
         .merge(protected)
+        .route("/api/v1/health", get(health))
         .route("/openapi.json", get(openapi_json))
 }
 
@@ -74,12 +92,12 @@ pub fn router() -> Router<Arc<AppState>> {
 // Auth — optional `x-api-key` gate, OFF by default (matches today's open demo)
 // ===========================================================================
 
-/// Pure authorization check, deliberately separated from env-var reading so
-/// it is unit-testable without mutating global process state: `std::env`
-/// mutation from inside a multithreaded test binary is a documented
-/// flakiness hazard (other tests in this same binary run concurrently and
-/// would observe the mutated var). Tests below exercise this function
-/// directly instead of setting `TESSERACT_API_KEY` and hitting the router.
+/// Pure authorization check, deliberately separated from state reading so it
+/// is unit-testable with no `AppState`/router at all. Tests below exercise
+/// this function directly for the decision-logic cases, and build their own
+/// local `AppState` (never a shared/global one) for the router-wiring cases —
+/// see [`AppState::api_key`](crate::state::AppState::api_key)'s doc comment
+/// for why a real deployment's config never touches `std::env` per request.
 fn is_authorized(configured_key: Option<&str>, provided_key: Option<&str>) -> bool {
     match configured_key {
         None | Some("") => true, // unset/empty => auth disabled, open like today
@@ -87,15 +105,19 @@ fn is_authorized(configured_key: Option<&str>, provided_key: Option<&str>) -> bo
     }
 }
 
-/// Gate `/api/v1/*` on `x-api-key` when `TESSERACT_API_KEY` is set in the
-/// environment; a request with a missing/mismatched header gets `401` before
-/// any recognition work starts. When the env var is unset (the default) the
-/// gate is a no-op — this is the honest, documented default; see
+/// Gate `/api/v1/*` on `x-api-key` when [`AppState::api_key`] is configured; a
+/// request with a missing/mismatched header gets `401` before any
+/// recognition work starts. When unset (the default) the gate is a no-op —
+/// this is the honest, documented default; see
 /// `integrations/power-platform/README.md` §3.
-async fn require_api_key(headers: HeaderMap, req: Request, next: Next) -> Response {
-    let configured = std::env::var("TESSERACT_API_KEY").ok();
+async fn require_api_key(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    req: Request,
+    next: Next,
+) -> Response {
     let provided = headers.get("x-api-key").and_then(|v| v.to_str().ok());
-    if is_authorized(configured.as_deref(), provided) {
+    if is_authorized(state.api_key.as_deref(), provided) {
         next.run(req).await
     } else {
         api_error(
@@ -364,6 +386,37 @@ async fn pdf_impl(
     }
 }
 
+/// The `GET /api/v1/health` response — which recognition models this
+/// instance actually loaded at startup (`eng` is always present; `deu` only
+/// when `MODEL_DIR` had its `deu.lstm*` components — see [`AppState`]'s own
+/// doc comment). Reading this,
+/// not just an HTTP `200`, is what lets a caller ask "can I request
+/// `lang=deu` here" before finding out the hard way via a silent English
+/// fallback.
+#[derive(Serialize)]
+struct HealthBody {
+    status: &'static str,
+    models: Vec<&'static str>,
+}
+
+/// `GET /api/v1/health` — `HealthCheck` in the connector: a liveness +
+/// capability probe with NO recognition work and NO request body, so it is
+/// cheap enough to be Power Platform's "Test operation" target (the button a
+/// connection author clicks before ever uploading a real document) and safe
+/// to poll from an external monitor. Never gated — see [`router`]'s doc
+/// comment.
+async fn health(State(state): State<Arc<AppState>>) -> Response {
+    let mut models = vec!["eng"];
+    if state.deu.is_some() {
+        models.push("deu");
+    }
+    Json(HealthBody {
+        status: "ok",
+        models,
+    })
+    .into_response()
+}
+
 /// `GET /openapi.json` — the Swagger 2.0 document, served verbatim from the
 /// checked-in file. Never gated by [`require_api_key`] — see [`router`]'s doc
 /// comment.
@@ -391,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn openapi_json_is_valid_and_declares_the_three_operations() {
+    fn openapi_json_is_valid_and_declares_the_four_operations() {
         let parsed: serde_json::Value = serde_json::from_str(OPENAPI_JSON)
             .expect("apiDefinition.swagger.json must be valid JSON");
         assert_eq!(parsed["swagger"], "2.0");
@@ -408,12 +461,51 @@ mod tests {
             "StructuredPdf"
         );
         assert_eq!(
+            parsed["paths"]["/api/v1/health"]["get"]["operationId"],
+            "HealthCheck"
+        );
+        // The health check must not force an api_key prompt on a caller who
+        // is just testing the connection — the server itself never gates
+        // this route (see `router`'s doc comment), so the spec's own
+        // security override must agree: an explicit empty array, not merely
+        // absent (which would inherit the global `security` requirement).
+        assert_eq!(
+            parsed["paths"]["/api/v1/health"]["get"]["security"],
+            serde_json::json!([]),
+            "HealthCheck must override the global security requirement to an empty array"
+        );
+        assert_eq!(
             parsed["securityDefinitions"]["api_key"]["name"],
             "x-api-key"
         );
         assert_eq!(
             parsed["definitions"]["RecognizeJsonBody"]["properties"]["rectify"]["type"],
             "boolean"
+        );
+
+        // Power Automate ergonomics: every POST operation carries an
+        // x-ms-summary (a friendly action-picker label), and the two new
+        // doc.v1 response fields are documented in the DocPage schema.
+        for (path, method, opid) in [
+            ("/api/v1/recognize", "post", "RecognizeDocument"),
+            ("/api/v1/pdf", "post", "SearchablePdf"),
+            ("/api/v1/pdf/structured", "post", "StructuredPdf"),
+            ("/api/v1/health", "get", "HealthCheck"),
+        ] {
+            let op = &parsed["paths"][path][method];
+            assert_eq!(op["operationId"], opid);
+            assert!(
+                op["x-ms-summary"].is_string(),
+                "{opid} must carry an x-ms-summary for the Power Automate action picker"
+            );
+        }
+        assert_eq!(
+            parsed["definitions"]["DocPage"]["properties"]["plain_text"]["type"],
+            "string"
+        );
+        assert_eq!(
+            parsed["definitions"]["DocPage"]["properties"]["fields_map"]["type"],
+            "object"
         );
     }
 
@@ -455,6 +547,121 @@ mod tests {
         assert_eq!(decode_base64(&url_safe).unwrap(), bytes);
 
         assert!(decode_base64("not base64!!!").is_err());
+    }
+
+    #[tokio::test]
+    async fn get_health_returns_200_without_auth_and_lists_eng() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let dir = model_dir();
+        if !dir.join("eng.lstm").exists() {
+            eprintln!("skipping: corpus model absent");
+            return;
+        }
+        // Confirms the health route ignores a configured API key even when a
+        // real deployment has one set — exercised WITHOUT an x-api-key header
+        // below. Sets `api_key` directly on this test's OWN local `AppState`
+        // instead of `std::env::set_var("TESSERACT_API_KEY", ...)`: the
+        // latter mutates real process-global state that every OTHER
+        // `#[tokio::test]` in this binary shares, and `cargo test`'s default
+        // harness runs those concurrently on separate threads — a stray
+        // `TESSERACT_API_KEY` value observed mid-mutation by an unrelated
+        // gated-route test would flip its expected-200 into an actual 401.
+        // See `AppState::api_key`'s doc comment.
+        let mut state = AppState::load(&dir).expect("load model");
+        state.api_key = Some("some-secret-configured-elsewhere".to_string());
+        let app = crate::routes::router(Arc::new(state));
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "health must answer even when the API key gate is configured"
+        );
+        let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["status"], "ok");
+        let models: Vec<&str> = v["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap())
+            .collect();
+        assert!(models.contains(&"eng"), "eng is always loaded: {models:?}");
+    }
+
+    #[tokio::test]
+    async fn post_recognize_response_carries_plain_text_and_fields_map() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let dir = model_dir();
+        if !dir.join("eng.lstm").exists() {
+            eprintln!("skipping: corpus model absent");
+            return;
+        }
+        let state = Arc::new(AppState::load(&dir).expect("load model"));
+        let app = crate::routes::router(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/v1/recognize")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(page_01_bytes()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let out = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let page = &v["pages"][0];
+
+        // Anti-vacuity: plain_text must be REAL recognized text, not merely
+        // present — page_01.pgm's known first line, and it must join every
+        // line (not just the first) via '\n'.
+        let plain_text = page["plain_text"].as_str().expect("plain_text is a string");
+        assert!(
+            plain_text.contains("The old clock ticked all night."),
+            "plain_text must contain real recognized text: {plain_text:?}"
+        );
+        assert!(
+            plain_text.contains('\n'),
+            "plain_text must join multiple lines: {plain_text:?}"
+        );
+        let line_count_in_regions: usize = page["regions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["lines"].as_array().map_or(0, Vec::len))
+            .sum();
+        assert_eq!(
+            plain_text.lines().count(),
+            line_count_in_regions,
+            "plain_text must cover every recognized line, not a subset"
+        );
+
+        // fields_map must be present as an object (page_01.pgm has no
+        // harvested fields — no harvest_profile was requested — so it is
+        // legitimately empty; the KEY existing and being object-typed is
+        // what a Power Automate expression like fields_map['iban'] depends
+        // on, regardless of whether any entries are populated).
+        assert!(
+            page["fields_map"].is_object(),
+            "fields_map must always be an object, even when empty: {:?}",
+            page["fields_map"]
+        );
     }
 
     #[test]

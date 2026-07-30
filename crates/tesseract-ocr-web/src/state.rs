@@ -37,6 +37,18 @@ pub struct AppState {
     /// box's memory. Sized to the machine's parallelism so we saturate cores
     /// without oversubscribing.
     pub recognize_permits: Arc<Semaphore>,
+    /// The `x-api-key` gate's configured secret, read from `TESSERACT_API_KEY`
+    /// ONCE here at startup rather than per-request via `std::env::var` —
+    /// deliberately: reading a real process env var inside a request handler
+    /// means every test hitting a gated route races against any OTHER test
+    /// in the same binary that mutates that env var (`cargo test`'s default
+    /// harness runs `#[tokio::test]`s concurrently on separate threads within
+    /// one process). Caching it on `AppState` means a test that wants to
+    /// exercise "the gate IS configured" builds its own local `AppState` with
+    /// this field set directly — no shared global, no possible cross-test
+    /// interaction. `None`/`Some("")` both mean "gate disabled", exactly as
+    /// [`crate::api`]'s `is_authorized` already treats an absent/empty value.
+    pub api_key: Option<String>,
 }
 
 /// Load one language's `{lang}.lstm*` components from `model_dir`. `Ok(None)`
@@ -112,11 +124,13 @@ impl AppState {
             .map(|n| n.get())
             .unwrap_or(2);
         let recognize_permits = Arc::new(Semaphore::new(permits));
+        let api_key = std::env::var("TESSERACT_API_KEY").ok();
 
         Ok(Self {
             eng,
             deu,
             recognize_permits,
+            api_key,
         })
     }
 

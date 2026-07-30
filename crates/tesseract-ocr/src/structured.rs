@@ -28,11 +28,23 @@
 //!     }],
 //!     "fields": [{"key": "netto", "label": "Netto:", "value": "1.250,00",
 //!                  "value_cents": 125000, "bbox": [l, t, r, b],
-//!                  "conf": 96.1, "checks": ["arithmetic_ok"]}]
+//!                  "conf": 96.1, "checks": ["arithmetic_ok"]}],
+//!     "plain_text": "…\n…",
+//!     "fields_map": {"netto": "1.250,00"}
 //!   }]
 //! }
 //! ```
 //!
+//! - `plain_text` and `fields_map` are Power Automate/low-code ergonomics,
+//!   NOT new information — `plain_text` is every `words[].text` joined the
+//!   same way [`crate::render_text`] joins them (per-word `leading_space`,
+//!   a `\n` appended after every non-empty line INCLUDING the last one, an
+//!   empty line contributing nothing at all — covering every line regardless
+//!   of region classification), and `fields_map` is `fields` reshaped
+//!   `key -> value` (last write wins on a duplicate key). Both are always
+//!   present, even when empty (`""` / `{}`) — never `null`, never absent —
+//!   so a no-code caller never needs a null-check before reading them. See
+//!   [`render_doc`] for exactly where each is assembled.
 //! - `bbox` is always top-down image coordinates `[left, top, right, bottom]`
 //!   (the hOCR convention, via the same `PageIterator::BoundingBox` transcode
 //!   the other renderers use).
@@ -705,6 +717,35 @@ fn render_doc(page: &DocPage, regions: &[EmitRegion], fields: &[HarvestedField])
         None => out.push_str("\"quality\":{\"mean_conf\":null,\"low_confidence\":false},"),
     }
 
+    // `plain_text` — additive, Power Automate ergonomics: the whole page as
+    // ONE string, so a flow can plug OCR output straight into "Send an
+    // email" / "Post a message" without an Apply-to-each over regions/lines.
+    // Independent of `regions` (covers every line in `page.lines`, including
+    // any orphan a region classifier didn't place) — same per-word
+    // leading_space join and per-line '\n' separator as `render_text`
+    // (renderer.rs): a line with no words contributes nothing (no text, no
+    // separator), and every non-empty line gets a `\n` appended AFTER it,
+    // including the last one.
+    out.push_str("\"plain_text\":\"");
+    for line in &page.lines {
+        if line.words.is_empty() {
+            continue;
+        }
+        for w in &line.words {
+            // Mirrors `render_text`'s exact per-word rule (renderer.rs):
+            // `if word.leading_space { push(' ') }` unconditionally, no
+            // special-case for a line's first word — real recognizer output
+            // already reports `leading_space: false` there, so trust the
+            // signal rather than re-deriving position.
+            if w.leading_space {
+                out.push(' ');
+            }
+            out.push_str(&json_escape(&w.text));
+        }
+        out.push_str("\\n");
+    }
+    out.push_str("\",");
+
     out.push_str("\"regions\":[");
     for (ri, (kind, bbox, line_indices, table)) in regions.iter().enumerate() {
         if ri > 0 {
@@ -786,7 +827,28 @@ fn render_doc(page: &DocPage, regions: &[EmitRegion], fields: &[HarvestedField])
         }
         out.push_str("]}");
     }
-    out.push_str("]}]}");
+    out.push(']'); // close the fields array
+
+    // `fields_map` — additive, Power Automate ergonomics: the SAME fields as
+    // above, reshaped `key -> value`. Finding one value in the `fields` array
+    // needs a Filter-Array + First() expression in the no-code designer;
+    // `fields_map['iban']` is a single dynamic-content lookup. Duplicate keys
+    // (the harvester does not guarantee uniqueness) keep the LAST value, the
+    // same "later write wins" rule a JS/Python object literal would apply.
+    out.push_str(",\"fields_map\":{");
+    for (fi, f) in fields.iter().enumerate() {
+        if fi > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "\"{}\":\"{}\"",
+            json_escape(&f.key),
+            json_escape(&f.value)
+        ));
+    }
+    out.push('}');
+
+    out.push_str("}]}");
     out
 }
 
@@ -1700,6 +1762,125 @@ mod tests {
         );
     }
 
+    /// `plain_text` — Power Automate ergonomics: the whole page as ONE
+    /// string. Must join EVERY line (not just the first), respect
+    /// `leading_space` the same way `render_text` does, and separate lines
+    /// with `\n`. Two-sided: proves the join actually happens (not just "a
+    /// string is present") by checking BOTH lines' content and the
+    /// separator between them.
+    #[test]
+    fn render_json_emits_plain_text_joining_every_line() {
+        let page = DocPage {
+            width: 300,
+            height: 100,
+            lines: vec![
+                dl(
+                    (10, 10, 200, 30),
+                    vec![
+                        dw("The", (10, 10, 40, 30), 99.0),
+                        DocWord {
+                            leading_space: true,
+                            ..dw("dog", (45, 10, 80, 30), 99.0)
+                        },
+                    ],
+                ),
+                dl((10, 40, 200, 60), vec![dw("runs.", (10, 40, 60, 60), 99.0)]),
+            ],
+        };
+        let json = render_json(&page, &[]);
+        assert!(
+            json.contains("\"plain_text\":\"The dog\\nruns.\\n\","),
+            "plain_text must join both lines with a leading-space-respecting \
+             per-line text, matching render_text's rule of a \\n appended \
+             after EVERY non-empty line including the last: {json}"
+        );
+    }
+
+    /// `plain_text` on an all-empty page is the empty string, not absent —
+    /// consumers should never need a null-check before reading it.
+    #[test]
+    fn render_json_plain_text_is_empty_string_on_an_empty_page() {
+        let page = DocPage {
+            width: 100,
+            height: 100,
+            lines: vec![],
+        };
+        let json = render_json(&page, &[]);
+        assert!(
+            json.contains("\"plain_text\":\"\","),
+            "an empty page's plain_text must be \"\", not null or absent: {json}"
+        );
+    }
+
+    /// `fields_map` — Power Automate ergonomics: `fields`, reshaped
+    /// `key -> value`. Real falsifier: builds two DISTINCT harvested fields
+    /// and asserts BOTH keys resolve to their OWN (not swapped/duplicated)
+    /// values — a implementation that emitted the same value for every key,
+    /// or dropped one, would fail this.
+    #[test]
+    fn render_json_emits_fields_map_mirroring_fields() {
+        let page = DocPage {
+            width: 300,
+            height: 100,
+            lines: vec![],
+        };
+        let fields = vec![
+            HarvestedField {
+                key: "netto".to_string(),
+                label_text: "Netto:".to_string(),
+                value: "1.250,00".to_string(),
+                value_cents: Some(125_000),
+                bbox: (10, 10, 100, 30),
+                conf: 98.0,
+                checks: vec!["arithmetic_ok".to_string()],
+            },
+            HarvestedField {
+                key: "iban".to_string(),
+                label_text: "IBAN:".to_string(),
+                value: "DE89370400440532013000".to_string(),
+                value_cents: None,
+                bbox: (10, 40, 250, 60),
+                conf: 97.0,
+                checks: vec!["iban_mod97_ok".to_string()],
+            },
+        ];
+        let json = render_json(&page, &fields);
+        let v: serde_json::Value =
+            serde_json::from_str(&json).expect("render_json must emit valid JSON");
+        let map = &v["pages"][0]["fields_map"];
+        assert_eq!(
+            map["netto"], "1.250,00",
+            "fields_map[\"netto\"] must match the netto field's own value, not iban's: {json}"
+        );
+        assert_eq!(
+            map["iban"], "DE89370400440532013000",
+            "fields_map[\"iban\"] must match the iban field's own value, not netto's: {json}"
+        );
+        assert_eq!(
+            map.as_object().unwrap().len(),
+            2,
+            "fields_map must have exactly the 2 harvested keys, no more, no fewer: {json}"
+        );
+    }
+
+    /// `fields_map` on a page with no harvested fields is `{}`, not absent —
+    /// the SAME "never null-check" guarantee as `plain_text`'s empty case,
+    /// and what a `fields_map['x']` Power Automate expression relies on not
+    /// erroring on "property of null."
+    #[test]
+    fn render_json_fields_map_is_empty_object_with_no_fields() {
+        let page = DocPage {
+            width: 100,
+            height: 100,
+            lines: vec![],
+        };
+        let json = render_json(&page, &[]);
+        assert!(
+            json.contains("\"fields_map\":{}"),
+            "no harvested fields must emit fields_map as {{}}, not null or absent: {json}"
+        );
+    }
+
     // --- numeric hardening -------------------------------------------------
 
     #[test]
@@ -1971,13 +2152,15 @@ mod tests {
             "{\"schema\":\"tesseract-rs/doc.v1\",\"pages\":[{",
             "\"page\":1,\"width\":10,\"height\":10,",
             "\"quality\":{\"mean_conf\":100.00,\"low_confidence\":false},",
+            "\"plain_text\":\"a\\n\",",
             "\"regions\":[{\"type\":\"paragraph\",\"bbox\":[0,0,10,10],",
             "\"lines\":[{\"bbox\":[0,0,10,10],\"words\":[",
             "{\"text\":\"a\",\"bbox\":[0,0,4,10],\"conf\":100.00,\"leading_space\":false}",
             "]}]}],",
             "\"fields\":[{\"key\":\"netto\",\"label\":\"Netto:\",\"value\":\"1,00\"",
             ",\"value_cents\":100,\"bbox\":[1,2,3,4],\"conf\":99.50,",
-            "\"checks\":[\"arithmetic_ok\"]}]}]}",
+            "\"checks\":[\"arithmetic_ok\"]}],",
+            "\"fields_map\":{\"netto\":\"1,00\"}}]}",
         );
         assert_eq!(json, expected);
     }
@@ -1994,7 +2177,8 @@ mod tests {
             json,
             "{\"schema\":\"tesseract-rs/doc.v1\",\"pages\":[{\"page\":1,\
              \"width\":5,\"height\":5,\"quality\":{\"mean_conf\":null,\
-             \"low_confidence\":false},\"regions\":[],\"fields\":[]}]}"
+             \"low_confidence\":false},\"plain_text\":\"\",\"regions\":[],\
+             \"fields\":[],\"fields_map\":{}}]}"
         );
     }
 
