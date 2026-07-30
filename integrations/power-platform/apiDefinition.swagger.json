@@ -54,7 +54,8 @@
               "deu"
             ],
             "default": "eng",
-            "description": "Recognition model for a binary (application/octet-stream) body. Ignored when the body is application/json - use the JSON form's own lang field there instead."
+            "description": "Recognition model for a binary (application/octet-stream) body. Ignored when the body is application/json - use the JSON form's own lang field there instead.",
+            "x-ms-summary": "Language"
           },
           {
             "name": "rectify",
@@ -62,7 +63,8 @@
             "required": false,
             "type": "boolean",
             "default": false,
-            "description": "Runs page rectification (auto-corrects rotational skew and first-order keystone/trapezoid distortion from a photographed page) before recognition. For a JSON body, this combines with the body's own rectify field - true from either source enables it (unlike lang, there is no 'which one wins', since a plain flag has no competing values to choose between). Always a safe no-op on an already-straight page - never fails a request that would otherwise succeed."
+            "description": "Runs page rectification (auto-corrects rotational skew and first-order keystone/trapezoid distortion from a photographed page) before recognition. For a JSON body, this combines with the body's own rectify field - true from either source enables it (unlike lang, there is no 'which one wins', since a plain flag has no competing values to choose between). Always a safe no-op on an already-straight page - never fails a request that would otherwise succeed.",
+            "x-ms-summary": "Auto-rectify skew"
           },
           {
             "name": "body",
@@ -72,7 +74,9 @@
             "schema": {
               "type": "string",
               "format": "binary"
-            }
+            },
+            "x-ms-summary": "Image file",
+            "x-ms-visibility": "important"
           }
         ],
         "responses": {
@@ -106,7 +110,8 @@
               "$ref": "#/definitions/ApiError"
             }
           }
-        }
+        },
+        "x-ms-summary": "Recognize document (doc.v1 JSON)"
       }
     },
     "/api/v1/pdf": {
@@ -132,7 +137,8 @@
               "structured"
             ],
             "default": "searchable",
-            "description": "PDF reconstruction mode. searchable (default): original raster + invisible text layer. structured: doc.v1 layout reconstruction (same as the StructuredPdf action)."
+            "description": "PDF reconstruction mode. searchable (default): original raster + invisible text layer. structured: doc.v1 layout reconstruction (same as the StructuredPdf action).",
+            "x-ms-summary": "PDF mode"
           },
           {
             "name": "lang",
@@ -144,7 +150,8 @@
               "deu"
             ],
             "default": "eng",
-            "description": "Recognition model for a binary (application/octet-stream) body. Ignored when the body is application/json - use the JSON form's own lang field there instead."
+            "description": "Recognition model for a binary (application/octet-stream) body. Ignored when the body is application/json - use the JSON form's own lang field there instead.",
+            "x-ms-summary": "Language"
           },
           {
             "name": "rectify",
@@ -152,7 +159,8 @@
             "required": false,
             "type": "boolean",
             "default": false,
-            "description": "Runs page rectification (auto-corrects rotational skew and first-order keystone/trapezoid distortion from a photographed page) before recognition. For a JSON body, this combines with the body's own rectify field - true from either source enables it. Always a safe no-op on an already-straight page - never fails a request that would otherwise succeed."
+            "description": "Runs page rectification (auto-corrects rotational skew and first-order keystone/trapezoid distortion from a photographed page) before recognition. For a JSON body, this combines with the body's own rectify field - true from either source enables it. Always a safe no-op on an already-straight page - never fails a request that would otherwise succeed.",
+            "x-ms-summary": "Auto-rectify skew"
           },
           {
             "name": "body",
@@ -162,7 +170,9 @@
             "schema": {
               "type": "string",
               "format": "binary"
-            }
+            },
+            "x-ms-summary": "Image file",
+            "x-ms-visibility": "important"
           }
         ],
         "responses": {
@@ -196,7 +206,8 @@
               "$ref": "#/definitions/ApiError"
             }
           }
-        }
+        },
+        "x-ms-summary": "Export searchable PDF"
       }
     },
     "/api/v1/pdf/structured": {
@@ -222,7 +233,8 @@
               "deu"
             ],
             "default": "eng",
-            "description": "Recognition model for a binary (application/octet-stream) body. Ignored when the body is application/json - use the JSON form's own lang field there instead."
+            "description": "Recognition model for a binary (application/octet-stream) body. Ignored when the body is application/json - use the JSON form's own lang field there instead.",
+            "x-ms-summary": "Language"
           },
           {
             "name": "rectify",
@@ -230,7 +242,8 @@
             "required": false,
             "type": "boolean",
             "default": false,
-            "description": "Runs page rectification (auto-corrects rotational skew and first-order keystone/trapezoid distortion from a photographed page) before recognition. For a JSON body, this combines with the body's own rectify field - true from either source enables it. Always a safe no-op on an already-straight page - never fails a request that would otherwise succeed."
+            "description": "Runs page rectification (auto-corrects rotational skew and first-order keystone/trapezoid distortion from a photographed page) before recognition. For a JSON body, this combines with the body's own rectify field - true from either source enables it. Always a safe no-op on an already-straight page - never fails a request that would otherwise succeed.",
+            "x-ms-summary": "Auto-rectify skew"
           },
           {
             "name": "body",
@@ -240,7 +253,9 @@
             "schema": {
               "type": "string",
               "format": "binary"
-            }
+            },
+            "x-ms-summary": "Image file",
+            "x-ms-visibility": "important"
           }
         ],
         "responses": {
@@ -272,6 +287,27 @@
             "description": "The server is shutting down and is not accepting new recognition work.",
             "schema": {
               "$ref": "#/definitions/ApiError"
+            }
+          }
+        },
+        "x-ms-summary": "Export structured PDF"
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "summary": "Liveness + loaded-model check",
+        "description": "Cheap liveness probe: no request body, no recognition work, no auth. Reports which recognition models this deployment actually loaded at startup (eng is always present; deu only when the deployment's model directory has the deu.lstm* components). Use this as the connector's Test-operation target, or poll it from an external monitor.",
+        "operationId": "HealthCheck",
+        "x-ms-summary": "Check server health",
+        "produces": [
+          "application/json"
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The server is up; models lists the loaded language codes.",
+            "schema": {
+              "$ref": "#/definitions/HealthStatus"
             }
           }
         }
@@ -487,6 +523,17 @@
           "items": {
             "$ref": "#/definitions/DocField"
           }
+        },
+        "plain_text": {
+          "type": "string",
+          "description": "The whole page as one string (every recognized word, joined the same way the plain-text renderer does: leading_space-aware, lines separated by \\n). Ergonomics for low-code flows that just want the text, not the region/line/word tree - e.g. piping straight into \"Send an email\" or \"Post a message\". Always present, even on an empty page (\"\"), never null."
+        },
+        "fields_map": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "The same values as fields, reshaped key -> value. Finding one field in the fields array needs a Filter-Array + First() expression in the Power Automate designer; fields_map['iban'] is a single dynamic-content lookup. Always present, even with no harvested fields ({}), never null. Duplicate keys keep the last value."
         }
       }
     },
@@ -502,6 +549,26 @@
           "type": "array",
           "items": {
             "$ref": "#/definitions/DocPage"
+          }
+        }
+      }
+    },
+    "HealthStatus": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "example": "ok"
+        },
+        "models": {
+          "type": "array",
+          "description": "Recognition models this deployment loaded at startup (\"eng\", optionally \"deu\").",
+          "items": {
+            "type": "string",
+            "enum": [
+              "eng",
+              "deu"
+            ]
           }
         }
       }

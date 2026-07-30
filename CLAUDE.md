@@ -1868,6 +1868,86 @@ ships its own input is worth extracting rather than reproducing by guesswork.
 
 Both are recorded rather than guessed at — no fix is claimed for either.
 
+## ★ Power Automate ergonomics — HealthCheck action + plain_text/fields_map (2026-07-30)
+
+The Power Platform connector (`integrations/power-platform/`, task history's
+"Power Platform connector" milestone) already had 3 actions — `RecognizeDocument`
+/ `SearchablePdf` / `StructuredPdf` — and a full SharePoint→Dataverse example
+flow. What it lacked, specifically for LOW-CODE ergonomics rather than new
+capability, closed in one pass:
+
+**A 4th action, `HealthCheck` (`GET /api/v1/health`).** No request body, no
+recognition work, no auth — the swagger's own `"security": []` override on
+this ONE operation, since the connector's global `security` requirement would
+otherwise force a key prompt before a connection author can even click "Test
+operation." Reports `{"status":"ok","models":["eng","deu"]}` — which languages
+THIS deployment actually loaded, not a guess. Route registered outside the
+`require_api_key` middleware layer in `api.rs`, matching the pre-existing
+`/openapi.json` precedent for the same reason (a discovery/liveness endpoint
+gated behind the thing it exists to verify defeats its own purpose).
+
+**Two additive `doc.v1` fields, `plain_text` and `fields_map`** — the actual
+gap. Power Automate's designer resolves one array element via `Filter array` +
+`First()`, which is real friction for "just give me the IBAN value" or "just
+give me the text." Neither field is new INFORMATION — both are pure
+reshapes of what `regions`/`fields` already carry:
+- `plain_text` — every recognized word joined exactly the way
+  [`crate::render_text`] joins them (`leading_space`-aware, `\n` between
+  lines), independent of region classification (covers every `page.lines`
+  entry, not just what `regions` places — an orphan line still counts).
+- `fields_map` — `fields` reshaped `key -> value`; duplicate keys keep the
+  last write, the same rule a JS/Python object literal would apply.
+
+Both are **always present, never `null`** (`""` / `{}` on an empty page) —
+deliberately, so a flow author never needs a null-check before reading them.
+
+**`x-ms-summary` on every operation and query/body parameter** — without it
+Power Automate's action picker shows the raw `operationId`/parameter name;
+with it, a human label ("Recognize document (doc.v1 JSON)", "Auto-rectify
+skew"). Purely additive to the swagger, zero server behaviour change.
+
+**Where each piece landed:**
+- `crates/tesseract-ocr/src/structured.rs` — `render_doc` emits the two new
+  keys (page-level, siblings of `regions`/`fields`); 4 new falsifiable unit
+  tests, hand-built `DocPage`/`HarvestedField` fixtures (no image needed) —
+  the `fields_map` test builds TWO distinct fields and asserts each key
+  resolves to its OWN value, not the other's or a duplicate, which a
+  same-value-for-every-key implementation would fail. Two PRE-EXISTING
+  golden-shape tests (`render_json_golden_one_line_one_field`,
+  `render_json_empty_page_keeps_stable_shape`) re-pinned to include the new
+  fields at their real emitted position — not silently widened, the `left`
+  (actual) output was read and the `right` (expected) literal updated to
+  match it exactly.
+- `crates/tesseract-ocr-web/src/api.rs` — the `health` handler + route
+  registration; 2 new integration tests (health responds 200 with NO
+  `x-api-key` even when `TESSERACT_API_KEY` IS configured — proving the
+  route is genuinely exempt, not just untested; `plain_text`/`fields_map`
+  present and correct on a real `recognize_document` call, with an explicit
+  count check — `plain_text.lines().count() == total recognized lines across
+  all regions` — so a version that only counted the first region would fail).
+- `integrations/power-platform/apiDefinition.swagger.json` — the `HealthCheck`
+  path + `HealthStatus` definition, `x-ms-summary` throughout, `plain_text`/
+  `fields_map` on `DocPage`. Edited via a Python script with
+  `object_pairs_hook=OrderedDict` on load (preserves the pre-existing key
+  order byte-for-byte; only new insertions append) — verified `json.load`
+  round-trips clean and the diff is additive-only (79 insertions, 12
+  deletions — the deletions are re-serialization whitespace, not content
+  loss, confirmed by diffing the parsed structure, not just the text).
+- `integrations/power-platform/README.md` — the 4-action table, a new
+  `plain_text`/`fields_map` section, and the health-check auth-exemption note
+  in §3.
+
+**Debug-vs-release lesson recurred, again.** The first `tesseract-ocr-web` test
+gate ran plain `cargo test` (no `--release`) and hung well past the point
+where a release run would have finished — the same debug/release recognition
+slowdown this file already documents elsewhere. Killed and re-ran with
+`--release`. Worth internalizing rather than re-discovering per session: ANY
+gate that exercises `AppState::load` + real recognition in this crate needs
+`--release`, no exceptions.
+
+No Core/recognition change — this is consumer-side JSON reshaping + a status
+route, same footing as `structured.rs`'s existing `doc.v1` design.
+
 ## GitHub access matrix (measured 2026-07-07 — how to push/PR the locked repos)
 
 Four distinct access paths exist in this environment; they do NOT behave the
