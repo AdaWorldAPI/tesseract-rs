@@ -2406,12 +2406,23 @@ the field is a policy rather than a dead constant.
 > group B is the actual falsifier — `Haemoglobln2`, `Glukos3`, `2Kreatlnin`,
 > whose cores are long, unknown, and provably in-budget (asserted by checking
 > the digit-stripped form IS correctable), so only guard 1 can decline them.
-> Verified: deleting guard 1 now fails with
-> `"Haemoglobln2" ... would become "Haemoglobin2"`. **Second time in one
-> session for this exact trap** (the first was the table-gutter falsifier) —
-> the `falsifier-auditor` card names it, and writing the card is evidently not
-> the same as being immune to it. The disable-the-thing run is the only
-> reliable check.
+> Verified: deleting guard 1 now fails with `"Haemoglobln2" carries a digit and
+> must be left alone`. **Second time in one session for this exact trap** (the
+> first was the table-gutter falsifier) — the `falsifier-auditor` card names it,
+> and writing the card is evidently not the same as being immune to it. The
+> disable-the-thing run is the only reliable check.
+>
+> **⚠⚠ AND THE FIX ITSELF DID NOT LAND IN THE COMMIT THAT CLAIMED IT.** Commit
+> `77d70b3` shipped this paragraph, and a commit message describing the same
+> rewrite, while `correction.rs` still carried the group-A-only version. The
+> rewrite landed only in the follow-up commit. So for one commit this file
+> asserted a fix that did not exist — caught by re-running the disable-the-guard
+> check against the pushed tree while writing the PR, not by any gate. **A
+> third-order version of the same failure: the vacuous test was documented as
+> repaired instead of being repaired.** Rule: when a doc paragraph and a code
+> change are written in one pass, `git show` the commit and confirm BOTH are in
+> the diff before claiming it — prose and patch are written in the same breath
+> and only the patch is checked by anything.
 
 Probe: `examples/correction_probe.rs` (prints WHICH guard declined each token,
 so "the lexicon lacks this word" and "this is data we must never touch" are

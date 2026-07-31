@@ -436,14 +436,56 @@ mod tests {
     /// GUARD 1, the load-bearing one. A lab value or invoice total has no
     /// lexical answer; correcting it would FABRICATE data. Measured motivation:
     /// `14.2 -> $142` and `0.9 -> O09` on the ruled lab fixture.
+    ///
+    /// **The first version of this test was VACUOUS and shipped that way.** It
+    /// used group A alone — and every one of those tokens has an alphabetic
+    /// core BELOW `min_len`, so guard 3 (the length floor) declined them and
+    /// guard 1 was never reached. Deleting the digit guard left the test
+    /// passing; verified by running exactly that. Group B exists so the guard
+    /// has something only *it* can decline.
     #[test]
     fn never_touches_a_token_containing_a_digit() {
         let l = lex();
         let p = CorrectionPolicy::default();
+
+        // GROUP A — the real measured tokens. They ARE declined, but say
+        // plainly why: their alphabetic cores sit below the length floor. This
+        // group cannot falsify guard 1, and the assertion below pins that
+        // honestly rather than letting it read as evidence.
         for t in ["$142", "O09", "13.5", "4mm", "2.4", "136-145"] {
+            let (_, core, _) = split_core(t);
+            assert!(
+                core.chars().count() < p.min_len,
+                "group A is the length-floor group by construction, but {t:?} \
+                 has core {core:?} at or above the floor — it belongs in group B"
+            );
             assert!(
                 suggest(t, &l, &p).is_none(),
                 "numeric token {t:?} must never be corrected — a fabricated \
+                 number is worse than a visibly wrong one"
+            );
+        }
+
+        // GROUP B — a long, unknown, IN-BUDGET alphabetic core plus a digit.
+        // Guards 2, 3 and 4 all pass these through, so guard 1 is the only
+        // thing that can decline them. Delete guard 1 and this loop fails.
+        for (t, would_become) in [
+            ("Haemoglobln2", "Haemoglobin"),
+            ("Glukos3", "Glukose"),
+            ("2Kreatlnin", "Kreatinin"),
+        ] {
+            // Prove the premise instead of asserting it: the SAME core with the
+            // digit removed IS corrected, so the digit is the only difference.
+            let (_, core, _) = split_core(t);
+            assert_eq!(
+                suggest(core, &l, &p).map(|(s, _)| s).as_deref(),
+                Some(would_become),
+                "the digit-free core {core:?} must be correctable, or {t:?} \
+                 cannot falsify guard 1"
+            );
+            assert!(
+                suggest(t, &l, &p).is_none(),
+                "{t:?} carries a digit and must be left alone — a fabricated \
                  number is worse than a visibly wrong one"
             );
         }
@@ -474,9 +516,12 @@ mod tests {
         assert!(suggest("qx", &l, &p).is_none());
     }
 
-    /// GUARD 4, two-sided on the budget itself. `Ergebnis` (8 chars) gets the
-    /// long budget of 2, so a 2-edit misread is corrected; a token that is 5
-    /// edits from everything is left as-is rather than snapped to nonsense.
+    /// GUARD 4, two-sided on the budget itself. `Ergebnis` (8 chars) takes the
+    /// LONG budget, so a misread within it is corrected; a token that is far
+    /// from everything is left as-is rather than snapped to nonsense. The long
+    /// budget's default VALUE is 1, not 2 — measured, 2 bought no extra correct
+    /// fixes and cost one cross-language corruption — and the assertions below
+    /// pin both that value and the fact that raising it still works.
     #[test]
     fn respects_the_distance_budget_in_both_directions() {
         let l = lex();
