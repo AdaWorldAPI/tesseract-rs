@@ -414,6 +414,29 @@ bounded by the half-step) as the byte-derived surprise/`free_e` candidate for
 the MetaWord arc. Recognizer-local example, no Core change → this file + the
 commit are the record.
 
+**★ Domino vs reservoir head-to-head — step 2 of the substrate probe ladder
+(2026-07-31).** `crates/tesseract-recognizer/examples/domino_vs_reservoir.rs` —
+the two `CognitiveWork` candidate dynamics on the same 16-board x 16-lane
+Morton-tile stream, BOTH through the proven kernel (`FcActivation::Linear`
+exists = NT_LINEAR, so the ungated domino shape runs through
+`fully_connected_forward` too; nothing in `src/` changed, 49/49 green, clippy
+0). Measured regimes, all asserted: ungated linear+requant = forget (gain 0.4)
+/ **LSB GHOST** (gain 0.8: perturbation locks at exactly 0.8*4/127 forever —
+`gain*dq >= 0.5 LSB` re-rounds to the same dq; spurious grid-scale memory for
+any gain in (0.5,1) — found BY the falsifier, which first asserted "0.8
+forgets" and caught the flatline) / knife-edge (1.0, printed not asserted) /
+rail (1.25: f32 state escapes the band, max|s|=1.8, +/-127 clamp does real
+clipping). Gated (same LSTM kernel, fixed seeded weights) = clean forget
+(leak) or **bounded hold** (latch: perturbation held at ~1.4 for 48 steps with
+every f32 state inside (-1,1) — clamp never engages; the regime the ungated
+map lacks at any gain). Two fixture bugs caught by the asserts and kept in
+comments: the perturbed-run RNG not burning the base draw (whole suffix
+differed), and rail measured on |q| instead of the pre-quant state (tanh
+compression misread as clamping). free_e readout (6-bit, MetaWord-bound
+value, contract type NOT re-implemented): driven boards 31.5 vs frozen 2.9 —
+discriminates. Recognizer-local example, no Core change → this file + the
+commit are the record.
+
 ## Web demo (`crates/tesseract-ocr-web`)
 
 A single-binary **consumer** demo (axum + askama + tokio) proving the pipeline
