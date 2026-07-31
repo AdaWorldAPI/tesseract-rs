@@ -2258,3 +2258,74 @@ The cell TEXT remains degraded (`14.2` -> `$142`, `0.9` -> `O09`, header ->
 Structure is now right; the characters inside the cells are a separate defect
 on a deliberately hard fixture, and `collapsed_cells_still_report_high_confidence`
 already pins the honesty problem. Not conflated with this fix.
+
+## ★ Drop cap — DIAGNOSED, and the obvious fix is MEASURED HARMFUL (2026-07-30)
+
+The open defect ("Alice" recognizes as "ice") named two candidate mechanisms
+and never separated them. Both are now settled, and the probe that settles
+them is committed (`examples/dropcap_probe.rs`).
+
+### Mechanism: `large` is populated and dropped — the period bug's mirror
+
+`filter_blobs` puts a blob in `large` when `height > max_y` or
+`width > max_x`. **Nothing in this crate consumes `.large`** (`grep '\.large'`
+outside `blob_filter.rs` returns nothing) — structurally IDENTICAL to `.noise`
+before the period fix, at the opposite end of the size scale, exactly as this
+file predicted.
+
+Measured on the real page (2550x3300, Otsu, 8-conn): 2601 components ->
+2389 blobs / 193 noise / 18 small / **1 large**. That one member is
+`x=290..371 y=2740..2812` (y-UP), **81x72 px, h/median = 3.27x, aspect 1.12**
+— tall, glyph-shaped, at the left margin. It is the drop cap, it never
+reaches `make_rows`, and mechanism (2) (row assignment) never gets a chance
+to be the cause.
+
+### The period-style fix is measured HARMFUL here — do not attempt it
+
+The period fix worked by widening the row's CROP. Measured on the same page,
+three arms, same recognizer:
+
+| crop | recognized |
+|---|---|
+| the glyph ALONE, its own unit | `"Ai"` |
+| glyph + the line to its right (a widened row crop) | `"ye hewn to eet very tired of"` |
+| line only, glyph excluded (CURRENT behaviour) | `"ice was beginning to get very tired of"` |
+
+**Widening the crop destroys the entire line.** A drop cap spans ~2 text lines
+by construction (72 px against a 22 px median glyph), so including it forces
+the row band to ~3x its true height and the prescale that follows wrecks every
+other glyph on the line. Current behaviour loses ONE word's opening; the
+"fix" loses the whole sentence. This also explains libtesseract's own
+`"Aitice"` — the oracle is cramming a multi-line-tall glyph into a one-line
+band and paying for it.
+
+**So the two size-extreme defects have OPPOSITE correct treatments**, which is
+the generalizable finding: a line-final period is *part of* its line and only
+needed the crop to reach it; a drop cap is *not part of any line* and cannot be
+recovered by any single-line crop. Do not reason from the period fix's success
+to this one — measured, that inference is wrong.
+
+### Status: diagnosed, deliberately NOT fixed
+
+The best available recovery reads the glyph as `"Ai"`, so prepending would
+yield `"Aiice was beginning..."` against the true `"Alice was beginning..."`.
+That is not obviously better than today's `"ice ..."` — it trades a missing
+opening for a misspelled word that a dict beam may then "correct" confidently
+in the wrong direction. Both are wrong; neither is worth a behaviour change on
+this evidence.
+
+The honest next rungs, in order of value:
+
+1. **Make the loss LOUD.** Today content is discarded in silence. Surfacing
+   dropped `large` blobs in `doc.v1`'s quality signal would turn silent
+   truncation into a visible flag — the same "fails loudly (empty set, not
+   wrong data)" principle the table section already argues for. This is the
+   safe increment and it needs no recognition change.
+2. **Recognize a drop cap as its own unit and reattach it**, which is what a
+   real layout engine does. Viable — the glyph alone DOES decode — but it needs
+   a drop-cap detector (tall + glyph-aspect + left-margin + vertically
+   overlapping >= 2 rows), a second fixture (one page is not evidence for a
+   detector), and a rule for merging its text with the following line.
+
+Recorded rather than guessed at; no fix is claimed, and the ruled-out fix is
+named so it is not re-attempted.
