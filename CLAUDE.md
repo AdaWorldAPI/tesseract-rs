@@ -437,6 +437,25 @@ value, contract type NOT re-implemented): driven boards 31.5 vs frozen 2.9 —
 discriminates. Recognizer-local example, no Core change → this file + the
 commit are the record.
 
+> **⚠ VERDICT WITHDRAWN, MEASUREMENTS STAND (operator correction, same day).**
+> This probe's conclusion — "the ungated map has no bounded-hold regime,
+> gated beats ungated" — judged domino by a RETENTION criterion, and that is
+> the wrong axis: domino is **pay-forward torque** (the NNUE-style
+> incremental accumulator over the 64×64 = 4096 Stockfish square-pair tile —
+> deltas summed FORWARD per move, never held), and it keeps its place as
+> **attention headers** modulated by the Morton cascade inverse-pyramid
+> perturbation shader (spatial perturbation hydration, Gaussian-splat
+> blasgraph), other than the Pythagorean comma (the per-level closure
+> residual, routed not absorbed). Holding a perturbation was never its job,
+> so "lacks bounded hold" is not a defect finding — it is a category error in
+> the probe's framing. What SURVIVES: every measurement (the LSB ghost at
+> exactly 0.8·4/127 for gain ∈ (0.5,1), the rail at gain > 1, the gated
+> arm's clean forget / bounded hold, the free_e discrimination 31.5 vs 2.9)
+> — these are real properties of the respective dynamics, just not a
+> competition. Canonical corrected framing: lance-graph
+> `.claude/plans/SYNERGY-MAP-S00-S07.md` §8 (+ its same-day §8.3/§8.4
+> correction: temporal deinterlacing / splat hydration; no VSA bundle).
+
 ## Web demo (`crates/tesseract-ocr-web`)
 
 A single-binary **consumer** demo (axum + askama + tokio) proving the pipeline
