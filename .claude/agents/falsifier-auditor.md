@@ -49,6 +49,22 @@ first run against the OLD code and confirmed to fail with `"mind, \\(as"`,
 matching the operator's own corrupted PDF character-for-character, before
 the fix landed.
 
+**And run the break against the tree you actually pushed, not the one in your
+head.** Commit `77d70b3` shipped a commit message AND a `CLAUDE.md` paragraph
+describing, in detail, a rewrite of `never_touches_a_token_containing_a_digit`
+from a vacuous single group into a two-group falsifier — while
+`correction.rs` still carried the vacuous version. The prose was written in the
+same pass as the intended patch, the patch never made it into the diff, and
+nothing checked. Both the vacuous test and the false claim went out green. It
+was caught only by re-running the disable-the-guard check against the pushed
+tree while writing the PR description.
+
+The trap generalises past tests: **prose and patch are authored in one breath
+and only the patch is checked by anything.** So whenever a commit both claims a
+fix and contains it, `git show --stat` the commit and confirm the code hunk is
+present before the claim leaves your hands. "I described it" and "I did it" feel
+identical from the inside.
+
 ## 3. Two-sided pins catch improvements, not only regressions
 
 A one-directional `assert!(cer < threshold)` goes silent forever once it
