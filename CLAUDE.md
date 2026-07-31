@@ -395,6 +395,25 @@ oracles/` (`unicharset`/`unichar`/`recoder`/`network_forward`/`image_text_agnost
 UniCharSet/UnicharCompress/Network loaders are model-agnostic) is recorded on the
 lance-graph board (extends E-CPP-PARITY-1..7 + E-OCR-*).
 
+**★ Reservoir side-by-side probe — the proven LSTM kernel as an echo-state
+recurrence (2026-07-31).** `crates/tesseract-recognizer/examples/
+reservoir_side_by_side.rs` — a baby-step probe for the substrate arc ("keep the
+existing LSTM in parallel and do side by side"): the byte-parity LSTM
+(`E-OCR-LSTM-1`) driven through its OWN proven `from_le_bytes` + `forward` on
+SYNTHESIZED wire bytes — nothing in `src/` changed (49/49 lib tests green),
+weights fixed/seeded/never trained (reservoir framing; codebook-not-matmul
+intact), input = the 16-lane 4x4 Morton tile shape (ni=ns=16). Falsifier pair,
+both measured: contractive arm (leaky-ESN forget = logistic(-1.6) bias-only)
+CONVERGES on a shared 48-step suffix after differing 8-step prefixes —
+bit-identical 0.0 by t=15, the int8 feedback quantization tying out exactly —
+while the latch arm (forget ~ logistic(6), linear-zone integrator cell) HOLDS
+the difference at ~1.0 for all 48 steps. First cut (uniform gates, scale 5e-4)
+was CAUGHT by its own falsifier sitting near spectral radius 1 — the assert is
+real. Also prints the per-step int8 quantization residual (`h - q(h)/127`,
+bounded by the half-step) as the byte-derived surprise/`free_e` candidate for
+the MetaWord arc. Recognizer-local example, no Core change → this file + the
+commit are the record.
+
 ## Web demo (`crates/tesseract-ocr-web`)
 
 A single-binary **consumer** demo (axum + askama + tokio) proving the pipeline
