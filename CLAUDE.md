@@ -2329,3 +2329,91 @@ The honest next rungs, in order of value:
 
 Recorded rather than guessed at; no fix is claimed, and the ruled-out fix is
 named so it is not re-attempted.
+
+## ★ OPTIONAL dictionary correction — shipped, and the measurement reshaped it twice (2026-07-30)
+
+Operator request: add optional Levenshtein dictionary correction, noting
+DeepNSM-v2 has "18k codebook, German probably similar — that's not nothing."
+Correct: 18k is a real lexicon, and my earlier objection (that correction is
+dangerous) held only for NUMERIC cells, not word cells.
+
+**`crates/tesseract-ogar/src/correction.rs`** — opt-in post-processing over a
+`DocPage`, sibling to `sentences.rs`/`reasoning.rs`. **NOT in `tesseract-ocr`**:
+that crate stays deepnsm-free so the web demo keeps its lean BBB-clean dep set.
+
+### Six guards, each from a measured failure
+
+1. **Never touch a token containing a digit.** The load-bearing one. `14.2 ->
+   $142`, `0.9 -> O09` have no lexical answer; nearest-neighbour would
+   FABRICATE a lab value.
+2. Never "correct" a word the lexicon knows. 3. Length floor (4). 4.
+   Length-scaled distance budget. 5. Deterministic frequency tie-break.
+6. **Every change REPORTED** (`Vec<Correction>` carrying the original), never
+   silent.
+
+### The lexicon is 3558 words, NOT 18k — and that mattered
+
+`Vocabulary::word(rank)` enumerates only the **canonical lemma ranks**
+(measured 3558). The 11,461 inflected forms sit in a private `forms` map
+reachable via `lookup_word` but not iterable. Building from ranks alone was a
+REAL BUG, caught by the probe: `pictures` is not a canonical rank, so guard 2
+never fired and the corrector rewrote a correct plural to `picture`.
+
+**A lexicon missing inflections does not merely fail to correct — it actively
+corrupts correct text**, because every absent form looks like a typo one edit
+from its own lemma. Fixed by also reading `word_forms.csv`: **3558 -> 10,239**
+words, `pictures` now left alone, and `rabblt -> rabbit` newly fixed (the
+lexicon had lacked `rabbit` entirely).
+
+### The German result, and the counterintuitive part
+
+| corpus | result |
+|---|---|
+| English prose (the lexicon's own language) | **6/6 correct** (`beginnlng->beginning`, `thlnking->thinking`, `conversatlon->conversation`, `slster->sister`, `rabblt->rabbit`, `wondet->wonder`) |
+| German lab fixture, English lexicon | **1 change, and it is WRONG**: `Referenz -> Refered` |
+
+**Enlarging the lexicon made the cross-language corruption WORSE, not better**
+(`Reference` at 3558 words became `Refered` at 10,239) — more candidates means
+more chances something lands within budget. That inverts the natural
+assumption and is why the module docs say plainly: supply the lexicon that
+matches the document, or do not run this pass.
+
+The guards did the real work on German: 20 of 21 tokens declined, mostly by
+the digit guard and the length floor.
+
+### The default budget is MEASURED, not guessed
+
+Swept `max_distance_long` over the real lexicon:
+
+| budget | English fixes | German corruptions |
+|---|---|---|
+| **1** | **6** | **0** |
+| 2 | 6 (identical) | 1 |
+
+Distance 2 bought **zero** additional correct fixes and cost one corruption, so
+the default is **1**, with the knob left live for a caller who measures 2-edit
+wins on their own corpus. A paired test arm proves raising it still works, so
+the field is a policy rather than a dead constant.
+
+> **⚠ I SHIPPED A VACUOUS FALSIFIER AGAIN — on the module's MOST IMPORTANT
+> guard, and again only the disable-the-guard run caught it.**
+> `never_touches_a_token_containing_a_digit` used `$142`, `O09`, `4mm` — every
+> one has an alphabetic core under `min_len`, so **guard 3 (length floor)
+> declined them and guard 1 was never consulted**. The test passed identically
+> with the digit guard deleted. Rewritten into two groups: group A keeps the
+> real measured strings with an explicit assertion that they are declined by
+> the LENGTH FLOOR (so they cannot masquerade as digit-guard evidence), and
+> group B is the actual falsifier — `Haemoglobln2`, `Glukos3`, `2Kreatlnin`,
+> whose cores are long, unknown, and provably in-budget (asserted by checking
+> the digit-stripped form IS correctable), so only guard 1 can decline them.
+> Verified: deleting guard 1 now fails with
+> `"Haemoglobln2" ... would become "Haemoglobin2"`. **Second time in one
+> session for this exact trap** (the first was the table-gutter falsifier) —
+> the `falsifier-auditor` card names it, and writing the card is evidently not
+> the same as being immune to it. The disable-the-thing run is the only
+> reliable check.
+
+Probe: `examples/correction_probe.rs` (prints WHICH guard declined each token,
+so "the lexicon lacks this word" and "this is data we must never touch" are
+never confused). 11 unit tests + 38 crate tests green; fmt + clippy clean.
+No Core change, no recognition change, nothing on by default.

@@ -74,6 +74,12 @@ pub mod sentences;
 /// deliberately not (the AS-IS BOUNDARY split from `tesseract-rs/CLAUDE.md`).
 pub mod reasoning;
 
+/// OPTIONAL Levenshtein dictionary correction over a recognized `DocPage`.
+/// Opt-in, never on a recognition path, and guarded so it can never rewrite a
+/// numeric value — read that module's docs before enabling it, especially the
+/// note that the lexicon must match the document's language.
+pub mod correction;
+
 /// Every OCR capability this crate's [`OcrExecutor::execute`] handles, in the
 /// same order as [`ogar_vocab::ocr_actions::OCR_ACTION_NAMES`] — this
 /// crate's half of the exhaustiveness fuse (see the module docs).
