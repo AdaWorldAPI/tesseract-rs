@@ -1,0 +1,14 @@
+[toolchain]
+channel = "1.97.1"
+# Pinned 1.97.1 (bumped from the unpinned-1.95 convention, 2026-08-05) —
+# joins the workspace-wide lance-9 / Rust-1.97.1 sweep (lance-graph #896;
+# siblings OGAR / ruff / MedCare-rs / woa-rs already pin 1.97.1). This repo
+# previously carried the pin only as prose ("rustup run 1.95 cargo ...") +
+# CI install lines + Dockerfile base tags, which is exactly the drift shape
+# #896 caught in lance-graph's own Dockerfiles. The file makes bare `cargo`
+# in this checkout resolve to the reviewed toolchain. Never auto-track
+# `stable` — bump explicitly, with the scoped clippy/fmt/test gates green.
+#
+# rustfmt + clippy ride the pin so a fresh `rustup show` materializes the
+# complete CI-equivalent toolchain in one step (lance-graph's rationale).
+components = ["rustfmt", "clippy"]

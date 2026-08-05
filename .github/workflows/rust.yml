@@ -37,9 +37,11 @@ jobs:
       with:
         repository: AdaWorldAPI/OGAR
         path: OGAR
-    # ndarray declares rust-version = 1.95; bump the toolchain to satisfy it.
-    - name: Rust 1.95 toolchain
-      run: rustup toolchain install 1.95 --profile minimal --component clippy --component rustfmt && rustup default 1.95
+    # Workspace sweep pin (lance-graph #896 family): 1.97.1, matching the
+    # repo's rust-toolchain.toml. ndarray's rust-version = 1.95 floor is
+    # satisfied a fortiori.
+    - name: Rust 1.97.1 toolchain
+      run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt && rustup default 1.97.1
     - name: Build (core)
       working-directory: tesseract-rs
       run: cargo build -p tesseract-core --verbose
@@ -145,12 +147,13 @@ jobs:
       with:
         repository: AdaWorldAPI/OGAR
         path: OGAR
-    # ndarray declares rust-version = 1.95; bump the toolchain to satisfy it.
-    - name: Rust 1.95 toolchain
-      run: rustup toolchain install 1.95 --profile minimal && rustup default 1.95
+    # Workspace sweep pin (lance-graph #896 family): 1.97.1, matching the
+    # repo's rust-toolchain.toml.
+    - name: Rust 1.97.1 toolchain
+      run: rustup toolchain install 1.97.1 --profile minimal && rustup default 1.97.1
     - name: Quality (resolution ladder, ocr)
       working-directory: tesseract-rs
-      run: cargo +1.95 test -p tesseract-ocr --test quality_resolution_grid --verbose
+      run: cargo +1.97.1 test -p tesseract-ocr --test quality_resolution_grid --verbose
     - name: Quality (typography overlay, ocr-pdf)
       working-directory: tesseract-rs
-      run: cargo +1.95 test -p tesseract-ocr-pdf --test typography_overlay --verbose
+      run: cargo +1.97.1 test -p tesseract-ocr-pdf --test typography_overlay --verbose

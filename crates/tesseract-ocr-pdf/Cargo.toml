@@ -18,7 +18,8 @@ lopdf = "0.36"
 # Pure-Rust JPEG (DCTDecode) decoder for D5.2. Chosen over `jpeg-decoder`:
 # zune-jpeg is the actively-maintained continuation (jpeg-decoder's last
 # release predates it and its README points readers at zune-jpeg/zune-image),
-# it builds clean on stable 1.95 with no C toolchain, and it re-exports its
+# it builds clean on the pinned stable toolchain (rust-toolchain.toml) with
+# no C toolchain, and it re-exports its
 # `zune_core` byte-reader dependency (`zune_jpeg::zune_core::bytestream::
 # ZCursor`) so no extra crate is needed to feed it an in-memory `&[u8]`.
 zune-jpeg = "0.5.15"
