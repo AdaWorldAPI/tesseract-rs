@@ -2471,3 +2471,115 @@ skip-guard for a fuse — the skip hides it exactly where a fresh CI would have
 caught it. Real-data tests read the committed corpus, full stop. (Same family
 as the falsifiability rule: a test that cannot fail WHERE YOU LOOK is not a
 test there.)
+
+## ★ Typography is a PARAGRAPH property — stop measuring it per glyph (2026-08-06)
+
+Operator direction, arrived at over one debugging arc. Recorded in full
+because most of it is doctrine this commit does NOT yet implement.
+
+### The defect that started it, measured on the operator's own PDFs
+
+`structured (4).pdf`, 172 runs, 11 columns, 90 consecutive-line pairs:
+
+| quantity | measured |
+|---|---|
+| baseline pitch | **17–18 pt, sd 0.00 across all 8 columns** |
+| `Tf` | min 17.20 · med 25.07 · max 72.13 |
+| `Tf`/pitch | med **1.44**, max 3.03 — **95% of pairs OVERLAP** |
+| `Tz` | min **32.4** · med 72.3 · max **850** |
+
+Implied `glyph_px` = `Tf`×¾ = **18.4 pt of ink on an 18 pt pitch**. A single
+line's ink cannot exceed the distance to the next line — that is the proof
+that `attach_glyph_px`'s scan reads its NEIGHBOURS through the (deliberately
+generous) makerow recognition band. It explains every symptom at once: always
+too big (contamination only adds ink), unstable for identical text (up to
+**1.82×** between columns for the same string), and worst on tightly-set text.
+
+**Why `resgrid.pgm` never caught it:** 3 lines/cell at ~54 px pitch against
+~17 px glyphs — hugely leaded, bands never overlap. The operator's page is 13
+lines/cell at ~19 px. The committed quality fixture is structurally incapable
+of expressing this bug.
+
+### The operator's correction, in order
+
+1. **"why don't you normalize the data — you can just use the median."**
+   Correct, with one refinement the data forced: median of the *ink* leaves
+   **97%** still overlapping (on tight text most lines are contaminated, so
+   the median is contaminated too). Median of the *pitch* → **1%**. Pitch is
+   the signal; ink height is the noise.
+2. **"calculate the fontsize from page × borders × margins / lines."** The
+   geometric form is the one thing that does NOT survive: dropped lines
+   inflate it monotonically with degradation (**19.08 → 21.68 → 22.71 →
+   25.32** across the ladder) while the median of consecutive deltas holds at
+   **18.00**. A dropped line doubles ONE gap; a median steps over it.
+3. **"nobody cares for small variance, they care about Blocksatz vs
+   fixed-width consistency."** The priority correction, and the sharpest
+   point. `Tz` 32%..850% means every line got a different glyph aspect —
+   letterforms alternately crushed to a third and stretched eightfold. No
+   font-size fix touches that, and it damages a reader far more than a few
+   points of size error.
+4. **"Blocksatz vs fixed width detection."** In justified text every line but
+   the last ends at *exactly* the measure, so width becomes a hard constraint
+   — and comparing it to the ink width calibrates the render-font-vs-scan-font
+   ratio (the substitution bias that lands the width-solve at 0.98× pitch
+   instead of ~0.80×; Helvetica is narrower than the DejaVu-class faces these
+   corpora are set in).
+
+### SHIPPED here
+
+- `page_pitch_px` / `page_font_px` — ONE size per page from the median
+  consecutive baseline delta × `PITCH_TO_FONT_PX` (0.80, the standard
+  1.15–1.30 leading relation). Per-line `baseline` still drives PLACEMENT,
+  which measured correct (sd 0.00).
+- `RunFit::{StretchToBox, Natural, JustifyToBox}` — **painted text is never
+  glyph-distorted again** (`Tz` ≡ 100). The INVISIBLE searchable layer keeps
+  `Tz`, deliberately: nobody renders those glyphs and selection must land on
+  the scanned ink.
+- Justification via **`Tw` (word spacing)**, never `Tz`. Always emitted, so a
+  previous line's spacing cannot leak through the persistent text state.
+- `classify_justification` — right-edge spread, last line excluded (short by
+  construction; including it is the classic false negative), ≥3 lines.
+- 8 falsifiers, each verified by breaking what it tests.
+
+### OPERATOR DOCTRINE — stated, NOT yet built
+
+- **(a) A bent right edge means the book's inside/gutter.** Page curvature is
+  evidence about binding geometry, not noise to be flattened blindly.
+- **(b) Do not crop — keep headroom for trapezoid normalization.** Cropping
+  destroys the margin the rectifier needs. (`rectify.rs` already learned the
+  canvas-expansion half of this; the *don't crop upstream* half is unbuilt.)
+- **(c) Never use measured sizes as a QUANTITY — only as a CLASSIFIER** for
+  bold / italic / headline meta-information. This inverts what the renderer
+  does today even after this commit: it still trusts a measurement for size
+  page-wide, where the doctrine says size should be extrapolated and the
+  measurement kept only to spot what is *different*.
+- **(d) Extrapolate one size per LINE and per PARAGRAPH.** The genuine
+  exceptions are small and enumerable — footnotes at a paragraph's end, under
+  a picture, in or under a table — and they are **rare in Blocksatz; in
+  Blocksatz, normalize instead of hunting exceptions.**
+
+This commit implements page-level normalization; (d) asks for paragraph-level
+with outlier detection. That is the next rung, and the fixture it needs is a
+tightly-set justified page with a real footnote — which the corpus does not
+yet contain.
+
+### Two further operator refinements (same arc, recorded)
+
+- **In Blocksatz the inter-WORD space varies but the inter-LINE space is
+  constant.** That is a second, independent Blocksatz signal (gap variance
+  within a line vs across lines) — and it is also *why* pitch-normalization is
+  especially safe on justified text: the one quantity justification does not
+  touch is the leading. Only the right-edge test is implemented today; the
+  gap-variance signal is unbuilt.
+- **"does 12.4 become too wide, or too high?"** — the fit, made mechanical and
+  SHIPPED: `page_font_px` now takes `min(pitch × 0.80, median 1000·box_w /
+  advance)`. Two constraints, the binding one wins, either direction. This is
+  what makes it self-correcting for font substitution instead of carrying my
+  hardcoded guess.
+- **"doppelt falscher Ansatz" (regula falsi) as the calibration frame.**
+  Correct, and honestly *not yet load-bearing*: `advance_width_1000em` is
+  linear in font size by construction, so two probes interpolate to exactly
+  the closed form already used. It becomes necessary the moment width stops
+  being invertible — kerning tables, ligatures, or justification feeding back
+  into the fit — and that is the shape the next rung should take rather than
+  a hand-derived formula.
