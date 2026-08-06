@@ -120,6 +120,11 @@ pub struct TextBlock {
     /// searchable runs and legacy JSON without the per-line keys) — see
     /// [`TextMetrics`].
     pub metrics: Option<TextMetrics>,
+    /// How this line was set in the source, when known
+    /// ([`classify_justification`]). Consulted only for PAINTED runs — the
+    /// invisible searchable layer always stretches to the ink box regardless.
+    /// `None` (blocks under 3 lines, legacy callers) renders natural.
+    pub justification: Option<Justification>,
 }
 
 /// A text run's measured typography, from `doc.v1`'s per-line
@@ -304,6 +309,44 @@ const TEXT_HEIGHT_TO_FONTSIZE: f64 = 0.5;
 /// A degenerate box emits nothing and counts nothing; a positive box counts
 /// its substitutions even if its (all-zero-advance) run shows nothing — this
 /// matches the original `build_page_content` semantics exactly.
+/// Largest width correction justification may absorb, as a fraction of the
+/// column. Past this the line is not a justified line at all (a heading, a
+/// mis-segmented run, a single long token) and is left natural rather than
+/// pulled apart.
+const MAX_JUSTIFY_SLACK_FRAC: f64 = 0.35;
+
+/// How a run is fitted to its box width.
+///
+/// The distinction is not stylistic — it is about whether anyone sees the
+/// glyphs:
+///
+/// - [`StretchToBox`](RunFit::StretchToBox) — the INVISIBLE searchable layer
+///   (`3 Tr`). Nobody renders these glyphs; what matters is that a selection
+///   or a search hit lands exactly on the scanned ink. Distorting the glyphs
+///   with `Tz` to occupy the ink box precisely is therefore not just
+///   acceptable, it is the correct behaviour, and it stays.
+/// - [`Natural`](RunFit::Natural) — PAINTED ragged text. Glyphs are drawn at
+///   their true proportions and the line ends where it ends.
+/// - [`JustifyToBox`](RunFit::JustifyToBox) — PAINTED justified text. The
+///   line reaches the measure through WORD SPACING (`Tw`), never by squeezing
+///   letterforms.
+///
+/// The bug this replaces: `Tz` was applied unconditionally, so painted text
+/// got a different horizontal glyph scale on every single line. Measured on a
+/// real structured render, `Tz` ranged **32.4 % to 850 %** — letterforms
+/// alternately crushed to a third and stretched eightfold, line by line. That
+/// inconsistency is far more damaging to a reader than a few points of
+/// font-size error, and no font-size fix alone would have touched it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunFit {
+    /// Distort glyphs to occupy the box exactly (invisible layer only).
+    StretchToBox,
+    /// Draw at true proportions; the line ends naturally.
+    Natural,
+    /// Reach the measure via word spacing, glyphs undistorted.
+    JustifyToBox,
+}
+
 fn emit_text_run(
     ops: &mut Vec<Operation>,
     bbox: (u32, u32, u32, u32),
@@ -311,6 +354,7 @@ fn emit_text_run(
     dpi: u32,
     page_h_pt: f64,
     metrics: Option<&TextMetrics>,
+    fit: RunFit,
 ) -> usize {
     let (left, top, right, bottom) = bbox;
     if right <= left || bottom <= top {
@@ -342,7 +386,26 @@ fn emit_text_run(
         ),
     };
     let natural_width_pt = fontsize_pt * f64::from(natural_width_1000em) / 1000.0;
-    let tz = 100.0 * box_w_pt / natural_width_pt;
+    // How the run reaches (or does not reach) the box width. `Tz` distorts
+    // GLYPH shapes; `Tw` widens the SPACES. Which is correct depends entirely
+    // on whether a human ever looks at these glyphs — see [`RunFit`].
+    let (tz, tw) = match fit {
+        RunFit::StretchToBox => (100.0 * box_w_pt / natural_width_pt, 0.0),
+        RunFit::Natural => (100.0, 0.0),
+        RunFit::JustifyToBox => {
+            let spaces = bytes.iter().filter(|b| **b == b' ').count();
+            let slack = box_w_pt - natural_width_pt;
+            // Justify only through the spaces, and only when there are spaces
+            // to give and the correction is not absurd. A single word cannot
+            // be justified without distorting it, so it is simply left
+            // natural — a short last line, exactly as a typesetter leaves it.
+            if spaces == 0 || slack.abs() > box_w_pt * MAX_JUSTIFY_SLACK_FRAC {
+                (100.0, 0.0)
+            } else {
+                (100.0, slack / spaces as f64)
+            }
+        }
+    };
 
     ops.push(Operation::new(
         "Tm",
@@ -360,6 +423,10 @@ fn emit_text_run(
         vec!["F1".into(), (prec(fontsize_pt) as f32).into()],
     ));
     ops.push(Operation::new("Tz", vec![(prec(tz) as f32).into()]));
+    // Always emitted: `Tw` is part of the PDF text state and persists across
+    // runs, so a run that needs none must reset it to 0 rather than inherit
+    // the previous line's spacing.
+    ops.push(Operation::new("Tw", vec![(prec(tw) as f32).into()]));
     ops.push(Operation::new(
         "Tj",
         // RAW WinAnsi bytes — lopdf escapes a Literal string itself. Escaping
@@ -462,6 +529,9 @@ fn build_layout_content(page: &LayoutPage, dpi: u32) -> (Vec<u8>, usize) {
                         dpi,
                         page_h_pt,
                         t.metrics.as_ref(),
+                        // Invisible: fitting the ink box exactly is what makes
+                        // selection and search land on the right pixels.
+                        RunFit::StretchToBox,
                     );
                 }
             }
@@ -488,6 +558,10 @@ fn build_layout_content(page: &LayoutPage, dpi: u32) -> (Vec<u8>, usize) {
                         dpi,
                         page_h_pt,
                         t.metrics.as_ref(),
+                        match t.justification {
+                            Some(Justification::Blocksatz) => RunFit::JustifyToBox,
+                            _ => RunFit::Natural,
+                        },
                     );
                 }
                 Block::Table(t) => {
@@ -503,6 +577,8 @@ fn build_layout_content(page: &LayoutPage, dpi: u32) -> (Vec<u8>, usize) {
                             dpi,
                             page_h_pt,
                             cell.metrics.as_ref(),
+                            // A cell is a short measure, never justified.
+                            RunFit::Natural,
                         );
                     }
                 }
@@ -662,6 +738,188 @@ fn css_box(bbox: (u32, u32, u32, u32)) -> String {
 /// PDF's painted/invisible text actually looks like, not an unrelated fixed
 /// size. Clamped to at least `1.0` so a degenerate/thin box never emits
 /// `font-size:0px`.
+/// Font size as a fraction of the baseline pitch.
+///
+/// Standard typesetting sets leading at 1.15–1.30× the body size, so the body
+/// is 0.77–0.87 of the pitch; `0.80` sits in that band. This is ONE constant
+/// for the whole corpus rather than a per-line measurement, which is the
+/// point — see [`page_font_px`].
+const PITCH_TO_FONT_PX: f32 = 0.80;
+
+/// How far apart two line right-edges may sit (as a fraction of the column
+/// width) and still count as "the same margin" for [`Justification`].
+const BLOCKSATZ_EDGE_TOLERANCE: f32 = 0.02;
+
+/// How a block's lines are set horizontally.
+///
+/// This is not cosmetic bookkeeping: it decides whether a line's WIDTH is
+/// evidence about the font size.
+///
+/// - [`Blocksatz`](Justification::Blocksatz) (justified) — every line except
+///   the last was stretched to *exactly* the column measure. The rendered
+///   width is therefore a hard constraint, and comparing it against the
+///   measured ink width calibrates the render-font-vs-scan-font width ratio
+///   (the substitution error: Helvetica is narrower than the DejaVu-class
+///   faces these corpora are set in, so "the size that fills this column"
+///   overshoots by that ratio and by nothing else).
+/// - [`Flattersatz`](Justification::Flattersatz) (ragged) — a line ends
+///   wherever its last word happened to land, so width carries no
+///   information about size and must not be used as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Justification {
+    /// Justified: right edges agree to within [`BLOCKSATZ_EDGE_TOLERANCE`].
+    Blocksatz,
+    /// Ragged: right edges vary.
+    Flattersatz,
+}
+
+/// Classify a block's justification from the spread of its line right-edges.
+///
+/// The last line of a justified paragraph is short by construction and is
+/// excluded — including it would make every `Blocksatz` block look ragged,
+/// which is the classic false negative here.
+///
+/// Needs at least three lines: two lines give one comparison, and a single
+/// coincidence would then decide the answer.
+#[must_use]
+pub fn classify_justification(line_bboxes: &[(u32, u32, u32, u32)]) -> Option<Justification> {
+    if line_bboxes.len() < 3 {
+        return None;
+    }
+    // Drop the final line (short by construction in justified text).
+    let rights: Vec<f32> = line_bboxes[..line_bboxes.len() - 1]
+        .iter()
+        .map(|b| b.2 as f32)
+        .collect();
+    let lefts: Vec<f32> = line_bboxes.iter().map(|b| b.0 as f32).collect();
+    let (min_r, max_r) = rights
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(lo, hi), &r| (lo.min(r), hi.max(r)));
+    let measure = max_r - lefts.iter().cloned().fold(f32::MAX, f32::min);
+    if measure <= 0.0 {
+        return None;
+    }
+    Some(if (max_r - min_r) / measure <= BLOCKSATZ_EDGE_TOLERANCE {
+        Justification::Blocksatz
+    } else {
+        Justification::Flattersatz
+    })
+}
+
+/// The median consecutive baseline delta over an ENTIRE page, in pixels.
+///
+/// # Why the pitch and not the ink
+///
+/// Measured on a real 16-cell structured render (172 runs, 11 columns): the
+/// per-line ink-derived size has median `Tf`/pitch **1.44** and overlaps
+/// **95%** of consecutive line pairs, and the *same string* comes out up to
+/// **1.82× different** between columns. Its implied ink height is 18.4 pt on
+/// an 18 pt pitch — taller than the distance to the next line, which is
+/// impossible for one line of text and is the signature of
+/// `attach_glyph_px`'s scan reading its neighbours through the (deliberately
+/// generous) recognition band.
+///
+/// Taking the *median of that same ink measurement* does not rescue it —
+/// measured, it still leaves 97% overlapping, because on tightly-set text
+/// most lines are contaminated so the median is contaminated too. The pitch
+/// is the quantity that is already correct: **median 18.00 with sd 0.00
+/// across all eight columns** of that page.
+///
+/// # Why the median of deltas, not span/(n−1)
+///
+/// The geometric form — column height over line count — is corrupted by
+/// dropped lines, and OCR drops lines exactly where the scan degrades. On
+/// that same page it inflates monotonically with degradation, 19.08 → 21.68 →
+/// 22.71 → 25.32, while the median of consecutive deltas holds at 18.00: a
+/// dropped line doubles ONE gap, and a median steps over it.
+///
+/// Cost is a sort of a few hundred floats against a multi-second recognition
+/// pass — free in context, which is why it runs page-wide rather than
+/// per-block.
+///
+/// Returns `None` when fewer than [`MIN_PITCH_SAMPLES`] deltas exist, in
+/// which case callers keep the per-line path.
+fn page_pitch_px(page: &JsonPage) -> Option<f32> {
+    let mut deltas: Vec<f32> = Vec::new();
+    for region in &page.regions {
+        // Within a region only: a delta ACROSS regions is a column jump, not
+        // a line pitch.
+        let mut bl: Vec<f32> = region.lines.iter().filter_map(|l| l.baseline).collect();
+        bl.sort_by(f32::total_cmp);
+        deltas.extend(bl.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 0.0));
+    }
+    if deltas.len() < MIN_PITCH_SAMPLES {
+        return None;
+    }
+    deltas.sort_by(f32::total_cmp);
+    Some(deltas[deltas.len() / 2])
+}
+
+/// Minimum consecutive-baseline samples before a page pitch is trusted.
+const MIN_PITCH_SAMPLES: usize = 3;
+
+/// The one font size for a page: the largest that overflows NEITHER axis.
+///
+/// # "does 12.4 become too wide, or too high?"
+///
+/// A single number cannot be read off one axis, because the render face is
+/// not the scanned face. Two independent constraints bound it, and the
+/// binding one wins:
+///
+/// - **too high** — the body cannot exceed its own leading, so
+///   `pitch × PITCH_TO_FONT_PX`.
+/// - **too wide** — at the right size a line's glyphs span exactly its
+///   measured ink width, so `1000 × box_width / natural_advance`.
+///
+/// Taking the MINIMUM is what makes this self-correcting for font
+/// substitution. Measured on the reference page the height constraint binds
+/// (≈14.4 pt) while the width constraint sits higher (≈17.7 pt, sd 0.04)
+/// because Helvetica is narrower than the DejaVu-class face the corpus is set
+/// in — so the page renders at 14.4 and neither axis overflows. Were the
+/// render face the WIDER one, width would bind instead and the page would
+/// shrink to fit rather than spilling past the measure. Neither axis is
+/// privileged; the fit decides.
+///
+/// The width samples are a MEDIAN for the same reason the pitch is (see
+/// [`page_pitch_px`]): a garbled line in a degraded region produces a wild
+/// advance, and a median steps over it where a mean would not.
+fn page_font_px(page: &JsonPage) -> Option<f32> {
+    let by_height = page_pitch_px(page)? * PITCH_TO_FONT_PX;
+
+    // The width constraint, per line, in px of font size.
+    let mut widths: Vec<f32> = Vec::new();
+    for region in &page.regions {
+        for line in &region.lines {
+            let text = line
+                .words
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let (bytes, _) = winansi_encode_str(&text);
+            let advance = advance_width_1000em(&bytes);
+            if advance == 0 {
+                continue;
+            }
+            let (l, _, r, _) = match line.bbox {
+                Some(b) => to_u32_bbox(b),
+                None => union_words(&line.words),
+            };
+            if r <= l {
+                continue;
+            }
+            widths.push(1000.0 * (r - l) as f32 / advance as f32);
+        }
+    }
+    if widths.len() < MIN_PITCH_SAMPLES {
+        // No usable width evidence — the height bound stands alone.
+        return Some(by_height);
+    }
+    widths.sort_by(f32::total_cmp);
+    let by_width = widths[widths.len() / 2];
+    Some(by_height.min(by_width))
+}
+
 fn text_font_size_px(bbox: (u32, u32, u32, u32), metrics: Option<&TextMetrics>) -> f64 {
     if let Some(m) = metrics {
         // Same measured body height the PDF projection uses -- Klickwege
@@ -924,6 +1182,7 @@ pub fn searchable_layout(pages: Vec<PageOcr>) -> LayoutDoc {
                         text: w.text,
                         visible: false,
                         metrics: None,
+                        justification: None,
                     })
                 })
                 .collect();
@@ -987,7 +1246,7 @@ struct JsonDoc {
     pages: Vec<JsonPage>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct JsonPage {
     #[serde(default)]
     width: u32,
@@ -999,7 +1258,7 @@ struct JsonPage {
     fields: Vec<JsonField>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct JsonRegion {
     #[serde(rename = "type", default)]
     kind: String,
@@ -1015,7 +1274,7 @@ struct JsonRegion {
     cells: Vec<JsonCell>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct JsonLine {
     #[serde(default)]
     bbox: Option<[i64; 4]>,
@@ -1039,7 +1298,7 @@ struct JsonLine {
     glyph_px: Option<f32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct JsonWord {
     #[serde(default)]
     text: String,
@@ -1195,6 +1454,10 @@ pub fn doc_v1_layout(doc_json: &str, page_rasters: &[GreyImage]) -> Result<Layou
 
     for (pi, jp) in parsed.pages.into_iter().enumerate() {
         let mut blocks: Vec<Block> = Vec::new();
+        // ONE size for the page, from the pitch — see [`page_font_px`]. The
+        // per-line ink measurement is not trusted for SIZE; per-line
+        // `baseline` is still trusted for PLACEMENT.
+        let page_font_px = page_font_px(&jp);
 
         for region in &jp.regions {
             match region.kind.as_str() {
@@ -1231,6 +1494,20 @@ pub fn doc_v1_layout(doc_json: &str, page_rasters: &[GreyImage]) -> Result<Layou
                 }
                 // text / paragraph / header / footer / unknown-with-lines.
                 _ => {
+                    // Classified ONCE per region: justification is a property
+                    // of the block, not of a line. A line cannot tell you
+                    // whether it was justified; only its siblings' right
+                    // edges can.
+                    let justification = classify_justification(
+                        &region
+                            .lines
+                            .iter()
+                            .map(|l| match l.bbox {
+                                Some(b) => to_u32_bbox(b),
+                                None => union_words(&l.words),
+                            })
+                            .collect::<Vec<_>>(),
+                    );
                     for line in &region.lines {
                         let text = line
                             .words
@@ -1258,12 +1535,21 @@ pub fn doc_v1_layout(doc_json: &str, page_rasters: &[GreyImage]) -> Result<Layou
                             line.descdrop,
                             line.baseline,
                             line.glyph_px,
-                        );
+                        )
+                        // SIZE comes from the page pitch when we have one;
+                        // PLACEMENT (`baseline_px`) is untouched, because the
+                        // baselines measured correctly (pitch sd 0.00 across
+                        // every column of the reference page).
+                        .map(|m| match page_font_px {
+                            Some(f) => TextMetrics { font_px: f, ..m },
+                            None => m,
+                        });
                         blocks.push(Block::Text(TextBlock {
                             bbox,
                             text,
                             visible: true,
                             metrics,
+                            justification,
                         }));
                     }
                 }
@@ -1277,6 +1563,7 @@ pub fn doc_v1_layout(doc_json: &str, page_rasters: &[GreyImage]) -> Result<Layou
                 text: field.value.clone(),
                 visible: true,
                 metrics: None,
+                justification: None,
             }));
         }
 
@@ -1441,6 +1728,7 @@ mod tests {
                         text: "Hi".to_string(),
                         visible: true,
                         metrics: None,
+                        justification: None,
                     }),
                     Block::Image {
                         bbox: (80, 10, 180, 90),
@@ -1539,6 +1827,7 @@ mod tests {
                     text: "Visible".to_string(),
                     visible: true,
                     metrics: None,
+                    justification: None,
                 })],
             }],
         };
@@ -1571,12 +1860,14 @@ mod tests {
                         text: "Line one".to_string(),
                         visible: true,
                         metrics: None,
+                        justification: None,
                     }),
                     Block::Text(TextBlock {
                         bbox: (0, 15, 100, 45),
                         text: "Line two".to_string(),
                         visible: true,
                         metrics: None,
+                        justification: None,
                     }),
                 ],
             }],
@@ -1749,6 +2040,7 @@ mod tests {
                     bbox: (10, 30, 150, 70),
                     text: "Hello".to_string(),
                     visible: true,
+                    justification: None,
                     metrics: Some(TextMetrics {
                         font_px: 17.0,
                         baseline_px: 60.0, // top-down → pen y = 100 - 60 = 40
@@ -1985,5 +2277,281 @@ mod tests {
              from coincidence"
         );
         assert_eq!(m.baseline_px, 17.5, "baseline always comes from `baseline`");
+    }
+}
+
+#[cfg(test)]
+mod normalization_tests {
+    use super::*;
+
+    fn line(l: u32, r: u32) -> (u32, u32, u32, u32) {
+        (l, 0, r, 10)
+    }
+
+    /// Justified: every line but the last ends at the same margin. The last
+    /// line is SHORT (300 vs 1000) and must not defeat the classification —
+    /// that is the classic false negative.
+    #[test]
+    fn blocksatz_is_detected_despite_a_short_last_line() {
+        let ls = [
+            line(0, 1000),
+            line(0, 998),
+            line(0, 1001),
+            line(0, 999),
+            line(0, 300),
+        ];
+        assert_eq!(
+            classify_justification(&ls),
+            Some(Justification::Blocksatz),
+            "right edges within 0.3% must read as justified"
+        );
+    }
+
+    /// The silence twin, on REAL measured data: the reference page's own
+    /// paragraph is ragged, and must classify as such. Right edges here are
+    /// the actual per-line extents of the corpus paragraph shape.
+    #[test]
+    fn flattersatz_is_not_mistaken_for_blocksatz() {
+        let ls = [
+            line(0, 980),
+            line(0, 870),
+            line(0, 760),
+            line(0, 910),
+            line(0, 300),
+        ];
+        assert_eq!(
+            classify_justification(&ls),
+            Some(Justification::Flattersatz),
+            "22% ragged edges must NOT read as justified"
+        );
+    }
+
+    /// Under three lines there is not enough evidence, and guessing would
+    /// make every heading and every stray line "justified".
+    #[test]
+    fn justification_declines_on_too_few_lines() {
+        assert_eq!(
+            classify_justification(&[line(0, 1000), line(0, 1000)]),
+            None
+        );
+        assert_eq!(classify_justification(&[]), None);
+    }
+
+    /// THE headline invariant. Painted text must never be horizontally
+    /// distorted: `Tz` is exactly 100 for both painted fits. Measured on the
+    /// real structured render before this change, `Tz` ranged 32.4%..850%
+    /// line to line.
+    #[test]
+    fn painted_runs_never_distort_glyphs() {
+        for fit in [RunFit::Natural, RunFit::JustifyToBox] {
+            let mut ops = Vec::new();
+            emit_text_run(
+                &mut ops,
+                (0, 0, 400, 20),
+                "the quick brown fox jumps",
+                72,
+                800.0,
+                None,
+                fit,
+            );
+            let tz: Vec<f32> = ops
+                .iter()
+                .filter(|o| o.operator == "Tz")
+                .map(|o| o.operands[0].as_float().unwrap())
+                .collect();
+            assert_eq!(tz, vec![100.0], "{fit:?} must leave glyph width alone");
+        }
+        // …and the invisible layer still DOES stretch, or search/selection
+        // would stop landing on the scanned ink.
+        let mut ops = Vec::new();
+        emit_text_run(
+            &mut ops,
+            (0, 0, 400, 20),
+            "the quick brown fox jumps",
+            72,
+            800.0,
+            None,
+            RunFit::StretchToBox,
+        );
+        let tz = ops
+            .iter()
+            .find(|o| o.operator == "Tz")
+            .and_then(|o| o.operands[0].as_float().ok())
+            .unwrap();
+        assert!(
+            (tz - 100.0).abs() > 1.0,
+            "the invisible layer must still fit the ink box exactly (got Tz={tz})"
+        );
+    }
+
+    /// Justification happens through the SPACES: `Tw` is non-zero and of the
+    /// right sign, and it is reset to 0 on a natural run so a previous line's
+    /// spacing cannot leak into it via the persistent PDF text state.
+    ///
+    /// The box width is derived from the run's OWN natural width (recovered
+    /// from the stretch fit's `Tz`) rather than hardcoded, so the test states
+    /// "10% slack" rather than a number that silently becomes a 40% stretch
+    /// when font metrics change — which is exactly how the first version of
+    /// this test tripped [`MAX_JUSTIFY_SLACK_FRAC`] and failed for the wrong
+    /// reason.
+    #[test]
+    fn justification_uses_word_spacing_and_always_resets_it() {
+        const TEXT: &str = "a b c d e";
+        let op = |fit, w: u32, name: &str| {
+            let mut ops = Vec::new();
+            emit_text_run(&mut ops, (0, 0, w, 20), TEXT, 72, 800.0, None, fit);
+            ops.iter()
+                .find(|o| o.operator == name)
+                .and_then(|o| o.operands[0].as_float().ok())
+                .unwrap_or_else(|| panic!("{name} must always be emitted"))
+        };
+        // Recover the run's natural width: Tz = 100 * box_w / natural_w.
+        let probe_w = 200.0_f64;
+        let natural_w = 100.0 * probe_w / f64::from(op(RunFit::StretchToBox, 200, "Tz"));
+        // 10% slack — comfortably inside the guard, so this measures
+        // justification and not the guard.
+        let just_w = (natural_w * 1.10).round() as u32;
+        let tw = op(RunFit::JustifyToBox, just_w, "Tw");
+        assert!(
+            tw > 0.0,
+            "10% slack must be absorbed by word spacing (got Tw={tw})"
+        );
+        // 4 spaces share the slack; each gets roughly a quarter of it.
+        let expected = (f64::from(just_w) - natural_w) / 4.0;
+        assert!(
+            (f64::from(tw) - expected).abs() < 0.5,
+            "Tw={tw} should be ~{expected:.2} (slack / 4 spaces)"
+        );
+        // Natural and stretch runs must ACTIVELY zero it, or the previous
+        // line's spacing leaks in through the persistent text state.
+        assert_eq!(op(RunFit::Natural, just_w, "Tw"), 0.0);
+        assert_eq!(op(RunFit::StretchToBox, just_w, "Tw"), 0.0);
+    }
+
+    /// The guard's can-it-fire twin: past [`MAX_JUSTIFY_SLACK_FRAC`] the line
+    /// is not a justified line (a heading, a mis-segmented run, one long
+    /// token) and is left NATURAL rather than pulled apart. Without this the
+    /// justify path would happily stretch a two-word heading across a column.
+    #[test]
+    fn justification_declines_an_absurd_stretch() {
+        let mut ops = Vec::new();
+        emit_text_run(
+            &mut ops,
+            (0, 0, 4000, 20),
+            "a b c d e",
+            72,
+            800.0,
+            None,
+            RunFit::JustifyToBox,
+        );
+        let tw = ops
+            .iter()
+            .find(|o| o.operator == "Tw")
+            .and_then(|o| o.operands[0].as_float().ok())
+            .unwrap();
+        assert_eq!(tw, 0.0, "a 40x box must not be justified into, got Tw={tw}");
+    }
+
+    /// The page pitch is the median of consecutive baselines, so a DROPPED
+    /// line (which OCR does exactly where a scan degrades) cannot inflate it
+    /// — the defect that sinks the geometric span/(n-1) form, measured
+    /// inflating 19.08 -> 25.32 across the reference page's degradation
+    /// ladder.
+    #[test]
+    fn page_pitch_is_immune_to_a_dropped_line() {
+        let mk = |bl: &[f32]| JsonPage {
+            regions: vec![JsonRegion {
+                lines: bl
+                    .iter()
+                    .map(|b| JsonLine {
+                        baseline: Some(*b),
+                        ..JsonLine::default()
+                    })
+                    .collect(),
+                ..JsonRegion::default()
+            }],
+            ..JsonPage::default()
+        };
+        let clean = page_pitch_px(&mk(&[0.0, 18.0, 36.0, 54.0, 72.0, 90.0])).unwrap();
+        // Same page with the 3rd line lost: one gap becomes 36 instead of 18.
+        let dropped = page_pitch_px(&mk(&[0.0, 18.0, 54.0, 72.0, 90.0])).unwrap();
+        assert!(
+            (clean - 18.0).abs() < 0.01,
+            "clean pitch = 18 (got {clean})"
+        );
+        assert!(
+            (dropped - 18.0).abs() < 0.01,
+            "a dropped line must not move the median (got {dropped})"
+        );
+        // The geometric form WOULD have been fooled — pin the contrast so the
+        // reason for choosing the median is not lost.
+        let geometric: f32 = 90.0 / 4.0;
+        assert!(
+            (geometric - 22.5).abs() < 0.01 && geometric > dropped,
+            "span/(n-1) inflates to 22.5 where the median holds 18"
+        );
+    }
+
+    /// The two-axis fit takes the BINDING constraint. A page whose lines are
+    /// wide for their measure must shrink below the leading bound, or it
+    /// spills past the column — "does 12.4 become too wide, or too high?"
+    /// made mechanical.
+    #[test]
+    fn page_font_takes_whichever_axis_binds() {
+        // Same baselines (pitch 18 -> height bound 14.4) in both cases; only
+        // the ink width per line differs.
+        let page = |box_w: u32| JsonPage {
+            regions: vec![JsonRegion {
+                lines: (0..6)
+                    .map(|i| JsonLine {
+                        baseline: Some(i as f32 * 18.0),
+                        bbox: Some([0, 0, i64::from(box_w), 16]),
+                        words: vec![JsonWord {
+                            text: "the quick brown fox jumps over".into(),
+                            bbox: [0, 0, i64::from(box_w), 16],
+                        }],
+                        ..JsonLine::default()
+                    })
+                    .collect(),
+                ..JsonRegion::default()
+            }],
+            ..JsonPage::default()
+        };
+        let height_bound = 18.0 * PITCH_TO_FONT_PX;
+        // ROOMY: the text is narrow for its box, so width does not bind and
+        // the leading bound stands.
+        let roomy = page_font_px(&page(4000)).unwrap();
+        assert!(
+            (roomy - height_bound).abs() < 0.01,
+            "with room to spare the height bound must stand (got {roomy})"
+        );
+        // TIGHT: the same text in a much narrower box CANNOT be set at the
+        // leading bound without overflowing, so the fit shrinks it.
+        let tight = page_font_px(&page(40)).unwrap();
+        assert!(
+            tight < height_bound,
+            "a too-narrow measure must bind BELOW the leading bound \
+             (got {tight}, height bound {height_bound})"
+        );
+        // …and it is the width solve, not an arbitrary shrink.
+        assert!(tight > 0.0 && tight < roomy);
+    }
+
+    /// Too few baselines to establish a pitch -> `None`, and the caller keeps
+    /// the per-line path rather than sizing the page off one guess.
+    #[test]
+    fn page_pitch_declines_without_enough_samples() {
+        let p = JsonPage {
+            regions: vec![JsonRegion {
+                lines: vec![JsonLine {
+                    baseline: Some(10.0),
+                    ..JsonLine::default()
+                }],
+                ..JsonRegion::default()
+            }],
+            ..JsonPage::default()
+        };
+        assert_eq!(page_pitch_px(&p), None);
+        assert_eq!(page_font_px(&p), None);
     }
 }
