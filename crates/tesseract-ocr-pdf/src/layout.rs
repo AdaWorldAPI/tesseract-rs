@@ -1444,6 +1444,181 @@ fn crop_grey(src: &GreyImage, bbox: (u32, u32, u32, u32)) -> GreyImage {
     GreyImage { data, w: cw, h: ch }
 }
 
+// ---------------------------------------------------------------------------
+// Per-region scale factor (header/footer) — see [`region_scale_factor`].
+// ---------------------------------------------------------------------------
+
+/// Minimum region lines carrying `baseline` before the region's OWN pitch is
+/// trusted for rung A of [`region_scale_factor`] (`>= MIN_REGION_PITCH_LINES`
+/// baselines, i.e. `>= 2` deltas) — the per-region analogue of
+/// [`MIN_PITCH_SAMPLES`], applied within one region instead of page-wide.
+const MIN_REGION_PITCH_LINES: usize = 3;
+
+/// Below this ratio (region indicator / page indicator) a `header`/`footer`
+/// region is left at page size. Symmetric in log space with
+/// [`SCALE_DEAD_BAND_HI`] (`1 / 0.80 = 1.25`), i.e. +-one conventional
+/// typographic step (1.125/1.2/1.25): a running head set AT body size but
+/// measuring differently because its ink is cap-height-only (all-caps -> no
+/// descender) lands inside the band and is correctly normalized rather than
+/// nudged.
+///
+/// **Honesty pin, mandatory to restate at every use:** this and the three
+/// constants below are POLICY PINS, not measurements — the corpus contains
+/// no fixture with a real headline. Do not defend these numbers; re-measure
+/// when a tightly-set page with a real headline lands.
+const SCALE_DEAD_BAND_LO: f32 = 0.80;
+
+/// Upper edge of the dead band — see [`SCALE_DEAD_BAND_LO`]. Policy pin, not
+/// a measurement.
+const SCALE_DEAD_BAND_HI: f32 = 1.25;
+
+/// Below this ratio a "headline" measurement reads as a truncated or
+/// mis-cropped line, not a genuine design choice — a running foot
+/// legitimately sits at 0.7-0.85 of body, but not below half. Policy pin, not
+/// a measurement.
+const SCALE_CLAMP_LO: f32 = 0.5;
+
+/// Above this ratio a measurement is reachable by cross-line contamination
+/// alone (the corpus's own measured `Tf`/pitch maximum was 3.03, see
+/// [`page_pitch_px`]'s doc) and carries no discriminating information; it is
+/// also roughly the largest conventional display step over body on a text
+/// page. Policy pin, not a measurement.
+const SCALE_CLAMP_HI: f32 = 3.0;
+
+/// Sort in place and return the middle element — the SAME
+/// `sort_by(f32::total_cmp)` + `v[len/2]` idiom [`page_pitch_px`] and
+/// [`page_font_px`] already use for their own medians, factored out here so
+/// [`region_scale_factor`]'s two rungs share it rather than re-deriving it.
+fn median_f32(v: &mut [f32]) -> Option<f32> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(f32::total_cmp);
+    Some(v[v.len() / 2])
+}
+
+/// Rung A of [`region_scale_factor`]: the median consecutive baseline delta
+/// WITHIN one region, requiring [`MIN_REGION_PITCH_LINES`] lines carrying
+/// `baseline` (`>= 2` deltas) before it is trusted.
+///
+/// *Contamination: none.* A multi-line headline's own leading scales with
+/// its own size, so the ratio against the page's [`page_pitch_px`] is real —
+/// see [`region_scale_factor`]'s doc for why the numerator and denominator
+/// must be LIKE quantities.
+fn region_pitch_px(lines: &[JsonLine]) -> Option<f32> {
+    let mut bl: Vec<f32> = lines.iter().filter_map(|l| l.baseline).collect();
+    if bl.len() < MIN_REGION_PITCH_LINES {
+        return None;
+    }
+    bl.sort_by(f32::total_cmp);
+    let mut deltas: Vec<f32> = bl
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|d| *d > 0.0)
+        .collect();
+    median_f32(&mut deltas)
+}
+
+/// Rung B of [`region_scale_factor`]: the median over the region's lines of
+/// [`derive_text_metrics`]'s `font_px` — deliberately reusing the file's
+/// EXISTING three-tier ladder (glyph_px*4/3 -> band fit -> none) rather than
+/// re-deriving band-then-glyph, per [`derive_text_metrics`]'s own doc
+/// comment ("is how the two silently drift apart").
+fn region_measured_font_px(lines: &[JsonLine]) -> Option<f32> {
+    let mut vals: Vec<f32> = lines
+        .iter()
+        .filter_map(|l| {
+            derive_text_metrics(l.xheight, l.ascrise, l.descdrop, l.baseline, l.glyph_px)
+                .map(|m| m.font_px)
+        })
+        .collect();
+    median_f32(&mut vals)
+}
+
+/// Rung B's page-wide denominator: [`region_measured_font_px`]'s SAME
+/// median, taken over BODY regions only (`kind` not in `{"header",
+/// "footer"}`).
+///
+/// Deliberately body-only rather than page-wide-including-furniture: unlike
+/// [`page_pitch_px`], which absorbs a header's `<= 2`-of-dozens deltas by its
+/// own page-wide median, this is new code with no many-sample median
+/// protection on a short page, so the header/footer numerator must never be
+/// allowed to denominate against itself.
+fn page_measured_font_px_median(page: &JsonPage) -> Option<f32> {
+    let mut vals: Vec<f32> = page
+        .regions
+        .iter()
+        .filter(|r| r.kind != "header" && r.kind != "footer")
+        .flat_map(|r| r.lines.iter())
+        .filter_map(|l| {
+            derive_text_metrics(l.xheight, l.ascrise, l.descdrop, l.baseline, l.glyph_px)
+                .map(|m| m.font_px)
+        })
+        .collect();
+    median_f32(&mut vals)
+}
+
+/// The page-level denominators [`region_scale_factor`] needs, built ONCE per
+/// page alongside [`page_font_px`] (see [`doc_v1_layout`]).
+struct PageScaleRefs {
+    /// [`page_pitch_px`]'s page-wide median baseline delta — rung A's
+    /// denominator.
+    pitch: Option<f32>,
+    /// [`page_measured_font_px_median`] — rung B's denominator (body regions
+    /// only).
+    measured: Option<f32>,
+}
+
+/// Per-region scale factor for a `header`/`footer` region whose own evidence
+/// is a CLEAR outlier from the page size. Every other region — and every
+/// region kind other than `header`/`footer` — returns exactly `1.0`, i.e.
+/// today's behaviour, unchanged.
+///
+/// # The ratio must compare LIKE WITH LIKE (load-bearing)
+///
+/// Contamination is a MULTIPLICATIVE bias: [`page_pitch_px`]'s doc records
+/// the measured `Tf`/pitch median 1.44, up to 1.82x apart for the same
+/// string between columns. A ratio of UNLIKE quantities — a region's
+/// band/ink measurement over [`page_font_px`] (a pitch/width SOLVE) — would
+/// carry that ~1.44 systematic offset, so *every* region would read as a
+/// 1.44x headline and no dead-band could absorb it. A ratio of LIKE
+/// quantities cancels it: numerator and denominator inherit the same bias.
+///
+/// So the region's indicator rung SELECTS its own page-level denominator —
+/// never cross rungs; if the matching denominator is `None`, the factor is
+/// `1.0`.
+///
+/// # Why an isolated header's rung-B measurement is trustworthy
+///
+/// Contamination is ink from an ADJACENT line entering this line's generous
+/// recognition band. A page-furniture line sits in white space by
+/// construction — that is precisely why it classified as `header`/`footer`
+/// in the first place — so an isolated line has no neighbour in its band and
+/// nothing to import; the 1.82x body-vs-body spread does not bound the
+/// header's own error.
+///
+/// And the residual bias runs the SAFE way: the rung-B denominator (body,
+/// tight-set) IS contaminated upward, while the isolated header numerator is
+/// not. The ratio is therefore UNDERSTATED — a genuine headline gets less
+/// amplification than it deserves, never more. The failure mode is
+/// under-correction.
+fn region_scale_factor(region: &JsonRegion, refs: &PageScaleRefs) -> f32 {
+    if region.kind != "header" && region.kind != "footer" {
+        return 1.0;
+    }
+    let ratio = region_pitch_px(&region.lines)
+        .zip(refs.pitch)
+        .or_else(|| region_measured_font_px(&region.lines).zip(refs.measured))
+        .and_then(|(num, den)| (den > 0.0).then_some(num / den));
+    let Some(ratio) = ratio else {
+        return 1.0;
+    };
+    if (SCALE_DEAD_BAND_LO..=SCALE_DEAD_BAND_HI).contains(&ratio) {
+        return 1.0;
+    }
+    ratio.clamp(SCALE_CLAMP_LO, SCALE_CLAMP_HI)
+}
+
 /// Reconstruct a [`LayoutDoc`] from a `tesseract-rs/doc.v1` JSON document plus
 /// the per-page grey rasters (indexed by page order). Region → block mapping:
 ///
@@ -1473,6 +1648,12 @@ pub fn doc_v1_layout(doc_json: &str, page_rasters: &[GreyImage]) -> Result<Layou
         // per-line ink measurement is not trusted for SIZE; per-line
         // `baseline` is still trusted for PLACEMENT.
         let page_font_px = page_font_px(&jp);
+        // The page-level denominators `region_scale_factor` needs, built
+        // ONCE per page alongside `page_font_px` — see `PageScaleRefs`.
+        let scale_refs = PageScaleRefs {
+            pitch: page_pitch_px(&jp),
+            measured: page_measured_font_px_median(&jp),
+        };
 
         for region in &jp.regions {
             match region.kind.as_str() {
@@ -1523,6 +1704,11 @@ pub fn doc_v1_layout(doc_json: &str, page_rasters: &[GreyImage]) -> Result<Layou
                             })
                             .collect::<Vec<_>>(),
                     );
+                    // Also classified ONCE per region, same reasoning: a
+                    // header/footer's deviation from page size is a property
+                    // of the region's own evidence, not of any one line.
+                    // `1.0` (today's exact behaviour) for every other kind.
+                    let scale = region_scale_factor(region, &scale_refs);
                     for line in &region.lines {
                         let text = line
                             .words
@@ -1556,7 +1742,10 @@ pub fn doc_v1_layout(doc_json: &str, page_rasters: &[GreyImage]) -> Result<Layou
                         // baselines measured correctly (pitch sd 0.00 across
                         // every column of the reference page).
                         .map(|m| match page_font_px {
-                            Some(f) => TextMetrics { font_px: f, ..m },
+                            Some(f) => TextMetrics {
+                                font_px: f * scale,
+                                ..m
+                            },
                             None => m,
                         });
                         blocks.push(Block::Text(TextBlock {
@@ -2571,5 +2760,323 @@ mod normalization_tests {
         };
         assert_eq!(page_pitch_px(&p), None);
         assert_eq!(page_font_px(&p), None);
+    }
+
+    // -------------------------------------------------------------------
+    // Per-region scale factor (header/footer) — #49.
+    //
+    // ORCHESTRATOR EXECUTES: the six falsifiers below are all verified by
+    // construction (each assertion is unreachable unless the specific edit
+    // it names is present) but per this repo's iron rule ("the worker must
+    // run the disable-the-fix edit for every test and report the observed
+    // failure message — not assert that it would fail") the actual disable
+    // -> re-run -> observe-the-failure step needs a live `cargo test`,
+    // which this Sonnet worker is instructed NOT to run (the orchestrator
+    // compiles/tests centrally, once, in the shared `target/`). The
+    // orchestrator MUST run each edit below against
+    // `cargo test -p tesseract-ocr-pdf --release normalization_tests` and
+    // record the real failure message before considering #49 landed:
+    //
+    // | test | disable edit | expected failure |
+    // |---|---|---|
+    // | `header_2x_body_scales_the_header_block` | drop `* scale` at the `TextMetrics { font_px: f * scale, ..m }` override | header block's font_px assertion (~2x page size) fails — it renders at exactly page size instead |
+    // | `text_only_page_stays_at_page_size_exactly` | force `region_scale_factor` to always return `2.0` | `assert_eq!` on every body block's `font_px` fails (font_px is now 2x `page_font_px`) |
+    // | `header_within_dead_band_is_left_at_page_size` | remove the dead-band branch (`if (SCALE_DEAD_BAND_LO..=SCALE_DEAD_BAND_HI).contains(&ratio) { return 1.0; }`) | `assert_eq!` fails — the header would render at `page_font_px * 1.1` instead of exactly `page_font_px` |
+    // | `header_10x_body_clamps_to_the_ceiling` | remove the `.clamp(SCALE_CLAMP_LO, SCALE_CLAMP_HI)` call | header block's font_px assertion (`page_font_px * 3.0`) fails — it renders at `page_font_px * 10.0` instead |
+    // | `header_deviation_with_no_body_metrics_stays_at_page_size` | change the rung-B fallback to denominate against `page_font_px(&jp)` instead of `refs.measured` | `assert_eq!` fails — the header renders at `page_font_px * (20.0 / page_font_px)` instead of exactly `page_font_px` |
+    // | `text_kind_never_deviates_even_at_2x` | delete the `if region.kind != "header" && region.kind != "footer" { return 1.0; }` kind gate | `assert_eq!` fails for BOTH the `"text"` and the `""`-kind variant — each renders at `page_font_px * 2.0` instead of exactly `page_font_px` |
+
+    /// One `doc.v1` line JSON fragment: `baseline` always present; the band
+    /// keys (`xheight`/`ascrise`/`descdrop`) only when `Some` — omitting
+    /// them is deliberately possible here (test 5's body fixture needs it),
+    /// mirroring test 1's own trap: a metrics-less line makes
+    /// `derive_text_metrics` return `None`, so a fixture that is SUPPOSED to
+    /// carry metrics must say so explicitly, never by accident.
+    fn norm_line_json(baseline: f32, band: Option<(f32, f32, f32)>) -> String {
+        match band {
+            Some((xh, ar, dr)) => format!(
+                r#"{{"baseline":{baseline},"xheight":{xh},"ascrise":{ar},"descdrop":{dr},"words":[]}}"#
+            ),
+            None => format!(r#"{{"baseline":{baseline},"words":[]}}"#),
+        }
+    }
+
+    /// One `"text"` body region: 4 lines, 18px pitch, constant band font_px
+    /// 10.0 (`xheight 10, ascrise 2, descdrop 2`) — repeated across the
+    /// tests below so [`page_pitch_px`] and [`page_measured_font_px_median`]
+    /// both see clean, deterministic evidence: pitch median exactly 18.0
+    /// (zero spread) and body measured font_px exactly 10.0 (zero spread),
+    /// both BY CONSTRUCTION rather than by median-over-noise luck.
+    fn norm_body_region_json(base_baseline: f32) -> String {
+        let lines: Vec<String> = (0..4)
+            .map(|i| norm_line_json(base_baseline + i as f32 * 18.0, Some((10.0, 2.0, 2.0))))
+            .collect();
+        format!(r#"{{"type":"text","lines":[{}]}}"#, lines.join(","))
+    }
+
+    /// The same shape as [`norm_body_region_json`] but WITHOUT any band
+    /// keys — every line carries `baseline` only, so
+    /// [`page_measured_font_px_median`] sees zero evidence (test 5's "no
+    /// body metrics" fixture) while [`page_pitch_px`] still sees a full
+    /// pitch (it only needs `baseline`).
+    fn norm_body_region_json_no_metrics(base_baseline: f32) -> String {
+        let lines: Vec<String> = (0..4)
+            .map(|i| norm_line_json(base_baseline + i as f32 * 18.0, None))
+            .collect();
+        format!(r#"{{"type":"text","lines":[{}]}}"#, lines.join(","))
+    }
+
+    /// `n` copies of [`norm_body_region_json`], each in its own baseline
+    /// range (`+= 500.0` per region) so cross-region baseline collisions
+    /// never create a spurious same-region delta — deltas are computed
+    /// per-region by [`page_pitch_px`]/[`region_pitch_px`], so this is
+    /// belt-and-braces rather than load-bearing, but it keeps every fixture
+    /// unambiguous to read.
+    fn norm_body_regions(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| norm_body_region_json(i as f32 * 500.0))
+            .collect()
+    }
+
+    /// The no-metrics sibling of [`norm_body_regions`] (test 5 only).
+    fn norm_body_regions_no_metrics(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| norm_body_region_json_no_metrics(i as f32 * 500.0))
+            .collect()
+    }
+
+    /// The bare page BODY (everything inside one `"pages"` array entry, no
+    /// `doc.v1` envelope) for `regions` — parseable directly as a
+    /// [`JsonPage`] via `serde_json::from_str`, so a test can compute its
+    /// exact expected [`page_font_px`]/[`page_pitch_px`]/
+    /// [`page_measured_font_px_median`] from the SAME evidence
+    /// [`doc_v1_layout`] itself will use, rather than a hand-derived number
+    /// that could silently drift from the real constants.
+    fn norm_page_body_json(regions: &[String]) -> String {
+        format!(
+            r#"{{"width":1000,"height":2000,"regions":[{}],"fields":[]}}"#,
+            regions.join(",")
+        )
+    }
+
+    /// [`norm_page_body_json`] wrapped in the full `doc.v1` envelope, ready
+    /// for [`doc_v1_layout`].
+    fn norm_doc_json(regions: &[String]) -> String {
+        format!(
+            r#"{{"schema":"tesseract-rs/doc.v1","pages":[{}]}}"#,
+            norm_page_body_json(regions)
+        )
+    }
+
+    /// Every `Block::Text` in page 0, in emission order.
+    fn text_blocks(doc: &LayoutDoc) -> Vec<&TextBlock> {
+        doc.pages[0]
+            .blocks
+            .iter()
+            .map(|b| match b {
+                Block::Text(t) => t,
+                other => panic!("expected only Block::Text in these fixtures, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Test 1 (can-fire). Six `"text"` body regions (4 lines each, real
+    /// baselines + xheight + a constant band font_px of 10.0) plus one
+    /// single-line `"header"` whose measured font is 2x body (xheight 20.0).
+    /// Because the header has only ONE line, rung A (region pitch) cannot
+    /// apply (`< MIN_REGION_PITCH_LINES`) and the factor must come from rung
+    /// B (region measured font vs body measured font median) — exercising
+    /// exactly the single-line-headline path the spec calls out.
+    ///
+    /// **THE TRAP:** if the header line omitted `xheight`/`baseline`,
+    /// `derive_text_metrics` would return `None` and this block's
+    /// `metrics` would stay `None` — the caller's `TEXT_HEIGHT_TO_FONTSIZE`
+    /// box-height fallback would then apply on the RENDER side (not tested
+    /// here), and a taller header BOX would render bigger even WITH `*
+    /// scale` deleted, passing this test for the wrong reason. The
+    /// `metrics.is_some()` assertion below is what forbids that — the
+    /// fixture below deliberately DOES carry `xheight`/`baseline` on the
+    /// header line, so the only way its font_px can be ~2x page size is
+    /// through the scale factor actually firing.
+    #[test]
+    fn header_2x_body_scales_the_header_block() {
+        let header =
+            r#"{"type":"header","lines":[{"baseline":5.0,"xheight":20.0,"ascrise":0.0,"descdrop":0.0,"words":[]}]}"#
+                .to_string();
+        let mut regions = norm_body_regions(6);
+        regions.push(header);
+
+        let jp: JsonPage = serde_json::from_str(&norm_page_body_json(&regions)).unwrap();
+        let expected_page_font = page_font_px(&jp).expect("page font must resolve");
+
+        let doc = doc_v1_layout(&norm_doc_json(&regions), &[]).expect("parse");
+        let texts = text_blocks(&doc);
+        assert_eq!(
+            texts.len(),
+            6 * 4 + 1,
+            "6 body regions x 4 lines + 1 header line"
+        );
+
+        let (header_block, body_blocks) = texts.split_last().unwrap();
+        let m = header_block
+            .metrics
+            .expect("header line carries xheight+baseline, metrics must resolve");
+        assert!(
+            (m.font_px - expected_page_font * 2.0).abs() < 1e-2,
+            "header measuring 2x body must render at ~2x page size \
+             (got {}, expected {})",
+            m.font_px,
+            expected_page_font * 2.0
+        );
+        for b in body_blocks {
+            assert_eq!(
+                b.metrics.unwrap().font_px,
+                expected_page_font,
+                "every body block must stay at EXACT page size"
+            );
+        }
+    }
+
+    /// Test 2 (stay-silent). An all-`"text"` page: every block's `font_px`
+    /// must equal `page_font_px(&jp).unwrap()` EXACTLY — `assert_eq!`, no
+    /// epsilon, because `f * 1.0f32` is exact in IEEE 754, so equality is
+    /// the correct AND the stronger assertion here.
+    #[test]
+    fn text_only_page_stays_at_page_size_exactly() {
+        let regions = norm_body_regions(6);
+        let jp: JsonPage = serde_json::from_str(&norm_page_body_json(&regions)).unwrap();
+        let expected_page_font = page_font_px(&jp).expect("page font must resolve");
+
+        let doc = doc_v1_layout(&norm_doc_json(&regions), &[]).expect("parse");
+        let texts = text_blocks(&doc);
+        assert_eq!(texts.len(), 6 * 4);
+        for b in &texts {
+            assert_eq!(
+                b.metrics.unwrap().font_px,
+                expected_page_font,
+                "an all-text page must never deviate from page size"
+            );
+        }
+    }
+
+    /// Test 3 (dead-band). A `"header"` measuring 1.1x body (inside
+    /// `[SCALE_DEAD_BAND_LO, SCALE_DEAD_BAND_HI]`) must land at EXACTLY page
+    /// size — `assert_eq!`, since the dead band collapses the factor to the
+    /// exact constant `1.0`.
+    #[test]
+    fn header_within_dead_band_is_left_at_page_size() {
+        let header =
+            r#"{"type":"header","lines":[{"baseline":5.0,"xheight":11.0,"ascrise":0.0,"descdrop":0.0,"words":[]}]}"#
+                .to_string();
+        let mut regions = norm_body_regions(6);
+        regions.push(header);
+
+        let jp: JsonPage = serde_json::from_str(&norm_page_body_json(&regions)).unwrap();
+        let expected_page_font = page_font_px(&jp).expect("page font must resolve");
+
+        let doc = doc_v1_layout(&norm_doc_json(&regions), &[]).expect("parse");
+        let texts = text_blocks(&doc);
+        let header_block = texts.last().unwrap();
+        assert_eq!(
+            header_block.metrics.unwrap().font_px,
+            expected_page_font,
+            "1.1x body (inside the dead band) must land at exactly page size"
+        );
+    }
+
+    /// Test 4 (clamp). A `"header"` measuring 10x body must clamp to
+    /// `SCALE_CLAMP_HI` (3.0), not the raw ratio.
+    #[test]
+    fn header_10x_body_clamps_to_the_ceiling() {
+        let header =
+            r#"{"type":"header","lines":[{"baseline":5.0,"xheight":100.0,"ascrise":0.0,"descdrop":0.0,"words":[]}]}"#
+                .to_string();
+        let mut regions = norm_body_regions(6);
+        regions.push(header);
+
+        let jp: JsonPage = serde_json::from_str(&norm_page_body_json(&regions)).unwrap();
+        let expected_page_font = page_font_px(&jp).expect("page font must resolve");
+
+        let doc = doc_v1_layout(&norm_doc_json(&regions), &[]).expect("parse");
+        let texts = text_blocks(&doc);
+        let header_block = texts.last().unwrap();
+        let m = header_block.metrics.unwrap();
+        assert!(
+            (m.font_px - expected_page_font * 3.0).abs() < 1e-2,
+            "a 10x-measuring header must clamp to 3x, not render at 10x \
+             (got {}, expected {})",
+            m.font_px,
+            expected_page_font * 3.0
+        );
+    }
+
+    /// Test 5 (rung isolation). A `"header"` carries valid rung-B evidence
+    /// (xheight+baseline, one line only — so rung A cannot apply either),
+    /// but every BODY line carries `baseline` only, no band keys — so
+    /// [`page_measured_font_px_median`] returns `None` and rung B's
+    /// denominator is empty. The factor must fall back to exactly `1.0`,
+    /// NOT silently denominate against `page_font_px(&jp)` (which page pitch
+    /// alone still makes available, since it needs only `baseline`).
+    #[test]
+    fn header_deviation_with_no_body_metrics_stays_at_page_size() {
+        let header =
+            r#"{"type":"header","lines":[{"baseline":5.0,"xheight":20.0,"ascrise":0.0,"descdrop":0.0,"words":[]}]}"#
+                .to_string();
+        let mut regions = norm_body_regions_no_metrics(6);
+        regions.push(header);
+
+        let jp: JsonPage = serde_json::from_str(&norm_page_body_json(&regions)).unwrap();
+        // Sanity-check the fixture actually reaches the intended state
+        // before trusting the assertion below: pitch resolves (body lines
+        // carry baseline), but the body-only measured median does not (no
+        // body line carries a band key).
+        assert!(
+            page_pitch_px(&jp).is_some(),
+            "fixture must still have a pitch"
+        );
+        assert!(
+            page_measured_font_px_median(&jp).is_none(),
+            "fixture must have NO body-metrics evidence"
+        );
+        let expected_page_font = page_font_px(&jp).expect("page font must resolve");
+
+        let doc = doc_v1_layout(&norm_doc_json(&regions), &[]).expect("parse");
+        let texts = text_blocks(&doc);
+        let header_block = texts.last().unwrap();
+        assert_eq!(
+            header_block.metrics.unwrap().font_px,
+            expected_page_font,
+            "an empty rung-B denominator must decline to page size, \
+             not fall back to page_font_px as a substitute denominator"
+        );
+    }
+
+    /// Test 6 (kind gate). The IDENTICAL 2x-measuring fixture from test 1,
+    /// but with `kind = "text"` and again with `kind = ""` (doc.v1's legacy
+    /// no-`type` shape) — both must land at EXACTLY page size, proving the
+    /// kind gate itself, not the dead band (a real 2.0 ratio is nowhere near
+    /// the dead band, so only the gate can be suppressing it).
+    #[test]
+    fn text_kind_never_deviates_even_at_2x() {
+        for kind_json in ["\"type\":\"text\",", ""] {
+            let extra = format!(
+                r#"{{{kind_json}"lines":[{{"baseline":5.0,"xheight":20.0,"ascrise":0.0,"descdrop":0.0,"words":[]}}]}}"#
+            );
+            let mut regions = norm_body_regions(6);
+            regions.push(extra);
+
+            let jp: JsonPage = serde_json::from_str(&norm_page_body_json(&regions)).unwrap();
+            let expected_page_font = page_font_px(&jp).expect("page font must resolve");
+
+            let doc = doc_v1_layout(&norm_doc_json(&regions), &[]).expect("parse");
+            let texts = text_blocks(&doc);
+            let extra_block = texts.last().unwrap();
+            assert_eq!(
+                extra_block.metrics.unwrap().font_px,
+                expected_page_font,
+                "kind={kind_json:?}: a 2x measurement on a non-header/footer \
+                 kind must never deviate from page size"
+            );
+        }
     }
 }

@@ -62,6 +62,15 @@ const K_MIN_CERTAINTY: f32 = -20.0;
 /// `INVALID_UNICHAR_ID` (`unichar.h`).
 const INVALID_UNICHAR_ID: i32 = -1;
 
+/// Bounded per-timestep posterior-summary width retained by
+/// [`RecodeBeamSearch::retaining_posteriors`] / read via
+/// [`RecodeBeamSearch::retained_posteriors`] and [`RetainedStep::top`].
+/// Independent of the beam's own `K_BEAM_WIDTHS` capacity (`K_BEAM_WIDTHS[0]
+/// == 5`; retaining fewer than that would only re-report the beam's own
+/// view, so this is deliberately wider) — a reproducible consumer-facing
+/// summary, not a transcode of any C++ constant.
+pub const RETAINED_TOP_K: usize = 8;
+
 /// Return shape of
 /// [`RecodeBeamSearch::extract_path_as_unichar_ids_with_boundaries`]:
 /// `(unichar_ids, certs, ratings, xcoords, character_boundaries)` — the same
@@ -400,6 +409,17 @@ pub struct RecodeBeamSearch<'a> {
     second_code: i32,
     /// Reused heap for `ComputeTopN`.
     top_heap: MinHeap,
+    /// Whether `decode_impl` retains a per-timestep top-K posterior summary
+    /// in `retained` (opt-in via
+    /// [`RecodeBeamSearch::retaining_posteriors`]). `false` by default;
+    /// every existing decode result is byte-identical regardless of this
+    /// flag's value — `retain_step` only reads `outputs`/`t` and is called
+    /// downstream of every parity-critical mutation for the step.
+    retain_posteriors: bool,
+    /// The retained per-timestep top-K summary, index-aligned with the
+    /// timestep (`retained[j].t == j`). Always empty when `retain_posteriors`
+    /// is `false`. Read via [`RecodeBeamSearch::retained_posteriors`].
+    retained: Vec<RetainedStep>,
 }
 
 /// One extracted word — the information-content equivalent of Tesseract's
@@ -436,6 +456,49 @@ pub struct WordResult {
     pub space_certainty: f32,
     /// True if a space immediately precedes this word (`recodebeam.cpp:296-297`).
     pub leading_space: bool,
+}
+
+/// One retained posterior alternative at a timestep: a raw `(class,
+/// probability)` pair read directly from the softmax row — NOT a beam node,
+/// NOT a `top_n_flags_` classification. See [`RetainedStep`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RetainedClass {
+    /// The class index into the softmax row (`outputs[t]`).
+    pub class: u16,
+    /// The class's raw probability at this timestep.
+    pub prob: f32,
+}
+
+/// A bounded, timestep-aligned top-K summary of one softmax row
+/// (`RETAINED_TOP_K` entries), retained by
+/// [`RecodeBeamSearch::decode`]/[`RecodeBeamSearch::decode_with_dict`] only
+/// when [`RecodeBeamSearch::retaining_posteriors`] opted in. This is a
+/// read-only consumer-facing summary of the row already passed to
+/// `compute_top_n`/`decode_step` — it feeds nothing back into the beam and
+/// changes no decode result.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RetainedStep {
+    /// The timestep index. Index-aligned with the xcoords both
+    /// `extract_best_path_as_labels` and `extract_best_path_as_unichar_ids`
+    /// return (`retained[j].t == j` — see
+    /// [`RecodeBeamSearch::retained_posteriors`]).
+    pub t: u32,
+    /// Descending by `prob`; ties broken ASCENDING by `class` — deliberately
+    /// NOT the beam's own heap insertion-order tie-break (see
+    /// [`RecodeBeamSearch::retaining_posteriors`]'s doc). Only `top[..len]`
+    /// is meaningful; the tail is padded with `prob: f32::NEG_INFINITY` and
+    /// is excluded by [`Self::top`].
+    pub top: [RetainedClass; RETAINED_TOP_K],
+    /// Number of meaningful entries in `top` (`min(row.len(), RETAINED_TOP_K)`).
+    pub len: u8,
+}
+
+impl RetainedStep {
+    /// The meaningful prefix of `top` (`top[..len]`).
+    #[must_use]
+    pub fn top(&self) -> &[RetainedClass] {
+        &self.top[..self.len as usize]
+    }
 }
 
 /// `RecodeBeamSearch::calculateCharBoundaries` (`recodebeam.cpp:187-198`): turn
@@ -492,6 +555,8 @@ impl<'a> RecodeBeamSearch<'a> {
             top_code: -1,
             second_code: -1,
             top_heap: MinHeap::default(),
+            retain_posteriors: false,
+            retained: Vec::new(),
         }
     }
 
@@ -527,7 +592,37 @@ impl<'a> RecodeBeamSearch<'a> {
             top_code: -1,
             second_code: -1,
             top_heap: MinHeap::default(),
+            retain_posteriors: false,
+            retained: Vec::new(),
         }
+    }
+
+    /// Opt in to retaining a per-timestep top-K posterior summary during the
+    /// next [`Self::decode`]/[`Self::decode_with_dict`] call, readable
+    /// afterwards via [`Self::retained_posteriors`]. Observationally inert
+    /// otherwise: every existing decode result (labels, unichar ids, certs,
+    /// ratings, words) is byte-identical whether or not this is set — a
+    /// builder, not a signature change, so the parity-critical `decode`/
+    /// `decode_with_dict` call sites elsewhere in this workspace are
+    /// untouched. Tie-break within a retained step is `(prob desc, class
+    /// asc)`, deliberately NOT the beam's own heap insertion-order tie-break
+    /// — a reproducible consumer-facing summary, not a transcode.
+    #[must_use]
+    pub fn retaining_posteriors(mut self) -> Self {
+        self.retain_posteriors = true;
+        self
+    }
+
+    /// The retained per-timestep top-K posterior summary from the most
+    /// recent [`Self::decode`]/[`Self::decode_with_dict`] call. EMPTY
+    /// (never `Option`) when retention was not opted into via
+    /// [`Self::retaining_posteriors`]. Index-aligned with the xcoords both
+    /// `extract_best_path_as_labels` and `extract_best_path_as_unichar_ids`
+    /// return: alternatives of character `i` are
+    /// `retained_posteriors()[xcoords[i] as usize].top()`.
+    #[must_use]
+    pub fn retained_posteriors(&self) -> &[RetainedStep] {
+        &self.retained
     }
 
     /// Decode a softmax matrix (`outputs[t]` = the class-prob row at timestep `t`)
@@ -572,9 +667,14 @@ impl<'a> RecodeBeamSearch<'a> {
         self.arena.clear();
         self.beams.clear();
         self.best_initial_dawgs.clear();
+        self.retained.clear();
+        if self.retain_posteriors {
+            self.retained.reserve(outputs.len());
+        }
         for (t, row) in outputs.iter().enumerate() {
             self.compute_top_n(row, K_BEAM_WIDTHS[0]);
             self.decode_step(row, t);
+            self.retain_step(row, t);
         }
     }
 
@@ -614,6 +714,62 @@ impl<'a> RecodeBeamSearch<'a> {
             }
         }
         self.top_n_flags[self.null_char as usize] = TopN::Top2;
+    }
+
+    /// Populate `retained[t]` from the raw softmax row for timestep `t` — a
+    /// bounded top-K summary computed independently of the beam (a fresh
+    /// pass over `outputs`, not a reuse of `compute_top_n`'s `top_heap`,
+    /// which is pinned to `K_BEAM_WIDTHS[0] == 5` and is the beam's own
+    /// parity-critical state — see [`RETAINED_TOP_K`]'s doc). No-op when
+    /// retention was not opted into via
+    /// [`RecodeBeamSearch::retaining_posteriors`], so this call changes
+    /// nothing observable by any existing decode result.
+    ///
+    /// Ties are broken by iterating classes in ascending order and inserting
+    /// on a *strict* `>` comparison: a later class with an EQUAL probability
+    /// never displaces an earlier one already holding that rank, which
+    /// yields `(prob desc, class asc)` ordering for free — deliberately NOT
+    /// the beam's own heap insertion-order tie-break.
+    ///
+    /// A `NaN` probability satisfies neither the `<=` short-circuit below
+    /// nor the `>` insertion test, so it is silently excluded from `top`
+    /// (never inserted, never counted against another class's rank) —
+    /// deliberate, not an oversight: there is no principled rank to give a
+    /// `NaN`, and excluding it is the only option that can't smuggle it into
+    /// a false top-K position.
+    fn retain_step(&mut self, outputs: &[f32], t: usize) {
+        if !self.retain_posteriors {
+            return;
+        }
+        const NEG_INF: RetainedClass = RetainedClass {
+            class: 0,
+            prob: f32::NEG_INFINITY,
+        };
+        let mut top = [NEG_INF; RETAINED_TOP_K];
+        // Computed from the row's own length, never by counting sentinels —
+        // a row shorter than RETAINED_TOP_K (e.g. a passthrough recoder's
+        // n=5) leaves the tail permanently NEG_INFINITY-padded and `len`
+        // reports the true, smaller count.
+        let len = outputs.len().min(RETAINED_TOP_K) as u8;
+        for (class, &prob) in outputs.iter().enumerate() {
+            if prob <= top[RETAINED_TOP_K - 1].prob {
+                continue;
+            }
+            let mut j = 0usize;
+            while j < RETAINED_TOP_K && prob <= top[j].prob {
+                j += 1;
+            }
+            top.copy_within(j..RETAINED_TOP_K - 1, j + 1);
+            top[j] = RetainedClass {
+                class: class as u16,
+                prob,
+            };
+        }
+        self.retained.push(RetainedStep {
+            t: t as u32,
+            top,
+            len,
+        });
     }
 
     /// `DecodeStep` (`recodebeam.cpp:743`): extend the beam for timestep `t`. `t==0`
@@ -2244,5 +2400,292 @@ mod tests {
         assert_eq!(words[1].unichar_ids, vec![2]);
         assert_eq!(words[2].unichar_ids, vec![3]);
         assert!(words.iter().all(|w| !w.leading_space));
+    }
+
+    // ---- #51 Step 1: retain per-timestep posteriors (additive, opt-in) ----
+    //
+    // (e) DISABLE table — ORCHESTRATOR EXECUTES, one row at a time, reverting
+    // each before the next:
+    //   1. delete the `if !self.retain_posteriors { return; }` guard in
+    //      `retain_step` -> fails (d)'s OFF-arm-is-empty assertion.
+    //   2. change `retain_step`'s insertion scan to index/insertion order
+    //      instead of `(prob desc, class asc)` -> fails (b).
+    //   3. change the insertion test from `prob <= top[j].prob` /
+    //      `prob > top[j].prob` to use `>=` instead of `>` -> fails (c).
+    //   4. change `decode_impl`'s loop to call `self.retain_step(row, t);`
+    //      only when `t == 0` -> fails (d)'s len==rows.len() assertion.
+    //   5. make `retain_step` also write `self.top_n_flags` (e.g. alias it
+    //      into the beam's classification state) -> fails (a) AND the 11
+    //      pre-existing `recodebeam` tests (`decodes_a_clean_sequence` etc.).
+
+    /// (a) INERTNESS. Every existing decode result (labels+xcoords, unichar
+    /// ids, certs, ratings, words) is byte-identical whether or not
+    /// [`RecodeBeamSearch::retaining_posteriors`] was called — retention is a
+    /// pure additional read, never a mutation of anything a pre-existing
+    /// accessor observes. The REAL gate for this claim is not this test
+    /// alone: it is that the 11 pre-existing `recodebeam` tests above plus
+    /// the 4 `dict_walker` tests (a sibling module walking the same
+    /// `continue_context`/`push_*` surface) stay green with ZERO edits to
+    /// any of their pre-existing lines — every change in this file is a
+    /// pure insertion (see the module's own gate checklist).
+    #[test]
+    fn retention_does_not_change_any_decode_output() {
+        // Synthetic passthrough arm.
+        let recoder = passthrough_recoder(5);
+        let charset = crate::UniCharSet::load_from_str(
+            "5\nNULL 0 Common 0\na 3 0 a Left a a\nb 3 0 b Left b b\nc 3 0 c Left c c\nd 3 0 d Left d d\n",
+        )
+        .expect("valid unicharset");
+        let rows = [row(5, 1, 4), row(5, 4, 4), row(5, 2, 4)];
+        let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
+
+        let mut plain = RecodeBeamSearch::new(&recoder, 4, false);
+        plain.decode(&refs, 1.0, 0.0);
+        let plain_labels = plain.extract_best_path_as_labels();
+        let plain_ids = plain.extract_best_path_as_unichar_ids();
+        let plain_words = plain.extract_best_path_as_words((0, 0, 1000, 36), 1.0, &charset);
+
+        let mut retaining = RecodeBeamSearch::new(&recoder, 4, false).retaining_posteriors();
+        retaining.decode(&refs, 1.0, 0.0);
+        let retaining_labels = retaining.extract_best_path_as_labels();
+        let retaining_ids = retaining.extract_best_path_as_unichar_ids();
+        let retaining_words = retaining.extract_best_path_as_words((0, 0, 1000, 36), 1.0, &charset);
+
+        assert_eq!(plain_labels, retaining_labels, "labels+xcoords must match");
+        assert_eq!(plain_ids.0, retaining_ids.0, "unichar ids must match");
+        assert_eq!(
+            plain_ids.1.iter().map(|c| c.to_bits()).collect::<Vec<_>>(),
+            retaining_ids
+                .1
+                .iter()
+                .map(|c| c.to_bits())
+                .collect::<Vec<_>>(),
+            "certs must be bit-identical"
+        );
+        assert_eq!(
+            plain_ids.2.iter().map(|r| r.to_bits()).collect::<Vec<_>>(),
+            retaining_ids
+                .2
+                .iter()
+                .map(|r| r.to_bits())
+                .collect::<Vec<_>>(),
+            "ratings must be bit-identical"
+        );
+        assert_eq!(plain_ids.3, retaining_ids.3, "xcoords must match");
+        assert_eq!(plain_words, retaining_words, "words must match");
+
+        // Real-model arm: `new_with_dict` + `decode_with_dict(2.25, -0.085,
+        // K_MIN_CERTAINTY)` on "the" (ids [91, 97, 92]), the same fixture as
+        // `dict_dawgs_attach_and_transfer_through_the_beam`.
+        let Some(dict_plain) = load_real_dict() else {
+            eprintln!("skipping real-model arm: corpus/model eng dawgs not present");
+            return;
+        };
+        let Some(charset_plain) = load_real_charset() else {
+            eprintln!("skipping real-model arm: corpus/model eng.lstm-unicharset not present");
+            return;
+        };
+        let Some(recoder_real) = load_real_recoder() else {
+            eprintln!("skipping real-model arm: corpus/model eng.lstm-recoder not present");
+            return;
+        };
+        let dict_retaining = load_real_dict().expect("just loaded above");
+        let charset_retaining = load_real_charset().expect("just loaded above");
+
+        let n = recoder_real.code_range() as usize;
+        let ids = [91_u32, 97, 92];
+        let codes: Vec<usize> = ids
+            .iter()
+            .map(|&id| {
+                let rc = recoder_real.encode(id).expect("id in range");
+                assert_eq!(rc.length(), 1, "eng.lstm recoder is pass-through");
+                usize::try_from(rc.codes()[0]).expect("non-negative code")
+            })
+            .collect();
+        let real_rows: Vec<Vec<f32>> = codes
+            .iter()
+            .map(|&c| row(n, c, ENG_NULL_CHAR as usize))
+            .collect();
+        let real_refs: Vec<&[f32]> = real_rows.iter().map(Vec::as_slice).collect();
+
+        let mut real_plain = RecodeBeamSearch::new_with_dict(
+            &recoder_real,
+            ENG_NULL_CHAR,
+            false,
+            dict_plain,
+            charset_plain,
+        );
+        real_plain.decode_with_dict(&real_refs, 2.25, -0.085, K_MIN_CERTAINTY);
+        let real_plain_ids = real_plain.extract_best_path_as_unichar_ids();
+
+        let mut real_retaining = RecodeBeamSearch::new_with_dict(
+            &recoder_real,
+            ENG_NULL_CHAR,
+            false,
+            dict_retaining,
+            charset_retaining,
+        )
+        .retaining_posteriors();
+        real_retaining.decode_with_dict(&real_refs, 2.25, -0.085, K_MIN_CERTAINTY);
+        let real_retaining_ids = real_retaining.extract_best_path_as_unichar_ids();
+
+        assert_eq!(
+            real_plain_ids.0, real_retaining_ids.0,
+            "real-model unichar ids must match"
+        );
+        assert_eq!(
+            real_plain_ids
+                .1
+                .iter()
+                .map(|c| c.to_bits())
+                .collect::<Vec<_>>(),
+            real_retaining_ids
+                .1
+                .iter()
+                .map(|c| c.to_bits())
+                .collect::<Vec<_>>(),
+            "real-model certs must be bit-identical"
+        );
+        assert_eq!(
+            real_plain_ids
+                .2
+                .iter()
+                .map(|r| r.to_bits())
+                .collect::<Vec<_>>(),
+            real_retaining_ids
+                .2
+                .iter()
+                .map(|r| r.to_bits())
+                .collect::<Vec<_>>(),
+            "real-model ratings must be bit-identical"
+        );
+        assert_eq!(
+            real_plain_ids.3, real_retaining_ids.3,
+            "real-model xcoords must match"
+        );
+    }
+
+    /// (b) FIDELITY. `retain_step`'s bounded insertion-sort must agree with
+    /// an INDEPENDENTLY computed full sort (`sort_by`, not a second
+    /// insertion pass) on a non-monotone permutation row — class 7 leads,
+    /// then 3, then 9, deliberately not in index order, so an
+    /// index-order-biased bug can't hide behind a monotone fixture.
+    #[test]
+    fn retained_top_k_equals_an_independent_full_sort() {
+        let recoder = passthrough_recoder(10);
+        let row: Vec<f32> = vec![0.05, 0.10, 0.15, 0.70, 0.20, 0.25, 0.30, 0.90, 0.35, 0.50];
+        let refs: Vec<&[f32]> = vec![row.as_slice()];
+
+        let mut beam = RecodeBeamSearch::new(&recoder, 0, false).retaining_posteriors();
+        beam.decode(&refs, 1.0, 0.0);
+        let retained = beam.retained_posteriors();
+        assert_eq!(retained.len(), 1, "one row decoded, one retained step");
+        let step = &retained[0];
+        assert_eq!(step.t, 0);
+        assert_eq!(
+            step.top().len(),
+            RETAINED_TOP_K,
+            "row longer than K must fill K"
+        );
+
+        // Independent reference: a full sort, not another insertion pass.
+        let mut reference: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
+        reference.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .expect("no NaN in fixture")
+                .then(a.0.cmp(&b.0))
+        });
+        let expected_classes: Vec<u16> = reference
+            .iter()
+            .take(RETAINED_TOP_K)
+            .map(|&(i, _)| i as u16)
+            .collect();
+        let expected_probs_bits: Vec<u32> = reference
+            .iter()
+            .take(RETAINED_TOP_K)
+            .map(|&(_, p)| p.to_bits())
+            .collect();
+        let got_classes: Vec<u16> = step.top().iter().map(|rc| rc.class).collect();
+        let got_probs_bits: Vec<u32> = step.top().iter().map(|rc| rc.prob.to_bits()).collect();
+
+        assert_eq!(
+            got_classes, expected_classes,
+            "class sequence must match the independent full sort"
+        );
+        assert_eq!(
+            got_probs_bits, expected_probs_bits,
+            "probs must be bit-identical to the independent full sort"
+        );
+        for rc in step.top() {
+            assert_eq!(
+                rc.prob.to_bits(),
+                row[rc.class as usize].to_bits(),
+                "retained prob must be bit-identical to outputs[class]"
+            );
+        }
+    }
+
+    /// (c) TIE-BREAK. Every class equal, `n > K` — must retain exactly
+    /// `[0..K-1]` in ascending class order. Fails under a heap/insertion-
+    /// order tie-break (which would NOT be sorted by class).
+    #[test]
+    fn a_uniform_row_retains_the_lowest_class_indices_in_order() {
+        let n = RETAINED_TOP_K + 4;
+        let recoder = passthrough_recoder(n as i32);
+        let row: Vec<f32> = vec![0.3_f32; n];
+        let refs: Vec<&[f32]> = vec![row.as_slice()];
+
+        let mut beam = RecodeBeamSearch::new(&recoder, 0, false).retaining_posteriors();
+        beam.decode(&refs, 1.0, 0.0);
+        let retained = beam.retained_posteriors();
+        assert_eq!(retained.len(), 1);
+        let step = &retained[0];
+        assert_eq!(step.len as usize, RETAINED_TOP_K);
+
+        let got_classes: Vec<u16> = step.top().iter().map(|rc| rc.class).collect();
+        let expected_classes: Vec<u16> = (0..RETAINED_TOP_K as u16).collect();
+        assert_eq!(
+            got_classes, expected_classes,
+            "a uniform row over-K must retain the LOWEST class indices, in order"
+        );
+        for rc in step.top() {
+            assert_eq!(rc.prob.to_bits(), 0.3_f32.to_bits());
+        }
+    }
+
+    /// (d) BOUNDEDNESS. `retained.len() == outputs.len()`; `retained[j].t ==
+    /// j`; `top().len() == min(row_len, K)` including the passthrough
+    /// `n=5 < K=8` case; the OFF arm retains nothing while the ON arm (same
+    /// rows) retains something.
+    #[test]
+    fn retention_is_timestep_aligned_and_bounded() {
+        let recoder = passthrough_recoder(5);
+        let rows = [row(5, 1, 4), row(5, 4, 4), row(5, 2, 4), row(5, 3, 4)];
+        let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
+
+        let mut off = RecodeBeamSearch::new(&recoder, 4, false);
+        off.decode(&refs, 1.0, 0.0);
+        assert!(
+            off.retained_posteriors().is_empty(),
+            "OFF arm must retain nothing"
+        );
+
+        let mut on = RecodeBeamSearch::new(&recoder, 4, false).retaining_posteriors();
+        on.decode(&refs, 1.0, 0.0);
+        let retained = on.retained_posteriors();
+        assert!(!retained.is_empty(), "ON arm must retain something");
+        assert_eq!(
+            retained.len(),
+            rows.len(),
+            "one retained step per input timestep"
+        );
+        for (j, step) in retained.iter().enumerate() {
+            assert_eq!(step.t as usize, j, "t must equal the timestep index");
+            assert_eq!(
+                step.top().len(),
+                5.min(RETAINED_TOP_K),
+                "n=5 < K=8: bounded by the row length, not K"
+            );
+        }
     }
 }
