@@ -2583,3 +2583,23 @@ yet contain.
   being invertible — kerning tables, ligatures, or justification feeding back
   into the fit — and that is the shape the next rung should take rather than
   a hand-derived formula.
+
+### Round 2 on the operator's re-render (2026-08-06, same arc)
+
+The re-rendered page measured: `Tf` **14.40, sd 0.000** (from 17–72), `Tz`
+**100 everywhere** (from 32–850), overlap 1/146 (from 95%). Operator verdict:
+"the structural on the top is almost perfect" — with one correct complaint:
+**14.40 = 18.00 × 0.80, the leading relation bound**, leaving every line ~19%
+narrower than its ink box, so inter-column gutters varied 6–12% with text
+length. The acceptance rule, operator-stated: **readers tolerate tight/
+variant leading far better than UNEVEN HORIZONTAL GUTTERS.** Fix: width-first
+— `min(width_solve, 0.95 × pitch)`, the leading relation only as the
+no-width-evidence fallback. The width solve was the most consistent signal on
+the page (17.73, sd 0.04) and at 0.985 × pitch never overlapped anyway.
+
+Also operator-named, filed as tasks: **grid inheritance** (#50 — the 2×8
+raster the clean row establishes should re-segment the degraded row: 7 cells
++ 1 empty, not full-width merges) and **cross-text revision** (#51 — the two
+garbled cells sit on a page where the same paragraph decodes cleanly 14
+times; posterior retention + deepnsm coverage + optical tetris, one-way
+evidence flow only).

@@ -746,6 +746,12 @@ fn css_box(bbox: (u32, u32, u32, u32)) -> String {
 /// point — see [`page_font_px`].
 const PITCH_TO_FONT_PX: f32 = 0.80;
 
+/// Hard no-overlap ceiling: the rendered body may approach — but never
+/// exceed — the measured baseline pitch. Solid-set print (the corpus pages
+/// measure 17–18 px ink on an 18 px pitch) legitimately runs close to 1.0;
+/// the margin below it absorbs pitch-measurement jitter.
+const MAX_FONT_TO_PITCH: f32 = 0.95;
+
 /// How far apart two line right-edges may sit (as a fraction of the column
 /// width) and still count as "the same margin" for [`Justification`].
 const BLOCKSATZ_EDGE_TOLERANCE: f32 = 0.02;
@@ -884,7 +890,7 @@ const MIN_PITCH_SAMPLES: usize = 3;
 /// [`page_pitch_px`]): a garbled line in a degraded region produces a wild
 /// advance, and a median steps over it where a mean would not.
 fn page_font_px(page: &JsonPage) -> Option<f32> {
-    let by_height = page_pitch_px(page)? * PITCH_TO_FONT_PX;
+    let pitch = page_pitch_px(page)?;
 
     // The width constraint, per line, in px of font size.
     let mut widths: Vec<f32> = Vec::new();
@@ -912,12 +918,21 @@ fn page_font_px(page: &JsonPage) -> Option<f32> {
         }
     }
     if widths.len() < MIN_PITCH_SAMPLES {
-        // No usable width evidence — the height bound stands alone.
-        return Some(by_height);
+        // No width evidence — the conservative leading relation stands alone.
+        return Some(pitch * PITCH_TO_FONT_PX);
     }
     widths.sort_by(f32::total_cmp);
     let by_width = widths[widths.len() / 2];
-    Some(by_height.min(by_width))
+    // WIDTH-FIRST, capped by the hard no-overlap ceiling — the operator
+    // acceptance rule from the 16-cell page: readers tolerate tight leading
+    // far better than UNEVEN COLUMN GUTTERS. Rendering at the leading
+    // relation (0.80 x pitch = 14.40 there) left every line ~19% narrower
+    // than its measured ink box, so inter-column gaps varied 6..12% with
+    // text length -- "beyond the acceptance threshold". The width solve
+    // (17.73, sd 0.04 -- the most consistent signal on the page) fills the
+    // measure uniformly, and at 0.985 x pitch it never overlapped anyway;
+    // the ceiling only guards the genuinely-wide-render-font case.
+    Some(by_width.min(pitch * MAX_FONT_TO_PITCH))
 }
 
 fn text_font_size_px(bbox: (u32, u32, u32, u32), metrics: Option<&TextMetrics>) -> f64 {
@@ -2517,21 +2532,24 @@ mod normalization_tests {
             }],
             ..JsonPage::default()
         };
-        let height_bound = 18.0 * PITCH_TO_FONT_PX;
+        let ceiling = 18.0 * MAX_FONT_TO_PITCH;
         // ROOMY: the text is narrow for its box, so width does not bind and
-        // the leading bound stands.
+        // the hard no-overlap ceiling stands. (Width-first, per the operator
+        // acceptance rule: uneven gutters hurt more than tight leading, so
+        // the conservative 0.80 relation applies only when NO width evidence
+        // exists at all.)
         let roomy = page_font_px(&page(4000)).unwrap();
         assert!(
-            (roomy - height_bound).abs() < 0.01,
-            "with room to spare the height bound must stand (got {roomy})"
+            (roomy - ceiling).abs() < 0.01,
+            "with room to spare the no-overlap ceiling must stand (got {roomy})"
         );
         // TIGHT: the same text in a much narrower box CANNOT be set at the
         // leading bound without overflowing, so the fit shrinks it.
         let tight = page_font_px(&page(40)).unwrap();
         assert!(
-            tight < height_bound,
-            "a too-narrow measure must bind BELOW the leading bound \
-             (got {tight}, height bound {height_bound})"
+            tight < ceiling,
+            "a too-narrow measure must bind BELOW the ceiling \
+             (got {tight}, ceiling {ceiling})"
         );
         // …and it is the width solve, not an arbitrary shrink.
         assert!(tight > 0.0 && tight < roomy);
