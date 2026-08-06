@@ -2603,3 +2603,70 @@ raster the clean row establishes should re-segment the degraded row: 7 cells
 garbled cells sit on a page where the same paragraph decodes cleanly 14
 times; posterior retention + deepnsm coverage + optical tetris, one-way
 evidence flow only).
+
+## ★ Quality wave v1 — and the disable runs earned their keep twice (2026-08-06)
+
+Operator directive: Opus agents write the scoped plan, Sonnet agents implement.
+Four Opus planners -> `.claude/plans/quality-wave-v1.md` (512 lines, verbatim
+specs); four Sonnet workers on DISJOINT files; orchestrator wires shared files
+and gates centrally. Landed here: the two new modules + `#51`/`#49` (committed
+separately as `641a071`).
+
+### The disable runs found two things, and they were different things
+
+Eleven disable-the-fix runs across three modules: **9 guards proven
+load-bearing, 2 hits.**
+
+**Hit 1 was MY disable, not the test.** Setting `MIN_BAND_OVERLAP_FRAC = 0.0`
+left `seam_requires_the_cap_to_span_the_row` green — because the above-row cap
+has `overlap = -5`, and `-5 < 0.0` still declines. **Zeroing a constant is not
+a disable when the quantity can go negative.** Unhooking the branch itself
+turned it red. The falsifier was always real; the check wasn't.
+
+**Hit 2 was a genuinely vacuous test — and behind it a real defect.**
+`two_column_prose_geometry_yields_no_raster` asserted in its own comment that
+lowering `MIN_RASTER_COLS` to 2 would flip it. Measured: it does not. Its two
+conforming blocks sit at the SAME left, so `distinct_k == 1` and the identical
+comparison rejects at `1 < 2`. Building a test that genuinely isolates the rule
+(a regular TWO-column lattice) did not flip either — which exposed the real
+bug:
+
+> **`detect_column_raster` never deduplicated `lefts`.** The pitch is the median
+> of consecutive left-edge diffs; on a multi-band grid every column contributes
+> one left PER BAND, so the sequence is dominated by `bands - 1` zero diffs per
+> column, the median collapses to 0, and `p > 0` returns `None`. **The module
+> would have shipped unable to detect the 2xN grid it was written for.** The one
+> passing detection fixture only worked because its second band is a single
+> non-conforming merged block, so band A supplied the lefts alone.
+
+Fixed (`lefts.dedup()`), plus two tests: one isolating the not-a-lattice rule
+(red only when BOTH its spellings — `distinct_k.len() < MIN_RASTER_COLS` and
+`k_max < 2` — are removed), and `a_two_band_grid_is_detected_despite_repeated_lefts`,
+the regression, with an anti-vacuity assertion that the fixture really is
+zero-dominated. Both verified red under their named disable.
+
+**The generalizable pair:** (a) a constant-flip is only a disable if the guarded
+quantity cannot pass the relaxed test by another route; (b) a suite of
+single-band fixtures cannot see a multi-band defect — *the fixture's shape is
+part of the test's coverage, not just its content.*
+
+### Gates run centrally
+
+`dropcap` 8/8, `grid_raster` 9/9 (7 specced + 2 added), tesseract-ocr lib
+**259/259**, clippy `-D warnings` clean (three real 1.97 lints fixed in
+`dropcap.rs`: two `manual_range_contains`, one doc-list indentation), fmt clean.
+
+**P-41 GATE 0 (the plan's STOP rule) PASSED**: `examples/dropcap_gate0.rs` over
+all **23** committed fixtures reports **0** shape-qualified drop caps, so
+default-on is provably a no-op on everything in the corpus. Had any fixture hit,
+the spec required re-scoping to opt-in rather than re-pinning a golden.
+
+### NOT yet wired — stated plainly
+
+Both modules are registered in `lib.rs` and fully tested, but nothing consumes
+them yet: `.large` still dies in `segment.rs`'s `ToBlockCtx` literal, and no
+recognition path calls the raster. The wiring (`textline.rs` `ToBlockCtx.large`,
+`segment.rs`, `lstm_recognizer.rs` seam + `apply_grid_raster` + `Document.drop_caps`)
+is orchestrator work spelled out in the plan, and the `xy_gutter_probe` re-run
+that gates P-50's default-on decision has not happened. Until both land, this
+commit changes NO behaviour — which is exactly why the goldens are untouched.

@@ -61,7 +61,10 @@ fn main() {
         .expect("a large blob");
     let (cl, cbot, cr, ctop) = cap;
     let caph = (ctop - cbot).abs() as f32;
-    println!("ordinary glyph height: mean={mean:.2} sd={sd:.2}  (n={})", hs.len());
+    println!(
+        "ordinary glyph height: mean={mean:.2} sd={sd:.2}  (n={})",
+        hs.len()
+    );
     println!(
         "drop cap {}x{} -> {:.2} SD above the mean   <-- the detector\n",
         (cr - cl).abs(),
@@ -70,7 +73,10 @@ fn main() {
     );
 
     // raster coords
-    let (rt, rb) = ((h as i32 - ctop).max(0) as usize, (h as i32 - cbot).max(0) as usize);
+    let (rt, rb) = (
+        (h as i32 - ctop).max(0) as usize,
+        (h as i32 - cbot).max(0) as usize,
+    );
     let (cl, cr) = (cl.max(0) as usize, cr.max(0) as usize);
     // The cap spans ~3 line-heights, so its OWN y-range is the right window:
     // makerow finds the rows inside it. A hardcoded band slices through the
@@ -87,18 +93,24 @@ fn main() {
         }
         (v, cw, ch)
     };
-    let say = |label: &str, (v, cw, ch): (Vec<u8>, usize, usize)| {
-        match r.recognize_page_makerow(&v, cw, ch, dict.as_ref()) {
-            Ok(t) => println!("  {label:<34} {:?}", t.trim()),
-            Err(e) => println!("  {label:<34} ERROR {e:?}"),
-        }
+    let say = |label: &str, (v, cw, ch): (Vec<u8>, usize, usize)| match r.recognize_page_makerow(
+        &v,
+        cw,
+        ch,
+        dict.as_ref(),
+    ) {
+        Ok(t) => println!("  {label:<34} {:?}", t.trim()),
+        Err(e) => println!("  {label:<34} ERROR {e:?}"),
     };
 
     // ── A. today, swept over the seam offset ─────────────────────────────
     println!("--- A. today (cap discarded), seam sweep ---");
     for off in [-8i32, -4, 0, 6, 12] {
         let l = (cr as i32 + off).max(0) as usize;
-        say(&format!("line from cr{off:+}"), crop(l, rt, line_r, rt + band));
+        say(
+            &format!("line from cr{off:+}"),
+            crop(l, rt, line_r, rt + band),
+        );
     }
 
     // ── C. split ──────────────────────────────────────────────────────────

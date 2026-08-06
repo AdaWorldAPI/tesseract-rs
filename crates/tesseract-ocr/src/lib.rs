@@ -18,6 +18,12 @@ pub mod binreduce;
 pub mod blob_filter;
 pub mod conncomp;
 pub mod deskew;
+/// Ornamental paragraph-initial detection + the row-crop seam recovery it
+/// enables. Plan: `.claude/plans/quality-wave-v1.md`.
+pub mod dropcap;
+/// Column-lattice detection + re-segmentation of blocks that span it.
+/// Plan: `.claude/plans/quality-wave-v1.md`.
+pub mod grid_raster;
 pub mod image_input;
 #[cfg(feature = "seg-approx")]
 pub mod line_segment;
