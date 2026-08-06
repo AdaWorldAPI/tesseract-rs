@@ -20,7 +20,8 @@
 # Usage:
 #   .claude/harvest/oracles/run_skew_parity.sh [fixture.pgm]
 #
-# Requires: g++, liblept-dev, the 1.95 toolchain. Run from the repo root.
+# Requires: g++, liblept-dev, the repo's pinned toolchain (rust-toolchain.toml
+# — bare `cargo` resolves to it). Run from the repo root.
 
 set -uo pipefail
 
@@ -50,8 +51,8 @@ g++ -std=c++17 .claude/harvest/oracles/skew_oracle.cpp \
 note "building the Rust dump"
 # Scoped -p ALWAYS: `--all` follows the path dep into the lance-graph
 # workspace and rebuilds ~30 unrelated files (CLAUDE.md iron rule 1).
-cargo +1.95 build -q -p tesseract-ocr --example deskew_dump || exit 1
-RUST="$(cargo +1.95 metadata --format-version 1 --no-deps \
+cargo build -q -p tesseract-ocr --example deskew_dump || exit 1
+RUST="$(cargo metadata --format-version 1 --no-deps \
         --manifest-path Cargo.toml 2>/dev/null \
         | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/examples/deskew_dump"
 

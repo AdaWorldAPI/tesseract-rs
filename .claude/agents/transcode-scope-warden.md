@@ -54,10 +54,13 @@ disaster this session." Always scope with `-p <crate>` (`-p tesseract-core`,
 is already scoped this way and sibling-checks-out lance-graph and ndarray to
 match; do not diverge from it locally.
 
-## 3. Toolchain 1.95, and `--release` wherever real recognition runs
+## 3. The pinned toolchain, and `--release` wherever real recognition runs
 
-Use `rustup run 1.95 cargo ...` in this workspace — the `ndarray` (and, via
-it, `deepnsm`) manifest gates on 1.95. Separately: any gate that exercises
+Bare `cargo` in this workspace resolves to the pinned toolchain in
+`rust-toolchain.toml` (1.97.1 since 2026-08-05, the lance-graph #896 sweep;
+previously the rule here said `rustup run 1.95` — the `ndarray`/`deepnsm`
+1.95 manifest floor is satisfied a fortiori, and no `rustup run` prefix is
+needed anymore). Separately: any gate that exercises
 real recognition (`AppState::load`, `recognize_document`, anything touching
 the LSTM) needs `--release`. Debug is not just slow here, it is
 non-linearly slow: measured debug-to-release speedups are `recognize_document`
@@ -148,8 +151,9 @@ it saying.
   (`quality_resolution_grid.rs`, `typography_overlay.rs`, `lab_table_grid.rs`,
   `lab_table_columns.rs`, ...)?
 - Is every cargo command scoped with `-p <crate>` (never `--all` /
-  `--all-targets` / `fmt --all`), run on `rustup run 1.95`, and `--release`
-  wherever real recognition executes?
+  `--all-targets` / `fmt --all`), run on the `rust-toolchain.toml` pin (bare
+  `cargo` — no `rustup run` prefix), and `--release` wherever real
+  recognition executes?
 - Am I about to re-implement something that belongs in `lance-graph-contract`
   or the OGAR Core instead of hand-rolling a parallel type here?
 - If I am replacing a fixture or generator: is the Rust replacement built

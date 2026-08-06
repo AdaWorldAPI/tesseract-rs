@@ -163,8 +163,12 @@ recognizer NEVER re-implements SIMD, per the `simd-savant` "all SIMD from
 int8, two shapes (`E-OCR-MATDOTVEC-1`, integer-combined diff so it is
 `TFloat`-agnostic; the in-env lib is FAST_FLOAT). The **two-foundations** split
 is now real: `tesseract-recognizer` (deps ndarray) = compute, `tesseract-core`
-(deps lance-graph-contract) = content. **Toolchain: always bump to 1.95** (ndarray
-manifest gate); CI sibling-checks-out ndarray now. **Leaf 2 shipped:**
+(deps lance-graph-contract) = content. **Toolchain: 1.97.1, pinned in
+`rust-toolchain.toml`** (2026-08-05, joining the lance-graph #896 lance-9 /
+Rust-1.97.1 workspace sweep; supersedes the older "always bump to 1.95" prose
+rule — ndarray's 1.95 floor is satisfied a fortiori, and bare `cargo` in this
+checkout now resolves to the pin, no `rustup run` prefix needed); CI
+sibling-checks-out ndarray now. **Leaf 2 shipped:**
 `WeightMatrix::DeSerialize` (int-mode load + f32 `forward`, byte-parity green on
 f32 bit-patterns vs libtesseract, `E-OCR-WEIGHTMATRIX-1`). **Leaf 3:** activations
 (LUT `tanh`/`logistic` + `relu`/`clip`/`softmax`, byte-parity on a 4096-pt sweep,
@@ -1606,8 +1610,8 @@ needing revision-over-time across multiple documents reaches for
 No Core change (both new modules are tesseract-ogar-local, consuming
 `deepnsm` + `lance-graph-contract` as ordinary path deps) → this file + the
 commit are the record. Toolchain note: `deepnsm` path-deps `ndarray 0.17.2`
-which gates on rustc 1.95 (`rustup run 1.95 cargo …`), same as this crate's
-own existing toolchain-bump note elsewhere in this file.
+which gates on rustc 1.95 — since 2026-08-05 the repo pins 1.97.1 in
+`rust-toolchain.toml` (satisfies that floor; bare `cargo` resolves to it).
 
 **★ The Dockerfile — the second, heavier deployment image.**
 `crates/tesseract-ogar/Dockerfile` mirrors `tesseract-ocr-web/Dockerfile`'s
@@ -2428,3 +2432,42 @@ Probe: `examples/correction_probe.rs` (prints WHICH guard declined each token,
 so "the lexicon lacks this word" and "this is data we must never touch" are
 never confused). 11 unit tests + 38 crate tests green; fmt + clippy clean.
 No Core change, no recognition change, nothing on by default.
+
+## ★ Toolchain 1.97.1 + two dict tests silently red since 2026-07-23 (2026-08-05)
+
+**The sweep:** this repo joined the workspace lance-9 / Rust-1.97.1 arc
+(lance-graph #896 family — OGAR/ruff/MedCare-rs/woa-rs already there).
+`rust-toolchain.toml` now pins 1.97.1 (+rustfmt/clippy components) — bare
+`cargo` resolves to it, no `rustup run` prefix; CI (both jobs) and both
+Dockerfiles moved off 1.95; the `transcode-scope-warden` card and
+`run_skew_parity.sh` were de-staled (both still instructed 1.95). tesseract-rs
+has **zero direct lance/lancedb deps** (proven: `cargo tree -p tesseract-ogar`,
+136 nodes, no lance/arrow/datafusion crates) — lance 9 / lancedb 0.33 arrive
+entirely via the lance-graph sibling checkout. 1.97.1's whole lint surface here
+was ONE clippy nit (`recodebeam` heap-pop `truncate(0)` → `clear()`, identical
+semantics, parity untouched).
+
+**The find (method: #896's toolchain-alone-first attribution run):** the Phase-A
+gate on unchanged code showed `tesseract-core` 21/23 — and the bisect exonerated
+everything plausible: same 2 tests fail on 1.95, on the pre-resync lance-graph,
+and on clean master. `dict_walker::def_letter_is_okay_walks_the_word_the` +
+`recodebeam::dict_word_beats_higher_raw_probability_non_word_under_dict_ratio`
+loaded fixtures from **`/tmp/eng.lstm-*`** — ephemeral oracle-arc extractions.
+On 2026-07-23 the eng+deu parity arc overwrote those paths with a DIFFERENT
+bake (116-entry unicharset; the committed corpus bake has 112). The tests
+hardcode ids in the CORPUS numbering (t=91 e=92 h=97; the /tmp bake has t=97
+e=85 h=95), so the dawg walk spelled garbage ("step 2 should keep at least one
+position") and a 116-space id overran the 112-entry recoder ("id in range").
+**Red for 13 days, invisible three ways:** CI never runs on this repo's PRs
+(fork restriction, measured 2026-08-05 — zero PR-triggered runs ever); no
+session gate since ran `-p tesseract-core`; and on any FRESH container the
+skip-if-absent guard makes them skip-and-pass — the failure could only appear
+on a machine that HAD the stale files. Fix: both test modules now load the
+COMMITTED `corpus/model/eng.lstm-*` (CARGO_MANIFEST_DIR-relative, like the
+golden suites) — hermetic, unconditionally real. 23/23 green.
+
+**Rule extracted:** a test fixture under `/tmp` is a time bomb with a
+skip-guard for a fuse — the skip hides it exactly where a fresh CI would have
+caught it. Real-data tests read the committed corpus, full stop. (Same family
+as the falsifiability rule: a test that cannot fail WHERE YOU LOOK is not a
+test there.)

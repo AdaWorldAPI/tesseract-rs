@@ -288,7 +288,10 @@ impl MinHeap {
             let hole = self.sift_down(0, hole_pair);
             self.v[hole] = hole_pair;
         } else {
-            self.v.truncate(0);
+            // `truncate(0)` spelled as `clear()` (identical semantics — drop
+            // all, keep capacity) for clippy 1.97; the C++ `Pop` mirror is
+            // unchanged.
+            self.v.clear();
         }
         Some(top)
     }
@@ -1834,19 +1837,30 @@ mod tests {
 
     // ---- D1.3: dict-enabled beam arms ----
 
+    /// The COMMITTED corpus copy — never `/tmp` (see `dict_walker::tests::
+    /// corpus` for the full story: the ephemeral `/tmp/eng.lstm-*` extractions
+    /// these tests originally read were overwritten by a different bake on
+    /// 2026-07-23, whose 116-entry charset numbering breaks the hardcoded
+    /// corpus-numbering ids and overruns the 112-entry recoder).
+    fn corpus(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../corpus/model")
+            .join(name)
+    }
+
     fn load_real_dict() -> Option<DictLite> {
-        let word = std::fs::read("/tmp/eng.lstm-word-dawg").ok()?;
-        let punc = std::fs::read("/tmp/eng.lstm-punc-dawg").ok()?;
-        let number = std::fs::read("/tmp/eng.lstm-number-dawg").ok()?;
+        let word = std::fs::read(corpus("eng.lstm-word-dawg")).ok()?;
+        let punc = std::fs::read(corpus("eng.lstm-punc-dawg")).ok()?;
+        let number = std::fs::read(corpus("eng.lstm-number-dawg")).ok()?;
         DictLite::from_components(&word, &punc, &number).ok()
     }
 
     fn load_real_charset() -> Option<UniCharSet> {
-        UniCharSet::load_from_file(std::path::Path::new("/tmp/eng.lstm-unicharset")).ok()
+        UniCharSet::load_from_file(&corpus("eng.lstm-unicharset")).ok()
     }
 
     fn load_real_recoder() -> Option<UnicharCompress> {
-        let bytes = std::fs::read("/tmp/eng.lstm-recoder").ok()?;
+        let bytes = std::fs::read(corpus("eng.lstm-recoder")).ok()?;
         UnicharCompress::from_le_bytes(&bytes).ok()
     }
 
@@ -1875,15 +1889,15 @@ mod tests {
     #[test]
     fn dict_dawgs_attach_and_transfer_through_the_beam() {
         let Some(dict) = load_real_dict() else {
-            eprintln!("skipping: /tmp/eng.lstm-*-dawg not present");
+            eprintln!("skipping: corpus/model eng dawgs not present");
             return;
         };
         let Some(charset) = load_real_charset() else {
-            eprintln!("skipping: /tmp/eng.lstm-unicharset not present");
+            eprintln!("skipping: corpus/model eng.lstm-unicharset not present");
             return;
         };
         let Some(recoder) = load_real_recoder() else {
-            eprintln!("skipping: /tmp/eng.lstm-recoder not present");
+            eprintln!("skipping: corpus/model eng.lstm-recoder not present");
             return;
         };
         let n = recoder.code_range() as usize;
@@ -1950,15 +1964,15 @@ mod tests {
         // unconditional `cert * dict_ratio` on the non-dawg push vs `ContinueDawg`'s
         // unscaled dawg push).
         let Some(dict) = load_real_dict() else {
-            eprintln!("skipping: /tmp/eng.lstm-*-dawg not present");
+            eprintln!("skipping: corpus/model eng dawgs not present");
             return;
         };
         let Some(charset) = load_real_charset() else {
-            eprintln!("skipping: /tmp/eng.lstm-unicharset not present");
+            eprintln!("skipping: corpus/model eng.lstm-unicharset not present");
             return;
         };
         let Some(recoder) = load_real_recoder() else {
-            eprintln!("skipping: /tmp/eng.lstm-recoder not present");
+            eprintln!("skipping: corpus/model eng.lstm-recoder not present");
             return;
         };
         let n = recoder.code_range() as usize;

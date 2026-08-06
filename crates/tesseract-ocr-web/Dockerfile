@@ -22,7 +22,7 @@
 # Local run:  docker run --rm -e PORT=8080 -p 8080:8080 ocr-web
 
 # ── builder ─────────────────────────────────────────────────────────────────
-FROM rust:1.95-bookworm AS builder
+FROM rust:1.97.1-bookworm AS builder
 
 # ring (the rustls crypto backend selected here) builds some C/asm — the gcc in
 # rust:bookworm covers it; no cmake needed (that would be aws-lc-rs).

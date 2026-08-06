@@ -433,21 +433,35 @@ impl DictLite {
 mod tests {
     use super::*;
 
+    /// The COMMITTED corpus copy — never `/tmp`. These tests hardcode unichar
+    /// ids from the corpus bake's numbering (t=91, e=92, h=97 in the
+    /// 112-entry `eng.lstm-unicharset`); the original `/tmp/eng.lstm-*` paths
+    /// were ephemeral oracle-arc extractions, and on 2026-07-23 the eng+deu
+    /// parity arc overwrote them with a DIFFERENT bake (116 entries, t=97) —
+    /// after which these tests failed wherever those files existed and
+    /// silently skipped wherever they didn't. Loading the committed corpus
+    /// makes them hermetic and unconditionally real, like the golden suites.
+    fn corpus(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../corpus/model")
+            .join(name)
+    }
+
     fn load_real_dawgs() -> Option<DictLite> {
-        let word = std::fs::read("/tmp/eng.lstm-word-dawg").ok()?;
-        let punc = std::fs::read("/tmp/eng.lstm-punc-dawg").ok()?;
-        let number = std::fs::read("/tmp/eng.lstm-number-dawg").ok()?;
+        let word = std::fs::read(corpus("eng.lstm-word-dawg")).ok()?;
+        let punc = std::fs::read(corpus("eng.lstm-punc-dawg")).ok()?;
+        let number = std::fs::read(corpus("eng.lstm-number-dawg")).ok()?;
         DictLite::from_components(&word, &punc, &number).ok()
     }
 
     fn load_real_charset() -> Option<UniCharSet> {
-        UniCharSet::load_from_file(std::path::Path::new("/tmp/eng.lstm-unicharset")).ok()
+        UniCharSet::load_from_file(&corpus("eng.lstm-unicharset")).ok()
     }
 
     #[test]
     fn default_dawgs_seeds_only_punc_when_available() {
         let Some(dict) = load_real_dawgs() else {
-            eprintln!("skipping: /tmp/eng.lstm-*-dawg not present");
+            eprintln!("skipping: corpus/model eng dawgs not present");
             return;
         };
         let seeds = dict.default_dawgs(false);
@@ -475,11 +489,11 @@ mod tests {
     #[test]
     fn char_for_dawg_maps_digits_on_number_dawg_only() {
         let Some(dict) = load_real_dawgs() else {
-            eprintln!("skipping: /tmp/eng.lstm-*-dawg not present");
+            eprintln!("skipping: corpus/model eng dawgs not present");
             return;
         };
         let Some(charset) = load_real_charset() else {
-            eprintln!("skipping: /tmp/eng.lstm-unicharset not present");
+            eprintln!("skipping: corpus/model eng.lstm-unicharset not present");
             return;
         };
         let number_dawg = dict
@@ -506,11 +520,11 @@ mod tests {
     #[test]
     fn def_letter_is_okay_walks_the_word_the() {
         let Some(dict) = load_real_dawgs() else {
-            eprintln!("skipping: /tmp/eng.lstm-*-dawg not present");
+            eprintln!("skipping: corpus/model eng dawgs not present");
             return;
         };
         let Some(charset) = load_real_charset() else {
-            eprintln!("skipping: /tmp/eng.lstm-unicharset not present");
+            eprintln!("skipping: corpus/model eng.lstm-unicharset not present");
             return;
         };
         let mut active = dict.default_dawgs(false);

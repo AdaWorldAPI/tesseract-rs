@@ -7,7 +7,7 @@
 name = "tesseract-ocr-web"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.95"
+rust-version = "1.97.1"
 publish = false
 
 [[bin]]
