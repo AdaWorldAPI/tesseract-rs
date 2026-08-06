@@ -2661,6 +2661,19 @@ all **23** committed fixtures reports **0** shape-qualified drop caps, so
 default-on is provably a no-op on everything in the corpus. Had any fixture hit,
 the spec required re-scoping to opt-in rather than re-pinning a golden.
 
+### P-50 gate: the planner's premise is now MEASURED, not simulated
+
+The spec's detection design rested on a Python-simulated `xy_cut` over
+`resgrid.pgm`, and said so — "the orchestrator must confirm with
+`examples/xy_gutter_probe.rs` before trusting it". Confirmed on the real
+pipeline: **7/18 interior gutters clear the threshold** (69-70 px against
+`gap_min = 49`, i.e. by only 1.4x), and **`xy_cut leaves: 8`** — eight
+full-height columns spanning BOTH grid bands, exactly the simulated list. So
+on this fixture a correct raster detects 8 columns and splits nothing, and the
+8+7+0 fence is a genuine no-op rather than a prediction. That is what licenses
+the default-on decision; had the real leaf list differed, the spec's fallback
+rule required `DocumentOptions::grid_raster` instead.
+
 ### NOT yet wired — stated plainly
 
 Both modules are registered in `lib.rs` and fully tested, but nothing consumes
