@@ -3531,3 +3531,99 @@ own step rather than a bolt-on. RAW comparison is non-negotiable there:
 Phase 0's first measurement normalized whitespace and reported
 `CER 0.0000, exact=true` on a page that was missing its paragraph break — the
 normalization deleted exactly the defect it was meant to find.
+
+## ★ Binarization escalation matrix — committing to ONE algorithm was the actual bug (2026-08-07)
+
+Operator correction, and it lands squarely: the earlier "Sauvola default-flip
+— DECIDED: keep Otsu" entry treated this as a single-winner-takes-default
+question. It never is. Both catastrophic failure modes this repo already
+measured — Otsu's illumination flood (`~0.48` ink fraction), Sauvola's
+contrast collapse (`0.0000`) — are **cheaply detectable from the binarized
+output's own ink fraction**, which means committing to either one as a blind
+default throws away information already sitting in the very thing being
+produced. `binarize_page_escalating` (`xy_cut.rs`) replaces the single-winner
+framing with a **lazy escalation cascade**: try the cheap rung, check its own
+plausibility, only pay for the next rung when it fails.
+
+**The plausibility band is measured, not guessed.** A healthy page's ink
+fraction clusters at `0.026`–`0.030` across every method this crate
+implements (re-measured on the full `corpus/quality/{uneven,faded}_*.pgm`
+set, via a throwaway `escalate_probe.rs` deleted after use, same pattern this
+session has used all along). `PLAUSIBLE_INK_FRAC_LO = 0.005` and `_HI = 0.15`
+each sit strictly between the two real numbers they must separate — the
+genuine collapse (`0.0000`) vs. the least healthy real reading that must
+still pass (`faded_060.pgm`'s Sauvola, `0.0246`); the highest healthy reading
+measured (`0.0303`) vs. the lowest flood reading measured (`0.4566`) — with
+wide margin on both sides, not hair-trigger constants.
+
+**The rung order is measured too, and it produced a genuine finding before
+any code was written.** Probing whether Otsu and Sauvola's failure modes
+could ever coincide (needed to know if rung 3/4 are reachable at all):
+
+| fixture | otsu | sauvola | wolf | singh |
+|---|---|---|---|---|
+| every `uneven_*.pgm` | **flood ~0.46–0.50** | 0.028 (fine) | 0.028 (fine) | 0.030 (fine) |
+| `faded_085.pgm` (severe) | 0.026 (fine) | **collapse 0.0000** | 0.028 (fine) | 0.027 (fine) |
+
+**On every single-axis fixture in the corpus, Otsu and Sauvola's failures
+are structurally disjoint** — whichever one fails, the other is fine. This
+makes mechanistic sense: Otsu fails when the GLOBAL histogram is corrupted
+by illumination unevenness but LOCAL contrast is intact (exactly what
+Sauvola needs); Sauvola fails when LOCAL contrast is too compressed but the
+GLOBAL histogram is still bimodal enough for Otsu. They are genuine safety
+nets for each other's blind spots, not competing candidates for one slot.
+
+**Rung 3 (Wolf) needed a fixture that doesn't exist in the corpus — so one
+was built from real pixels, not invented from nothing.** Took
+`uneven_linear_085.pgm`'s real illumination-uneven pixels and additionally
+compressed their dynamic range toward mid-grey (the SAME transform
+`gen_faded_contrast.py` uses, applied to a different source) — at `b=0.15`
+this defeats Otsu (`0.4893`) AND Sauvola (`0.0000`) simultaneously, while
+Wolf stays plausible (`0.0275`): the first constructed evidence that Wolf
+contributes information neither Otsu nor Sauvola has.
+
+**Rung 4 (Singh) does NOT have equivalent evidence, and the doc comment says
+so rather than papering over it.** Pushed the SAME combined transform to its
+extreme (`b=0.01`, illumination + severe compression + additive noise,
+sweeping `b` down from `0.5` in six steps first) hunting for a case where
+Wolf fails and Singh recovers. At every severity tried, Wolf and Singh either
+both passed or **collapsed together** (`0.0000` each at the extreme). No
+measured case shows Singh recovering where Wolf has already failed — matching
+this session's own earlier verdict that Singh is "second-tier," now with a
+sharper reason: it may not be a distinct failure mode at all, just a weaker
+variant of Wolf's. Singh stays as the terminal rung (some output beats none,
+and it is a genuinely different formula — no windowed second moment — so
+absence of a discovered win is not proof one can never occur, mirroring this
+repo's own "absence of a discovered failure after one probe is not evidence
+of absence" reasoning about Wolf, applied here in the opposite direction).
+The doc comment states this as CONJECTURE, not fact, and the test that
+reaches rung 4 is scoped honestly: it proves the cascade terminates and
+returns a value rather than panicking or looping, not that Singh recovers
+anything.
+
+**Five disable-runs, all verified — not four, because the "always-plausible"
+and "always-implausible" disables are complementary, not redundant.** Forcing
+`is_plausible_ink_frac` to always return `true` failed 3 of 5 integration
+tests (everything silently accepts rung 1, including the flood); forcing it
+to always return `false` failed 4 of 5 (everything falls through to rung 4,
+including the clean-page cases that should never escalate at all) — together
+the two disables cover every integration assertion, and neither alone would
+have. A third disable (widening `PLAUSIBLE_INK_FRAC_LO` to `0.0`) confirmed
+the pure boundary unit test is load-bearing too.
+
+Gates: `tesseract-ocr` lib 268/268 (4 new pure boundary tests), goldens +
+`golden_lines` + `blocks_columns` + both `lab_table_*` + `page_bands` +
+new `binarize_escalation` (5/5) all green, 8+7+0 fence exact and unchanged
+(this is a new, uncalled function — zero existing caller reaches it, so zero
+regression risk by construction), clippy `-D warnings` + fmt clean.
+
+**Not wired as a default anywhere yet.** `binarize_page_escalating` exists as
+a new public entry point in `xy_cut.rs`; no caller (`XyCutParams`,
+`DocumentOptions`, the web demo, the machine API) invokes it yet. Wiring it
+in is the natural next step but is deliberately NOT bundled into this same
+commit — it changes what a caller's default OUTPUT looks like on any page
+whose ink fraction is naturally outside the plausible band (a genuinely
+dense or genuinely sparse but non-pathological page), which needs its own
+measurement pass against the full golden suite before landing, matching the
+standing rule that a heuristic gate needs evidence at the point it is turned
+on, not just at the point it is written.

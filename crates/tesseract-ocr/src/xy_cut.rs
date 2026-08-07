@@ -418,6 +418,188 @@ fn local_adaptive(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Escalation ladder — see [`binarize_page_escalating`].
+// ---------------------------------------------------------------------------
+
+/// Which rung of [`binarize_page_escalating`]'s ladder a page's binarization
+/// actually came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscalatedMode {
+    /// Rung 1 — the zero-cost default; used whenever it produces a plausible
+    /// ink fraction (the overwhelming common case).
+    Otsu,
+    /// Rung 2 — Otsu's ink fraction was implausible; Sauvola recovered.
+    Sauvola,
+    /// Rung 3 — Otsu's AND Sauvola's ink fractions were both implausible;
+    /// Wolf recovered.
+    Wolf,
+    /// Rung 4 — the unconditional last resort. Reached when Otsu, Sauvola
+    /// AND Wolf all read implausible; returned regardless of its own ink
+    /// fraction, since there is nowhere further to escalate.
+    Singh,
+}
+
+/// The result of [`binarize_page_escalating`]: the binarized page, which rung
+/// produced it, and that rung's own ink fraction (for callers that want to
+/// report or log the escalation, e.g. a debug view — see
+/// [`EscalatedMode`]'s doc for why a silent single default is the wrong
+/// architecture here).
+#[derive(Debug, Clone)]
+pub struct EscalatedBinarization {
+    /// The binarized page in this crate's `{0, 255}` convention.
+    pub binary: Vec<u8>,
+    /// Which rung produced [`Self::binary`].
+    pub mode: EscalatedMode,
+    /// That rung's own ink fraction (fraction of pixels classified as ink).
+    pub ink_frac: f32,
+}
+
+/// Lower edge of the plausible-ink-fraction band a rung must clear to be
+/// accepted. Below this, a method has classified the page as functionally
+/// BLANK — Sauvola's measured catastrophic mode on severe faded contrast
+/// (`ink_frac = 0.0000` exactly, `.claude/harvest/sauvola-vs-otsu-probe.md`
+/// / `CLAUDE.md` § "faded-contrast corpus arm").
+///
+/// `0.005` sits strictly between the two real numbers it must separate: the
+/// genuine collapse (`0.0000`) and the LEAST healthy real-corpus reading that
+/// must still pass (`faded_060.pgm`'s Sauvola result, `0.0246`).
+const PLAUSIBLE_INK_FRAC_LO: f32 = 0.005;
+
+/// Upper edge of the plausible-ink-fraction band. Above this, a method has
+/// classified roughly HALF the page as ink — Otsu's measured catastrophic
+/// mode under uneven illumination (`0.45`–`0.50` across all four
+/// `uneven_*.pgm` fixtures, vs. a healthy reading around `0.026`–`0.030`).
+///
+/// `0.15` sits strictly between the two real numbers it must separate: the
+/// highest healthy reading measured across every fixture in this file's own
+/// test corpus (`0.0303`) and the lowest flood reading measured
+/// (`uneven_vignette_060.pgm`'s Otsu result, `0.4566`) — five times the
+/// healthy ceiling, nowhere near the flood floor.
+const PLAUSIBLE_INK_FRAC_HI: f32 = 0.15;
+
+/// Fraction of pixels classified as ink (`0`) in a binarized `{0, 255}`
+/// buffer. `0.0` for an empty buffer (never divides by zero).
+#[must_use]
+fn ink_fraction(binary: &[u8]) -> f32 {
+    if binary.is_empty() {
+        return 0.0;
+    }
+    let ink = binary.iter().filter(|&&p| p == 0).count();
+    ink as f32 / binary.len() as f32
+}
+
+/// Whether `frac` sits inside [`PLAUSIBLE_INK_FRAC_LO`]..=[`PLAUSIBLE_INK_FRAC_HI`].
+#[must_use]
+fn is_plausible_ink_frac(frac: f32) -> bool {
+    (PLAUSIBLE_INK_FRAC_LO..=PLAUSIBLE_INK_FRAC_HI).contains(&frac)
+}
+
+/// Binarize `grey` via a **lazy escalation ladder** — Otsu → Sauvola → Wolf →
+/// Singh — instead of committing to one method as a blind default.
+///
+/// # Why an escalation ladder, not a single chosen default
+///
+/// This crate spent real measurement effort (`CLAUDE.md` §§ "Sauvola default-
+/// flip", "faded-contrast corpus arm", "Wolf-Jolion") establishing that
+/// **neither Otsu nor Sauvola is individually safe as an unconditional
+/// default**: Otsu floods to `~0.48` ink fraction under uneven illumination
+/// (a real document defect any photographed page can carry), and Sauvola
+/// collapses to `0.0000` — the WHOLE PAGE silently blank — under compressed
+/// contrast (faded print, worn toner). Each failure is catastrophic and
+/// **cheaply detectable from the binarized output alone**: a healthy page's
+/// ink fraction clusters tightly around `0.026`–`0.030` across every method
+/// this crate implements (measured on the full `corpus/quality/{uneven,
+/// faded}_*.pgm` set), so a reading far outside that band is not a subtle
+/// hint, it is the method openly failing.
+///
+/// Given that, committing to one method — Otsu forever, or flipping to
+/// Sauvola forever — is throwing away information that is already sitting in
+/// the very output being produced. This function reads that information: run
+/// the cheap rung, check whether its own ink fraction is plausible, and only
+/// pay for the next rung when it is not. On the overwhelming common case
+/// (Otsu succeeds) this costs exactly what the existing default already
+/// costs — one Otsu pass, nothing more.
+///
+/// # The rung order is measured, not arbitrary
+///
+/// 1. **Otsu** — zero-cost, and its own worst measured failure (illumination
+///    flood) is loud (`~0.48`), never silent.
+/// 2. **Sauvola** — the byte-parity leaf; fixes Otsu's illumination flood
+///    (measured `~17×` ink-fraction reduction, `CLAUDE.md` § "Sauvola does
+///    what it claims") but has its OWN silent collapse on faded contrast.
+/// 3. **Wolf** — reached only when BOTH Otsu and Sauvola read implausible.
+///    Measured (this function's own construction, real
+///    `uneven_linear_085.pgm` pixels with a faded-contrast compression
+///    layered on top): a combined illumination+faded-contrast page defeats
+///    Otsu (`0.4893`) AND Sauvola (`0.0000`) simultaneously, while Wolf
+///    stays plausible (`0.0275`) — the genuinely NEW information Wolf
+///    contributes over Sauvola (no fixed `R = 128`, see
+///    [`crate::binarize`]'s module docs).
+/// 4. **Singh** — the unconditional last resort. **Honesty pin:** no
+///    combined degradation this function's own construction could reach
+///    ever showed Singh recovering where Wolf had already failed — at the
+///    most extreme combination measured (illumination + `b=0.01` contrast
+///    compression + additive noise), Wolf and Singh collapsed TOGETHER
+///    (`0.0000` each). Singh's presence here is a defensive floor (some
+///    output beats none, and it is a genuinely different formula with no
+///    windowed second moment — see [`singh_binarize`]), not a proven fourth
+///    recovery path. Do not cite rung 4 as measured; it is CONJECTURE.
+///
+/// # Cost
+///
+/// One binarization pass in the common case; up to four on a page bad enough
+/// to defeat the first three. `whsize`/`k` for the three adaptive rungs
+/// mirror this crate's own established defaults (Sauvola `k=0.34`, Wolf
+/// `k=0.5`, Singh `k=0.06` — see [`BinarizeMode`]'s variants); only `whsize`
+/// is a caller parameter, since it is the one knob tied to source DPI rather
+/// than to the method itself.
+#[must_use]
+pub fn binarize_page_escalating(
+    grey: &[u8],
+    w: usize,
+    h: usize,
+    whsize: usize,
+) -> EscalatedBinarization {
+    let otsu = binarize_page_with(grey, w, h, BinarizeMode::Otsu);
+    let otsu_frac = ink_fraction(&otsu);
+    if is_plausible_ink_frac(otsu_frac) {
+        return EscalatedBinarization {
+            binary: otsu,
+            mode: EscalatedMode::Otsu,
+            ink_frac: otsu_frac,
+        };
+    }
+
+    let sauvola = binarize_page_with(grey, w, h, BinarizeMode::Sauvola { whsize, k: 0.34 });
+    let sauvola_frac = ink_fraction(&sauvola);
+    if is_plausible_ink_frac(sauvola_frac) {
+        return EscalatedBinarization {
+            binary: sauvola,
+            mode: EscalatedMode::Sauvola,
+            ink_frac: sauvola_frac,
+        };
+    }
+
+    let wolf = binarize_page_with(grey, w, h, BinarizeMode::Wolf { whsize, k: 0.5 });
+    let wolf_frac = ink_fraction(&wolf);
+    if is_plausible_ink_frac(wolf_frac) {
+        return EscalatedBinarization {
+            binary: wolf,
+            mode: EscalatedMode::Wolf,
+            ink_frac: wolf_frac,
+        };
+    }
+
+    let singh = binarize_page_with(grey, w, h, BinarizeMode::Singh { whsize, k: 0.06 });
+    let singh_frac = ink_fraction(&singh);
+    EscalatedBinarization {
+        binary: singh,
+        mode: EscalatedMode::Singh,
+        ink_frac: singh_frac,
+    }
+}
+
 /// Per-column ink profile of `rect` (used to find VERTICAL cuts / left→right
 /// splits): `out[xi]` is `true` when column `rect.left + xi` is inked, i.e. the
 /// ink fraction of the rect's height exceeds `ink_threshold_frac`.
@@ -1408,5 +1590,62 @@ mod tests {
                 lf.width()
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Escalation ladder — pure boundary tests. Corpus-fixture tests (which
+    // rung a real degraded page lands on) live in
+    // `tests/binarize_escalation.rs`, matching this crate's convention that
+    // tests needing `corpus/` PGMs live in `tests/`, not the lib module.
+    // -----------------------------------------------------------------
+
+    /// The three real numbers [`PLAUSIBLE_INK_FRAC_LO`] must separate,
+    /// measured on the committed `corpus/quality/*.pgm` set (see
+    /// [`binarize_page_escalating`]'s doc): Sauvola's genuine collapse
+    /// (`0.0000`, must be REJECTED), the least healthy real reading that
+    /// must still pass (`faded_060.pgm`'s Sauvola result, `0.0246`,
+    /// ACCEPTED), and a normal healthy reading (`0.028`, ACCEPTED).
+    #[test]
+    fn plausible_lo_separates_collapse_from_a_real_faded_reading() {
+        assert!(
+            !is_plausible_ink_frac(0.0000),
+            "exact zero (Sauvola's measured collapse) must be rejected"
+        );
+        assert!(
+            is_plausible_ink_frac(0.0246),
+            "faded_060.pgm's measured Sauvola reading must be accepted"
+        );
+        assert!(
+            is_plausible_ink_frac(0.028),
+            "a healthy reading must be accepted"
+        );
+    }
+
+    /// The two real numbers [`PLAUSIBLE_INK_FRAC_HI`] must separate: the
+    /// highest healthy reading measured across every fixture in this
+    /// crate's quality corpus (`0.0303`, must be ACCEPTED) and the lowest
+    /// flood reading measured (`uneven_vignette_060.pgm`'s Otsu result,
+    /// `0.4566`, must be REJECTED).
+    #[test]
+    fn plausible_hi_separates_a_real_healthy_ceiling_from_the_lowest_flood() {
+        assert!(
+            is_plausible_ink_frac(0.0303),
+            "the highest measured healthy reading must be accepted"
+        );
+        assert!(
+            !is_plausible_ink_frac(0.4566),
+            "the lowest measured flood reading must be rejected"
+        );
+    }
+
+    #[test]
+    fn ink_fraction_of_empty_buffer_is_zero_not_a_panic() {
+        assert_eq!(ink_fraction(&[]), 0.0);
+    }
+
+    #[test]
+    fn ink_fraction_counts_zero_bytes_as_ink() {
+        // {0,255} convention: 0 = ink. 3 ink px of 4 = 0.75.
+        assert_eq!(ink_fraction(&[0, 0, 0, 255]), 0.75);
     }
 }
