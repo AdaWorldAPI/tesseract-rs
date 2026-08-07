@@ -2960,3 +2960,43 @@ needs its own wave with a golden re-pin.
 keep on image number one. A corpus you generate can only contain the failure
 modes you already imagined; upstream's canonical page is small, and *small* was
 the axis nothing local varied.
+
+### The neighbour-relative fix was ATTEMPTED and reverted — what the attempt taught
+
+`.claude/` carries the rule "judge a valley against its neighbours" as the
+correction shape shared by the gutter fallback, `noise_readmit_reach` and the
+table-gutter bridge. Applying it to `gap_min` looked mechanical. It is not, and
+the attempt is recorded so the next one starts from the finding rather than
+the intuition.
+
+**Attempt:** inside `axis_cuts`, after the page-relative filter, additionally
+require a candidate to clear `VALLEY_TO_MEDIAN × median(all valleys in this
+rect)`.
+
+| variant | phototest | resgrid | corpus pages | `xy_cut` unit tests |
+|---|---|---|---|---|
+| baseline | 19 blocks | 8 | 1 each | 259/259 |
+| rule, no guard | **6** | **16** | 1 each | **2 FAIL** |
+| rule + `valleys >= 4` guard | **20** | **18** | 1 each | 259/259 |
+
+**Two findings, both load-bearing for the next attempt:**
+
+1. **A rect whose only valleys ARE the gutters has the gutter as its median**,
+   so `2 × median` rejects the very cut the rule exists to preserve. That is
+   what broke `two_columns_wide_gutter_left_then_right` and
+   `two_by_two_grid_reading_order_horizontal_gutter_thicker` — synthetic
+   fixtures with no word-level valleys at all. The obvious guard (decline below
+   a minimum valley count, as `noise_readmit_reach` and `ordinary_scale` both
+   do) fixes the unit tests.
+2. **...and the guard makes phototest WORSE (19 -> 20) while moving resgrid
+   8 -> 18.** The reason is the part I had not modelled: `axis_cuts` returns
+   the thickest *confirmed* valley and `split_rect_inner` **chooses the axis by
+   that thickness**. Removing candidates therefore changes which axis wins, and
+   the change cascades through the recursion. **The rule cannot be a simple
+   additive filter inside `axis_cuts` — it perturbs the axis choice.**
+
+So a correct design must either apply the neighbour test AFTER axis selection,
+or preserve the thickness ranking while filtering. Reverted rather than shipped
+half-understood; `examples/cut_probe.rs` (block count + widest block across
+every fixture plus any extra path) is committed as the before/after instrument
+for the next attempt.
