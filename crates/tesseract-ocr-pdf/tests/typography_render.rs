@@ -74,6 +74,25 @@
 //!
 //! **Turning a knob that does not bind is not a disable.** Both misses looked
 //! like confirmations.
+//!
+//! # `Tw` — and a THIRD instance of the same trap
+//!
+//! `Tw` (the mechanism justification actually uses) was unasserted when this
+//! file first landed, because the fixture's marks recognized as ONE word per
+//! line: `JustifyToBox` took its `spaces == 0` early-out and never justified,
+//! so there was no `Tw` to check. Fixed by drawing WORDS — 2 marks each, an
+//! 18 px inter-word gap against a 10 px intra-word advance, every constant
+//! chosen against a specific `xy_cut` step (see [`tight_set_page`]).
+//!
+//! Then the reset half went vacuous for its own reason: **measured, all 42
+//! runs on the justified page carry a non-zero `Tw`**, because each
+//! `TextBlock`'s box is its own line's ink box — even the short last line
+//! justifies to its own measure. A page where no run ever needs `Tw = 0`
+//! cannot exercise the always-emit guard, and the assertion passed
+//! identically with `layout.rs` changed to emit `Tw` only when non-zero.
+//! Split in two: justification is asserted on the JUSTIFIED page, the reset
+//! on the RAGGED one (where `RunFit::Natural` legitimately yields `tw = 0`).
+//! Same shape as the `Tz` split, one layer down.
 
 #![allow(clippy::items_after_statements, reason = "test-local geometry helpers")]
 
@@ -150,8 +169,34 @@ fn tight_set_page(justified: bool) -> (Vec<u8>, Truth) {
     const GLYPH_H: usize = 15;
     const ADVANCE: usize = 10; // 7 px glyph + 3 px sidebearing
     const PITCH: usize = 16; // 15 px ink on a 16 px pitch => 1.07
-    const MARKS_PER_LINE: usize = 18;
-    const COL_W: usize = MARKS_PER_LINE * ADVANCE; // 180
+                             // Words, not a uniform mark run: the recognizer's own space detection is
+                             // gap-based, so a line drawn as one continuous run recognizes as ONE word
+                             // and `RunFit::JustifyToBox` then takes its `spaces == 0` early-out and
+                             // never justifies at all — which is exactly why `Tw` went unasserted when
+                             // this fence first landed. 3 marks per word (27 px ink) at a 51 px word
+                             // pitch => a 24 px inter-word gap against a 10 px intra-word advance.
+                             // Every constant is chosen against a SPECIFIC step of `xy_cut`, because a
+                             // word gap and a column gutter are the same thing to a projection profile.
+                             // A first attempt (3 marks/word, 24 px gaps) split the page at every word:
+                             //
+                             //   - word ink 17 px < `min_region_px` (24), so even where a word gap
+                             //     clears `gap_min` it is REJECTED by the confirm filter — the region
+                             //     it would carve is too small. This is what stops the page
+                             //     decomposing into words INSIDE a column, where `gap_min` collapses
+                             //     to ~6.
+                             //   - at PAGE level `gap_min` = ceil(0.015 * 1346) = 21 > the 18 px word
+                             //     gap, so word gaps are not even candidates there and the 40 px
+                             //     column gutter's nearest candidates are the column edges — which is
+                             //     what lets the columns themselves still split.
+                             //   - the 18 px gap against a 10 px intra-word advance (1.8x) is what the
+                             //     recognizer's own gap-based space detection needs to emit a SPACE,
+                             //     without which `RunFit::JustifyToBox` takes its `spaces == 0`
+                             //     early-out and never justifies.
+    const MARKS_PER_WORD: usize = 2;
+    const WORDS_PER_LINE: usize = 12;
+    const WORD_INK: usize = (MARKS_PER_WORD - 1) * ADVANCE + GLYPH_W; // 17
+    const WORD_PITCH: usize = 35; // 17 ink + 18 gap
+    const COL_W: usize = (WORDS_PER_LINE - 1) * WORD_PITCH + WORD_INK; // 402
     const GUTTER: usize = 40;
     const MARGIN: usize = 30;
 
@@ -165,25 +210,34 @@ fn tight_set_page(justified: bool) -> (Vec<u8>, Truth) {
         let cx = MARGIN + c * (COL_W + GUTTER);
         col_lefts.push(cx);
         // Justified: every line but the last ends at the same measure.
-        col_rights.push(cx + (MARKS_PER_LINE - 1) * ADVANCE + GLYPH_W);
+        col_rights.push(cx + COL_W);
         for row in 0..ROWS {
             let y = MARGIN + row * PITCH;
             // Last line short — real Blocksatz never stretches it.
-            let n = match (justified, row == ROWS - 1) {
-                // Justified: every line but the last ends at the measure.
-                (true, true) => MARKS_PER_LINE / 2,
-                (true, false) => MARKS_PER_LINE,
+            let words = match (justified, row == ROWS - 1) {
+                // Justified: every line but the last reaches the measure.
+                (true, true) => WORDS_PER_LINE / 2,
+                (true, false) => WORDS_PER_LINE,
                 _ => {
                     // Ragged: line lengths vary, so `classify_justification`
                     // returns Flattersatz and the renderer takes `RunFit::Natural`
                     // — the ONLY painted path that could ever apply `Tz`, and
                     // therefore the only one on which the Tz assertion can be
                     // falsified at all.
-                    MARKS_PER_LINE - (row * 3) % 7
+                    WORDS_PER_LINE - (row * 2) % 5
                 }
             };
-            for i in 0..n {
-                mark(&mut page, w, cx + i * ADVANCE, y, GLYPH_W, GLYPH_H);
+            for word in 0..words {
+                for i in 0..MARKS_PER_WORD {
+                    mark(
+                        &mut page,
+                        w,
+                        cx + word * WORD_PITCH + i * ADVANCE,
+                        y,
+                        GLYPH_W,
+                        GLYPH_H,
+                    );
+                }
             }
         }
     }
@@ -205,6 +259,12 @@ fn tight_set_page(justified: bool) -> (Vec<u8>, Truth) {
 struct PaintedRun {
     tf: f64,
     tz: f64,
+    tw: f64,
+    /// Was `Tw` set explicitly since the previous run? The PDF text state is
+    /// persistent, so a run WITHOUT its own `Tw` silently inherits the
+    /// previous line's word spacing — `layout.rs` claims it "always emits"
+    /// `Tw` for exactly this reason, and nothing checked it.
+    tw_explicit: bool,
     tm_x: f64,
     tm_y: f64,
 }
@@ -226,26 +286,38 @@ fn painted_runs(pdf: &[u8]) -> Vec<PaintedRun> {
     // carries forward until re-set. Tracking it (rather than reading only the
     // operands adjacent to a Tj) is what makes a leaked Tz or a never-reset Tw
     // visible instead of invisible.
-    let (mut tf, mut tz, mut tr) = (0.0f64, 100.0f64, 0.0f64);
+    let (mut tf, mut tz, mut tr, mut tw) = (0.0f64, 100.0f64, 0.0f64, 0.0f64);
     let (mut tx, mut ty) = (0.0f64, 0.0f64);
+    let mut tw_explicit = false;
     let mut out = Vec::new();
     for op in &content.operations {
         match op.operator.as_str() {
             "Tf" => tf = num(&op.operands[1]),
             "Tz" => tz = num(&op.operands[0]),
             "Tr" => tr = num(&op.operands[0]),
+            "Tw" => {
+                tw = num(&op.operands[0]);
+                tw_explicit = true;
+            }
             "Tm" => {
                 tx = num(&op.operands[4]);
                 ty = num(&op.operands[5]);
             }
             // `0 Tr` == painted; the invisible searchable layer is `3 Tr`
             // and is deliberately NOT measured here (it keeps `Tz` by design).
-            "Tj" | "TJ" if tr.abs() < 0.5 => out.push(PaintedRun {
-                tf,
-                tz,
-                tm_x: tx,
-                tm_y: ty,
-            }),
+            "Tj" | "TJ" => {
+                if tr.abs() < 0.5 {
+                    out.push(PaintedRun {
+                        tf,
+                        tz,
+                        tw,
+                        tw_explicit,
+                        tm_x: tx,
+                        tm_y: ty,
+                    });
+                }
+                tw_explicit = false;
+            }
             _ => {}
         }
     }
@@ -425,5 +497,68 @@ fn column_gutters_stay_even_across_the_page() {
         hi - lo <= 4.0,
         "gutters must stay even; measured spacings {measured:?}, spread {:.1} px",
         hi - lo
+    );
+}
+
+#[test]
+fn justification_reaches_the_measure_through_word_spacing() {
+    let (page, truth) = tight_set_page(true);
+    let Some(pdf) = render(&truth, &page) else {
+        return;
+    };
+    let runs = painted_runs(&pdf);
+    assert!(runs.len() >= 10, "fixture must produce painted runs");
+
+    // Justification must actually have HAPPENED, or this measures a page that
+    // silently took `JustifyToBox`'s `spaces == 0` early-out and never
+    // justified at all — the exact hole that left `Tw` unasserted when this
+    // fence first landed, because the marks recognized as ONE word per line.
+    let justified = runs.iter().filter(|r| r.tw.abs() > 0.01).count();
+    assert!(
+        justified > 0,
+        "no painted run carries a non-zero Tw: the recognizer produced no \
+         word spaces, so JustifyToBox never justified ({} runs)",
+        runs.len()
+    );
+}
+
+/// The RESET half — and it needs the ragged page, for the same reason the
+/// `Tz` test does.
+///
+/// Measured on the justified fixture, **all 42 runs carry a non-zero `Tw`**:
+/// each `TextBlock`'s box is its own line's ink box, so even the short last
+/// line justifies to its own measure. A page where no run ever needs
+/// `Tw = 0` cannot exercise the always-emit guard at all — verified, the
+/// assertion passed identically with `layout.rs` changed to emit `Tw` only
+/// when non-zero. Ragged text takes `RunFit::Natural`, which returns
+/// `tw = 0`, so the guard is the ONLY thing making the reset explicit there.
+#[test]
+fn word_spacing_is_always_reset_never_inherited() {
+    let (page, truth) = tight_set_page(false);
+    let Some(pdf) = render(&truth, &page) else {
+        return;
+    };
+    let runs = painted_runs(&pdf);
+    assert!(runs.len() >= 10, "fixture must produce painted runs");
+
+    // Anti-vacuity: this page must be the tw == 0 case, or the assertion
+    // below is measuring the justified path by accident.
+    let zero = runs.iter().filter(|r| r.tw.abs() <= 0.01).count();
+    assert_eq!(
+        zero,
+        runs.len(),
+        "ragged text must take RunFit::Natural (tw = 0) on every run, \
+         else this test does not exercise the reset"
+    );
+
+    // The PDF text state is persistent, so a run without its own `Tw`
+    // inherits the previous line's spacing. `layout.rs` claims it "always
+    // emits" for exactly this reason; nothing checked it until now.
+    let inherited = runs.iter().filter(|r| !r.tw_explicit).count();
+    assert_eq!(
+        inherited,
+        0,
+        "{inherited} of {} painted runs inherit Tw instead of setting their own",
+        runs.len()
     );
 }

@@ -2845,3 +2845,118 @@ is emitted but not asserted — the fixture's marks recognize without spaces, so
 `JustifyToBox` takes its `spaces == 0` path and never justifies. A fixture
 whose recognized text carries real word gaps is what that needs, and it is the
 same fixture the paragraph-level doctrine (d) has been waiting for.
+
+### `Tw` closed — and the same trap fired twice more (2026-08-07)
+
+The Axis-C fence shipped with `Tw` — the mechanism justification actually
+uses — **emitted but never asserted**. Two separate reasons, both found by
+disable runs, both the same shape as the `Tz` miss one layer up.
+
+**First: the fixture had no words.** A line drawn as one continuous mark run
+recognizes as ONE word, so `RunFit::JustifyToBox` took its `spaces == 0`
+early-out and never justified — nothing to check. Fixed by drawing WORDS, and
+every constant is chosen against a specific `xy_cut` step, because **a word
+gap and a column gutter are the same thing to a projection profile**:
+
+- word ink **17 px** < `min_region_px` (24) → even where a word gap clears
+  `gap_min`, the confirm filter rejects it; this is what stops the page
+  decomposing into words INSIDE a column, where `gap_min` collapses to ~6.
+- at PAGE level `gap_min = ceil(0.015 × 1346) = 21` > the **18 px** word gap,
+  so word gaps are not candidates there and the 40 px column gutter's nearest
+  candidates are the column edges — which is what lets the columns still split.
+- 18 px against a 10 px intra-word advance (**1.8×**) is what the recognizer's
+  own gap-based space detection needs.
+
+A first attempt (3 marks/word, 24 px gaps, ink 27) split the page at **every
+word** — measured drift 98 px on column 0.
+
+**Second: the reset half was vacuous for its own reason.** Measured, **all 42
+runs on the justified page carry a non-zero `Tw`** — each `TextBlock`'s box is
+its own line's ink box, so even the short last line justifies to its own
+measure. A page where no run ever needs `Tw = 0` cannot exercise the
+always-emit guard, and the assertion passed identically with `layout.rs`
+changed to emit `Tw` only when non-zero. Split: justification asserted on the
+JUSTIFIED page, the reset on the RAGGED one, where `RunFit::Natural`
+legitimately yields `tw = 0` and the guard is the only thing making it
+explicit.
+
+Five assertions, all disable-verified red-then-green:
+
+| assertion | disable |
+|---|---|
+| `Tz` ≡ 100 on painted runs | `RunFit::Natural` returns a box-fit stretch |
+| no run taller than the pitch | `page_font_px` returns `× 2.0` |
+| even column gutters | the per-block `dx = left` translation is dropped |
+| justification actually happens | force `JustifyToBox`'s `spaces == 0` path |
+| `Tw` never inherited | emit `Tw` only when non-zero |
+
+**The generalizable rule, now with five instances:** an assertion is only a
+test on a fixture that can *reach* the branch it guards. Justified vs ragged,
+words vs one run, width-bound vs ceiling-bound — each pair looks like the same
+page and exercises different code. The disable run is the only thing that
+tells them apart.
+
+Gates: `tesseract-ocr` lib 259/259, goldens + `blocks_columns` byte-identical,
+8+7+0 fence exact, `tesseract-ocr-pdf` 9 suites / 0 failures, clippy `-D
+warnings` + fmt clean.
+
+## ★ Upstream's own test image found a defect the local corpus cannot express (2026-08-07)
+
+Phase 0 of the benchmark ran on exactly one image — `tesseract-ocr/test`'s
+`testing/phototest.tif`, upstream's canonical regression input, with upstream's
+own `testing/phototest.gold.txt` as the answer — and it paid for itself twice.
+
+**Result 1, the reassuring one:** every non-empty line is **byte-identical** to
+gold (8/8), same as libtesseract 5.3.4. Recognition is exact on the canonical
+page.
+
+**Result 2, the methodological one:** raw bytes are `gold=286 cpp=286
+rust=285`. The single difference is the **blank line between the two
+paragraphs**. My first measurement normalized whitespace and reported
+`CER 0.0000, exact=true` — **the normalization deletes precisely the defect it
+was meant to find.** Any Phase-0 runner compares RAW. (Filed as the
+paragraph-break gap; `render_text` emits no separator between blocks.)
+
+**Result 3, the real one — and the local corpus is structurally unable to
+produce it.** `recognize_document` on phototest yields **19 regions**, most of
+them single WORDS:
+
+```
+page 640x480  xy_cut blocks = 19
+  block 0: l=36 t=92 r=201 b=116
+  block 1: l=212 t=92 r=282 b=116     <- ONE line, cut into two blocks
+  block 2..10: individual words
+```
+
+**Root cause, the exact mirror of the multi-column gutter bug.** `gap_min =
+ceil(min_gap_frac x extent)` is PAGE-RELATIVE. On a wide page it is too STRICT
+and columns stop splitting (fixed by the gutter fallback). On a SMALL page it
+is too PERMISSIVE: at 640 px, `gap_min = 10`, and 12 pt word spacing is ~10 px
+— so every word gap becomes a cut candidate, and words are wider than
+`min_region_px` (24) so the confirm filter passes them too. The same threshold,
+the same formula, failing in both directions for the same reason: **it is
+judged against the page instead of against its neighbours.**
+
+**Why no existing gate saw it.** The recognized TEXT is correct — saved
+entirely by `recognize_page_blocks_words`' no-content-loss fallback, which
+re-runs the whole-page path and takes whichever reading has more words. So the
+goldens are green while `doc.v1`'s REGION structure is word fragments. The
+committed corpus pages are 512x720 with generous spacing and yield `blocks=1`;
+none of them can express this.
+
+Pinned two-sided as `small_page_word_spacing_is_cut_as_if_it_were_column_gutters`
+(`tests/blocks_columns.rs`) over a Rust-generated 640x200 fixture — **not**
+phototest itself, per the `/tmp`-fixture time-bomb rule. Pinned by SIGNATURE
+rather than a count: no block may span half the page (measured: 6 blocks, one
+per word position, each spanning all four lines). A fix makes a block page-wide
+and FAILS the pin, forcing a deliberate re-measure.
+
+**Not fixed here.** The principled correction is the same shape as the gutter
+fallback and `noise_readmit_reach` — judge a valley against its NEIGHBOURS, not
+against the page — but it changes `xy_cut`'s cut decision on every page and
+needs its own wave with a golden re-pin.
+
+**The transferable lesson:** the fetch-don't-commit external corpus earned its
+keep on image number one. A corpus you generate can only contain the failure
+modes you already imagined; upstream's canonical page is small, and *small* was
+the axis nothing local varied.
