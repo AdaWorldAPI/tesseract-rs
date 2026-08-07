@@ -144,6 +144,8 @@ struct RecognizeJsonBody {
     #[serde(default)]
     lang: Option<String>,
     #[serde(default)]
+    deskew: bool,
+    #[serde(default)]
     rectify: bool,
 }
 
@@ -187,16 +189,16 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
 fn decode_request_body(
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<(Vec<u8>, Option<String>, bool), String> {
+) -> Result<(Vec<u8>, Option<String>, bool, bool), String> {
     if is_json_content_type(headers) {
         let parsed: RecognizeJsonBody = serde_json::from_slice(body).map_err(|e| {
             format!(
                 "invalid JSON body (expected {{\"content_base64\": \"...\", \"lang\": \"eng\", \
-                 \"rectify\": false}}): {e}"
+                 \"deskew\": false, \"rectify\": false}}): {e}"
             )
         })?;
         let bytes = decode_base64(parsed.content_base64.trim())?;
-        Ok((bytes, parsed.lang, parsed.rectify))
+        Ok((bytes, parsed.lang, parsed.deskew, parsed.rectify))
     } else if body.is_empty() {
         Err(
             "empty request body — send raw image bytes (application/octet-stream) or \
@@ -204,7 +206,7 @@ fn decode_request_body(
                 .to_string(),
         )
     } else {
-        Ok((body.to_vec(), None, false))
+        Ok((body.to_vec(), None, false, false))
     }
 }
 
@@ -272,12 +274,13 @@ async fn recognize(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let (bytes, body_lang, body_rectify) = match decode_request_body(&headers, &body) {
+    let (bytes, body_lang, body_deskew, body_rectify) = match decode_request_body(&headers, &body) {
         Ok(b) => b,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, e),
     };
     // Computed before `q.lang` is moved out below — `q.wants_rectify()`
     // borrows `q`, which a partial move would otherwise make unusable.
+    let deskew = body_deskew || q.wants_deskew();
     let rectify = body_rectify || q.wants_rectify();
     let lang = body_lang.or(q.lang);
 
@@ -288,7 +291,7 @@ async fn recognize(
     let st = state.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        ocr_image_bytes_json(&st, &bytes, lang.as_deref(), rectify)
+        ocr_image_bytes_json(&st, &bytes, lang.as_deref(), deskew, rectify)
     })
     .await;
     match outcome {
@@ -318,8 +321,9 @@ async fn pdf_searchable_or_query(
     // Computed before `q.lang` is moved out below — both borrow `q`, and a
     // partial move would otherwise make it unusable for the second call.
     let structured = q.is_structured();
+    let deskew = q.wants_deskew();
     let rectify = q.wants_rectify();
-    pdf_impl(state, &headers, &body, structured, q.lang, rectify).await
+    pdf_impl(state, &headers, &body, structured, q.lang, deskew, rectify).await
 }
 
 /// `POST /api/v1/pdf/structured` — `StructuredPdf` in the connector: a
@@ -335,8 +339,9 @@ async fn pdf_structured(
 ) -> Response {
     // Computed before `q.lang` is moved out below — see the identical note in
     // `pdf_searchable_or_query`.
+    let deskew = q.wants_deskew();
     let rectify = q.wants_rectify();
-    pdf_impl(state, &headers, &body, true, q.lang, rectify).await
+    pdf_impl(state, &headers, &body, true, q.lang, deskew, rectify).await
 }
 
 /// Shared body for [`pdf_searchable_or_query`] / [`pdf_structured`] — decode,
@@ -354,13 +359,15 @@ async fn pdf_impl(
     body: &[u8],
     structured: bool,
     query_lang: Option<String>,
+    query_deskew: bool,
     query_rectify: bool,
 ) -> Response {
-    let (bytes, body_lang, body_rectify) = match decode_request_body(headers, body) {
+    let (bytes, body_lang, body_deskew, body_rectify) = match decode_request_body(headers, body) {
         Ok(b) => b,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, e),
     };
     let lang = body_lang.or(query_lang);
+    let deskew = body_deskew || query_deskew;
     let rectify = body_rectify || query_rectify;
 
     let permit = match state.recognize_permits.clone().acquire_owned().await {
@@ -370,7 +377,7 @@ async fn pdf_impl(
     let st = state.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        build_pdf(&st, &bytes, structured, lang.as_deref(), rectify)
+        build_pdf(&st, &bytes, structured, lang.as_deref(), deskew, rectify)
     })
     .await;
     match outcome {

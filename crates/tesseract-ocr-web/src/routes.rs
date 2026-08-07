@@ -125,6 +125,7 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
     // An HTML checkbox only sends its field AT ALL when checked (any value,
     // conventionally "on") — its mere presence is the signal, same
     // consume-the-body discipline as read_image_upload's "rectify" field.
+    let mut deskew = false;
     let mut rectify = false;
 
     loop {
@@ -159,6 +160,10 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
                                 lang = Some(t.trim().to_string());
                             }
                         }
+                    }
+                    "deskew" => {
+                        let _ = field.text().await;
+                        deskew = true;
                     }
                     "rectify" => {
                         // Discard the value (conventionally "on") — the
@@ -201,7 +206,7 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
         OutputFormat::Text => {
             let outcome = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                ocr_image_bytes(&st, &bytes, lang.as_deref(), rectify)
+                ocr_image_bytes(&st, &bytes, lang.as_deref(), deskew, rectify)
             })
             .await;
             match outcome {
@@ -216,7 +221,7 @@ async fn ocr(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Ht
         OutputFormat::Json => {
             let outcome = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                ocr_image_bytes_json(&st, &bytes, lang.as_deref(), rectify)
+                ocr_image_bytes_json(&st, &bytes, lang.as_deref(), deskew, rectify)
             })
             .await;
             match outcome {
@@ -256,12 +261,20 @@ pub(crate) struct PdfQuery {
     #[serde(default)]
     pub(crate) lang: Option<String>,
     #[serde(default)]
+    deskew: Option<String>,
+    #[serde(default)]
     rectify: Option<String>,
 }
 
 impl PdfQuery {
     pub(crate) fn is_structured(&self) -> bool {
         matches!(self.mode.as_deref(), Some("structured"))
+    }
+
+    /// `true` only for the literal query value `deskew=true` — same
+    /// exact-match philosophy as [`Self::wants_rectify`].
+    pub(crate) fn wants_deskew(&self) -> bool {
+        matches!(self.deskew.as_deref(), Some("true"))
     }
 
     /// `true` only for the literal query value `rectify=true` — same
@@ -289,10 +302,17 @@ pub(crate) struct LangQuery {
     #[serde(default)]
     pub(crate) lang: Option<String>,
     #[serde(default)]
+    deskew: Option<String>,
+    #[serde(default)]
     rectify: Option<String>,
 }
 
 impl LangQuery {
+    /// See [`PdfQuery::wants_deskew`] — identical exact-match semantics.
+    pub(crate) fn wants_deskew(&self) -> bool {
+        matches!(self.deskew.as_deref(), Some("true"))
+    }
+
     /// See [`PdfQuery::wants_rectify`] — identical exact-match semantics.
     pub(crate) fn wants_rectify(&self) -> bool {
         matches!(self.rectify.as_deref(), Some("true"))
@@ -480,6 +500,7 @@ struct DebugView {
     /// (`auto_rectify` is a no-op on an already-straight page — see
     /// `tesseract_ocr::rectify`'s module docs).
     rectified: bool,
+    deskewed: bool,
     mean_conf: String,
     low_confidence: bool,
     word_count: usize,
@@ -571,9 +592,10 @@ fn build_debug_view(
     state: &AppState,
     bytes: &[u8],
     lang: Option<&str>,
+    deskew: bool,
     rectify: bool,
 ) -> Result<DebugView, String> {
-    let dbg = ocr_image_bytes_debug(state, bytes, lang, rectify)?;
+    let dbg = ocr_image_bytes_debug(state, bytes, lang, deskew, rectify)?;
     let doc: docv1::Doc =
         serde_json::from_str(&dbg.doc_json).map_err(|e| format!("parsing doc.v1: {e}"))?;
     let (w, h) = (dbg.width, dbg.height);
@@ -667,6 +689,7 @@ fn build_debug_view(
         null_char: dbg.null_char,
         dict_on: dbg.dict_on,
         rectified: dbg.rectified,
+        deskewed: dbg.deskewed,
         mean_conf: confidence_str(dbg.mean_conf),
         low_confidence: dbg.low_confidence,
         word_count: dbg.word_count,
@@ -699,9 +722,10 @@ pub(crate) fn build_pdf(
     bytes: &[u8],
     structured: bool,
     lang: Option<&str>,
+    deskew: bool,
     rectify: bool,
 ) -> Result<(Vec<u8>, &'static str), String> {
-    let dbg = ocr_image_bytes_debug(state, bytes, lang, rectify)?;
+    let dbg = ocr_image_bytes_debug(state, bytes, lang, deskew, rectify)?;
     let grey = GreyImage {
         data: dbg.grey,
         w: dbg.width,
@@ -731,6 +755,7 @@ pub(crate) fn build_pdf(
 struct UploadedImage {
     bytes: Vec<u8>,
     lang: Option<String>,
+    deskew: bool,
     rectify: bool,
 }
 
@@ -744,6 +769,7 @@ async fn read_image_upload(mut multipart: Multipart) -> Result<UploadedImage, St
     let mut lang: Option<String> = None;
     // An HTML checkbox only sends its field AT ALL when checked (any value,
     // conventionally "on") — its mere presence is the signal, not its text.
+    let mut deskew = false;
     let mut rectify = false;
     loop {
         match multipart.next_field().await {
@@ -768,6 +794,12 @@ async fn read_image_upload(mut multipart: Multipart) -> Result<UploadedImage, St
                                 lang = Some(t.trim().to_string());
                             }
                         }
+                    }
+                    "deskew" => {
+                        // Same consume-the-body discipline as "rectify" below
+                        // — the field's mere presence is the checkbox signal.
+                        let _ = field.text().await;
+                        deskew = true;
                     }
                     "rectify" => {
                         // Discard the value (conventionally "on") — the
@@ -794,6 +826,7 @@ async fn read_image_upload(mut multipart: Multipart) -> Result<UploadedImage, St
     Ok(UploadedImage {
         bytes,
         lang,
+        deskew,
         rectify,
     })
 }
@@ -845,6 +878,7 @@ async fn pdf(
             &uploaded.bytes,
             structured,
             uploaded.lang.as_deref(),
+            uploaded.deskew,
             uploaded.rectify,
         )
     })
@@ -897,6 +931,7 @@ async fn debug_post(State(state): State<Arc<AppState>>, multipart: Multipart) ->
             &st,
             &uploaded.bytes,
             uploaded.lang.as_deref(),
+            uploaded.deskew,
             uploaded.rectify,
         )
     })
@@ -1068,7 +1103,7 @@ mod tests {
         let state = AppState::load(&dir).expect("load model");
         let page = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pages/page_01.pgm");
         let bytes = std::fs::read(&page).expect("read page_01.pgm");
-        let out = ocr_image_bytes(&state, &bytes, None, false).expect("ocr");
+        let out = ocr_image_bytes(&state, &bytes, None, false, false).expect("ocr");
         assert!(out.width > 0 && out.height > 0);
         assert!(
             out.line_count >= 2,
@@ -1094,7 +1129,7 @@ mod tests {
         let state = AppState::load(&dir).expect("load model");
         let page = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pages/page_01.pgm");
         let bytes = std::fs::read(&page).expect("read page_01.pgm");
-        let out = ocr_image_bytes_json(&state, &bytes, None, false).expect("ocr json");
+        let out = ocr_image_bytes_json(&state, &bytes, None, false, false).expect("ocr json");
         assert!(out.width > 0 && out.height > 0);
         assert!(
             out.json.starts_with("{\"schema\":\"tesseract-rs/doc.v1\""),

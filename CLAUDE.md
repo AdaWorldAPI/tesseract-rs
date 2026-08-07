@@ -3000,3 +3000,60 @@ or preserve the thickness ranking while filtering. Reverted rather than shipped
 half-understood; `examples/cut_probe.rs` (block count + widest block across
 every fixture plus any extra path) is committed as the before/after instrument
 for the next attempt.
+
+## ★ Deskew D8 CLOSED — the pipeline wiring, and the falsifier that caught a real trap (2026-08-07)
+
+D1-D7 have carried byte-parity (170/170) since 2026-07-30 without a single
+caller — a rotated page was never corrected. D8 closes it.
+
+### Library: `auto_deskew`
+
+`deskew.rs` gains `auto_deskew(grey, w, h) -> (Vec<u8>, usize)` — the
+[`rectify::auto_rectify`] sibling for ROTATION rather than keystone. A thin
+wrapper over `deskew_general(grey, w, h, 0, 0.0, 0.0, 0, 0)` (every knob at
+its C default); the confidence/angle gate already lives inside
+`deskew_general`, so the wrapper adds no threshold logic of its own.
+
+### The pipeline-order falsifier — composing two crate surfaces for real
+
+`deskew::tests::deskew_then_rectify_measures_near_zero_shear_on_a_purely_rotated_page`
+rotates a synthetic text-like page by a REAL angle (`rotate_am_gray`, D5,
+byte-parity proven — not a shear approximation), runs `auto_deskew`, then
+feeds the result through `rectify::detect_row_shears` + `fit_shear_ramp` —
+the exact scan `auto_rectify` itself runs. Measured: before deskew the shear
+is `0.0698` (comfortably over `is_significant`'s `0.0087` gate); after, it
+sits below the gate. **Disable-verified**: skipping `auto_deskew` leaves the
+shear at the identical `0.0698` before AND after — the falsifier is real, not
+decorative.
+
+### Web demo wiring — and a vacuous-test trap caught mid-build
+
+`ocr.rs` gained a shared `preprocess(decoded, w, h, deskew, rectify)` helper
+run at all three entry points (`ocr_image_bytes`, `ocr_image_bytes_json`,
+`ocr_image_bytes_debug`) — deskew ALWAYS before rectify, never the reverse,
+matching the falsifier's own claim. `deskew: bool` threads through the full
+surface `rectify` already occupies: `UploadedImage`, both HTML multipart
+loops, `RecognizeJsonBody`, `decode_request_body`, `PdfQuery`/`LangQuery`
+(`wants_deskew()` mirroring `wants_rectify()`), `build_debug_view`/`build_pdf`,
+and a new checkbox + stats row in `index.html`/`debug.html`.
+
+**The wiring-level falsifier was vacuous on its first version, and the
+disable run caught it — same trap as five times earlier this arc.** The first
+attempt asserted "no significant shear left in the output" after the wired
+`preprocess(..., true, true)` call. Disabled by swapping the two passes
+inside `preprocess` itself: **the test stayed green.** Root cause, measured:
+at a small angle a pure rotation approximates a shear well enough that
+`auto_rectify` ALONE can also straighten it — so "ended up straight" cannot
+tell the two orders apart; both reach the same endpoint by different means.
+
+The actual order-discriminating signal is `rectified` itself. Measured
+directly: correct order → `deskewed=true, rectified=false` (deskew consumes
+the rotation, rectify finds nothing and correctly no-ops); swapped order →
+`deskewed=true, rectified=true` (rectify fires for real on the raw rotation).
+Rewritten to assert `!rectified` — **now disable-verified**: swapping the
+passes flips it to `rectified=true` and the test fails with the exact
+"deskew did NOT run before rectify's scan" message.
+
+Gates: `tesseract-ocr` lib 259/259 (`deskew::` 36/36, `rectify::` 12/12),
+goldens byte-identical, `tesseract-ocr-web` 38/38 (36 pre-existing + 2 new),
+clippy `-D warnings` + fmt clean on both crates.
