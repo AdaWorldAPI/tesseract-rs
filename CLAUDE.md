@@ -2674,11 +2674,38 @@ on this fixture a correct raster detects 8 columns and splits nothing, and the
 the default-on decision; had the real leaf list differed, the spec's fallback
 rule required `DocumentOptions::grid_raster` instead.
 
-### NOT yet wired — stated plainly
+### Drop-cap WIRED — and the seam is measured INERT on output, by construction
 
-Both modules are registered in `lib.rs` and fully tested, but nothing consumes
-them yet: `.large` still dies in `segment.rs`'s `ToBlockCtx` literal, and no
-recognition path calls the raster. The wiring (`textline.rs` `ToBlockCtx.large`,
+`.large` no longer dies: `ToBlockCtx.large` carries it (`textline.rs`),
+`segment.rs`'s literal fills it (the ONE line where it used to be dropped), the
+seam runs in `makerow_row_crops`, and `Document.drop_caps` reports the count.
+
+**The honest result, from the disable-the-fix run on the real page with a real
+cap** (`/tmp/alice_page.pgm`, 2550x3300): output is **byte-identical with and
+without the seam**. That is not a wiring failure — the wiring provably carries
+data (`pool=2389 large=1 caps=1`, the cap measured at `x=290..371 y=2740..2812`,
+81x72, ratio 2.83, aspect 1.12 — the same blob this file already documented).
+The gate quantities all PASS: nearest text left = 372 against cap right = 371,
+so the gap is **1 px** against a reach of **14**. The seam fires and moves the
+crop left by at most one glyph width — **~14 px against an 81 px cap.** A
+14 px slice of an "A" does not change the LSTM's reading.
+
+So the seam does exactly what its own doc says ("recovers the seam between cap
+and text, NOT the cap itself") and **cannot** recover drop-cap text at all. What
+this wiring delivers is rung 1 of the two the drop-cap section named — *make the
+loss LOUD*: `Document.drop_caps > 0` now means "this page dropped an initial",
+where before the blob was discarded in silence. Rung 2 (recognize the cap as its
+own unit and reattach) remains unbuilt and is the only path to the text.
+
+Gates: goldens + `golden_lines` + `blocks_columns` + both `lab_table_*` suites
+byte-identical, 8+7+0 fence exact (`0.000` x14, `0.023`, `0.814`), lib 259/259,
+clippy/fmt clean. Behaviour on every committed fixture is unchanged — GATE 0
+already proved 0/23 qualify, and this run confirms it end-to-end.
+
+### grid_raster NOT yet wired — stated plainly
+
+`grid_raster` is registered in `lib.rs` and fully tested, but no recognition
+path calls it yet (the dropcap half above IS now wired). The wiring (`textline.rs` `ToBlockCtx.large`,
 `segment.rs`, `lstm_recognizer.rs` seam + `apply_grid_raster` + `Document.drop_caps`)
 is orchestrator work spelled out in the plan, and the `xy_gutter_probe` re-run
 that gates P-50's default-on decision has not happened. Until both land, this

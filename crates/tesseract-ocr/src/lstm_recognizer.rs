@@ -151,6 +151,22 @@ pub struct Document {
     /// (`eng.lstm` is a print-trained model). A conservative heuristic, not a
     /// proof.
     pub low_confidence: bool,
+    /// Shape-qualified drop caps on the page ([`crate::dropcap`]).
+    ///
+    /// **This is a LOSS counter, not a feature counter.** A drop cap is
+    /// rejected by `filter_blobs` into `.large`, never reaches `make_rows`, and
+    /// so contributes NO text — "Alice" reads as "ice". Measured, the fix that
+    /// worked for the period bug (widen the row crop) is HARMFUL here: a cap
+    /// spans ~2 line heights, so including it inflates the band ~3x and the
+    /// prescale then wrecks every other glyph on the line (the whole line
+    /// degrades to `"ye hewn to eet very tired of"`). The seam in
+    /// [`Self::makerow_row_crops`] therefore moves the crop's left edge by at
+    /// most ONE glyph width — enough to recover the cap/text seam, structurally
+    /// unable to recover an 81 px cap. So this count exists to make the loss
+    /// LOUD rather than silent: non-zero means the page dropped an initial that
+    /// no current path recovers. Recovering it needs the cap recognized as its
+    /// OWN unit and reattached — filed, not attempted.
+    pub drop_caps: usize,
 }
 
 /// A loaded LSTM recognizer — the network plus the char-set / recoder tissue and
@@ -602,6 +618,9 @@ impl LstmRecognizer {
         // wave 3's `compute_block_xheight`. The recognizer input is then the
         // proven prescale+FromPix path, exactly as `RecognizeLine` does.
         const K_IMAGE_PADDING: i32 = 4;
+        // Shape-qualified drop caps, computed ONCE against the page's own blob
+        // population (never per row — the population is a page property).
+        let caps = crate::dropcap::detect_drop_caps(&block.large, &block.blobs);
         let mut out: Vec<MakerowRowCrop> = Vec::with_capacity(block.rows.len());
         for row in &block.rows {
             if row.blobs.is_empty() {
@@ -645,9 +664,14 @@ impl LstmRecognizer {
             // real content from every sentence on the page. This only widens
             // the CROP; `make_rows` still never sees these blobs, so row
             // assignment, x-height and baseline fitting are untouched.
+            // Hoisted out of the noise guard below: the drop-cap seam uses the
+            // SAME population-relative yardstick, so both consumers must read
+            // one `reach`, not two independently-derived ones.
+            let spans: Vec<(i32, i32)> = row.blobs.iter().map(|&(l, _, r, _)| (l, r)).collect();
+            let reach = noise_readmit_reach(&spans);
+
             if !block.noise.is_empty() && row.blobs.len() > 1 {
-                let spans: Vec<(i32, i32)> = row.blobs.iter().map(|&(l, _, r, _)| (l, r)).collect();
-                if let Some(reach) = noise_readmit_reach(&spans) {
+                if let Some(reach) = reach {
                     for &(nl, nb, nr, nt) in &block.noise {
                         let vcenter = (nb + nt) as f32 / 2.0;
                         if vcenter < bottom || vcenter > top {
@@ -666,6 +690,29 @@ impl LstmRecognizer {
                             bottom = bottom.min(nb as f32);
                             top = top.max(nt as f32);
                         }
+                    }
+                }
+            }
+
+            // Drop-cap seam. A cap spans several line heights, so
+            // `filter_blobs` rejects it into `.large` and `make_rows` never
+            // sees it — which is why "Alice" recognized as "ice". Measured,
+            // the two size-extreme defects have OPPOSITE correct treatments:
+            // a line-final period IS part of its line and only needed the
+            // crop to reach it, but including a whole cap forces the band to
+            // ~3x its true height and the prescale then wrecks every other
+            // glyph on the line (measured: the full line degrades to
+            // "ye hewn to eet very tired of"). So the seam moves the crop's
+            // LEFT edge only, by at most one glyph width, and never into the
+            // cap's body — it recovers the seam between cap and text, not the
+            // cap itself. Left edge only: `bottom`/`top` stay untouched, so
+            // the band height — the thing that broke — cannot change.
+            if !caps.is_empty() {
+                if let Some(r) = reach {
+                    if let Some(new_left) =
+                        crate::dropcap::seam_left_extension(left, bottom, top, &spans, &caps, r)
+                    {
+                        left = new_left;
                     }
                 }
             }
@@ -1293,6 +1340,7 @@ impl LstmRecognizer {
         let mean_confidence = crate::structured::mean_word_confidence(&page);
         let low_confidence =
             mean_confidence.is_some_and(|mc| mc < crate::structured::LOW_CONFIDENCE_THRESHOLD);
+        let drop_caps = crate::dropcap::count_page_drop_caps(&binary, w, h);
         Ok(Document {
             json,
             fields,
@@ -1300,6 +1348,7 @@ impl LstmRecognizer {
             line_count,
             mean_confidence,
             low_confidence,
+            drop_caps,
         })
     }
 
