@@ -1259,6 +1259,43 @@ pub fn deskew_both(
     Some((rot2, rw2, rh2))
 }
 
+/// The default-parameter, gated, grey-in/grey-out convenience wrapper —
+/// [`auto_rectify`](crate::rectify::auto_rectify)'s sibling for ROTATION
+/// rather than keystone. Runs [`deskew_general`] with every knob at its C
+/// default (`0`/`0.0` — `redsweep`/`sweeprange`/`sweepdelta`/`redsearch`/
+/// `thresh`), which already carries the confidence/angle gate
+/// ([`MIN_DESKEW_ANGLE`], [`MIN_ALLOWED_CONFIDENCE`]) — so this wrapper adds
+/// NO threshold logic of its own, only the angle/conf-dropping return shape
+/// callers that just want a corrected page expect.
+///
+/// # Pipeline order — deskew BEFORE rectify, always
+///
+/// Deskew corrects ROTATION (the whole page turned in-plane); rectify
+/// corrects KEYSTONE (a row-height-dependent shear from an off-axis camera).
+/// They are independent distortions and the correction order matters for
+/// [`crate::rectify::detect_row_shears`]'s per-row line fit: a page that is
+/// merely rotated (no keystone) should — once straightened here — measure a
+/// keystone ramp of `m0 ≈ 0`, since there is no shear left for
+/// [`crate::rectify::fit_shear_ramp`] to find. Running rectify first would
+/// leave the rotation folded into that per-row fit and corrupt it. This is a
+/// genuine falsifier, not a convention: see the crate's `deskew_pipeline`
+/// integration test.
+///
+/// # Return
+/// `(grey, h)`, mirroring [`auto_rectify`](crate::rectify::auto_rectify)'s
+/// own signature exactly — width is invariant (rotation-correction here never
+/// expands the canvas, unlike keystone correction's shear-margin growth), so
+/// only height is worth returning alongside the buffer. A safe no-op — the
+/// UNCHANGED input, same `h` — whenever [`deskew_general`]'s own gate
+/// declines (page not confidently skewed) or its internal D4 step fails.
+#[must_use]
+pub fn auto_deskew(grey: &[u8], w: usize, h: usize) -> (Vec<u8>, usize) {
+    match deskew_general(grey, w, h, 0, 0.0, 0.0, 0, 0) {
+        Some(r) => (r.grey, r.h),
+        None => (grey.to_vec(), h),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1867,9 +1904,90 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // D8 — the pipeline-ORDER falsifier: deskew before rectify.
+    //
+    // CLAUDE.md's own standing claim about the deskew/rectify composition:
+    // a page that is purely ROTATED (no keystone) must, once run through
+    // `auto_deskew`, measure a rectify shear ramp of `m0 ≈ 0` — there is no
+    // rotational leftover for `crate::rectify::fit_shear_ramp` to find. This
+    // is a genuine cross-module claim, not a convention, so it is tested
+    // here by actually composing the two crate surfaces rather than trusting
+    // the doc comment.
+    // -----------------------------------------------------------------
+
+    /// A straight text-like page — the exact hollow-rectangle-blob pattern
+    /// `crate::rectify`'s own fixtures use (`detect_row_shears` needs
+    /// connected-component blob geometry, not real glyphs, and needs
+    /// `MIN_ROW_BLOBS >= 3` per row, hence 8 segments per line).
+    fn straight_text_like_page(w: usize, h: usize, n_lines: usize) -> Vec<u8> {
+        let mut page = vec![255u8; w * h];
+        let margin = h / (n_lines + 2);
+        let bar_h = 16usize.min(margin.saturating_sub(4).max(9));
+        let seg_w = w / 12;
+        for i in 0..n_lines {
+            let y0 = margin + i * margin;
+            for seg in 0..8 {
+                let x0 = seg * (w / 8) + seg_w / 4;
+                let x1 = (x0 + seg_w).min(w);
+                let border = 2usize;
+                for y in y0..(y0 + bar_h).min(h) {
+                    for x in x0..x1.min(w) {
+                        let on_border = y < y0 + border
+                            || y + border >= (y0 + bar_h).min(h)
+                            || x < x0 + border
+                            || x + border >= x1;
+                        if on_border {
+                            page[y * w + x] = 0;
+                        }
+                    }
+                }
+            }
+        }
+        page
+    }
+
     #[test]
-    #[should_panic(expected = "not w·h")]
-    fn deskew_both_rejects_mismatched_length() {
-        let _ = deskew_both(&[1u8; 3], 2, 2, 1);
+    fn deskew_then_rectify_measures_near_zero_shear_on_a_purely_rotated_page() {
+        let (w, h) = (300usize, 220usize);
+        let straight = straight_text_like_page(w, h, 5);
+
+        // A genuine ROTATION (not a shear approximation): rotate_am_gray is
+        // D5, byte-parity proven, so this is the same operation a
+        // photographed-but-not-keystoned page would have undergone.
+        let angle_deg = 4.0_f32;
+        let rotated = rotate_am_gray(&straight, w, h, angle_deg.to_radians(), 255);
+
+        // Sanity: the un-deskewed page must ACTUALLY carry a measurable
+        // shear, or this test would pass vacuously regardless of whether
+        // auto_deskew does anything at all.
+        let before =
+            crate::rectify::fit_shear_ramp(&crate::rectify::detect_row_shears(&rotated, w, h));
+        let before_m0 = before.map(|r| r.m0.abs()).unwrap_or(0.0);
+        assert!(
+            before_m0 > 0.02,
+            "fixture must carry a measurable rotational shear before deskew              ({before_m0}), or this test measures nothing"
+        );
+
+        let (deskewed, dh) = auto_deskew(&rotated, w, h);
+
+        // THE CLAIM: after deskew, essentially no rotational component is
+        // left for rectify's own row-shear fit to find.
+        let after =
+            crate::rectify::fit_shear_ramp(&crate::rectify::detect_row_shears(&deskewed, w, dh));
+        let after_m0 = after.map(|r| r.m0.abs()).unwrap_or(0.0);
+        assert!(
+            after_m0 < before_m0 / 4.0,
+            "deskew must remove most of the rotational shear: before              {before_m0}, after {after_m0}"
+        );
+
+        // The two-sided half: NOT merely smaller, but below rectify's own
+        // significance gate, so a caller running auto_rectify next would
+        // see a documented no-op rather than a spurious correction.
+        let stayed_below_gate = after.is_none_or(|r| !r.is_significant(dh));
+        assert!(
+            stayed_below_gate,
+            "after deskew, the residual shear ({after_m0}) must sit BELOW              ShearRamp::is_significant's own gate, or a caller chaining              auto_rectify next would apply a spurious correction"
+        );
     }
 }

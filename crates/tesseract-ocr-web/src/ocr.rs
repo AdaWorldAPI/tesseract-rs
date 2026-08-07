@@ -118,6 +118,46 @@ pub struct OcrJsonOutcome {
 /// [`MAX_PIXELS`] before the grey buffer (and the larger OCR working set) is
 /// ever materialized. Shared by both [`ocr_image_bytes`] and
 /// [`ocr_image_bytes_json`] so the two output modes decode identically.
+/// Shared opt-in preprocessing chain for every entry point below: DESKEW
+/// (rotation) runs BEFORE RECTIFY (keystone), never the reverse.
+///
+/// The order is not a convention, it is load-bearing: a purely-rotated page
+/// that skipped deskew would leak its rotational component into
+/// [`tesseract_ocr::rectify::detect_row_shears`]'s per-row line fit, and
+/// `auto_rectify`'s single-shear model would then apply a spurious
+/// correction trying to explain a distortion that is not keystone at all.
+/// Running deskew first is what makes
+/// `deskew::tests::deskew_then_rectify_measures_near_zero_shear_on_a_purely_rotated_page`
+/// true: after deskew, a purely-rotated page's own residual shear sits below
+/// `ShearRamp::is_significant`'s gate, so `auto_rectify` correctly no-ops.
+///
+/// Both passes are independently a documented no-op when nothing significant
+/// is detected (see their own doc comments), so `deskewed`/`rectified` report
+/// what ACTUALLY changed — never just an echo of the request flags.
+fn preprocess(
+    decoded: &[u8],
+    w: usize,
+    decoded_h: usize,
+    deskew: bool,
+    rectify: bool,
+) -> (Vec<u8>, usize, bool, bool) {
+    let (after_deskew, dh, deskewed) = if deskew {
+        let (out, out_h) = tesseract_ocr::deskew::auto_deskew(decoded, w, decoded_h);
+        let changed = out_h != decoded_h || out != decoded;
+        (out, out_h, changed)
+    } else {
+        (decoded.to_vec(), decoded_h, false)
+    };
+    let (raw, h, rectified) = if rectify {
+        let (out, out_h) = tesseract_ocr::rectify::auto_rectify(&after_deskew, w, dh);
+        let changed = out_h != dh || out != after_deskew;
+        (out, out_h, changed)
+    } else {
+        (after_deskew, dh, false)
+    };
+    (raw, h, deskewed, rectified)
+}
+
 fn decode_grey(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
     // Sniff the format from the bytes, then decode under explicit limits — the
     // `image` defaults set only a 512 MiB alloc cap and NO dimension cap, so a
@@ -178,21 +218,11 @@ pub fn ocr_image_bytes(
     state: &AppState,
     bytes: &[u8],
     lang: Option<&str>,
+    deskew: bool,
     rectify: bool,
 ) -> Result<OcrOutcome, String> {
     let (decoded, w, decoded_h) = decode_grey(bytes)?;
-    // Same before/after comparison as ocr_image_bytes_debug: auto_rectify is
-    // a documented no-op when nothing significant is detected, so comparing
-    // rather than echoing the request flag is the honest way to report
-    // whether it did anything. Its canvas can grow/shrink — `h` MUST be
-    // rebound to the returned height for everything downstream.
-    let (raw, h, rectified) = if rectify {
-        let (out, out_h) = tesseract_ocr::rectify::auto_rectify(&decoded, w, decoded_h);
-        let changed = out_h != decoded_h || out != decoded;
-        (out, out_h, changed)
-    } else {
-        (decoded, decoded_h, false)
-    };
+    let (raw, h, _deskewed, rectified) = preprocess(&decoded, w, decoded_h, deskew, rectify);
     let (_lang, model) = state.model(lang);
 
     let t0 = Instant::now();
@@ -248,19 +278,11 @@ pub fn ocr_image_bytes_json(
     state: &AppState,
     bytes: &[u8],
     lang: Option<&str>,
+    deskew: bool,
     rectify: bool,
 ) -> Result<OcrJsonOutcome, String> {
     let (decoded, w, decoded_h) = decode_grey(bytes)?;
-    // Same before/after comparison as ocr_image_bytes_debug — see that
-    // function's doc comment for the full rationale (no-op honesty, height
-    // rebinding).
-    let (raw, h, rectified) = if rectify {
-        let (out, out_h) = tesseract_ocr::rectify::auto_rectify(&decoded, w, decoded_h);
-        let changed = out_h != decoded_h || out != decoded;
-        (out, out_h, changed)
-    } else {
-        (decoded, decoded_h, false)
-    };
+    let (raw, h, _deskewed, rectified) = preprocess(&decoded, w, decoded_h, deskew, rectify);
     let (_lang, model) = state.model(lang);
 
     let t0 = Instant::now();
@@ -331,6 +353,13 @@ pub struct OcrDebugOutcome {
     /// panel's honest "did rectification do anything" signal, since
     /// `auto_rectify` is a safe no-op on an already-straight page.
     pub rectified: bool,
+    /// `true` when [`tesseract_ocr::deskew::auto_deskew`] actually changed
+    /// the page (it was requested AND [`tesseract_ocr::deskew::deskew_general`]'s
+    /// own confidence/angle gate cleared) — same honesty contract as
+    /// [`Self::rectified`], reported separately since the two passes correct
+    /// different distortions (rotation vs keystone) and can each fire
+    /// independently.
+    pub deskewed: bool,
 }
 
 /// Decode `bytes` to grey and run the canonical one-shot structured-document
@@ -354,24 +383,11 @@ pub fn ocr_image_bytes_debug(
     state: &AppState,
     bytes: &[u8],
     lang: Option<&str>,
+    deskew: bool,
     rectify: bool,
 ) -> Result<OcrDebugOutcome, String> {
     let (decoded, w, decoded_h) = decode_grey(bytes)?;
-    // auto_rectify is a documented no-op (returns its input + height
-    // unchanged) when nothing significant was detected — comparing
-    // before/after is the honest way to report whether rectification
-    // actually did anything, rather than just echoing back the request
-    // flag. Its canvas can GROW (or, after its own content-crop, shrink) —
-    // `h` MUST be rebound to the returned height; everything downstream
-    // (recognition, the reported page dimensions) has to agree with the
-    // buffer `raw` actually holds, not the originally-decoded size.
-    let (raw, h, rectified) = if rectify {
-        let (out, out_h) = tesseract_ocr::rectify::auto_rectify(&decoded, w, decoded_h);
-        let changed = out_h != decoded_h || out != decoded;
-        (out, out_h, changed)
-    } else {
-        (decoded, decoded_h, false)
-    };
+    let (raw, h, deskewed, rectified) = preprocess(&decoded, w, decoded_h, deskew, rectify);
     let (lang, model) = state.model(lang);
 
     let t0 = Instant::now();
@@ -397,6 +413,7 @@ pub fn ocr_image_bytes_debug(
         network_spec: model.recognizer.network_str.clone(),
         null_char: model.recognizer.null_char,
         rectified,
+        deskewed,
     })
 }
 
@@ -416,5 +433,107 @@ mod tests {
     #[test]
     fn output_format_from_field_recognizes_json() {
         assert_eq!(OutputFormat::from_field(Some("json")), OutputFormat::Json);
+    }
+
+    // -----------------------------------------------------------------
+    // preprocess() — D8's actual wiring, tested directly against a
+    // synthetic ROTATED page. No model load needed: this exercises only
+    // the deskew/rectify composition, not recognition.
+    // -----------------------------------------------------------------
+
+    /// The same hollow-rectangle-blob text-like fixture
+    /// `tesseract_ocr::deskew`'s own D8 falsifier uses (`detect_row_shears`
+    /// needs connected-component blob geometry, not real glyphs).
+    fn straight_text_like_page(w: usize, h: usize, n_lines: usize) -> Vec<u8> {
+        let mut page = vec![255u8; w * h];
+        let margin = h / (n_lines + 2);
+        let bar_h = 16usize.min(margin.saturating_sub(4).max(9));
+        let seg_w = w / 12;
+        for i in 0..n_lines {
+            let y0 = margin + i * margin;
+            for seg in 0..8 {
+                let x0 = seg * (w / 8) + seg_w / 4;
+                let x1 = (x0 + seg_w).min(w);
+                let border = 2usize;
+                for y in y0..(y0 + bar_h).min(h) {
+                    for x in x0..x1.min(w) {
+                        let on_border = y < y0 + border
+                            || y + border >= (y0 + bar_h).min(h)
+                            || x < x0 + border
+                            || x + border >= x1;
+                        if on_border {
+                            page[y * w + x] = 0;
+                        }
+                    }
+                }
+            }
+        }
+        page
+    }
+
+    #[test]
+    fn preprocess_deskew_runs_before_rectify_and_actually_straightens_a_rotated_page() {
+        let (w, h) = (300usize, 220usize);
+        let straight = straight_text_like_page(w, h, 5);
+        let rotated =
+            tesseract_ocr::deskew::rotate_am_gray(&straight, w, h, 4.0_f32.to_radians(), 255);
+
+        // Sanity: the fixture must carry a measurable shear before ANY
+        // preprocessing, or this test measures nothing.
+        let before = tesseract_ocr::rectify::fit_shear_ramp(
+            &tesseract_ocr::rectify::detect_row_shears(&rotated, w, h),
+        );
+        assert!(
+            before.is_some_and(|r| r.is_significant(h)),
+            "fixture must carry a significant shear before preprocessing"
+        );
+
+        // deskew=true, rectify=true — the wired production path.
+        let (out, out_h, deskewed, rectified) = preprocess(&rotated, w, h, true, true);
+        assert!(
+            deskewed,
+            "a 4-degree rotation must clear auto_deskew's gate"
+        );
+
+        // THE ORDER-DISCRIMINATING CLAIM (measured, not assumed — an earlier
+        // version of this test checked only "is there residual shear left",
+        // which stayed GREEN even with the two passes swapped: at this small
+        // angle a pure rotation approximates a shear well enough that
+        // auto_rectify ALONE can also straighten it, so "ended up straight"
+        // does not distinguish the orders). What DOES distinguish them:
+        // `rectified` itself. Measured on the swapped (rectify-first) order,
+        // `rectified` comes back `true` — rectify fires for real on the raw
+        // rotation, then deskew has nothing left to do. With the correct
+        // order, deskew consumes the rotation FIRST, so rectify's own
+        // shear-fit finds nothing significant and must report a genuine
+        // no-op: `rectified == false`.
+        assert!(
+            !rectified,
+            "with deskew running FIRST, rectify must be a documented no-op \
+             on a purely-rotated page (rectified=true means deskew did NOT \
+             run before rectify's scan)"
+        );
+
+        // Secondary confirmation: no significant shear left in the OUTPUT
+        // either way (this alone is not order-discriminating, per the note
+        // above, but it is still a real property of the composed result).
+        let after = tesseract_ocr::rectify::fit_shear_ramp(
+            &tesseract_ocr::rectify::detect_row_shears(&out, w, out_h),
+        );
+        assert!(
+            after.is_none_or(|r| !r.is_significant(out_h)),
+            "the composed output must not carry a significant residual shear"
+        );
+    }
+
+    #[test]
+    fn preprocess_with_both_flags_off_is_a_byte_identical_no_op() {
+        let (w, h) = (40usize, 30usize);
+        let page: Vec<u8> = (0..w * h).map(|i| (i % 256) as u8).collect();
+        let (out, out_h, deskewed, rectified) = preprocess(&page, w, h, false, false);
+        assert_eq!(out, page, "no-op preprocessing must not touch the buffer");
+        assert_eq!(out_h, h);
+        assert!(!deskewed);
+        assert!(!rectified);
     }
 }
