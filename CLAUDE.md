@@ -2774,3 +2774,74 @@ sequencing, not as an open item. The wiring (`textline.rs` `ToBlockCtx.large`,
 is orchestrator work spelled out in the plan, and the `xy_gutter_probe` re-run
 that gates P-50's default-on decision has not happened. Until both land, this
 commit changes NO behaviour — which is exactly why the goldens are untouched.
+
+## ★ Axis C — the render/typography contract now has a fence (2026-08-07)
+
+Operator question: *"misst du nur die txt Ergebnisse, oder auch die krassen
+Unfälle der Schriften und Blocksatz?"* Checked rather than answered from
+memory, and the honest answer was **only text, plus typography on the one
+fixture that cannot express the failure**:
+
+- `typography_overlay.rs` — the ONLY integration typography fence — reads the
+  rendered content stream for **`Tm` alone**. It never asserts `Tf` or `Tz`.
+- It runs on `resgrid` cell 0: `font_px 22 / pitch 30` = **1.36**, generous
+  leading. This file already said it: *"structurally incapable of expressing
+  this bug."*
+- `classify_justification` / `RunFit` / `page_font_px` are guarded by **unit
+  tests on hand-built bboxes** in `layout.rs`.
+- The catastrophic numbers — `Tz` **32 %..850 %**, **95 %** of consecutive
+  line pairs overlapping, `Tf`/pitch median **1.44** — were measured ad hoc in
+  Python on the operator's own PDF and **never became a gate**. If the `Tz`
+  bug returned tomorrow, nothing would have caught it.
+
+`crates/tesseract-ocr-pdf/tests/typography_render.rs` closes that. A
+**tight-set** page (15 px glyphs on a 16 px pitch = **1.07**, the regime where
+`Tf` overshoot becomes visible collision) x 3 columns, recognized → `doc.v1` →
+`doc_v1_layout` → `render_pdf` → the content stream parsed with a **persistent
+text-state** walk (`Tf`/`Tz`/`Tr`/`Tm` carry forward until re-set, which is
+what makes a leaked `Tz` visible at all). Measured on the real render: 42
+painted runs, `Tf` **14.35** against pitch **16.00**, `Tz` **100** everywhere.
+
+Quality-fence footing, NOT parity — libtesseract has no structured-PDF
+renderer of this shape, so there is nothing to diff against.
+
+### The two disables that PASSED — and would have shipped a vacuous fence
+
+**Neither knob binds on this fixture, and both misses looked like
+confirmations.**
+
+1. `PITCH_TO_FONT_PX 0.80 → 1.60` changed **nothing**. `page_font_px` returns
+   `min(width_solve, MAX_FONT_TO_PITCH × pitch)` and the **width solve binds**
+   here (14.35 against a 15.2 ceiling). Lifting `MAX_FONT_TO_PITCH` itself was
+   equally inert. Only inflating the final value (`× 2.0`) reaches the
+   assertion — then 42/42 runs overshoot at 28.7 pt and it goes red.
+2. Making `RunFit::Natural` stretch left the `Tz` test green, because the
+   JUSTIFIED fixture never takes that branch — `JustifyToBox` returns
+   `Tz = 100` unconditionally (it justifies through `Tw`). **On justified text
+   the assertion is a structural tautology.** Fixed by giving
+   `tight_set_page` a `justified` flag and running the `Tz` test on the
+   **ragged** variant — the only painted path where `Tz` could ever be
+   non-100. It then goes red under the same disable.
+
+**Turning a knob that does not bind is not a disable** — the fourth and fifth
+vacuity findings of this arc, and the first two where the *test* was fine and
+my *check* was wrong.
+
+Final disable table, all three verified red-then-green:
+
+| assertion | disable |
+|---|---|
+| `Tz` ≡ 100 on painted runs | `RunFit::Natural` returns a box-fit stretch |
+| no run taller than the pitch | `page_font_px` returns `× 2.0` |
+| even column gutters | the per-block `dx = left` translation is dropped |
+
+Gates: `tesseract-ocr` lib 259/259, goldens + `golden_lines` +
+`blocks_columns` byte-identical, 8+7+0 fence exact (`0.000` x14, `0.023`,
+`0.814`), `tesseract-ocr-pdf` all suites incl. the pre-existing
+`typography_overlay`, clippy `-D warnings` + fmt clean on both crates.
+
+**Still uncovered, stated plainly:** `Tw` (the justification mechanism itself)
+is emitted but not asserted — the fixture's marks recognize without spaces, so
+`JustifyToBox` takes its `spaces == 0` path and never justifies. A fixture
+whose recognized text carries real word gaps is what that needs, and it is the
+same fixture the paragraph-level doctrine (d) has been waiting for.
