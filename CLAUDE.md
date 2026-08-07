@@ -3183,3 +3183,59 @@ Gates: `tesseract-ocr` lib 264/264 (5 new), goldens + `golden_lines` +
 `blocks_columns` + both `lab_table_*` + `page_bands` byte-identical, 8+7+0
 fence exact, `tesseract-ocr-web` 38/38, clippy `-D warnings` + fmt clean on
 both crates.
+
+## ★ Sauvola default-flip — DECIDED: do NOT flip. Otsu stays default (2026-08-07)
+
+The open question this file carried since the faded-contrast probe
+("`Sauvola remains the default-flip candidate`... `Not a default-flip
+decision by itself`") is now closed, on evidence rather than inertia.
+Verdict reviewed by `heuristic-gate-warden` against `binarize.rs` + every
+measured number already on record in this file, cross-checked rather than
+taken on faith.
+
+**Sauvola is disqualified outright, not merely "unproven better."** On the
+faded-contrast fixture it returns **0/42 words, the entire page silently
+blank** (`ink_frac=0.0000`, CER 1.0) where Otsu gets 42/42 on the identical
+input. Otsu's own worst measured case (the illumination corpus) is a
+DEGRADED reading (18/42 words) — never zero, never silent. A candidate whose
+worst case is strictly worse than the incumbent's worst case, and fails
+**silently** (nothing in `doc.v1` distinguishes a collapsed-blank page from a
+genuinely blank one), cannot be a default no matter how large its win is
+elsewhere. This is the same class of finding `decide_if_table`'s borderless
+path and the first `xy_cut_table_aware` landing already produced in this
+repo: a heuristic that fires correctly most of the time but catastrophically
+on an axis nobody tested yet is not safe to make unconditional.
+
+**If a flip is ever revisited, the candidate is Wolf, not Sauvola.** Wolf
+survives the faded-contrast fixture (42/42, same as Otsu) AND nearly matches
+Sauvola's illumination win (mean CER wolf 0.0054 vs sauvola 0.0045, both far
+ahead of otsu 0.3041), at lower measured pipeline cost (+1.17% vs Sauvola's
+corrected +2.85%). Singh is second-tier (CER 0.0090 on illumination, worse
+than Wolf) and stays a documented option, not a candidate.
+
+**Why not flip to Wolf now either — two reasons, both about evidence
+completeness, not about Wolf's numbers:**
+
+1. Sauvola's catastrophic mode was found only because a NEW fixture axis
+   (`gen_faded_contrast.py`) was deliberately built to break it — the
+   existing illumination corpus never would have surfaced it. Wolf has not
+   been hunted the same way (a fixture built specifically to break Wolf the
+   way faded-contrast broke Sauvola does not exist yet). Absence of a
+   discovered failure after one probe is not evidence of absence.
+2. Wolf sits on quality-fence footing, not byte-parity (leptonica implements
+   neither Wolf nor Singh — no oracle exists). No adaptive mode has been run
+   through the full golden suite + 8+7+0 CER fence *as the default* — only
+   "selectable and provably inert when off" has ever been shown.
+
+**Decision:** `BinarizeMode::default()` stays `Otsu`
+(`xy_cut.rs:1156`'s `assert_eq!(BinarizeMode::default(), BinarizeMode::Otsu)`
+is correct and stays pinned). `Sauvola`/`Wolf`/`Singh` remain fully exposed
+and selectable — `XyCutParams::binarize_mode`, `DocumentOptions`, the web
+demo's mode selector, the machine API's `mode` field — for a caller who
+knows their corpus characteristics (e.g. photographed pages with known
+uneven lighting). A future flip to Wolf needs, in order: (a) a
+faded-contrast-shaped fixture built specifically against Wolf, and (b) a
+full `golden_pages` + `quality_resolution_grid` re-run with Wolf as the
+temporary default, both green, before touching the pin. No code changed by
+this entry — it is the closing record of a decision already earned by the
+measurements, not a new one.
