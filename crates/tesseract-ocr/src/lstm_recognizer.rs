@@ -237,6 +237,36 @@ fn noise_readmit_reach(blob_spans: &[(i32, i32)]) -> Option<f32> {
     Some(steps.iter().sum::<i32>() as f32 / steps.len() as f32 / 2.0)
 }
 
+/// Re-segment an `xy_cut` block list against a detected column raster
+/// ([`crate::grid_raster`]) — a no-op when no regular lattice is present.
+///
+/// # Why this runs AFTER `xy_cut` rather than inside it
+///
+/// `xy_cut` decides each cut from the ink in ONE rect, so it cannot see that a
+/// merged block straddles a lattice the REST of the page already establishes.
+/// The 2xN failure it exists to fix: a clean band splits into N cells while a
+/// degraded band beside it merges into one full-width block, because its own
+/// inter-cell gutters are too noisy to clear the threshold locally. The clean
+/// band's geometry IS the evidence the degraded one lacks — same correction
+/// shape as [`noise_readmit_reach`] and `xy_cut`'s gutter fallback: **judge a
+/// candidate by what is around it.**
+///
+/// # Why it is NEVER applied to the table-aware branch
+///
+/// `xy_cut_table_aware` deliberately emits a table as ONE whole-width leaf so
+/// `extract_table_grid`'s "rows ARE the recognized lines" assumption holds.
+/// Splitting that leaf on a column lattice would re-create exactly the
+/// per-column fragmentation table ingredient 3 was built to remove — the
+/// table's own columns ARE a regular lattice, so the raster would fire on
+/// every ruled table. The two features are mutually exclusive by construction,
+/// not by accident.
+fn apply_grid_raster(blocks: Vec<crate::xy_cut::PageRect>) -> Vec<crate::xy_cut::PageRect> {
+    match crate::grid_raster::detect_column_raster(&blocks) {
+        Some(r) => crate::grid_raster::split_nonconforming(&blocks, &r),
+        None => blocks,
+    }
+}
+
 impl LstmRecognizer {
     /// `IsRecoding()` (`lstmrecognizer.h:91`): the recoder is a real compress
     /// codec, not a pass-through. eng: true (`training_flags & 64 != 0`).
@@ -983,7 +1013,7 @@ impl LstmRecognizer {
             binarize_mode,
             ..crate::xy_cut::XyCutParams::default()
         };
-        let blocks = crate::xy_cut::xy_cut(grey, w, h, &xy_params);
+        let blocks = apply_grid_raster(crate::xy_cut::xy_cut(grey, w, h, &xy_params));
         if blocks.len() <= 1 {
             return self.recognize_page_makerow_words_with_mode(grey, w, h, dict, binarize_mode);
         }
@@ -1248,7 +1278,7 @@ impl LstmRecognizer {
         let rec_blocks = if opts.strip_borders {
             crate::xy_cut::xy_cut_table_aware(recog_grey, w, h, &xy_params, &binary)
         } else {
-            crate::xy_cut::xy_cut(recog_grey, w, h, &xy_params)
+            apply_grid_raster(crate::xy_cut::xy_cut(recog_grey, w, h, &xy_params))
         };
         let lines = if rec_blocks.len() <= 1 {
             self.recognize_page_makerow_words_with_mode(recog_grey, w, h, dict, binarize_mode)?
@@ -1288,7 +1318,7 @@ impl LstmRecognizer {
         let blocks: Vec<(i32, i32, i32, i32)> = if opts.strip_borders {
             crate::xy_cut::xy_cut_table_aware(grey, w, h, &xy_params, &binary)
         } else {
-            crate::xy_cut::xy_cut(grey, w, h, &xy_params)
+            apply_grid_raster(crate::xy_cut::xy_cut(grey, w, h, &xy_params))
         }
         .into_iter()
         .map(|r| (r.left as i32, r.top as i32, r.right as i32, r.bottom as i32))

@@ -199,3 +199,187 @@ fn blocks_surface_never_loses_content_to_over_splitting() {
         words(&whole)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Grid inheritance (#50/#53): the integration falsifier the CORPUS cannot give.
+//
+// `examples/raster_probe.rs` measured the committed corpus: 23 fixtures, the
+// raster changes the block list on ZERO. That is not a defect — it is the
+// P-50 result (on `resgrid.pgm` the raster detects the 8-column lattice and
+// correctly splits nothing, because that page cuts vertically only, so both
+// bands already live in the same columns and there is no merged band to
+// inherit geometry FOR). The failure mode the feature exists to fix simply is
+// not expressed anywhere in the corpus — the same gap `gen_faded_contrast.py`
+// was built to close for Wolf. So it is built here.
+// ---------------------------------------------------------------------------
+
+/// Draw a hollow glyph-sized mark (density ~30-40%, so `filter_blobs`'
+/// `>= h*w*0.7` "too dense to be text" heuristic does not reject it — the
+/// documented `rectify.rs` fixture trap).
+fn mark(page: &mut [u8], w: usize, x: usize, y: usize, mw: usize, mh: usize) {
+    for dy in 0..mh {
+        for dx in 0..mw {
+            let edge = dy == 0 || dy == mh - 1 || dx == 0 || dx == mw - 1;
+            if edge {
+                page[(y + dy) * w + (x + dx)] = 0;
+            }
+        }
+    }
+}
+
+/// A SOLID bar. Deliberately not [`mark`]: a hollow rectangle draws only its
+/// edges, so a "bridge" built from one would leave its own white interior as a
+/// corridor and `xy_cut` would cut straight through it — measured, that was
+/// this fixture's second wrong version (widths [184, 280, 280, 280], still no
+/// merged band). A bridge must be solid; the density heuristic that motivates
+/// hollow glyphs lives in `filter_blobs`, which is downstream of `xy_cut`'s
+/// projection profile and irrelevant here.
+fn bar(page: &mut [u8], w: usize, x: usize, y: usize, bw: usize, bh: usize) {
+    for dy in 0..bh {
+        for dx in 0..bw {
+            page[(y + dy) * w + (x + dx)] = 0;
+        }
+    }
+}
+
+/// A 2-band x 4-column page whose TOP band has clean gutters (so `xy_cut`
+/// splits it into 4) and whose BOTTOM band has ink bridging every gutter (so
+/// `xy_cut` cannot split it and emits ONE full-width block). The top band's
+/// geometry is exactly the evidence the bottom band lacks.
+fn two_band_page(bridge_bottom: bool) -> (Vec<u8>, usize, usize) {
+    // Geometry chosen so `xy_cut`'s axis choice is UNAMBIGUOUS. It picks the
+    // axis with the THICKEST valid valley (tie -> vertical), so the band gap
+    // must clearly beat the column gutters or the page cuts into full-height
+    // columns and never separates the bands at all — measured, that is what a
+    // 130 px band gap against 92 px gutters did (every block spanned
+    // y 40..510, both bands, no horizontal cut anywhere).
+    //
+    //   column pitch 250, content 184  => gutter  66 px
+    //   band gap                        => 212 px   (3.2x the gutter)
+    //
+    // Content is 7*24 + 16 = 184, NOT 8*24 = 192: eight marks at 24 px pitch
+    // put the LAST mark's left edge at 7*24. Getting that wrong left a 20 px
+    // sliver between the content edge and the bridge bar, which cleared
+    // `gap_min` (15 at this extent) and split the band anyway — the bridge
+    // must start exactly at the content edge.
+    //
+    // The text-ROW geometry matters just as much, and cost three wrong
+    // versions to see: `axis_cuts` confirms a valley only if the gap to the
+    // ADJACENT CANDIDATE valley is >= `min_region_px` (24) — not the gap to
+    // the rect edge. With 20 px rows at 10 px leading, every inter-row gap
+    // clears `gap_min` (ceil(0.015 * 640) = 10) and so becomes a candidate,
+    // leaving the band gap with a 20 px neighbour and getting it REJECTED.
+    // Rows are therefore 24 px tall at 30 px pitch => 6 px leading, BELOW
+    // `gap_min`, so the band gap is the only horizontal candidate.
+    //
+    // ...and 24 px was still wrong, for the OPPOSITE reason: `gap_min` is
+    // relative to the CURRENT rect, so once the page is cut into bands and
+    // columns the extent collapses (640 -> 178) and a 6 px leading clears the
+    // now-tiny bar (ceil(0.015 * 178) = 3), decomposing every column into one
+    // block PER LINE (measured: 48 blocks). Rows are 28 px at 30 px pitch =>
+    // 2 px leading, below the threshold at EVERY recursion depth. The marks
+    // are likewise 16 px at 24 px pitch, so the 8 px inter-mark gaps are
+    // rejected by the `min_region_px` confirm filter (a 16 px mark between
+    // two candidates is < 24) rather than by thickness alone.
+    let (w, h) = (1100usize, 640usize);
+    let mut page = vec![255u8; w * h];
+    let cols = [40usize, 290, 540, 790];
+    for band_y in [40usize, 430] {
+        for &cx in &cols {
+            for row in 0..6 {
+                for i in 0..8 {
+                    mark(&mut page, w, cx + i * 24, band_y + row * 30, 16, 28);
+                }
+            }
+        }
+    }
+    if bridge_bottom {
+        // Solid bars covering each bottom-band gutter COMPLETELY:
+        // content ends at cx+184, the next column starts at cx+250, so the
+        // bar spans cx+184 .. cx+254 and overlaps both sides.
+        for &cx in &cols[..3] {
+            for row in 0..6 {
+                bar(&mut page, w, cx + 184, 430 + row * 30, 70, 28);
+            }
+        }
+    }
+    (page, w, h)
+}
+
+#[test]
+fn a_merged_band_inherits_the_clean_band_s_column_lattice() {
+    let params = tesseract_ocr::xy_cut::XyCutParams::default();
+
+    // Control: with no bridging, xy_cut alone already finds every column, so
+    // the raster has nothing to add. Proves the fixture is a real 4-column
+    // layout and not an artifact.
+    let (clean, w, h) = two_band_page(false);
+    let clean_blocks = tesseract_ocr::xy_cut::xy_cut(&clean, w, h, &params);
+    assert!(
+        clean_blocks.len() >= 4,
+        "un-bridged fixture must expose the 4-column layout, got {}",
+        clean_blocks.len()
+    );
+
+    // The real case: bridging the bottom band's gutters merges it.
+    let (page, w, h) = two_band_page(true);
+    let blocks = tesseract_ocr::xy_cut::xy_cut(&page, w, h, &params);
+    let widths: Vec<usize> = blocks.iter().map(|b| b.right - b.left).collect();
+    let merged = widths.iter().filter(|&&x| x > w / 2).count();
+    assert!(
+        merged >= 1,
+        "fixture must produce at least one merged full-width band \
+         (widths {widths:?}) or this test measures nothing"
+    );
+
+    // Detection + split — what `apply_grid_raster` composes at all three
+    // wired call sites.
+    let raster = tesseract_ocr::grid_raster::detect_column_raster(&blocks)
+        .expect("the clean band establishes a lattice");
+    let after = tesseract_ocr::grid_raster::split_nonconforming(&blocks, &raster);
+
+    assert!(
+        after.len() > blocks.len(),
+        "the merged band must be re-segmented: {} -> {}",
+        blocks.len(),
+        after.len()
+    );
+    let still_merged = after.iter().filter(|b| b.right - b.left > w / 2).count();
+    assert!(
+        still_merged < merged,
+        "at least one merged band must be gone: {merged} -> {still_merged}"
+    );
+}
+
+/// The WIRING falsifier — the sibling above proves the FEATURE fires but calls
+/// `detect_column_raster`/`split_nonconforming` directly, so it passes
+/// identically with `apply_grid_raster` unhooked (measured: it did). This one
+/// goes through the wired public entry and asserts what a reader actually
+/// sees: with the merged band read as ONE block, every recognized line spans
+/// all four columns — text read straight across the gutters, the exact defect
+/// `recognize_page_blocks_words` exists to prevent one level up.
+#[test]
+fn the_wired_path_does_not_read_a_merged_band_across_its_gutters() {
+    let Some((r, dict)) = load() else { return };
+    let (page, w, h) = two_band_page(true);
+    let lines = r
+        .recognize_page_blocks_words(&page, w, h, dict.as_ref())
+        .expect("recognize");
+    assert!(!lines.is_empty(), "fixture must recognize something");
+
+    // A line whose box spans more than half the page crossed a gutter.
+    let wide = lines
+        .iter()
+        .filter(|l| (l.line_box.2 - l.line_box.0) as usize > w / 2)
+        .count();
+    assert_eq!(
+        wide,
+        0,
+        "no line may span the gutters; {wide} of {} do (boxes {:?})",
+        lines.len(),
+        lines
+            .iter()
+            .map(|l| (l.line_box.0, l.line_box.2))
+            .collect::<Vec<_>>()
+    );
+}
