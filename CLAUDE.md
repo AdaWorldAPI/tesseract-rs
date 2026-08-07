@@ -3239,3 +3239,100 @@ full `golden_pages` + `quality_resolution_grid` re-run with Wolf as the
 temporary default, both green, before touching the pin. No code changed by
 this entry — it is the closing record of a decision already earned by the
 measurements, not a new one.
+
+## ★ gap_min neighbour-relative fix — third look, still open, two more dead ends ruled out (2026-08-07)
+
+Picked this back up (the small-page word-gap direction the earlier
+`VALLEY_TO_MEDIAN`/`valleys>=4` attempt left reverted). Before writing any
+code, worked out two NEW candidate discriminators from first principles and
+checked each against the existing fixtures/use-cases BEFORE implementing
+either — both failed on inspection, which is a cheaper way to burn a bad
+idea than a third live revert.
+
+**Candidate 1 — compare valley width to the rect's CROSS-axis extent**
+(`rect.height()` for a vertical/column cut, as a stand-in for "roughly one
+line's height"). Checked the numbers first: on the pinned synthetic fixture,
+word gap (10px) / mark height (22px) ≈ 0.45; on the real phototest dump
+recorded above, word gap (11px) / line height (24px) ≈ 0.46 — encouragingly
+close, so the RATIO itself looks like a real signal. **But the reference
+quantity is wrong.** At the ROOT of the recursion (the first cut attempted on
+the whole page) `rect.height()` is the FULL PAGE height, not a line height —
+so this is the exact same disease as the current `gap_min` bug (a valley
+judged against the CURRENT RECT's extent), just moved to the orthogonal axis.
+On `two_columns_wide_gutter_left_then_right`'s 200×200 root rect, a real
+40px gutter divided by a 200px rect height is 0.20 — comfortably clears a
+reasonable ratio bar there, but on a page with a genuinely tall body (say a
+2000px-tall single-paragraph column before any row-cut has run), the SAME
+40px-scale gutter divided by 2000px collapses toward zero. Not usable without
+first knowing a genuine LINE height, which this candidate doesn't have.
+
+**Candidate 2 — require ≥2 distinct row-ink-bands in the rect before
+accepting ANY vertical cut** (a real column, being multi-line by
+construction, should show multiple horizontal bands in its OWN row profile
+before it's ever column-split; a single word-gap on one line shows only one).
+Checked against `two_by_two_grid_reading_order_horizontal_gutter_thicker`
+first, since that's the fixture most likely to break it — and it does: each
+of the four TL/TR/BL/BR cells is drawn as ONE SOLID FILLED RECTANGLE (no
+internal row structure at all), so after the horizontal cut splits top from
+bottom, each resulting band's OWN row profile is a single contiguous inked
+run — zero row-bands by this rule's count — and the required vertical
+TL-vs-TR cut would be wrongly suppressed. This isn't a fixture artifact to
+route around: the module's own header names deimposition (splitting a
+scanned *imposed* sheet — e.g. a 2×2 ganged page — back into its constituent
+pages) as a first-class use case, and a ganged page's cells are frequently
+NOT multi-line text bodies (could be single-line labels, photos, forms) — so
+"require multi-line internal structure" is a real conflict with a real
+documented use case, not just a test-fixture mismatch.
+
+**Third data point — tried to reproduce the defect on REAL corpus content,
+and could not, at the widths tried.** Cropped `corpus/pages/page_01.pgm`
+(real rendered prose, known ground truth) to widths 512/400/320/260/200 and
+ran both a standalone `xy_cut()` and the full `recognize_page_blocks_words`/
+`recognize_document` pipeline. At every width down to 200px (`gap_min` down
+to 3), `xy_cut` returned exactly **one leaf** — this corpus's real word
+spacing, in pixels, stays under `gap_min` even at the narrowest width tried,
+so it never entered the over-split regime at all. This is a genuine negative
+result, not a null probe: it narrows where the bug actually manifests (needs
+BOTH a narrow-enough page AND a large-enough word-spacing-to-page-width
+ratio — phototest.tif's specific dimensions/font apparently sit in that
+narrow band, this corpus's rendered text does not) rather than confirming or
+refuting either candidate above. The already-pinned SYNTHETIC fixture
+(`small_page_ordinary_word_spacing`, drawn marks not real glyphs) remains the
+only reliable, deterministic reproduction available in this repo, but it can
+only exercise `xy_cut`'s pure geometry (the pinned test calls `xy_cut()`
+directly) — it cannot be pushed through the recognizer to observe real-word
+fragmentation behaviour, since drawn marks aren't valid glyphs and the
+recognizer would return empty for every block regardless of the geometry
+question being tested.
+
+**Where this leaves the problem, honestly:** the SAME whitespace-valley
+signal is structurally ambiguous between "column gutter" and "word gap"
+using ONLY the information `xy_cut` has (a binary ink profile, no DPI/font
+scale, no recognition-level word boundaries) — both candidates tried here
+needed a "typical line height" reference that isn't available without either
+deeper profile analysis (multi-row correlation: does the same gutter recur
+at the same X across several lines — the real distinguishing feature of a
+genuine column, not yet attempted) or accepting a use-case-specific tradeoff
+against deimposition.
+
+**The more promising direction, NOT attempted this session, proposed for the
+next one:** stop trying to fix this at the pure-geometry `xy_cut` layer at
+all. Add a POST-recognition MERGE pass — after `recognize_blocks_words`
+produces its per-block `Vec<LineWords>`, detect groups of entries that are
+(a) on the same physical text row (overlapping/near-identical `line_box`
+y-range) and (b) horizontally adjacent with a gap consistent with
+word-spacing rather than a column gutter, then merge them into one
+`LineWords` before `doc.v1` region assignment ever sees them. This sidesteps
+the ambiguous geometry question entirely by using information `xy_cut` does
+NOT have but the recognizer DOES by that point (actual recognized word
+boxes, actual row placement) — same architectural category (and same low
+risk: purely additive post-processing, touches zero already-tested `xy_cut`
+recursion) as `detect_paragraph_gaps`/`render_text_with_gaps` shipped earlier
+this session. Deliberately not attempted here rather than rushed: it deserves
+its own fixture (real recognized fragments on a real small page, which this
+session's own probe shows is harder to construct than expected) and its own
+disable-run-verified test wave, not a same-session bolt-on after two
+already-falsified geometry hypotheses.
+
+No code changed by this entry. `examples/cut_probe.rs` remains the
+before/after instrument for whichever direction is attempted next.
