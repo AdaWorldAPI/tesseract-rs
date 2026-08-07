@@ -3336,3 +3336,97 @@ already-falsified geometry hypotheses.
 
 No code changed by this entry. `examples/cut_probe.rs` remains the
 before/after instrument for whichever direction is attempted next.
+
+## ★ Doctrine (d) LANDED — one size per PARAGRAPH, and the rung split is the whole idea (2026-08-07)
+
+The operator doctrine block above closes with *"This commit implements
+page-level normalization; (d) asks for paragraph-level with outlier
+detection. That is the next rung."* That rung is now in.
+
+**The machinery already existed and was gated too narrowly.**
+`region_scale_factor` (shipped for #49, header/footer sizing) already
+computed a per-region deviation, dead-banded it, and clamped it — but
+opened with `if region.kind != "header" && region.kind != "footer" { return
+1.0; }`. A `doc.v1` region IS the paragraph unit, so removing the right part
+of that gate is exactly Doctrine (d): one size per paragraph, with the dead
+band doing *"in Blocksatz, normalize instead of hunting exceptions."*
+
+**The right part is rung A, and NOT rung B — the asymmetry is the finding.**
+The function has two indicator rungs, and they have genuinely different
+contamination exposure:
+
+| rung | quantity | contaminated? | now applies to |
+|---|---|---|---|
+| A — `region_pitch_px` | median consecutive baseline delta WITHIN the region | **No.** Contamination inflates a line's measured INK band; it does not move where the next baseline sits. | **every kind** |
+| B — `region_measured_font_px` | median band/ink `font_px` | **Only safe when isolated.** A furniture line sits in white space by construction (that's *why* it classified as header/footer) so it has no neighbour to import from. A body paragraph has neighbours on both sides. | header/footer only |
+
+So a footnote paragraph is detectable by precisely the quantity the
+page-wide normalization already trusts (`page_pitch_px`, measured sd 0.00
+across all eight columns of the reference page), while the ink measurement
+that `page_font_px` exists to *stop* trusting stays untrusted for body text.
+Extending rung B to body text would have reintroduced the exact per-line ink
+measurement the whole normalization arc removed — a one-line change that
+looks identical from the call site and is wrong.
+
+This also satisfies Doctrine (c) (*"never use measured sizes as a QUANTITY —
+only as a CLASSIFIER"*): the measurement never becomes the rendered size,
+it only classifies the paragraph as same-as-body (→ exactly `page_font_px`)
+or outlier (→ scaled). Dead band `[0.80, 1.25]` and clamp `[0.5, 3.0]`
+unchanged.
+
+**Re-pinned, not silently widened.**
+`text_kind_never_deviates_even_at_2x` was accurate under the old gate and is
+no longer, so it is renamed
+`a_text_regions_band_measurement_never_deviates_even_at_2x` — its fixture is
+a SINGLE-line 2× *band* measurement, so rung A structurally cannot fire and
+it was always testing the rung-B gate specifically. Its twin
+`a_text_paragraph_at_its_own_pitch_deviates_via_rung_a` is the can-fire half.
+Together they pin the exact rung split above; the old name would have hidden
+it.
+
+**Two anti-vacuity guards fired during construction, both worth recording:**
+
+1. **The clamp nearly ate the fixture.** First footnote pitch was 8.0 against
+   a body 18.0 — ratio **0.444**, *below* the `SCALE_CLAMP_LO = 0.5` floor,
+   so the test would have measured the clamp rather than rung A. My own
+   `ratio >= SCALE_CLAMP_LO` assertion caught it before the real assertion
+   ran. Corrected to pitch 12.0 (ratio **0.667**), which sits in the window
+   BETWEEN the clamp floor and the dead-band floor — the only band where
+   rung A alone decides the answer. **A fixture for a dead-banded, clamped
+   quantity has to be bounded on BOTH sides; one bound is not enough.**
+2. **Clippy caught a tautological guard.** The rung-B test's first
+   anti-vacuity assertion was `assert!(MIN_REGION_PITCH_LINES > 1)` — a
+   constant, flagged by `clippy::assertions_on_constants`, and correctly:
+   it asserted a fact about the code rather than about the fixture.
+   Rewritten to `assert!(region_pitch_px(&extra_region.lines).is_none())`,
+   which checks the actual parsed fixture and would fail if someone later
+   gave that region more lines. The better assertion was the one clippy
+   forced.
+
+**Disable-runs, both verified red-then-green:**
+
+| assertion | disable | observed |
+|---|---|---|
+| a text paragraph at its own pitch scales | restore the old `kind != header && kind != footer → 1.0` early return | renders **14.400001** (page size) instead of **9.6** |
+| a text region's BAND measurement never scales | drop the `is_furniture.then(..)` guard so rung B runs for all kinds | renders **28.800001** instead of **14.400001** — exactly the 2× contamination the gate blocks |
+
+The third one that matters is inside the can-fire test itself: it also
+asserts every ordinary body paragraph on the SAME page still lands at
+EXACTLY page size, so an implementation that scaled *everything* cannot pass
+it.
+
+Gates: `tesseract-ocr-pdf` 39/39 lib + all 9 suites (incl. both integration
+typography fences), `tesseract-ocr` lib 264/264, goldens + `golden_lines` +
+`blocks_columns` + both `lab_table_*` + `page_bands` byte-identical, 8+7+0
+fence exact (`0.000` ×14, `0.023`, `0.814`), clippy `-D warnings` + fmt
+clean. Zero golden re-pin — every corpus page has uniform pitch across its
+regions, so every ratio lands in the dead band and every body paragraph
+renders at exactly `page_font_px`, unchanged.
+
+**Still open on this doctrine, stated honestly:** the constants
+(`SCALE_DEAD_BAND_*`, `SCALE_CLAMP_*`) remain POLICY PINS, not measurements
+— their own doc comment says so and that has not changed. The corpus still
+contains no page with a real footnote at a genuinely different size, so the
+can-fire test is a synthetic `doc.v1` fixture, not a rendered-page
+measurement. When such a page lands, re-measure the constants rather than
+defending them.
