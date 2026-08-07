@@ -1445,7 +1445,7 @@ fn crop_grey(src: &GreyImage, bbox: (u32, u32, u32, u32)) -> GreyImage {
 }
 
 // ---------------------------------------------------------------------------
-// Per-region scale factor (header/footer) — see [`region_scale_factor`].
+// Per-region scale factor — see [`region_scale_factor`].
 // ---------------------------------------------------------------------------
 
 /// Minimum region lines carrying `baseline` before the region's OWN pitch is
@@ -1454,8 +1454,8 @@ fn crop_grey(src: &GreyImage, bbox: (u32, u32, u32, u32)) -> GreyImage {
 /// [`MIN_PITCH_SAMPLES`], applied within one region instead of page-wide.
 const MIN_REGION_PITCH_LINES: usize = 3;
 
-/// Below this ratio (region indicator / page indicator) a `header`/`footer`
-/// region is left at page size. Symmetric in log space with
+/// Below this ratio (region indicator / page indicator) a region is left at
+/// page size. Symmetric in log space with
 /// [`SCALE_DEAD_BAND_HI`] (`1 / 0.80 = 1.25`), i.e. +-one conventional
 /// typographic step (1.125/1.2/1.25): a running head set AT body size but
 /// measuring differently because its ink is cap-height-only (all-caps -> no
@@ -1569,10 +1569,28 @@ struct PageScaleRefs {
     measured: Option<f32>,
 }
 
-/// Per-region scale factor for a `header`/`footer` region whose own evidence
-/// is a CLEAR outlier from the page size. Every other region — and every
-/// region kind other than `header`/`footer` — returns exactly `1.0`, i.e.
-/// today's behaviour, unchanged.
+/// Per-region scale factor for a region whose own evidence is a CLEAR
+/// outlier from the page size. A region with no usable evidence, or whose
+/// evidence sits inside the dead band, returns exactly `1.0` — i.e. it
+/// renders at [`page_font_px`], the page-wide normalization.
+///
+/// # This is operator Doctrine (d) — one size per PARAGRAPH
+///
+/// `CLAUDE.md` § "Typography is a PARAGRAPH property": *"Extrapolate one
+/// size per LINE and per PARAGRAPH. The genuine exceptions are small and
+/// enumerable — footnotes at a paragraph's end, under a picture, in or under
+/// a table — and they are rare in Blocksatz; in Blocksatz, normalize instead
+/// of hunting exceptions."*
+///
+/// A `doc.v1` region IS the paragraph unit here, so the per-paragraph size is
+/// this factor times the page size. "Normalize instead of hunting
+/// exceptions" is exactly what the dead band does: a paragraph whose own
+/// leading agrees with the page's (every ordinary body paragraph) is snapped
+/// to page size, and only a clear outlier — the enumerable footnote /
+/// caption case — is allowed to deviate. This also satisfies Doctrine (c)
+/// (*"never use measured sizes as a QUANTITY — only as a CLASSIFIER"*): the
+/// measurement never becomes the rendered size directly, it only classifies
+/// the paragraph as same-as-body or outlier.
 ///
 /// # The ratio must compare LIKE WITH LIKE (load-bearing)
 ///
@@ -1588,27 +1606,47 @@ struct PageScaleRefs {
 /// never cross rungs; if the matching denominator is `None`, the factor is
 /// `1.0`.
 ///
-/// # Why an isolated header's rung-B measurement is trustworthy
+/// # Why rung A applies to EVERY kind but rung B stays furniture-only
 ///
-/// Contamination is ink from an ADJACENT line entering this line's generous
-/// recognition band. A page-furniture line sits in white space by
-/// construction — that is precisely why it classified as `header`/`footer`
-/// in the first place — so an isolated line has no neighbour in its band and
-/// nothing to import; the 1.82x body-vs-body spread does not bound the
-/// header's own error.
+/// The two rungs have genuinely different contamination exposure, and that
+/// asymmetry — not a policy preference — is what scopes them:
 ///
-/// And the residual bias runs the SAFE way: the rung-B denominator (body,
+/// - **Rung A ([`region_pitch_px`], baseline deltas) is contamination-free
+///   for every kind.** Contamination inflates a line's measured INK band; it
+///   does not move where the next baseline sits. A paragraph set smaller
+///   carries its own tighter leading, and that is directly what this rung
+///   reads. So a footnote paragraph is detectable by exactly the quantity
+///   the page-wide normalization already trusts ([`page_pitch_px`], measured
+///   sd 0.00 across all eight columns of the reference page).
+/// - **Rung B ([`region_measured_font_px`], band/ink) is trustworthy only
+///   for an ISOLATED line.** Contamination is ink from an ADJACENT line
+///   entering this line's generous recognition band. A page-furniture line
+///   sits in white space by construction — that is precisely why it
+///   classified as `header`/`footer` — so it has no neighbour in its band
+///   and nothing to import; the 1.82x body-vs-body spread does not bound its
+///   error. A BODY paragraph has neighbours on both sides by construction,
+///   so its band measurement carries the full contamination and must never
+///   drive a size.
+///
+/// Hence: rung A for all kinds, rung B as a fallback for `header`/`footer`
+/// only. Extending rung B to body text would reintroduce precisely the
+/// per-line ink measurement [`page_font_px`] exists to stop trusting.
+///
+/// And rung B's residual bias runs the SAFE way: its denominator (body,
 /// tight-set) IS contaminated upward, while the isolated header numerator is
 /// not. The ratio is therefore UNDERSTATED — a genuine headline gets less
 /// amplification than it deserves, never more. The failure mode is
 /// under-correction.
 fn region_scale_factor(region: &JsonRegion, refs: &PageScaleRefs) -> f32 {
-    if region.kind != "header" && region.kind != "footer" {
-        return 1.0;
-    }
+    let is_furniture = region.kind == "header" || region.kind == "footer";
     let ratio = region_pitch_px(&region.lines)
         .zip(refs.pitch)
-        .or_else(|| region_measured_font_px(&region.lines).zip(refs.measured))
+        // Rung B is the FURNITURE-ONLY fallback — see the doc comment above.
+        .or_else(|| {
+            is_furniture
+                .then(|| region_measured_font_px(&region.lines).zip(refs.measured))
+                .flatten()
+        })
         .and_then(|(num, den)| (den > 0.0).then_some(num / den));
     let Some(ratio) = ratio else {
         return 1.0;
@@ -1704,10 +1742,14 @@ pub fn doc_v1_layout(doc_json: &str, page_rasters: &[GreyImage]) -> Result<Layou
                             })
                             .collect::<Vec<_>>(),
                     );
-                    // Also classified ONCE per region, same reasoning: a
-                    // header/footer's deviation from page size is a property
-                    // of the region's own evidence, not of any one line.
-                    // `1.0` (today's exact behaviour) for every other kind.
+                    // Also classified ONCE per region, same reasoning, and
+                    // this is operator Doctrine (d) — ONE SIZE PER
+                    // PARAGRAPH: a region's deviation from page size is a
+                    // property of the region's own evidence, never of any
+                    // one line. `1.0` (i.e. exactly `page_font_px`) for any
+                    // region whose own leading agrees with the page's —
+                    // "in Blocksatz, normalize instead of hunting
+                    // exceptions".
                     let scale = region_scale_factor(region, &scale_refs);
                     for line in &region.lines {
                         let text = line
@@ -2784,7 +2826,8 @@ mod normalization_tests {
     // | `header_within_dead_band_is_left_at_page_size` | remove the dead-band branch (`if (SCALE_DEAD_BAND_LO..=SCALE_DEAD_BAND_HI).contains(&ratio) { return 1.0; }`) | `assert_eq!` fails — the header would render at `page_font_px * 1.1` instead of exactly `page_font_px` |
     // | `header_10x_body_clamps_to_the_ceiling` | remove the `.clamp(SCALE_CLAMP_LO, SCALE_CLAMP_HI)` call | header block's font_px assertion (`page_font_px * 3.0`) fails — it renders at `page_font_px * 10.0` instead |
     // | `header_deviation_with_no_body_metrics_stays_at_page_size` | change the rung-B fallback to denominate against `page_font_px(&jp)` instead of `refs.measured` | `assert_eq!` fails — the header renders at `page_font_px * (20.0 / page_font_px)` instead of exactly `page_font_px` |
-    // | `text_kind_never_deviates_even_at_2x` | delete the `if region.kind != "header" && region.kind != "footer" { return 1.0; }` kind gate | `assert_eq!` fails for BOTH the `"text"` and the `""`-kind variant — each renders at `page_font_px * 2.0` instead of exactly `page_font_px` |
+    // | `a_text_regions_band_measurement_never_deviates_even_at_2x` | let rung B run for every kind (drop the `is_furniture.then(..)` guard) | `assert_eq!` fails for BOTH the `"text"` and the `""`-kind variant — each renders at `page_font_px * 2.0` instead of exactly `page_font_px` |
+    // | `a_text_paragraph_at_its_own_pitch_deviates_via_rung_a` | restore the old `if region.kind != "header" && region.kind != "footer" { return 1.0; }` early return | the footnote renders at exactly `page_font_px` instead of `page_font_px * 0.444` — both the ratio assertion and the `got < expected_page_font` half fail |
 
     /// One `doc.v1` line JSON fragment: `baseline` always present; the band
     /// keys (`xheight`/`ascrise`/`descdrop`) only when `Some` — omitting
@@ -3051,13 +3094,27 @@ mod normalization_tests {
         );
     }
 
-    /// Test 6 (kind gate). The IDENTICAL 2x-measuring fixture from test 1,
-    /// but with `kind = "text"` and again with `kind = ""` (doc.v1's legacy
-    /// no-`type` shape) — both must land at EXACTLY page size, proving the
-    /// kind gate itself, not the dead band (a real 2.0 ratio is nowhere near
-    /// the dead band, so only the gate can be suppressing it).
+    /// Test 6 (rung-B kind gate). The IDENTICAL 2x-measuring fixture from
+    /// test 1, but with `kind = "text"` and again with `kind = ""` (doc.v1's
+    /// legacy no-`type` shape) — both must land at EXACTLY page size.
+    ///
+    /// **RE-PINNED for Doctrine (d) — read the name change.** This test was
+    /// `text_kind_never_deviates_even_at_2x`, and under the header/footer-only
+    /// gate that name was accurate. It is no longer: rung A (the region's own
+    /// baseline pitch) now applies to EVERY kind, so a `"text"` region CAN
+    /// deviate — see [`a_text_paragraph_at_its_own_pitch_deviates_via_rung_a`],
+    /// the twin added alongside this re-pin.
+    ///
+    /// What this test pins is narrower and still exactly right: the fixture's
+    /// deviation is a BAND measurement (`xheight: 20.0`) on a SINGLE line, so
+    /// rung A cannot apply (`1 < MIN_REGION_PITCH_LINES`) and only rung B
+    /// could produce a factor. Rung B is deliberately furniture-only, because
+    /// a body paragraph's band measurement carries the contamination
+    /// [`page_font_px`] exists to stop trusting. So this is the rung-B gate
+    /// falsifier, and a real 2.0 ratio is nowhere near the dead band, so only
+    /// the gate can be suppressing it.
     #[test]
-    fn text_kind_never_deviates_even_at_2x() {
+    fn a_text_regions_band_measurement_never_deviates_even_at_2x() {
         for kind_json in ["\"type\":\"text\",", ""] {
             let extra = format!(
                 r#"{{{kind_json}"lines":[{{"baseline":5.0,"xheight":20.0,"ascrise":0.0,"descdrop":0.0,"words":[]}}]}}"#
@@ -3068,14 +3125,122 @@ mod normalization_tests {
             let jp: JsonPage = serde_json::from_str(&norm_page_body_json(&regions)).unwrap();
             let expected_page_font = page_font_px(&jp).expect("page font must resolve");
 
+            // Anti-vacuity: rung A must be genuinely UNABLE to fire on the
+            // extra region, or this stops testing the rung-B gate at all.
+            // Asserted against the fixture's real parsed region rather than
+            // against the constant (which would be a tautology, and which
+            // clippy correctly rejects as `assertions_on_constants`).
+            let extra_region = jp.regions.last().expect("extra region");
+            assert!(
+                region_pitch_px(&extra_region.lines).is_none(),
+                "fixture must isolate rung B: the extra region has \
+                 {} line(s), enough for rung A to fire, so a passing \
+                 assertion below would not prove the rung-B gate",
+                extra_region.lines.len()
+            );
+
             let doc = doc_v1_layout(&norm_doc_json(&regions), &[]).expect("parse");
             let texts = text_blocks(&doc);
             let extra_block = texts.last().unwrap();
             assert_eq!(
                 extra_block.metrics.unwrap().font_px,
                 expected_page_font,
-                "kind={kind_json:?}: a 2x measurement on a non-header/footer \
-                 kind must never deviate from page size"
+                "kind={kind_json:?}: a 2x BAND measurement on a \
+                 non-header/footer kind must never deviate from page size — \
+                 rung B is furniture-only"
+            );
+        }
+    }
+
+    /// Test 7 (Doctrine (d), the can-fire half). A `"text"` paragraph whose
+    /// OWN baseline pitch is half the page's — the footnote case Doctrine (d)
+    /// names explicitly ("footnotes at a paragraph's end, under a picture, in
+    /// or under a table") — must render SMALLER than page size, via rung A.
+    ///
+    /// This is the twin of
+    /// [`a_text_regions_band_measurement_never_deviates_even_at_2x`]: that one
+    /// proves a text region's BAND measurement is ignored, this one proves its
+    /// PITCH measurement is not. Together they pin the exact rung split the
+    /// implementation makes.
+    ///
+    /// Disable-verified: reverting `region_scale_factor` to its
+    /// `if region.kind != "header" && region.kind != "footer" { return 1.0; }`
+    /// early-return makes the footnote render at exactly `page_font_px` and
+    /// this assertion fails.
+    #[test]
+    fn a_text_paragraph_at_its_own_pitch_deviates_via_rung_a() {
+        // Six body regions at pitch 18.0 (norm_body_region_json's own pitch),
+        // plus a footnote paragraph at pitch 12.0 — a ratio of 12/18 = 0.667,
+        // which must sit in the WINDOW BETWEEN the clamp floor (0.5) and the
+        // dead-band floor (0.80): below 0.80 so it is not normalized away,
+        // above 0.5 so the clamp does not decide the answer instead of rung
+        // A. Both bounds are asserted below — a first attempt used pitch 8.0
+        // (ratio 0.444) and the clamp assertion caught it. 4 lines so rung A
+        // applies (>= MIN_REGION_PITCH_LINES).
+        let footnote_lines: Vec<String> = (0..4)
+            .map(|i| norm_line_json(4000.0 + i as f32 * 12.0, Some((10.0, 2.0, 2.0))))
+            .collect();
+        let footnote = format!(
+            r#"{{"type":"text","lines":[{}]}}"#,
+            footnote_lines.join(",")
+        );
+        let mut regions = norm_body_regions(6);
+        regions.push(footnote);
+
+        let jp: JsonPage = serde_json::from_str(&norm_page_body_json(&regions)).unwrap();
+        let expected_page_font = page_font_px(&jp).expect("page font must resolve");
+        let page_pitch = page_pitch_px(&jp).expect("page pitch must resolve");
+
+        // Anti-vacuity, both halves. The fixture is only meaningful if the
+        // footnote's ratio genuinely clears the dead band — otherwise this
+        // would pass under ANY implementation that returns 1.0.
+        let footnote_region = jp.regions.last().expect("footnote region");
+        let footnote_pitch = region_pitch_px(&footnote_region.lines)
+            .expect("footnote must have >= MIN_REGION_PITCH_LINES baselines");
+        let ratio = footnote_pitch / page_pitch;
+        assert!(
+            ratio < SCALE_DEAD_BAND_LO,
+            "fixture must sit OUTSIDE the dead band to test anything: \
+             footnote pitch {footnote_pitch} / page pitch {page_pitch} = \
+             {ratio}, dead band floor {SCALE_DEAD_BAND_LO}"
+        );
+        assert!(
+            ratio >= SCALE_CLAMP_LO,
+            "fixture must not be clamped, or it tests the clamp rather than \
+             rung A: ratio {ratio} vs clamp floor {SCALE_CLAMP_LO}"
+        );
+
+        let doc = doc_v1_layout(&norm_doc_json(&regions), &[]).expect("parse");
+        let texts = text_blocks(&doc);
+        let footnote_block = texts.last().unwrap();
+        let got = footnote_block
+            .metrics
+            .expect("footnote carries metrics")
+            .font_px;
+
+        assert!(
+            (got - expected_page_font * ratio).abs() < 1e-3,
+            "a text paragraph at its own (half) pitch must render at \
+             page_font_px * {ratio}, i.e. {}, got {got}",
+            expected_page_font * ratio
+        );
+        // The two-sided half: it must ALSO not have been left at page size.
+        assert!(
+            got < expected_page_font,
+            "the footnote must render SMALLER than page size ({expected_page_font}), \
+             got {got} — rung A did not fire for a text region"
+        );
+
+        // ...and every ordinary body paragraph on the SAME page must still
+        // land at EXACTLY page size (Doctrine (d): "in Blocksatz, normalize
+        // instead of hunting exceptions"). Without this half, an
+        // implementation that scaled EVERYTHING would pass the assertions
+        // above.
+        for (i, block) in texts.iter().enumerate().take(texts.len() - 4) {
+            assert_eq!(
+                block.metrics.unwrap().font_px,
+                expected_page_font,
+                "body block {i} must be normalized to page size exactly"
             );
         }
     }
