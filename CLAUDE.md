@@ -2702,10 +2702,74 @@ byte-identical, 8+7+0 fence exact (`0.000` x14, `0.023`, `0.814`), lib 259/259,
 clippy/fmt clean. Behaviour on every committed fixture is unchanged — GATE 0
 already proved 0/23 qualify, and this run confirms it end-to-end.
 
-### grid_raster NOT yet wired — stated plainly
+### grid_raster WIRED — and the corpus could not falsify it, so the fixture was built
 
-`grid_raster` is registered in `lib.rs` and fully tested, but no recognition
-path calls it yet (the dropcap half above IS now wired). The wiring (`textline.rs` `ToBlockCtx.large`,
+`apply_grid_raster` (detect -> split, no-op when no lattice) runs at all THREE
+non-table call sites: `recognize_page_blocks_words_with_mode`, and the
+`else` arms of `rec_blocks` and the classification block list. Both `else`
+arms are required — `build_regions` assigns lines to regions by centroid, so
+a raster applied to only one list would drop split cells. It is NEVER applied
+in the `xy_cut_table_aware` branch: that path deliberately emits a table as
+one whole-width leaf, and a table's own columns ARE a regular lattice, so the
+raster would re-create exactly the per-column fragmentation ingredient 3
+removed. The two are mutually exclusive by construction.
+
+**`examples/raster_probe.rs` measured the committed corpus: 23 fixtures, the
+raster changes the block list on ZERO.** That is the P-50 result, not a
+defect — on `resgrid.pgm` it detects the 8-column lattice and correctly
+splits nothing, because that page cuts vertically only, so both bands already
+live in the same columns and there is no merged band to inherit geometry FOR.
+The failure mode the feature exists to fix is simply not expressed anywhere in
+the corpus, the same gap `gen_faded_contrast.py` was built to close for Wolf.
+So it was built: `two_band_page(bridge_bottom)` in `tests/blocks_columns.rs`
+— a 2-band x 4-column page whose bottom band has ink bridging every gutter.
+Measured: clean -> 8 blocks (both bands split), bridged -> 5 (4 columns + ONE
+full-width band), raster -> back to 8.
+
+**Four wrong fixture versions, each caught by its own guard, and the reasons
+generalize:**
+
+1. **Partial bridges.** The bars covered only part of each gutter, so
+   full-height corridors survived and `xy_cut` cut vertically through both
+   bands (measured widths `[256, 256, 256, 184]`, no merged band at all).
+2. **Hollow bridges.** `mark()` draws only a rectangle's EDGES (correct for
+   glyphs — `filter_blobs` rejects `>= h*w*0.7` as too dense to be text), so a
+   bridge built from one leaves its own white interior as a corridor. A bridge
+   must be SOLID; that density heuristic is downstream of `xy_cut`'s
+   projection profile and irrelevant there.
+3. **The band gap was rejected by its NEIGHBOUR, not by its own width.**
+   `axis_cuts` confirms a valley only if the distance to the ADJACENT
+   CANDIDATE valley is `>= min_region_px` (24) — not the distance to the rect
+   edge. With 20 px rows at 10 px leading, every inter-row gap cleared
+   `gap_min` and became a candidate, leaving the 220 px band gap with a 20 px
+   neighbour and getting it dropped. **A 5x-wider valley can lose to a
+   threshold that never looks at it.**
+4. **...and widening the rows overshot, because `gap_min` is RELATIVE to the
+   current rect.** Once the page is cut into bands and columns the extent
+   collapses (640 -> 178) and a 6 px leading clears the now-tiny bar
+   (`ceil(0.015 * 178) = 3`), decomposing every column into one block per LINE
+   (measured: 48 blocks). Final geometry: rows 28 px at 30 px pitch => 2 px
+   leading, below the threshold at EVERY recursion depth; marks 16 px at 24 px
+   pitch, so inter-mark gaps die on the `min_region_px` confirm filter instead.
+
+> **⚠ THE FIRST FALSIFIER WAS VACUOUS — third time this session, and again
+> only the disable run caught it.** `a_merged_band_inherits_...` calls
+> `detect_column_raster`/`split_nonconforming` directly, so it proves the
+> FEATURE fires and passes **identically with `apply_grid_raster` unhooked**
+> (verified: green). It tests the module, not the wiring. Companion added:
+> `the_wired_path_does_not_read_a_merged_band_across_its_gutters` goes through
+> the wired public entry and asserts what a reader sees — no recognized line
+> may span more than half the page. Disable-verified: with the helper
+> unhooked, **6 of 30 lines span `(36, 978)`**, the full sheet, text read
+> straight across all four gutters. **A test that exercises a public API the
+> fix also happens to use is not a test OF the fix.**
+
+Gates: goldens + `golden_lines` + `blocks_columns` + both `lab_table_*`
+byte-identical, 8+7+0 fence exact (`0.000` x14, `0.023`, `0.814`), lib
+259/259, clippy `-D warnings` + fmt clean.
+
+Both halves are now wired. This section is kept as the record of the
+sequencing, not as an open item. The wiring (`textline.rs` `ToBlockCtx.large`,
 `segment.rs`, `lstm_recognizer.rs` seam + `apply_grid_raster` + `Document.drop_caps`)
 is orchestrator work spelled out in the plan, and the `xy_gutter_probe` re-run
 that gates P-50's default-on decision has not happened. Until both land, this
