@@ -2845,3 +2845,57 @@ is emitted but not asserted — the fixture's marks recognize without spaces, so
 `JustifyToBox` takes its `spaces == 0` path and never justifies. A fixture
 whose recognized text carries real word gaps is what that needs, and it is the
 same fixture the paragraph-level doctrine (d) has been waiting for.
+
+### `Tw` closed — and the same trap fired twice more (2026-08-07)
+
+The Axis-C fence shipped with `Tw` — the mechanism justification actually
+uses — **emitted but never asserted**. Two separate reasons, both found by
+disable runs, both the same shape as the `Tz` miss one layer up.
+
+**First: the fixture had no words.** A line drawn as one continuous mark run
+recognizes as ONE word, so `RunFit::JustifyToBox` took its `spaces == 0`
+early-out and never justified — nothing to check. Fixed by drawing WORDS, and
+every constant is chosen against a specific `xy_cut` step, because **a word
+gap and a column gutter are the same thing to a projection profile**:
+
+- word ink **17 px** < `min_region_px` (24) → even where a word gap clears
+  `gap_min`, the confirm filter rejects it; this is what stops the page
+  decomposing into words INSIDE a column, where `gap_min` collapses to ~6.
+- at PAGE level `gap_min = ceil(0.015 × 1346) = 21` > the **18 px** word gap,
+  so word gaps are not candidates there and the 40 px column gutter's nearest
+  candidates are the column edges — which is what lets the columns still split.
+- 18 px against a 10 px intra-word advance (**1.8×**) is what the recognizer's
+  own gap-based space detection needs.
+
+A first attempt (3 marks/word, 24 px gaps, ink 27) split the page at **every
+word** — measured drift 98 px on column 0.
+
+**Second: the reset half was vacuous for its own reason.** Measured, **all 42
+runs on the justified page carry a non-zero `Tw`** — each `TextBlock`'s box is
+its own line's ink box, so even the short last line justifies to its own
+measure. A page where no run ever needs `Tw = 0` cannot exercise the
+always-emit guard, and the assertion passed identically with `layout.rs`
+changed to emit `Tw` only when non-zero. Split: justification asserted on the
+JUSTIFIED page, the reset on the RAGGED one, where `RunFit::Natural`
+legitimately yields `tw = 0` and the guard is the only thing making it
+explicit.
+
+Five assertions, all disable-verified red-then-green:
+
+| assertion | disable |
+|---|---|
+| `Tz` ≡ 100 on painted runs | `RunFit::Natural` returns a box-fit stretch |
+| no run taller than the pitch | `page_font_px` returns `× 2.0` |
+| even column gutters | the per-block `dx = left` translation is dropped |
+| justification actually happens | force `JustifyToBox`'s `spaces == 0` path |
+| `Tw` never inherited | emit `Tw` only when non-zero |
+
+**The generalizable rule, now with five instances:** an assertion is only a
+test on a fixture that can *reach* the branch it guards. Justified vs ragged,
+words vs one run, width-bound vs ceiling-bound — each pair looks like the same
+page and exercises different code. The disable run is the only thing that
+tells them apart.
+
+Gates: `tesseract-ocr` lib 259/259, goldens + `blocks_columns` byte-identical,
+8+7+0 fence exact, `tesseract-ocr-pdf` 9 suites / 0 failures, clippy `-D
+warnings` + fmt clean.
