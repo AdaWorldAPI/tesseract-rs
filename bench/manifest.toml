@@ -1,0 +1,66 @@
+# External benchmark corpus — SHA-256-pinned sources.
+#
+# FETCH-DON'T-COMMIT. Nothing listed here enters git, and nothing listed here
+# may become a committed test fixture. Committed tests read `corpus/` (the
+# generated, in-repo fixtures) ONLY — see CLAUDE.md's `/tmp`-fixture time-bomb
+# rule: a test whose fixture lives outside the repo is red-or-skipping
+# depending on which machine runs it, and the skip-guard hides it exactly
+# where a fresh CI would have caught it.
+#
+# What this file IS: the reproducibility record for the benchmark harness —
+# which external pages were measured, at exactly which bytes.
+#
+# ## Adding an entry
+#
+# 1. Fetch it and compute the real hash:
+#      curl -sS --noproxy '*' -o /tmp/x <url> && sha256sum /tmp/x
+#    The `--noproxy '*'` is required, not cosmetic: this environment's agent
+#    proxy scopes GitHub to an allowlist and returns 403 for third-party
+#    repositories, while the direct path returns 200. See CLAUDE.md
+#    § "GitHub access matrix".
+# 2. Paste the REAL hash. Never a placeholder, never `<computed>` — an
+#    unpinned entry is worse than no entry, because `fetch.sh` would then
+#    accept whatever arrives.
+# 3. Record `license` as a plain SPDX identifier read from the source's own
+#    LICENSE file. A statement of fact about one asset — not analysis, not
+#    comparison, not a recommendation.
+#
+# ## Fields
+#
+#   name        stable slug; the cache directory name
+#   image_url   the page raster
+#   image_sha256
+#   gt_url      the ground-truth transcription
+#   gt_sha256
+#   gt_format   how to read the GT (see "GT formats" below)
+#   license     SPDX identifier of the SOURCE repository
+#   source      human-readable provenance
+#   note        why this entry is in the set — what it can falsify
+#
+# ## GT formats
+#
+#   plain_raw   The GT file's bytes ARE the expected output, compared RAW.
+#               RAW is load-bearing: Phase 0's first measurement normalized
+#               whitespace and reported `CER 0.0000, exact=true` on a page
+#               that was in fact missing its paragraph break — the
+#               normalization deleted precisely the defect it was meant to
+#               find. A runner that normalizes before comparing is not
+#               measuring. (CLAUDE.md § "Upstream's own test image found a
+#               defect the local corpus cannot express".)
+
+[[corpus]]
+name = "phototest"
+image_url = "https://raw.githubusercontent.com/tesseract-ocr/test/main/testing/phototest.tif"
+image_sha256 = "d2241a1eb6d6cd2eb6544b8e228c2862c852b7467d16ed636caa32179b780692"
+gt_url = "https://raw.githubusercontent.com/tesseract-ocr/test/main/testing/phototest.gold.txt"
+gt_sha256 = "76ef157baeb6ab275b7d90f310477a8060d5822aea2b2e05d480f459b016a6ed"
+gt_format = "plain_raw"
+license = "Apache-2.0"
+source = "tesseract-ocr/test — upstream's own canonical regression input"
+note = """
+640x480, 1bpp, two paragraphs of 12pt text. Earned its keep on image number
+one: it found the missing paragraph break (fixed, renderer::detect_paragraph_gaps)
+AND the small-page over-split (open, #57) — neither of which the generated
+corpus can express, because every generated page is 512x720 with generous
+spacing. `small` was the axis nothing local varied.
+"""

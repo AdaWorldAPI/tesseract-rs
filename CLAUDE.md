@@ -3133,10 +3133,40 @@ independently verified as genuine document structure.**
 
 ### Byte-exact against upstream, end to end
 
-`phototest.tif` through the full production composition (`recognize_page_blocks_words`
-→ `binarize_page_with(Otsu)` → `detect_paragraph_gaps` → `render_text_with_gaps`)
+`phototest.tif` through `recognize_page_makerow_words` →
+`binarize_page_with(Otsu)` → `detect_paragraph_gaps` → `render_text_with_gaps`
 is **byte-identical to `phototest.gold.txt`, 286/286 bytes**, closing the exact
 gap Phase 0 found.
+
+> **⚠ THIS PARAGRAPH NAMED THE WRONG FUNCTION — corrected 2026-08-07 by the
+> Phase-1 bench harness on its first run.** It read *"through the full
+> production composition (`recognize_page_blocks_words` → …)"*. Measured, with
+> both decode paths and both recognition paths in one probe:
+>
+> | recognition path | bytes | RAW exact vs gold |
+> |---|---|---|
+> | `recognize_page_makerow_words` (whole-page) | 286 | **true** |
+> | `recognize_page_blocks_words` (blocked) | 290 | **false** |
+>
+> The 286/286 result is the WHOLE-PAGE path. The blocked path — which is what
+> `recognize_document` actually runs, i.e. the real "full production
+> composition" — does **not** reproduce gold on this page, because phototest
+> is 640 px wide and lands squarely in the open **#57** small-page over-split:
+> its first paragraph fragments into word-scale blocks read column-major
+> (`"This is a lot / of 12 / ocr / code / and / see / …"`), while its denser
+> second paragraph reads perfectly. The paragraph-break fix itself is sound
+> and unaffected; what was wrong is the claim about which path was measured.
+>
+> **The decode path was ruled OUT as the variable, not assumed:**
+> `decode_image` (TIFF, feature `image-decode`) and `parse_pgm` (a PIL-converted
+> PGM) produce **byte-identical grey buffers**, and both give the same 286-vs-290
+> split. So this is purely a recognition-path difference.
+>
+> Textbook instance of this repo's own falsifiability rule — *"a doc-comment
+> claim is not a behaviour; a test must exercise the claim or the claim must be
+> labelled claimed, unverified."* The 286/286 number was real, was never gated,
+> and named the wrong function; nothing would have caught it, because no test
+> runs phototest (correctly — it is an external asset, see `bench/README.md`).
 
 ### Falsifiable tests, and the SAME vacuous-guard trap fired TWICE more this session
 
@@ -3430,3 +3460,74 @@ contains no page with a real footnote at a genuinely different size, so the
 can-fire test is a synthetic `doc.v1` fixture, not a rendered-page
 measurement. When such a page lands, re-measure the constants rather than
 defending them.
+
+## ★ Benchmark Phase 1 — the external corpus is pinned, and it corrected a stale claim on run one (2026-08-07)
+
+Phase 0 ran ad-hoc on one image and paid for itself twice. Phase 1 makes that
+repeatable: `bench/manifest.toml` (SHA-256 pins, source URLs, license facts,
+declared GT format), `bench/fetch.sh` (fetch + verify, hard-fails on
+mismatch), `bench/README.md`, `bench/cache/` gitignored.
+
+**The access blocker was NOT a blocker — this repo's own memory said so.**
+The first fetch attempt returned **403** with *"GitHub access to this
+repository is not enabled for this session"*, which reads like a hard stop
+for any third-party corpus. But CLAUDE.md § "GitHub access matrix" already
+carries the rule: *a 403 in this environment is USUALLY THE PROXY, not the
+repo — before declaring a repo locked, retest with the proxy bypassed.*
+Retested: `curl --noproxy '*'` returns **200**, 38668 bytes, and the
+env-cleared variant returns byte-identical bytes. Phase 1 went from
+"blocked, report it" to "done" on the strength of a lesson written down
+months earlier. `fetch.sh` carries `--noproxy '*'` with that reasoning inline
+so it is not re-derived.
+
+**Fetch-don't-commit, and the second half is load-bearing.** Nothing fetched
+enters git AND nothing fetched may become a committed test fixture. That is
+the `/tmp`-fixture time-bomb rule (two `tesseract-core` tests red for 13 days,
+invisible three ways, because their fixtures lived outside the repo). The
+split is clean: `corpus/` = gates that run identically everywhere;
+`bench/cache/` = measurements traceable to exact bytes. Keeping them in
+separate directories is what stops one being mistaken for the other.
+
+**A hash mismatch is a hard failure, verified as a real falsifier** — not
+assumed. Appended one byte to a cached GT file: `MISMATCH gt`, expected vs
+actual printed, **exit 1**. Restored: **exit 0**. (The first run also failed
+loudly for an unintended reason — my awk key-matcher was `[a-z_]+`, which
+excludes the digits in `image_sha256`, so every expected hash came back
+empty and the harness refused rather than silently accepting. The right
+behaviour, reached by accident, then fixed to `[a-z0-9_]+`.)
+
+### The first real run corrected CLAUDE.md
+
+Proving the fetched asset is *consumable* (not merely hash-verified) ran it
+end-to-end — and immediately falsified this file's own byte-exact claim. Full
+detail is inline at that claim above; the short form:
+
+- `recognize_page_makerow_words` → **286 bytes, RAW exact** ✓
+- `recognize_page_blocks_words` → **290 bytes, not exact** ✗ (the open #57
+  small-page over-split, reproducing on real text for the first time)
+- decode path ruled OUT as the variable: `decode_image(TIFF)` and
+  `parse_pgm(PGM)` give **byte-identical grey buffers**
+
+The claim named the blocked path — the one production actually runs — while
+the measurement came from the whole-page path. That is precisely the
+falsifiability rule's *"a doc-comment claim is not a behaviour"*, and nothing
+in the suite could have caught it, because no committed test runs phototest
+(correctly so).
+
+**#57 now has its real-text reproduction.** The earlier attempt to reproduce
+the over-split on real content failed at every crop width tried, which
+narrowed but did not exhibit the defect. Phototest exhibits it plainly:
+paragraph one fragments to `"This is a lot / of 12 / ocr / code / and / see /
+of / file / fo / rm.at. / point text / if it wo rks"` (word-scale blocks read
+column-major) while the denser paragraph two reads perfectly. Note the
+no-content-loss guard does not save it here — no block came back EMPTY, every
+block recognized *something*, so `any_block_empty` stays false and the
+whole-page comparison never runs.
+
+**Phase 2 (not built):** the scoring runner — recognize each entry, compare
+RAW, report per-entry CER/WER. It needs a TOML-parsing decision
+`tesseract-ocr` has deliberately avoided (no TOML dep), which is why it is its
+own step rather than a bolt-on. RAW comparison is non-negotiable there:
+Phase 0's first measurement normalized whitespace and reported
+`CER 0.0000, exact=true` on a page that was missing its paragraph break — the
+normalization deleted exactly the defect it was meant to find.

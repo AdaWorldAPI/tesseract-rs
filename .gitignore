@@ -2,3 +2,7 @@ target
 Cargo.lock
 __pycache__/
 *.pyc
+
+# Fetched external benchmark corpus — pinned in bench/manifest.toml, never
+# committed. See bench/README.md ("fetch-don't-commit").
+bench/cache/
