@@ -1102,6 +1102,15 @@ pub struct ToBlockCtx {
     /// rule and the "must-consider" note there. Never fed to `make_rows`, so
     /// row assignment and every existing measurement are untouched.
     pub noise: Vec<(i32, i32, i32, i32)>,
+    /// Blobs `filter_blobs` rejected as too large (`TO_BLOCK::large_blobs`),
+    /// `(left, bottom, right, top)` in y-up page space. RETAINED rather than
+    /// dropped, for the same reason as [`Self::noise`] and at the opposite end
+    /// of the size scale: a drop cap spans several line heights, so
+    /// `filter_blobs` rejects it and — before this field existed — it died
+    /// here, which is why "Alice" recognized as "ice". Consumed by
+    /// [`crate::dropcap`]; never fed to `make_rows`, so row assignment,
+    /// x-height and baseline fitting are untouched.
+    pub large: Vec<(i32, i32, i32, i32)>,
     /// Rows, ALWAYS maintained in descending-`min_y()` order (topmost row
     /// first) by every function below -- the `TO_ROW_LIST` invariant
     /// [`assign_blobs_to_rows`]'s trailing bubble-sort step maintains.
