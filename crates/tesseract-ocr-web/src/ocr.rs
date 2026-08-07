@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use image::{ImageReader, Limits};
 use tesseract_ocr::{
-    german_invoice_fields, mean_word_confidence, render_text, DocPage, LOW_CONFIDENCE_THRESHOLD,
+    german_invoice_fields, mean_word_confidence, DocPage, LOW_CONFIDENCE_THRESHOLD,
 };
 
 use crate::state::AppState;
@@ -233,9 +233,23 @@ pub fn ocr_image_bytes(
         .recognizer
         .recognize_page_blocks_words(&raw, w, h, model.dict.as_ref())
         .map_err(|e| format!("recognition failed: {e}"))?;
-    let text = render_text(&lines, &model.recognizer.charset)
-        .trim_end()
-        .to_string();
+    // Paragraph-gap detection is strictly additive (only ever inserts a blank
+    // line at a raw-pixel-measured structural break; never removes or
+    // reorders content) and default-on, not gated behind a checkbox like
+    // deskew/rectify: those alter what gets RECOGNIZED, this is pure
+    // post-processing of an already-final line list. See
+    // `renderer::detect_paragraph_gaps`'s doc comment for the guard that
+    // keeps it silent on un-deskewed rotated pages.
+    let binary =
+        tesseract_ocr::xy_cut::binarize_page_with(&raw, w, h, tesseract_ocr::BinarizeMode::Otsu);
+    let para_gaps = tesseract_ocr::renderer::detect_paragraph_gaps(&binary, w, h, &lines);
+    let text = tesseract_ocr::renderer::render_text_with_gaps(
+        &lines,
+        &model.recognizer.charset,
+        &para_gaps,
+    )
+    .trim_end()
+    .to_string();
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let page = DocPage::from_line_words(&lines, &model.recognizer.charset, w as u32, h as u32);

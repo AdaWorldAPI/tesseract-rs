@@ -3057,3 +3057,129 @@ passes flips it to `rectified=true` and the test fails with the exact
 Gates: `tesseract-ocr` lib 259/259 (`deskew::` 36/36, `rectify::` 12/12),
 goldens byte-identical, `tesseract-ocr-web` 38/38 (36 pre-existing + 2 new),
 clippy `-D warnings` + fmt clean on both crates.
+
+## ★ Paragraph breaks CLOSED — the raw-pixel signal that survives row-fit normalization (2026-08-07)
+
+`recognize_page_makerow`'s single missing byte on `phototest.tif` — no blank
+line between the two paragraphs — turned out to need a genuinely new sensor,
+not a wiring fix. Both obvious candidates were tried and both were dead ends,
+measured before either was believed.
+
+### Two false starts, both measured, both dead ends
+
+1. **`LineWords::line_box` top-to-top gaps: all identically `34`.** `make_rows`
+   → `fit_parallel_rows` fits every row onto ONE shared page-wide gradient
+   (the same forcing `rectify.rs`'s own docs already named), so consecutive
+   line boxes carry a uniformly-fitted pitch — zero row-to-row variation to
+   detect a paragraph gap FROM.
+2. **`ToRow.spacing` (`compute_row_stats`, provably computed BEFORE
+   `fit_parallel_rows` and never re-called after — `segment.rs`'s own doc
+   comment already said so): also exactly `34` on every row.** The per-row
+   blob min_y/max_y positions themselves are uniformly 34px apart in the
+   source image — there is no vertical whitespace signal in the RECOGNIZED
+   ROW geometry at all, at any stage of the row-fitting pipeline.
+
+### The real signal: raw blank-row runs, bucketed by line-CENTER midpoint
+
+A direct scan of the BINARIZED PAGE for blank-row runs (independent of any
+`ToRow`/`LineWords` crop band) DOES carry the signal: ordinary inter-line gaps
+measured **3-4px**, the true paragraph gap **10px** (ratio 3.33). The crop
+bands (`LineWords::line_box`) themselves can't be used as the scan boundary —
+they're the "at least ascender-to-descender" RECOGNITION band, deliberately
+generous, so consecutive bands routinely TOUCH OR OVERLAP even at the true
+10px gap (measured: using `line_box` edges as the scan window gave blank-run
+**zero** everywhere, including at the real boundary). Bucketing each raw run
+by which pair of line-CENTER midpoints (`(top+bottom)/2`, unaffected by crop
+padding) it falls between sidesteps the crop-band problem entirely.
+
+`renderer::detect_paragraph_gaps(binary, w, h, lines) -> Vec<bool>` +
+`renderer::render_text_with_gaps(lines, charset, para_break) -> String`
+(`render_text` itself is now a one-line wrapper passing `&[]` — zero behaviour
+change for existing callers). **Not a Tesseract transcode** — no oracle exists
+for paragraph detection, same footing as `rectify.rs`/`structured.rs`'s `doc.v1`.
+
+### GATE 0 was NOT clean — and the honest investigation of why is the real finding
+
+Unlike drop-cap/grid_raster's 0/23, this feature genuinely fires on 3 of 23
+committed fixtures. Each was inspected, not assumed:
+
+- **`page_furniture.pgm` (2 flags) — TRUE POSITIVE.** A 3-part synthetic page
+  (header / 12-sentence body / footer); the detector correctly separates
+  header-from-body and body-from-footer. `gap_after` sorted:
+  `[12×8, 17×3, 80, 166]`, median 12 — the two flagged gaps (80, 166) are
+  6.7×/13.8× the median, nowhere near the ordinary 12-17px range.
+- **`resgrid.pgm` (1 flag) — TRUE POSITIVE.** The 8×2 resolution grid; the
+  flag falls exactly between the top-band cells (lines 0-2) and the
+  bottom-band cells (lines 3-5) — genuine visual grouping a reader would also
+  perceive as two blocks. `gap_after = [8,7,89,7,6]`, median 7, outlier 89
+  (12.7×).
+- **`skew_p050.pgm` (1 flag, at first) — FALSE POSITIVE, and the reason
+  generalizes.** Same sentence set as `page_furniture`'s BODY (no real
+  paragraph structure), rotated +5° and un-deskewed. `gap_after =
+  [0, 0, 1, 1, 3, 0]` — **50% of the gaps are exactly zero.** Root cause: this
+  function's "blank across the FULL raster width" test is axis-aligned, and a
+  TILTED line's ink smears across MORE raster rows at its edges than at its
+  center, so on a sufficiently rotated page most inter-line gaps collapse
+  toward zero and the few that survive are quantization noise, not signal —
+  **the population itself is unreliable, not merely small.** Compare
+  `skew_m025.pgm` (milder −0.25° tilt): `[9,7,10,12,9,12]`, 0% zero, and it
+  correctly never flags (ratio 1.2 < 2.0) — the guard changes nothing there,
+  it targets only the degenerate case.
+
+**Fix: `MAX_ZERO_GAP_FRACTION = 0.3`** — decline (all-`false`) when ≥30% of
+measured gaps are exactly zero. Re-ran GATE 0 after: `skew_p050` → 0,
+`page_furniture`/`resgrid` unchanged. Final: **2 of 23 fixtures fire, both
+independently verified as genuine document structure.**
+
+### Byte-exact against upstream, end to end
+
+`phototest.tif` through the full production composition (`recognize_page_blocks_words`
+→ `binarize_page_with(Otsu)` → `detect_paragraph_gaps` → `render_text_with_gaps`)
+is **byte-identical to `phototest.gold.txt`, 286/286 bytes**, closing the exact
+gap Phase 0 found.
+
+### Falsifiable tests, and the SAME vacuous-guard trap fired TWICE more this session
+
+Five tests in `renderer.rs`, all now disable-verified — but two were vacuous on
+first write, the sixth and seventh instances of this session's recurring trap:
+
+1. **The zero-fraction guard's own test used a 2-line fixture** (1 gap
+   sample) — disabling `MAX_ZERO_GAP_FRACTION` left it green, because a LONE
+   gap can never be "2× itself" regardless of the guard; the ratio test
+   structurally can't fire with one sample. Fixed by testing the REAL edge
+   case the guard protects: 0 or 1 non-empty lines, where `gap_after` is
+   EMPTY and `sorted[sorted.len()/2]` would panic on an out-of-bounds index.
+2. **The degenerate-population fixture's own `tops` array had an arithmetic
+   slip** — my anti-vacuity guard (`assert!(zero_gaps*2 >= raw_gaps.len())`)
+   caught it immediately: measured `[0,1,1,1,4,0]` (33% zero) instead of the
+   intended `[0,0,1,1,3,0]` (50%). The anti-vacuity assertion did its job
+   before the real assertion could pass for the wrong reason.
+
+Final disable table, all four guards verified red-then-green:
+
+| assertion | disable |
+|---|---|
+| flags a gap well above the median | n/a (positive control) |
+| stays silent on uniform leading | `PARAGRAPH_GAP_RATIO = 0.0` |
+| declines on 0/1 lines (no panic) | n/a (structural, verified by construction) |
+| declines on a degenerate (≥30% zero) population | delete the zero-fraction guard entirely |
+
+### Wired as the DEFAULT, not gated behind a checkbox
+
+Unlike deskew/rectify (which alter what gets RECOGNIZED and are opt-in),
+paragraph-gap detection is pure POST-processing of an already-final line
+list — strictly additive (only ever inserts a blank line at a raw-pixel
+measured structural break; never removes or reorders content) and calibrated
+against the one measured false-positive mode. Wired into
+`tesseract-ocr-web::ocr_image_bytes` (the TEXT-mode output) unconditionally.
+
+No existing golden depends on exact `page_furniture.pgm`/`resgrid.pgm` text —
+checked before wiring, not after: `page_bands.rs` asserts `xy_cut` region
+boundaries (not rendered text), `blocks_columns.rs`/`lab_table_grid.rs` assert
+table-detection scores, `quality_resolution_grid.rs` computes CER PER CELL
+(cropped sub-images), never via `render_text`. Zero golden re-pin needed.
+
+Gates: `tesseract-ocr` lib 264/264 (5 new), goldens + `golden_lines` +
+`blocks_columns` + both `lab_table_*` + `page_bands` byte-identical, 8+7+0
+fence exact, `tesseract-ocr-web` 38/38, clippy `-D warnings` + fmt clean on
+both crates.

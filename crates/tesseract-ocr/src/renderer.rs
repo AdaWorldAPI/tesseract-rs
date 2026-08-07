@@ -222,10 +222,32 @@ pub(crate) fn word_confidence(word: &WordResult) -> f32 {
 /// this crate always is — see the block/par placeholders above).
 #[must_use]
 pub fn render_text(lines: &[LineWords], charset: &CharSet) -> String {
+    render_text_with_gaps(lines, charset, &[])
+}
+
+/// Same as [`render_text`], but inserts an EXTRA blank line before each line
+/// whose index is flagged in `para_break` (as produced by
+/// [`detect_paragraph_gaps`]) — a paragraph separator. `para_break` shorter
+/// than `lines` (including empty, [`render_text`]'s own case) is simply
+/// treated as `false` for any missing index; never a panic.
+///
+/// Never inserts a blank line before the FIRST emitted (non-empty) line,
+/// regardless of its flag — there is no preceding paragraph to separate
+/// from.
+#[must_use]
+pub fn render_text_with_gaps(
+    lines: &[LineWords],
+    charset: &CharSet,
+    para_break: &[bool],
+) -> String {
     let mut out = String::new();
-    for line in lines {
+    let mut emitted_any = false;
+    for (i, line) in lines.iter().enumerate() {
         if line.words.is_empty() {
             continue;
+        }
+        if emitted_any && para_break.get(i).copied().unwrap_or(false) {
+            out.push('\n');
         }
         for word in &line.words {
             if word.leading_space {
@@ -234,6 +256,140 @@ pub fn render_text(lines: &[LineWords], charset: &CharSet) -> String {
             out.push_str(&word_text(charset, word));
         }
         out.push('\n');
+        emitted_any = true;
+    }
+    out
+}
+
+/// Detect PARAGRAPH breaks — a vertical gap between two recognized lines
+/// that is genuinely larger than the page's ordinary inter-line leading —
+/// directly from the RAW binarized page. **Not a Tesseract transcode**, same
+/// footing as [`crate::rectify`] and [`crate::structured`]'s `doc.v1`: no
+/// oracle exists for paragraph detection here, and Tesseract's own
+/// `ParagraphModel`/`DetectParagraphs` (a real, separate subsystem — script
+/// direction, indentation, and spacing modelling) is not transcoded. This is
+/// this crate's own, deliberately narrow synthesis: spacing alone.
+///
+/// # Why not the lines' own crop bands (`LineWords::line_box`)
+///
+/// `line_box` is the *recognition* band — `linerec.cpp:239-246`'s "at least
+/// ascender-to-descender" extension plus `kImagePadding = 4` — deliberately
+/// generous, so consecutive crop bands routinely TOUCH OR OVERLAP even where
+/// the real image has visibly more whitespace between paragraphs (measured:
+/// on a real 8-line, 2-paragraph page, every `line_box`-to-`line_box` gap
+/// computed this way was **zero**, including at the true paragraph
+/// boundary). This function instead scans the binarized page directly for
+/// blank-row runs, then buckets each run by which pair of line CENTERS
+/// (`(top+bottom)/2`, converted to raster space) it falls between — the
+/// crop bands never enter the computation.
+///
+/// # The rule: judge a gap against its neighbours, not an absolute size
+///
+/// Same correction shape as `xy_cut`'s gutter fallback, `noise_readmit_reach`,
+/// and the table-gutter bridge — a fixed pixel threshold cannot separate
+/// "paragraph gap" from "ordinary leading" across different DPIs/point sizes,
+/// but a RATIO to the page's own MEDIAN inter-line gap can. A gap `>=
+/// PARAGRAPH_GAP_RATIO` times the median is flagged; measured on a real
+/// canonical test page (`tesseract-ocr/test`'s `phototest.tif`), ordinary
+/// gaps were 3-4px and the true paragraph gap was 10px (ratio 3.33) — a wide,
+/// unambiguous margin above the 2.0 threshold.
+///
+/// Declines (returns all-`false`) below [`MIN_LINES_FOR_PARAGRAPH_GAPS`]
+/// non-empty lines — a median of one or two samples is not a population,
+/// same reasoning as `noise_readmit_reach`'s and `dropcap::ordinary_scale`'s
+/// own minimum-population guards.
+///
+/// **Also declines when too many of the measured gaps are exactly zero**
+/// (`>= `[`MAX_ZERO_GAP_FRACTION`]` of them) — measured on an UN-DESKEWED
+/// rotated page (`skew_p050.pgm`, +5°): `gap_after = [0, 0, 1, 1, 3, 0]`,
+/// median 1, and the lone `3` clears a naive `2.0x` ratio test — a false
+/// paragraph flag between two ordinary sentences with no real break. Root
+/// cause: this function's "blank across the FULL raster width" test is
+/// axis-aligned, and a tilted line's ink smears across MORE raster rows at
+/// its edges than at its center, so on a sufinciently rotated page most
+/// inter-line gaps collapse toward zero and the few that don't are
+/// quantization noise, not signal — the population itself is unreliable,
+/// not merely small. A HEALTHY page (this function's true positives —
+/// `phototest.tif`: `[4,3,10,3,3,3,3]`; `page_furniture.pgm`: 13 gaps, 0
+/// zeros; `resgrid.pgm`: `[8,7,89,7,6]`) has a **0% zero rate**; the false
+/// positive has 50%. `skew_m025.pgm` (a milder −0.25° tilt) stays fully
+/// non-zero and simply never clears the ratio test — this guard changes
+/// nothing there, it specifically targets the degenerate-population case.
+///
+/// Returns a `Vec<bool>` the same length as `lines`, `para_break[i] == true`
+/// meaning "insert a blank line before line `i`" — feed directly to
+/// [`render_text_with_gaps`].
+#[must_use]
+pub fn detect_paragraph_gaps(binary: &[u8], w: usize, h: usize, lines: &[LineWords]) -> Vec<bool> {
+    const PARAGRAPH_GAP_RATIO: f32 = 2.0;
+    const MIN_LINES_FOR_PARAGRAPH_GAPS: usize = 3;
+    const MAX_ZERO_GAP_FRACTION: f32 = 0.3;
+
+    let mut out = vec![false; lines.len()];
+    if w == 0 || h == 0 {
+        return out;
+    }
+
+    // Indices (into `lines`) of the non-empty lines, with their raster-space
+    // vertical CENTER — the ordering render_text itself emits in.
+    let nonempty: Vec<(usize, f32)> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| !l.words.is_empty())
+        .map(|(i, l)| {
+            let (_, b, _, t) = l.line_box;
+            (i, h as f32 - (b + t) as f32 / 2.0)
+        })
+        .collect();
+    if nonempty.len() < MIN_LINES_FOR_PARAGRAPH_GAPS {
+        return out;
+    }
+
+    // Whole-page blank-row runs, scanned once — a maximal run of rows with
+    // no ink anywhere across the row's full width.
+    let is_row_blank = |y: usize| (0..w).all(|x| binary[y * w + x] == 255);
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for y in 0..h {
+        if is_row_blank(y) {
+            run_start.get_or_insert(y);
+        } else if let Some(s) = run_start.take() {
+            runs.push((s, y - s));
+        }
+    }
+    if let Some(s) = run_start {
+        runs.push((s, h - s));
+    }
+
+    // Bucket each run by the inter-line-center interval its MIDPOINT falls
+    // in, keeping the longest run per interval (a paragraph gap may span
+    // more than one raw blank-row run if leading/trailing rows are not
+    // perfectly blank).
+    let mut gap_after = vec![0usize; nonempty.len() - 1];
+    for &(start, len) in &runs {
+        let mid = start as f32 + len as f32 / 2.0;
+        for i in 0..nonempty.len() - 1 {
+            if mid >= nonempty[i].1 && mid <= nonempty[i + 1].1 {
+                gap_after[i] = gap_after[i].max(len);
+                break;
+            }
+        }
+    }
+
+    let zero_count = gap_after.iter().filter(|&&g| g == 0).count();
+    if zero_count as f32 >= MAX_ZERO_GAP_FRACTION * gap_after.len() as f32 {
+        return out;
+    }
+
+    let mut sorted = gap_after.clone();
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2].max(1);
+
+    for (k, &gap) in gap_after.iter().enumerate() {
+        if gap as f32 >= PARAGRAPH_GAP_RATIO * median as f32 {
+            let (line_idx, _) = nonempty[k + 1];
+            out[line_idx] = true;
+        }
     }
     out
 }
@@ -831,5 +987,175 @@ mod tests {
         assert!(!hocr.contains("class='ocrx_word'"));
         assert!(hocr.contains("  <div class='ocr_page' id='page_1'"));
         assert!(hocr.contains("  </div>\n </body>\n</html>\n"));
+    }
+
+    // -----------------------------------------------------------------
+    // detect_paragraph_gaps / render_text_with_gaps — consumer-side
+    // synthesis, NOT a Tesseract transcode (see the module doc). Every
+    // fixture below is a synthetic binarized page + hand-built LineWords,
+    // no model load needed.
+    // -----------------------------------------------------------------
+
+    /// A synthetic all-white `w x h` page with `n` horizontal ink bars
+    /// (`bar_h` tall) at the given raster-space TOP y-coordinates —
+    /// independent of any LineWords, mirroring the "raw pixel geometry"
+    /// this function actually scans.
+    fn page_with_bars(w: usize, h: usize, bar_tops: &[usize], bar_h: usize) -> Vec<u8> {
+        let mut page = vec![255u8; w * h];
+        for &top in bar_tops {
+            for y in top..(top + bar_h).min(h) {
+                for x in 0..w {
+                    page[y * w + x] = 0;
+                }
+            }
+        }
+        page
+    }
+
+    /// One non-empty `LineWords` whose `line_box` TOP/BOTTOM (bottom-up,
+    /// y-up page space) matches a raster bar at `[raster_top, raster_top +
+    /// bar_h)` on a page of height `h`.
+    fn line_at(h: usize, raster_top: usize, bar_h: usize) -> LineWords {
+        let top = h as i32 - raster_top as i32;
+        let bottom = h as i32 - (raster_top + bar_h) as i32;
+        LineWords {
+            words: vec![word(&[1], false, -0.1, (0, bottom, 10, top))],
+            line_box: (0, bottom, 10, top),
+            metrics: None,
+        }
+    }
+
+    #[test]
+    fn detect_paragraph_gaps_flags_a_gap_well_above_the_median() {
+        // 5 lines, ordinary leading 10px, ONE gap of 70px (7x median) —
+        // mirrors the real phototest.tif measurement (ratio 3.33) with a
+        // wider margin so the fixture is unambiguous.
+        let (w, h, bar_h) = (100usize, 300usize, 20usize);
+        let tops = [20usize, 50, 80, 150, 180]; // raster gaps: 10,10,70,10
+        let page = page_with_bars(w, h, &tops, bar_h);
+        let lines: Vec<LineWords> = tops.iter().map(|&t| line_at(h, t, bar_h)).collect();
+
+        let flags = detect_paragraph_gaps(&page, w, h, &lines);
+        assert_eq!(
+            flags,
+            vec![false, false, false, true, false],
+            "only the line after the 70px gap should be flagged"
+        );
+    }
+
+    #[test]
+    fn detect_paragraph_gaps_stays_silent_on_uniform_leading() {
+        let (w, h, bar_h) = (100usize, 300usize, 20usize);
+        let tops = [20usize, 50, 80, 110, 140]; // all raster gaps = 10px
+        let page = page_with_bars(w, h, &tops, bar_h);
+        let lines: Vec<LineWords> = tops.iter().map(|&t| line_at(h, t, bar_h)).collect();
+
+        let flags = detect_paragraph_gaps(&page, w, h, &lines);
+        assert_eq!(flags, vec![false; 5], "uniform leading must never flag");
+    }
+
+    #[test]
+    fn detect_paragraph_gaps_declines_below_the_minimum_line_count() {
+        // The REAL falsifier: with 0 or 1 non-empty lines, `gap_after` is
+        // EMPTY (`nonempty.len().saturating_sub(1)` -- zero pairs to
+        // compare), and computing a median from an empty slice
+        // (`sorted[sorted.len() / 2]`) panics. A 2-line fixture (1 gap
+        // sample) does NOT exercise this: a lone gap can never be "2x
+        // itself", so the ratio test structurally cannot fire regardless of
+        // the guard -- verified by disabling the guard and confirming a
+        // 2-line-only fixture stays green either way. The 1-line and 0-line
+        // cases below are what the guard actually protects.
+        let (w, h, bar_h) = (100usize, 300usize, 20usize);
+
+        let empty_lines: Vec<LineWords> = Vec::new();
+        assert_eq!(
+            detect_paragraph_gaps(&page_with_bars(w, h, &[], bar_h), w, h, &empty_lines),
+            Vec::<bool>::new(),
+            "zero lines must not panic"
+        );
+
+        let one_line = vec![line_at(h, 20, bar_h)];
+        assert_eq!(
+            detect_paragraph_gaps(&page_with_bars(w, h, &[20], bar_h), w, h, &one_line),
+            vec![false],
+            "one line (zero gap pairs) must not panic on an empty median"
+        );
+
+        // The originally-written 2-line case, kept as a DIFFERENT, weaker
+        // guarantee: still correctly silent, but not itself proof the
+        // MIN_LINES guard is load-bearing (see the note above).
+        let tops = [20usize, 50];
+        let page = page_with_bars(w, h, &tops, bar_h);
+        let lines: Vec<LineWords> = tops.iter().map(|&t| line_at(h, t, bar_h)).collect();
+        assert_eq!(detect_paragraph_gaps(&page, w, h, &lines), vec![false; 2]);
+    }
+
+    #[test]
+    fn detect_paragraph_gaps_declines_on_a_degenerate_mostly_zero_population() {
+        // Reproduces the measured skew_p050.pgm false positive: an
+        // un-deskewed rotated page collapses MOST inter-line gaps to
+        // exactly zero (tilted ink smears across raster rows), and a lone
+        // small non-zero value would otherwise clear a naive ratio test.
+        // Real measurement: gap_after = [0, 0, 1, 1, 3, 0] -- 3 of 6 (50%)
+        // exactly zero.
+        let (w, h, bar_h) = (100usize, 400usize, 30usize);
+        // Bars overlap/touch except for tiny 1-3px gaps at a few positions.
+        let tops = [20usize, 50, 80, 111, 142, 175, 205];
+        let page = page_with_bars(w, h, &tops, bar_h);
+        let lines: Vec<LineWords> = tops.iter().map(|&t| line_at(h, t, bar_h)).collect();
+
+        // Anti-vacuity: confirm the fixture really is degenerate before
+        // trusting the "declines" assertion below -- otherwise a fixture
+        // that never reaches the guard at all would pass vacuously.
+        let raw_gaps: Vec<i32> = tops
+            .windows(2)
+            .map(|p| (p[1] - p[0]) as i32 - bar_h as i32)
+            .collect();
+        let zero_gaps = raw_gaps.iter().filter(|&&g| g <= 0).count();
+        assert!(
+            zero_gaps * 2 >= raw_gaps.len(),
+            "fixture must reproduce the >=50% zero-gap regime: {raw_gaps:?}"
+        );
+
+        let flags = detect_paragraph_gaps(&page, w, h, &lines);
+        assert_eq!(
+            flags,
+            vec![false; tops.len()],
+            "a degenerate mostly-zero-gap population must decline entirely, \
+             even though one gap is numerically 3x another"
+        );
+    }
+
+    #[test]
+    fn render_text_with_gaps_inserts_exactly_one_blank_line_where_flagged() {
+        let cs = test_charset();
+        let l1 = LineWords {
+            words: vec![word(&[1], false, -0.1, (0, 0, 10, 10))],
+            line_box: (0, 0, 10, 10),
+            metrics: None,
+        };
+        let l2 = LineWords {
+            words: vec![word(&[2], false, -0.1, (0, 0, 10, 10))],
+            line_box: (0, 0, 10, 10),
+            metrics: None,
+        };
+        let lines = [l1, l2];
+
+        let plain = render_text(&lines, &cs);
+        assert_eq!(plain, "a\nb\n", "render_text itself must be unaffected");
+
+        let with_gap = render_text_with_gaps(&lines, &cs, &[false, true]);
+        assert_eq!(
+            with_gap, "a\n\nb\n",
+            "flagged second line gets a blank line before it"
+        );
+
+        // The first line is NEVER preceded by a blank line, even if flagged
+        // -- there is no prior paragraph to separate from.
+        let first_flagged = render_text_with_gaps(&lines, &cs, &[true, false]);
+        assert_eq!(
+            first_flagged, "a\nb\n",
+            "a flag on the first emitted line is a no-op"
+        );
     }
 }
