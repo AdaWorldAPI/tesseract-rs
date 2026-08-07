@@ -383,3 +383,76 @@ fn the_wired_path_does_not_read_a_merged_band_across_its_gutters() {
             .collect::<Vec<_>>()
     );
 }
+
+// ---------------------------------------------------------------------------
+// KNOWN DEFECT, pinned two-sided (found via tesseract-ocr/test phototest.tif).
+//
+// `gap_min = ceil(min_gap_frac * extent)` is PAGE-RELATIVE, so on a SMALL page
+// it falls below ordinary word spacing and `xy_cut` cuts at every word — the
+// exact mirror of the wide-multi-column bug the gutter fallback fixes, where
+// the same threshold was too STRICT. Measured on upstream's own canonical
+// `phototest.tif` (640x480, 12 pt text, 2 paragraphs, 8 lines):
+// **19 blocks, most of them single words.**
+//
+// The recognized TEXT is saved only by `recognize_page_blocks_words`'
+// no-content-loss fallback (the whole-page reading wins on word count), so
+// this is invisible in the goldens — but `recognize_document`'s REGIONS are
+// word fragments, and any consumer reading `doc.v1`'s region structure on a
+// small page gets nonsense.
+//
+// Not fixed here: the principled correction is the same shape as the gutter
+// fallback — judge a valley against its NEIGHBOURS, not the page — and that
+// is a change to `xy_cut`'s cut decision with golden implications. Pinned so
+// a fix FAILS this test and forces a deliberate re-pin.
+// ---------------------------------------------------------------------------
+
+/// A small page with ordinary word spacing — the regime where the
+/// page-relative threshold under-shoots. 640 px wide => `gap_min` = 10, and
+/// the word gaps are 10 px, so every one of them is a cut candidate; the
+/// words are 40 px wide, comfortably over `min_region_px` (24), so the
+/// confirm filter passes them too.
+fn small_page_ordinary_word_spacing() -> (Vec<u8>, usize, usize) {
+    let (w, h) = (640usize, 200usize);
+    let mut page = vec![255u8; w * h];
+    // 4 lines x 6 words; word = 4 marks at 8 px advance (ink 31), word gap 10.
+    for row in 0..4 {
+        let y = 40 + row * 34;
+        for word in 0..6 {
+            let wx = 40 + word * 41;
+            for i in 0..4 {
+                mark(&mut page, w, wx + i * 8, y, 7, 22);
+            }
+        }
+    }
+    (page, w, h)
+}
+
+#[test]
+fn small_page_word_spacing_is_cut_as_if_it_were_column_gutters() {
+    let (page, w, h) = small_page_ordinary_word_spacing();
+    let params = tesseract_ocr::xy_cut::XyCutParams::default();
+    let blocks = tesseract_ocr::xy_cut::xy_cut(&page, w, h, &params);
+
+    // Anti-vacuity: the fixture must genuinely be the small-page regime —
+    // gap_min at or below the drawn word gap, or it measures nothing.
+    let gap_min = (0.015_f32 * w as f32).ceil() as usize;
+    assert!(
+        gap_min <= 10,
+        "fixture must sit in the regime where gap_min ({gap_min}) <= the 10 px \
+         word gap, or the over-split cannot happen"
+    );
+
+    // THE DEFECT, pinned by its SIGNATURE rather than a count: a 4-line page
+    // with no columns should yield ONE full-width block. Measured, it yields
+    // 6 — one per word position, each spanning all four lines, exactly as if
+    // the word gaps were column gutters. So no block is page-wide.
+    let widest = blocks.iter().map(|b| b.right - b.left).max().unwrap_or(0);
+    assert!(
+        widest < w / 2,
+        "PINNED DEFECT: ordinary word spacing is cut as column gutters, so no \
+         block should span the page — got {} blocks, widest {widest} px of \
+         {w}. If a block is now page-wide the defect is FIXED and this pin \
+         must be re-measured, not deleted",
+        blocks.len()
+    );
+}
