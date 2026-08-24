@@ -59,6 +59,15 @@ WORKDIR /src/tesseract-rs
 # path deps) even when building a single `-p` package, so `tesseract-ocr-python`
 # — which path-deps `tesseract-ogar` → OGAR — must be trimmed too, or the build
 # fails looking for the uncloned `/src/OGAR` sibling.
+#
+# `tesseract-paperless` / `tesseract-paperless-web` are the SAME trap in a new
+# pair: `tesseract-paperless`'s DEFAULT deps (unconditional, not behind its
+# `ocr`/`token` features) include `ogar-doc-ir` + `ogar-from-docv1`, both path
+# deps into OGAR — so the moment these two crates joined the workspace,
+# resolving `-p tesseract-ocr-web` started failing the identical way, looking
+# for `/src/OGAR/crates/ogar-doc-ir/Cargo.toml`. This web image stays
+# deliberately OGAR-free (see the crate doc above), so they get trimmed too.
+#
 # Line-delete, not a `, "X"` substring substitution: the root Cargo.toml's
 # members list is ONE ENTRY PER LINE with a TRAILING comma
 # (`"crates/tesseract-ogar",`), so a leading `, "X"` pattern (written when
@@ -68,9 +77,12 @@ WORKDIR /src/tesseract-rs
 # line (codex P1 on PR #88) but this file was never updated to match. The
 # guard makes a silent no-op (e.g. a further reformat) a hard build failure
 # instead of a confusing later "failed to load OGAR/Cargo.toml".
-RUN sed -i '/"crates\/tesseract-ogar"/d; /"crates\/tesseract-ocr-python"/d' Cargo.toml; \
-    if grep -q '"crates/tesseract-ogar"' Cargo.toml || grep -q '"crates/tesseract-ocr-python"' Cargo.toml; then \
-      echo "FATAL: failed to trim tesseract-ogar/tesseract-ocr-python from workspace members (Cargo.toml reformatted?)" >&2; \
+RUN sed -i '/"crates\/tesseract-ogar"/d; /"crates\/tesseract-ocr-python"/d; /"crates\/tesseract-paperless"/d; /"crates\/tesseract-paperless-web"/d' Cargo.toml; \
+    if grep -q '"crates/tesseract-ogar"' Cargo.toml \
+       || grep -q '"crates/tesseract-ocr-python"' Cargo.toml \
+       || grep -q '"crates/tesseract-paperless"' Cargo.toml \
+       || grep -q '"crates/tesseract-paperless-web"' Cargo.toml; then \
+      echo "FATAL: failed to trim tesseract-ogar/tesseract-ocr-python/tesseract-paperless/tesseract-paperless-web from workspace members (Cargo.toml reformatted?)" >&2; \
       exit 1; \
     fi
 

@@ -82,6 +82,32 @@ a sharp, repo-specific edge:
 - **Never Haiku** for any subagent here — the quality floor is Sonnet regardless
   of how mechanical the task looks.
 
+> **⊘ AMENDED 2026-08-24 (operator ruling) — a churn tier now exists.**
+> Operator, verbatim: *"sonnet for grind and haiku for churn opus for filigrane
+> planning."* The three tiers, and the contract that keeps the new one narrow:
+>
+> - **Opus — filigree planning.** Authoring a wave's verbatim worker spec,
+>   sequencing, reading a review finding for whether it is actually right,
+>   judging whether a measurement means what it appears to mean, adjudicating
+>   a disable run. Plus all code review (multi-file judgment) and all central
+>   gating, as the orchestrator bullet above already says.
+> - **Sonnet — grind.** The "bounded transcription against a written spec"
+>   bullet above, unchanged. One source in, one shape out.
+> - **Haiku — churn, CONTRACT-GATED.** Mechanical execution of a PRE-WRITTEN
+>   card only: run this `-p`-scoped command with explicit START/STOP and a
+>   retry table, report the tail; re-run a disable arm the orchestrator
+>   already specified; collect probe output into its own tag-file. It never
+>   authors, never decides, never edits any file but that tag-file, and never
+>   chooses what to run. Anything requiring a judgment about output QUALITY
+>   escalates to Sonnet or above. This mirrors lance-graph's own
+>   guarded-executor carve-out rather than opening a general Haiku tier.
+>
+> The `Never Haiku` line above is superseded ONLY for that contract-gated
+> churn role; it still holds for synthesis, drafting, review, and any file
+> edit. Annotated rather than rewritten, per this file's own append-only
+> convention. First plan to declare the three tiers up front:
+> `.claude/plans/paperless-archive-integration-v1.md`.
+
 **Declare the allocation up front, in the plan, not implicitly at each spawn.**
 Consistency is not the same as policy: a session can spawn every agent at the
 right tier and still leave no rule behind, so the next session re-derives it.
