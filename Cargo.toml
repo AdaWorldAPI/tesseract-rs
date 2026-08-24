@@ -9,5 +9,20 @@
 # (source: AdaWorldAPI/Tesseract) before it lands. The transcoded primitives
 # ride the OGAR Core (`lance-graph-contract`) per the Core-First doctrine.
 [workspace]
-members = ["crates/tesseract-core", "crates/tesseract-ocr", "crates/tesseract-recognizer", "crates/tesseract-ocr-pdf", "crates/tesseract-ogar", "crates/tesseract-ocr-web", "crates/tesseract-ocr-python"]
+members = [
+    "crates/tesseract-core",
+    "crates/tesseract-ocr",
+    "crates/tesseract-recognizer",
+    "crates/tesseract-ocr-pdf",
+    "crates/tesseract-ogar",
+    "crates/tesseract-ocr-web",
+    "crates/tesseract-ocr-python",
+    # Document intake: the S-2 dedup gate, the doc.v1 -> DocIr seam, and an
+    # optional lexical token receipt. A CONSUMER of recognition, like
+    # -web / -pdf / -python; it adds no dependency to any recognition crate.
+    # Its heavy halves are behind off-by-default features (`ocr`, `token`) —
+    # a member so CI compiles it, gated so the default build stays lean. See
+    # the crate's own Cargo.toml for why that pairing is deliberate.
+    "crates/tesseract-paperless",
+]
 resolver = "2"

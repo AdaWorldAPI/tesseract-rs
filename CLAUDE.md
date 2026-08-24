@@ -3627,3 +3627,113 @@ dense or genuinely sparse but non-pathological page), which needs its own
 measurement pass against the full golden suite before landing, matching the
 standing rule that a heuristic gate needs evidence at the point it is turned
 on, not just at the point it is written.
+
+## ★ `tesseract-paperless` — document intake lands here, feature-gated (2026-08-24)
+
+Operator directive: *"can you add a paperless crate in Tesseract-rs instead and
+make it feature gated."* The work had been built in `AdaWorldAPI/paperless-rs`,
+whose push is denied at the GitHub-App level (403 through the session proxy AND
+proxy-bypassed; the in-environment `GH_TOKEN` is a 14-character placeholder, so
+the usual "a 403 here is the proxy" escape does not apply). It therefore had no
+durable home. **`crates/tesseract-paperless` is now the ONE source of truth**;
+the paperless-rs branch is a dead copy, archived as a patch under lance-graph
+`.claude/harvest/paperless-token-plateau/`. Do not sync the two — there is
+nothing to sync back to.
+
+### Why this does not breach the operator-set boundary
+
+This file already carries: *"tesseract-rs = faithful recognition → rich doc.v1
+… Store / graph / KV / PDF-from-data are NOT tesseract-rs concerns."* That rule
+stands, and three things keep the new crate on the right side of it:
+
+1. **It is a CONSUMER**, and this workspace already hosts consumers —
+   `tesseract-ocr-web`, `-pdf`, `-python`, `-ogar` are all downstream of
+   recognition rather than part of it.
+2. **No existing crate gains a dependency.** `tesseract-core`, `-recognizer`
+   and `-ocr` keep their exact dep sets. Recognition stays storage-less, which
+   is what the boundary actually protects.
+3. **There is no store.** `DedupIndex` is a trait and nothing here implements
+   it — the crate ships the GATE (a hash, a lookup contract, an ordering rule),
+   never the KV. That is the same line `OGAR-DOC-W4-BUILD-SPEC` draws: *"No
+   storage backend chosen (KV blob is the consumer's)."*
+
+### The three tiers, and why it is a MEMBER rather than excluded
+
+| tier | pulls | what it is |
+|---|---|---|
+| `default` | `sha2`, `lance-graph-contract`, `ogar-doc-ir`, `ogar-from-docv1` | the S-2 dedup gate + `doc.v1` → `DocIr` |
+| `ocr` | + `tesseract-ogar` | run the recognizer in-process |
+| `token` | + `tantivy`, `deepnsm-v2` | the lexical seam: one BPE tokenization per span, borrowed by several consumers |
+
+**Excluding it from the workspace would have been the wrong kind of gating.**
+An excluded crate is never compiled by CI, and an uncompiled crate rots
+invisibly — which this session watched happen for real to `spider_doc_ir`
+(a floating branch dep, no CI building the pair, broken for weeks by a field
+its own dependency added). A member with optional deps gets the opposite: the
+default build stays lean AND every tier has a CI line. All six lines are wired
+(`build`/`test`/`clippy` default, `clippy` ocr, `test`/`clippy` token) plus the
+probe itself, because the probe carries the evidence for every `token` claim.
+
+Note `token` turns on `lance-graph-contract/guid-v3-tail` transitively
+(deepnsm-v2 requires it, and requires it correctly — without it `mint_for`
+silently falls back to the V1 tail). Additive and correct, but it IS a
+graph-wide feature unification, so the manifest names it rather than leaving it
+to be discovered.
+
+### The DOM leg was replaced by something better, not dropped
+
+The paperless-rs version called `spider_doc_ir::harvest` directly, which both
+bound intake to one crawler and inherited its build — and that build is broken
+(`E0063: missing field 'confidence'`, a field `ogar-doc-ir` added after
+spider's only commit). The replacement is `ingest_doc_ir(bytes, index, build)`:
+the caller brings its own producer as a **closure**, so any producer that can
+build a `DocIr` is admitted and this crate depends on none of them. That is
+what a source-agnostic IR is FOR, and hard-coding one crawler had quietly spent
+the property.
+
+The closure — rather than an already-built `DocIr` — is what keeps S-2 true for
+a producer this crate has never heard of: on a duplicate it is **never called**.
+`a_duplicate_never_reaches_a_third_party_producer` proves it by passing a
+closure that PANICS, with the paired half proving the same closure DOES run on
+novel bytes (otherwise the first assertion would hold for a producer that is
+never called at all, which proves nothing about ordering).
+
+**One assertion was promoted to a runtime guard.** The old code merely *tested*
+that `spider_doc_ir`'s hash matched the gate's. `ingest_doc_ir` now REFUSES a
+mismatch (`IntakeError::IdentityMismatch`), because a producer that keys its IR
+by a normalised or re-encoded form of its input would otherwise leave the gate
+and the subtree silently addressing two different documents. Its falsifier uses
+exactly that realistic shape — a producer that hashes the trimmed input — and
+the paired half proves the guard is discriminating rather than always-on.
+
+### Evidence reproduced in the new home, not assumed
+
+The move is faithful, checked rather than trusted: `probe_token_seam` reports
+**ALL 41 GATES GREEN** with numbers identical to the paperless-rs run (Alice:
+75 513 B / 300 spans / 36 994 tokens / 245 uniq / 55 400 B resident), and both
+measurement probes reproduce (u8-vs-u16 rail: `alice-full` 1.95× cap-bound vs
+6.13× corpus-bound; WordId round-trips only 67.7 % of source bytes while
+TokenId is byte-exact). 13 lib tests, three tiers clippy-clean at
+`-D warnings`, fmt clean.
+
+Two things the move genuinely fixed rather than carried over: the whole
+`[patch]` section is **gone** (siblings are path deps here, which is this
+repo's convention, so the escaping-relative-path trap does not exist), and with
+it the branch-vs-rev unification problem — cargo does not unify a `branch` and
+a `rev` source even at the identical commit, and two SourceIds for
+`ogar-doc-ir` meant two incompatible `DocIr` types.
+
+### Disable table (both verified red-then-green)
+
+| assertion | disable | observed |
+|---|---|---|
+| a producer keyed by other bytes is refused | delete the `content_sha256 != hash` check | `a_producer_keyed_by_other_bytes_is_refused` FAILED |
+| a duplicate never reaches a third-party producer | move `build(source_bytes)` ahead of the short-circuit | `a_duplicate_never_reaches_a_third_party_producer` FAILED (the closure's own panic) |
+
+12 of 13 passed under each disable, so each one is pinned by exactly the test
+that names it rather than by collateral damage.
+
+**Still open, unchanged by the move:** the resident lane is a probe-local
+`Vec<[u8;12]>`, not a lawful `SoaEnvelope` lane; the 8-bit vocabulary is
+CAP-bound at 255/255 on 75 KB of English; there is no callable PoS surface; and
+the probe still builds its `DocIr` from text rather than from a real retina.
