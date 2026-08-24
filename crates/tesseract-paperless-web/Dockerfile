@@ -35,6 +35,13 @@
 # LANCE_GRAPH_REF / NDARRAY_REF / OGAR_REF for a reproducible build (default =
 # each repo's default branch = CI).
 #
+# NOT a fourth sibling: `tesseract-paperless`'s `search`/`token` features pull
+# `tantivy` via a pinned `git` dependency (not the sibling `path` form above),
+# specifically so this Dockerfile needs no clone-and-trim step for it — see
+# that Cargo.toml entry's own comment. Nothing else in this workspace
+# path-deps tantivy, so it has none of the "tesseract-ogar itself needs the
+# real directory present" ripple the three siblings above have.
+#
 # ── The protoc wrinkle (new versus the other two Dockerfiles) ───────────────
 # `lance-encoding` (a `lancedb`/`lance` transitive dep, pulled in by the
 # `store` feature) has a build script that compiles `.proto` files. Debian's
@@ -91,7 +98,13 @@ WORKDIR /src/tesseract-rs
 # even when building a single `-p` package, so a stale trim would fail loudly
 # rather than silently — the guard below makes that a hard build failure
 # instead of a confusing later "failed to load pyo3" error.
-RUN sed -i 's#, "crates/tesseract-ocr-python"##' Cargo.toml; \
+# Line-delete, not a `, "X"` substring substitution: the members list is
+# ONE ENTRY PER LINE with a TRAILING comma (`"crates/tesseract-ocr-python",`),
+# so a leading `, "X"` pattern (borrowed from tesseract-ocr-web's/
+# tesseract-ogar's Dockerfiles, written when this list was single-line) never
+# matches here and the guard below fired FATAL on every build (codex P1 on
+# PR #88) — caught before merge, not in a Railway deploy log.
+RUN sed -i '/"crates\/tesseract-ocr-python"/d' Cargo.toml; \
     if grep -q '"crates/tesseract-ocr-python"' Cargo.toml; then \
       echo "FATAL: failed to trim tesseract-ocr-python from workspace members (Cargo.toml reformatted?)" >&2; \
       exit 1; \

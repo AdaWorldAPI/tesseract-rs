@@ -451,16 +451,27 @@ async fn document_detail(
 }
 
 async fn document_delete(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
-    if let Err(e) = state.store.delete(&hash).await {
-        eprintln!("delete {hash} from archive failed: {e}");
-    }
-    // Same off-runtime dispatch as every other search-index write.
-    let st = state.clone();
-    let hash_for_index = hash.clone();
-    match tokio::task::spawn_blocking(move || st.search.delete_document(&hash_for_index)).await {
-        Ok(Err(e)) => eprintln!("delete {hash} from search index failed: {e}"),
-        Err(e) => eprintln!("delete {hash} from search index task failed: {e}"),
-        Ok(Ok(())) => {}
+    // The search-index delete only runs when the archive delete actually
+    // succeeded. Doing both unconditionally (codex P1 on PR #88) meant a
+    // transient LanceDB failure left the document ARCHIVED but UNSEARCHABLE
+    // -- worse than doing nothing, and silently so, since the redirect below
+    // looks identical to a real success either way. Gating on success keeps
+    // a failed delete's outcome identical to the pre-delete state (both
+    // stores untouched) rather than a half-deleted one.
+    match state.store.delete(&hash).await {
+        Ok(()) => {
+            // Same off-runtime dispatch as every other search-index write.
+            let st = state.clone();
+            let hash_for_index = hash.clone();
+            match tokio::task::spawn_blocking(move || st.search.delete_document(&hash_for_index))
+                .await
+            {
+                Ok(Err(e)) => eprintln!("delete {hash} from search index failed: {e}"),
+                Err(e) => eprintln!("delete {hash} from search index task failed: {e}"),
+                Ok(Ok(())) => {}
+            }
+        }
+        Err(e) => eprintln!("delete {hash} from archive failed: {e} (search index left untouched)"),
     }
     Redirect::to("/documents").into_response()
 }

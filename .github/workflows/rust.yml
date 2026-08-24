@@ -37,14 +37,11 @@ jobs:
       with:
         repository: AdaWorldAPI/OGAR
         path: OGAR
-    # Only `tesseract-paperless --features token` needs this one; the default
-    # build of every other crate never touches it. Checked out unconditionally
-    # because a conditional checkout is one more thing that can silently stop
-    # happening.
-    - uses: actions/checkout@v4
-      with:
-        repository: AdaWorldAPI/tantivy
-        path: tantivy
+    # NOTE: no sibling checkout for tantivy here. `tesseract-paperless`'s
+    # tantivy dependency is a pinned `git` dep (not the sibling `path` form
+    # lance-graph/ndarray/OGAR use), specifically so it needs no checkout
+    # step and no Dockerfile clone-and-trim stanza — see that Cargo.toml
+    # entry's own comment for why this one dependency is the exception.
     # `lance-encoding` (pulled in by `tesseract-paperless --features store`
     # and by `tesseract-paperless-web`) compiles .proto files at build time.
     # `protobuf-compiler` alone ships `protoc` but not the well-known

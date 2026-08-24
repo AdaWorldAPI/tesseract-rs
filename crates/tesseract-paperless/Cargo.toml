@@ -89,16 +89,24 @@ ogar-from-docv1 = { path = "../../../OGAR/crates/ogar-from-docv1" }
 # call `LstmRecognizer` / `structured` / the renderers directly).
 tesseract-ogar = { path = "../tesseract-ogar", optional = true }
 
-# --- feature `token` -------------------------------------------------------
-# The lexical index. Fork-only policy; default features OFF because the seam
-# indexes in RAM, so mmap/lz4/stemmer are dead weight — and
-# `columnar-zstd-compression` would drag `zstd-sys`, a C build, into a tree
-# whose entire proposition is that it contains no C.
-# `mmap`+`stopwords`+`stemmer`+`lz4-compression` are pure Rust (needed by
-# the `search` feature's persistent on-disk index below); the fork's ONLY
-# C dependency, `columnar-zstd-compression` (zstd-sys), is deliberately
-# excluded, same discipline `default-features = false` already stated.
-tantivy = { path = "../../../tantivy", optional = true, default-features = false, features = ["mmap", "stopwords", "stemmer", "lz4-compression"] }
+# --- feature `token` / `search` ---------------------------------------------
+# The lexical index. Fork-only policy (P0); GIT, not the sibling `path` form
+# every other cross-repo dep in this crate uses — deliberately, and unlike
+# lance-graph/ndarray/OGAR. Nothing else in this workspace path-deps tantivy
+# (no in-repo crate like tesseract-ogar needs it transitively), so this is an
+# ISOLATED dependency with none of the "tesseract-ogar itself needs the real
+# sibling directory present" ripple those three have — a `[patch]`-free git
+# pin is the clean fix here, not a Dockerfile sibling-clone step (codex P1 on
+# PR #88: a fourth clone-and-trim stanza for one crate's one optional feature
+# is exactly the trap `paperless-rs`'s own Cargo.toml already solved this
+# same way — same rev pinned here, proven working there first).
+#
+# `mmap`+`stopwords`+`stemmer`+`lz4-compression` are pure Rust (needed by the
+# `search` feature's persistent on-disk index); the fork's ONLY C dependency,
+# `columnar-zstd-compression` (zstd-sys), is deliberately excluded — `token`'s
+# RAM-only resident-lane seam doesn't need any of these four either, but
+# there is only one `tantivy` entry per manifest, so both features share it.
+tantivy = { git = "https://github.com/AdaWorldAPI/tantivy", rev = "5fc9fccb613c9838cf7fde77f73dc4afa3216375", optional = true, default-features = false, features = ["mmap", "stopwords", "stemmer", "lz4-compression"] }
 
 # The semantic consumer. It is a dependency of the PROBES and not of `src/`,
 # and that asymmetry is the measured finding rather than an oversight:
