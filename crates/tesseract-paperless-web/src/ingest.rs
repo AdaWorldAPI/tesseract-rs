@@ -19,6 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ogar_doc_ir::DocIr;
 use serde_json::Value;
+use tesseract_ogar::reasoning::SentenceBelief;
+use tesseract_ogar::sentences::assemble_sentences;
 use tesseract_ogar::{BinarizeMode, OcrExecError, OcrRequest, OcrResponse};
 use tesseract_paperless::kv::{mint_document_root, preflight, MatchedOn, Verdict};
 use tesseract_paperless::search::SearchError;
@@ -43,6 +45,16 @@ pub enum IngestOutcome {
         mean_confidence: u32,
         /// Whether the recognizer itself was not confident.
         low_confidence: bool,
+        /// How many SPO triples the reasoning layer extracted across every
+        /// sentence on the page. `0` either because extraction never ran
+        /// (`spo_extraction_ran == false`, no deepnsm vocabulary loaded) or
+        /// because it ran and genuinely found nothing — `spo_extraction_ran`
+        /// is what tells the two apart.
+        triple_count: usize,
+        /// Whether the reasoning layer ran at all — a loaded `AppState`
+        /// reasoner, independent of whether any triples were actually
+        /// found (see `triple_count`).
+        spo_extraction_ran: bool,
     },
     /// Bytes already held — recognition was skipped entirely. The OCR pass
     /// this branch never runs is exactly the spend S-2 exists to save.
@@ -146,10 +158,10 @@ pub async fn ingest(
         .await
         .map_err(|_| IngestError::Task("server is shutting down".to_string()))?;
     let st = state.clone();
-    let doc_json = tokio::task::spawn_blocking(move || {
+    let (doc_json, spo_json, triple_count) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let (grey, w, h) = decode_grey(&bytes).map_err(IngestError::Decode)?;
-        match st.executor.execute(OcrRequest::RecognizeDocument {
+        let doc_json = match st.executor.execute(OcrRequest::RecognizeDocument {
             grey: &grey,
             width: w,
             height: h,
@@ -157,10 +169,46 @@ pub async fn ingest(
             harvest_profile: None,
             binarize: BinarizeMode::default(),
         }) {
-            Ok(OcrResponse::DocumentOut { doc_json, .. }) => Ok(doc_json),
+            Ok(OcrResponse::DocumentOut { doc_json, .. }) => doc_json,
             Ok(_) => unreachable!("RecognizeDocument always returns DocumentOut"),
-            Err(e) => Err(IngestError::Recognize(e)),
-        }
+            Err(e) => return Err(IngestError::Recognize(e)),
+        };
+
+        // Reasoning layer — sentence assembly + deepnsm SPO/`NarsTruth`
+        // extraction, run over the SAME already-decoded `grey` buffer as a
+        // second recognition pass (`RecognizePageWords`, the typed
+        // `LineWords` surface `reasoning.rs`/`sentences.rs` need — distinct
+        // from `RecognizeDocument`'s serialized `doc.v1` string above).
+        // Mirrors `tesseract-ogar/examples/ocr_demo.rs`'s own step 6.
+        // `None` reasoner (no deepnsm vocabulary loaded) means this whole
+        // block is skipped, not a failed ingest.
+        let (spo_json, triple_count) = match &st.reasoner {
+            Some(reasoner) => {
+                let words = match st.executor.execute(OcrRequest::RecognizePageWords {
+                    grey: &grey,
+                    width: w,
+                    height: h,
+                    with_dict: true,
+                }) {
+                    Ok(OcrResponse::LineWordsOut(lines)) => lines,
+                    Ok(_) => unreachable!("RecognizePageWords always returns LineWordsOut"),
+                    Err(e) => return Err(IngestError::Recognize(e)),
+                };
+                let page = tesseract_ogar::DocPage::from_line_words(
+                    &words,
+                    st.executor.charset(),
+                    w as u32,
+                    h as u32,
+                );
+                let sentences = assemble_sentences(&page);
+                let beliefs = reasoner.analyze(sentences);
+                let triple_count = beliefs.iter().map(|b| b.triples.len()).sum();
+                (Some(spo_beliefs_to_json(&beliefs)), triple_count)
+            }
+            None => (None, 0),
+        };
+
+        Ok((doc_json, spo_json, triple_count))
     })
     .await
     .map_err(|e| IngestError::Task(e.to_string()))??;
@@ -169,6 +217,7 @@ pub async fn ingest(
     let ir: DocIr = ogar_from_docv1::from_doc_v1(&doc_json, *hash.as_bytes(), mime)
         .map_err(IngestError::Convert)?;
     let page_count = ir.pages.len();
+    let spo_extraction_ran = state.reasoner.is_some();
 
     let ingested_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -184,6 +233,7 @@ pub async fn ingest(
             low_confidence,
             &ir,
             ingested_at_unix_ms,
+            spo_json.as_deref(),
         )
         .await
         .map_err(IngestError::Store)?;
@@ -210,7 +260,54 @@ pub async fn ingest(
         page_count,
         mean_confidence,
         low_confidence,
+        triple_count,
+        spo_extraction_ran,
     })
+}
+
+/// Serialize the reasoning layer's per-sentence output to the JSON shape
+/// stored in [`tesseract_paperless::store::DocumentRow::spo_json`]: an array
+/// of `{text, coverage, truth: {frequency, confidence}, triples: [{subject,
+/// predicate, object}]}` objects, one per assembled sentence (including
+/// sentences with zero triples — a low/zero-coverage sentence is still
+/// reported, matching `SentenceReasoner::analyze`'s own
+/// never-drop-a-sentence guarantee). Neither `SentenceBelief` nor its
+/// fields derive `serde::Serialize` (they live in `tesseract-ogar`, which
+/// has no reason to carry a serde dependency for this crate's own storage
+/// shape), so this hand-builds the `Value` rather than adding derives
+/// upstream.
+fn spo_beliefs_to_json(beliefs: &[SentenceBelief]) -> String {
+    let sentences: Vec<Value> = beliefs
+        .iter()
+        .map(|b| {
+            let triples: Vec<Value> = b
+                .triples
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "subject": t.subject,
+                        "predicate": t.predicate,
+                        "object": t.object,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "text": b.sentence.text,
+                "coverage": b.coverage,
+                "truth": {
+                    "frequency": b.truth.frequency,
+                    "confidence": b.truth.confidence,
+                },
+                "triples": triples,
+            })
+        })
+        .collect();
+    // `Vec<Value>` -> JSON text never fails (every value here is already a
+    // valid `Value`, no NaN/Infinity floats can appear from this module's
+    // own `sentence_nars_truth` clamp), so a malformed-serialization branch
+    // would be dead code -- collapse it to the empty array rather than
+    // carry an unreachable `Result`.
+    serde_json::to_string(&sentences).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Pull `pages[0].quality.{mean_conf,low_confidence}` out of the RAW
@@ -273,5 +370,95 @@ mod tests {
     fn quality_defaults_on_malformed_json() {
         assert_eq!(quality_from_doc_json("not json"), (0, false));
         assert_eq!(quality_from_doc_json("{}"), (0, false));
+    }
+
+    use tesseract_ogar::reasoning::{NarsTruth, ResolvedTriple};
+    use tesseract_ogar::sentences::AssembledSentence;
+
+    fn sample_belief(text: &str, triples: Vec<ResolvedTriple>) -> SentenceBelief {
+        SentenceBelief {
+            sentence: AssembledSentence {
+                text: text.to_string(),
+                bbox: (0, 0, 100, 10),
+                line_indices: vec![0],
+                mean_conf: 91.5,
+            },
+            triples,
+            coverage: 0.8,
+            truth: NarsTruth::new(0.9, 0.75),
+        }
+    }
+
+    /// The round-trippable shape a consumer of `spo_json` needs: sentence
+    /// text, coverage, the truth pair, and every triple field — verified by
+    /// parsing the output back rather than substring-matching the string
+    /// (a substring check could pass on a shape a real JSON consumer can't
+    /// actually read).
+    #[test]
+    fn spo_beliefs_to_json_round_trips_a_real_triple() {
+        let belief = sample_belief(
+            "The dog sees the cat.",
+            vec![ResolvedTriple {
+                subject: "dog".to_string(),
+                predicate: "see".to_string(),
+                object: Some("cat".to_string()),
+            }],
+        );
+        let json = spo_beliefs_to_json(std::slice::from_ref(&belief));
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed.as_array().expect("array").len(), 1);
+        let s0 = &parsed[0];
+        assert_eq!(s0["text"], "The dog sees the cat.");
+        assert!((s0["coverage"].as_f64().expect("coverage") - 0.8).abs() < 1e-6);
+        assert!((s0["truth"]["frequency"].as_f64().expect("frequency") - 0.9).abs() < 1e-6);
+        assert!((s0["truth"]["confidence"].as_f64().expect("confidence") - 0.75).abs() < 1e-6);
+        let triples = s0["triples"].as_array().expect("triples array");
+        assert_eq!(triples.len(), 1);
+        assert_eq!(triples[0]["subject"], "dog");
+        assert_eq!(triples[0]["predicate"], "see");
+        assert_eq!(triples[0]["object"], "cat");
+    }
+
+    /// An intransitive triple's `object: None` must survive as JSON `null`,
+    /// not be silently dropped or coerced to an empty string — the
+    /// distinction a reader needs to tell "no object" from "empty object".
+    #[test]
+    fn spo_beliefs_to_json_preserves_a_null_object() {
+        let belief = sample_belief(
+            "The dog barks.",
+            vec![ResolvedTriple {
+                subject: "dog".to_string(),
+                predicate: "bark".to_string(),
+                object: None,
+            }],
+        );
+        let json = spo_beliefs_to_json(std::slice::from_ref(&belief));
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert!(parsed[0]["triples"][0]["object"].is_null());
+    }
+
+    /// A sentence with zero triples (the reasoning layer's own
+    /// never-drop-a-sentence guarantee) must still appear in the array —
+    /// an implementation that filtered empty-triple sentences out would
+    /// silently lose the sentence's own text/coverage/truth from the
+    /// stored record.
+    #[test]
+    fn spo_beliefs_to_json_never_drops_a_zero_triple_sentence() {
+        let belief = sample_belief("Zxqvblorptfizz wobbledoop.", Vec::new());
+        let json = spo_beliefs_to_json(std::slice::from_ref(&belief));
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed.as_array().expect("array").len(), 1);
+        assert!(parsed[0]["triples"]
+            .as_array()
+            .expect("triples array")
+            .is_empty());
+    }
+
+    /// An empty belief slice (extraction ran but produced no sentences —
+    /// distinct from `spo_extraction_ran == false`) must serialize to the
+    /// empty JSON array, never an error string or a malformed value.
+    #[test]
+    fn spo_beliefs_to_json_of_no_beliefs_is_an_empty_array() {
+        assert_eq!(spo_beliefs_to_json(&[]), "[]");
     }
 }

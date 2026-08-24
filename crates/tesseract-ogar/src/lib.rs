@@ -50,7 +50,7 @@ use tesseract_core::dawg::DawgError;
 use tesseract_core::DictLite;
 use tesseract_ocr::{
     conn_comp_bb, detect_page_furniture, generate_halftone_mask, german_invoice_fields,
-    harden_numeric_tokens, harvest_fields, xy_cut, DocPage, Document, HarvestedField, LineWords,
+    harden_numeric_tokens, harvest_fields, xy_cut, Document, HarvestedField, LineWords,
     LstmRecognizer, PageFurniture, PageRect, XyCutParams,
 };
 use tesseract_ocr_pdf::{GreyImage, PageOcr, PdfError, RenderReport, SearchablePdfError};
@@ -145,6 +145,15 @@ pub use tesseract_ocr::{decode_image, ImageDecodeError};
 /// threshold under-serves (uneven illumination, aged scans). See
 /// [`tesseract_ocr::BinarizeMode`] for the full algorithm documentation.
 pub use tesseract_ocr::BinarizeMode;
+
+/// The typed page a [`crate::sentences`]/[`crate::reasoning`] caller builds
+/// from [`OcrRequest::RecognizePageWords`]'s `LineWords` output — re-exported
+/// so a consumer reaches [`DocPage::from_line_words`] through this executor
+/// crate without a direct `tesseract-ocr` dependency, the same reasoning as
+/// [`BinarizeMode`] above. `recognize_document`'s own `DocPage` construction
+/// uses a private field, which is why this is the one path an external
+/// caller has.
+pub use tesseract_ocr::DocPage;
 
 /// One typed request per declared OGAR OCR capability. Plain Rust types,
 /// zero serialization — see the module docs.

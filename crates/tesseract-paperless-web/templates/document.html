@@ -31,9 +31,11 @@
     white-space: pre-wrap; word-break: break-word; font-family: inherit;
     font-size: .95rem; margin: 0;
   }
-  table.fields, table.regions { width: 100%; border-collapse: collapse; font-size: .9rem; }
-  table.fields td, table.regions td { padding: .35rem .5rem; border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, Canvas); vertical-align: top; }
+  table.fields, table.regions, table.triples { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  table.fields td, table.regions td, table.triples td, table.triples th { padding: .35rem .5rem; border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, Canvas); vertical-align: top; }
   table.fields td:first-child { font-weight: 600; white-space: nowrap; }
+  table.triples th { text-align: left; font-size: .75rem; text-transform: uppercase; letter-spacing: .03em; color: color-mix(in srgb, CanvasText 55%, Canvas); }
+  table.triples td.sentence { color: color-mix(in srgb, CanvasText 55%, Canvas); font-size: .85em; }
   .region-kind {
     display: inline-block; font-size: .75rem; font-weight: 600; text-transform: uppercase;
     letter-spacing: .03em; color: color-mix(in srgb, CanvasText 55%, Canvas);
@@ -92,6 +94,20 @@
       {% for r in regions %}
       <tr><td><span class="region-kind">{{ r.kind }}</span></td><td>{{ r.text }}</td></tr>
       {% endfor %}
+    </table>
+  </div>
+  {% endif %}
+
+  {% if !triples.is_empty() %}
+  <div class="card">
+    <h2>Extracted facts</h2>
+    <table class="triples">
+      <thead><tr><th>Subject</th><th>Predicate</th><th>Object</th><th>Sentence</th></tr></thead>
+      <tbody>
+      {% for t in triples %}
+      <tr><td>{{ t.subject }}</td><td>{{ t.predicate }}</td><td>{{ t.object }}</td><td class="sentence">{{ t.sentence }}</td></tr>
+      {% endfor %}
+      </tbody>
     </table>
   </div>
   {% endif %}

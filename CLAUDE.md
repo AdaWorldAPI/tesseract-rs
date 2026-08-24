@@ -4071,3 +4071,134 @@ which now exercise the three-way `ocr`+`store`+`search` feature pairing.
   as the honest fallback the store type itself documents) rather than
   removed — a deliberate choice to avoid coupling the store type's API to
   whether a caller happens to have a search index available.
+
+## ★ SPO extraction wired into ingestion — `spo_json`, and a real re-export bug fixed along the way (2026-08-24)
+
+Follow-up to `tesseract-paperless-web`/Tantivy search above. The reasoning
+layer (`tesseract-ogar::{sentences,reasoning}`, "AS-IS BOUNDARY" earlier in
+this file) computed `SentenceBelief`s but nothing in the archive path ever
+called it — `ocr_demo.rs` was the only caller, printing to stdout. This wires
+it into `ingest.rs` for real: every archived document now also gets sentence
+assembly + deepnsm SPO/`NarsTruth` extraction, stored and rendered.
+
+### The wiring, end to end
+
+`ingest.rs`'s `spawn_blocking` closure runs a SECOND recognition call
+(`RecognizePageWords`) over the SAME already-decoded `grey` buffer, alongside
+the existing `RecognizeDocument` call — the typed `LineWords` surface
+`sentences.rs`/`reasoning.rs` need, distinct from `RecognizeDocument`'s
+serialized `doc.v1` string. `DocPage::from_line_words` → `assemble_sentences`
+→ `SentenceReasoner::analyze` (when `AppState::reasoner` is loaded) produces
+`Vec<SentenceBelief>`, hand-serialized (`spo_beliefs_to_json` — neither
+`SentenceBelief` nor its fields derive `serde::Serialize`, and adding that
+derive upstream in `tesseract-ogar` for one consumer's storage shape would be
+the wrong direction) into a JSON array of `{text, coverage, truth:
+{frequency, confidence}, triples: [{subject, predicate, object}]}` objects,
+one per sentence — including zero-triple sentences, matching
+`SentenceReasoner::analyze`'s own never-drop-a-sentence guarantee.
+
+`AppState.reasoner: Option<SentenceReasoner>` mirrors `ocr_demo.rs`'s own
+step-6 graceful degrade EXACTLY: `DEEPNSM_VOCAB_DIR` env var (new, same
+convention as `MODEL_DIR`/`ARCHIVE_URI`/`SEARCH_INDEX_DIR`), falling back to
+the build-time sibling path; absence means `reasoner: None` and every
+ingest's `spo_json` is `None` — a log line at startup, never a boot failure.
+`store.rs` gained a nullable `spo_json` column (`Option<String>`, the same
+graceful-degrade shape `filename` already has on this table) threaded
+through `put`/`get`/`rows_from_batches`; the detail page parses it into flat
+`TripleView` rows (subject/predicate/object/sentence) and renders an
+"Extracted facts" table, degrading to an empty list on malformed/absent JSON
+rather than failing the page. `IngestOutcome::Stored` gained `triple_count`/
+`spo_extraction_ran` so the ingest log line reports what happened (not just
+that ingestion succeeded) — the same "every field is read, not just carried"
+discipline this crate's `log_ingest_outcome` already established for the
+archive/store fields.
+
+### `lance-graph-arm-*` — checked, and the AS-IS BOUNDARY section's own
+### attribution turns out to be imprecise
+
+Investigated per instruction: does `lance-graph-arm-discovery` relate to this
+wiring, as the AS-IS BOUNDARY section above claims ("`lance-graph-arm-
+discovery` consumes this `doc.v1` JSON to inhale the meaning of whole
+books")? Read the crate directly rather than trusting the citation.
+
+**It does not, and the citation was wrong about WHICH crate.**
+`lance-graph-arm-discovery` is a Rust transcode of **Aerial+** (Karabulut,
+Groth, Degeler, arXiv 2504.19354) — **tabular** association-rule mining over
+one-hot-encoded categorical feature rows (`encode::{Dataset, FeatureSpec}`,
+`aerial::{AerialProposer, CodebookDistance}`), translating integer
+support/confidence counts into `NarsTruth`/`TruthU8`. A grep across its
+entire source for `doc.v1`/`doc_v1`/`DocPage`/`tesseract` returns **nothing**.
+It shares a TARGET SHAPE with the reasoning layer (both produce
+`NarsTruth`-typed SPO/rule candidates) but a completely different SOURCE
+DOMAIN — structured tabular rows, not natural-language sentences.
+
+The passage's own supporting evidence — "lance-graph has already run the
+whole-book falsifier (`deepnsm-v2/examples/bible_wave.rs`...)" — names the
+REAL whole-book precedent, and `bible_wave.rs` lives in `deepnsm-v2`, not
+`lance-graph-arm-discovery`. The 2026-07-29 entry attributed evidence from
+one crate to a different, unrelated crate. What THIS session just wired
+(`tesseract-ogar::reasoning::SentenceReasoner`) is architecturally the SAME
+mechanism `bible_wave.rs` uses (both wrap deepnsm's low-level `Vocabulary`+
+`Parser` API), applied per-document instead of per-corpus — so there is
+nothing further to connect to `lance-graph-arm-discovery` specifically; it
+answers a different question (rule mining over structured data) than the one
+this wiring answers (SPO extraction from recognized prose). Not correcting
+the original entry in place (append-only convention) — recorded here instead.
+
+### A real bug the wiring surfaced: `DocPage` was private-imported, not re-exported
+
+`tesseract_ogar::DocPage` didn't exist as a public path before this session —
+`ocr_demo.rs` (an EXAMPLE inside `tesseract-ogar`'s own crate) reached
+`tesseract_ocr::DocPage` directly because `tesseract-ocr` is that crate's OWN
+normal dependency, a path unavailable to an EXTERNAL consumer like
+`tesseract-paperless-web` (which deliberately has no direct `tesseract-ocr`
+dependency — the "reach everything through the ONE executor crate" design
+`CONSUMER-GUIDE.md` documents). Fixed the same way `BinarizeMode`/
+`decode_image` already are: `pub use tesseract_ocr::DocPage;` in
+`tesseract-ogar/src/lib.rs`, right beside them. First attempt collided
+(`E0252`, "the name DocPage is defined multiple times") with a pre-existing
+PRIVATE `use tesseract_ocr::{..., DocPage, ...}` import the crate's own
+internal code relied on — removed from that list since the new `pub use`
+already provides the identical local binding, verified by every existing
+`DocPage::from_line_words` call site inside `tesseract-ogar` itself still
+resolving (37/37 `tesseract-ogar` tests green, unchanged).
+
+### Gates
+
+`tesseract-ogar` 37/37, `tesseract-paperless --features store,search` 35/35
+(26 store-specific incl. the new `spo_json_round_trips_present_and_absent`
+round-trip test + 9 search-feature tests unified in by the combined check),
+`tesseract-paperless-web` 18/18 (11 pre-existing + 7 new: 4
+`spo_beliefs_to_json` tests in `ingest.rs`, 3 `parse_spo_triples` tests in
+`routes.rs`). `cargo clippy -p tesseract-ogar -p tesseract-paperless-web
+--all-targets -- -D warnings` clean (one `#[expect(clippy::
+too_many_arguments)]` added to `LanceStore::put` — 8 params is one archive
+row's columns threaded 1:1, not a shape a param-object would meaningfully
+shorten). `cargo fmt` clean on all three touched crates.
+
+### Dockerfile
+
+`tesseract-paperless-web/Dockerfile` gained the same `deepnsm/word_frequency`
+COPY + `DEEPNSM_VOCAB_DIR` env var `tesseract-ogar/Dockerfile` already
+carries for its `ocr_demo` — absence is not a build failure (the runtime
+still boots and archives with `spo_json: None`), so this COPY exists to make
+a Railway deploy get the real reasoning layer by default rather than the
+degraded fallback.
+
+### Status — honest
+
+- The archive/search consistency gap this crate already names (`store.put`
+  and `search.index_document` are two separate stores with no shared commit)
+  now has a third leg with the SAME shape: `spo_json` is written in the SAME
+  `store.put` call as everything else (one Arrow batch, one commit), so it
+  does NOT add a new inconsistency window — it inherited the existing one,
+  not created a new one.
+- No end-to-end integration test drives a real upload through
+  `ingest()`→archive→detail-page with a real deepnsm vocabulary loaded (same
+  gap the store/search features already carry — `tower`/`tempfile` dev-deps
+  are present for exactly this, unused so far).
+- `parse_spo_triples`'s malformed-JSON degrade and `spo_beliefs_to_json`'s
+  shape are tested independently but never round-tripped THROUGH each other
+  in one test (write→store→read→render) — each half is proven, the seam
+  between them is proven only by both halves agreeing on the same JSON shape
+  by construction, not by a shared test.

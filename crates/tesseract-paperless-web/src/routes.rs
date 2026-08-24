@@ -143,11 +143,19 @@ fn log_ingest_outcome(outcome: &IngestOutcome) {
             page_count,
             mean_confidence,
             low_confidence,
+            triple_count,
+            spo_extraction_ran,
         } => {
             println!(
-                "ingest: stored {hash_hex} (guid {}) -- {page_count} page(s), confidence {mean_confidence}{}",
+                "ingest: stored {hash_hex} (guid {}) -- {page_count} page(s), confidence {mean_confidence}{}, \
+                 {}",
                 hex16(document_guid),
-                if *low_confidence { ", LOW CONFIDENCE" } else { "" }
+                if *low_confidence { ", LOW CONFIDENCE" } else { "" },
+                if *spo_extraction_ran {
+                    format!("{triple_count} SPO triple(s) extracted")
+                } else {
+                    "SPO extraction skipped (no deepnsm vocabulary loaded)".to_string()
+                }
             );
         }
         IngestOutcome::Duplicate {
@@ -338,6 +346,56 @@ fn kind_label(k: RegionKind) -> &'static str {
     }
 }
 
+/// One extracted SPO triple, flattened for the detail template's table --
+/// the sentence it came from is carried alongside each row rather than
+/// grouped, matching [`RegionView`]'s own flat-list-over-tree shape (Askama
+/// cannot recurse a Rust-side tree, and one flat table is simpler than a
+/// nested per-sentence template here too).
+struct TripleView {
+    sentence: String,
+    subject: String,
+    predicate: String,
+    /// Empty string for an intransitive triple's `None` object -- Askama
+    /// renders `Option<String>` awkwardly in a table cell, and "no object"
+    /// is exactly what an empty cell already communicates.
+    object: String,
+}
+
+/// Parse [`tesseract_paperless::store::DocumentRow::spo_json`] (the shape
+/// `tesseract-paperless-web::ingest::spo_beliefs_to_json` writes) into the
+/// flat rows the template renders. Malformed/absent JSON degrades to an
+/// empty list -- this is a display-only enrichment of an already-successful
+/// archive read, never a reason to fail the whole detail page.
+fn parse_spo_triples(spo_json: &str) -> Vec<TripleView> {
+    let Ok(sentences) = serde_json::from_str::<serde_json::Value>(spo_json) else {
+        return Vec::new();
+    };
+    let Some(sentences) = sentences.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for s in sentences {
+        let text = s["text"].as_str().unwrap_or_default().to_string();
+        let Some(triples) = s["triples"].as_array() else {
+            continue;
+        };
+        for t in triples {
+            let subject = t["subject"].as_str().unwrap_or_default().to_string();
+            let predicate = t["predicate"].as_str().unwrap_or_default().to_string();
+            if subject.is_empty() && predicate.is_empty() {
+                continue;
+            }
+            out.push(TripleView {
+                sentence: text.clone(),
+                subject,
+                predicate,
+                object: t["object"].as_str().unwrap_or_default().to_string(),
+            });
+        }
+    }
+    out
+}
+
 fn flatten_regions(ir: &DocIr, out: &mut Vec<RegionView>) {
     fn walk(r: &ogar_doc_ir::Region, out: &mut Vec<RegionView>) {
         let mut text = r.text.clone().unwrap_or_default();
@@ -382,6 +440,7 @@ struct DocumentDetailTemplate {
     text: String,
     regions: Vec<RegionView>,
     fields: Vec<(String, String)>,
+    triples: Vec<TripleView>,
     error: Option<String>,
 }
 
@@ -398,6 +457,7 @@ fn not_found_detail(hash_hex: &str, error: impl Into<String>) -> DocumentDetailT
         text: String::new(),
         regions: Vec::new(),
         fields: Vec::new(),
+        triples: Vec::new(),
         error: Some(error.into()),
     }
 }
@@ -433,6 +493,11 @@ async fn document_detail(
         .iter()
         .map(|f| (f.key.clone(), f.value.clone()))
         .collect();
+    let triples = row
+        .spo_json
+        .as_deref()
+        .map(parse_spo_triples)
+        .unwrap_or_default();
 
     render(&DocumentDetailTemplate {
         hash_hex: row.content_sha256_hex,
@@ -446,6 +511,7 @@ async fn document_detail(
         text: row.text,
         regions,
         fields,
+        triples,
         error: None,
     })
 }
@@ -549,5 +615,60 @@ mod tests {
     #[test]
     fn confidence_str_shows_placeholder_when_text_is_empty() {
         assert_eq!(confidence_str(97, "   "), "\u{2014}");
+    }
+
+    /// The exact shape `ingest::spo_beliefs_to_json` writes — parsed back
+    /// into flat rows, one per triple, each carrying its own sentence text.
+    #[test]
+    fn parse_spo_triples_flattens_sentences_into_rows() {
+        let json = r#"[
+            {"text":"The dog sees the cat.","coverage":1.0,
+             "truth":{"frequency":0.9,"confidence":0.75},
+             "triples":[{"subject":"dog","predicate":"see","object":"cat"}]},
+            {"text":"The dog barks.","coverage":0.8,
+             "truth":{"frequency":0.8,"confidence":0.5},
+             "triples":[{"subject":"dog","predicate":"bark","object":null}]}
+        ]"#;
+        let rows = parse_spo_triples(json);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].sentence, "The dog sees the cat.");
+        assert_eq!(rows[0].subject, "dog");
+        assert_eq!(rows[0].predicate, "see");
+        assert_eq!(rows[0].object, "cat");
+        // A `null` object must render as an empty cell, not the literal
+        // string "null" or a dropped row.
+        assert_eq!(rows[1].object, "");
+        assert_eq!(rows[1].sentence, "The dog barks.");
+    }
+
+    /// A sentence with zero triples contributes NO rows — proven by feeding
+    /// a mixed array where only one of two sentences has triples, so a
+    /// version that emitted a placeholder row per sentence would fail this
+    /// alongside the previous test's row count.
+    #[test]
+    fn parse_spo_triples_skips_sentences_with_no_triples() {
+        let json = r#"[
+            {"text":"Zxqvblorptfizz wobbledoop.","coverage":0.0,
+             "truth":{"frequency":0.0,"confidence":0.0},"triples":[]},
+            {"text":"The dog sees the cat.","coverage":1.0,
+             "truth":{"frequency":0.9,"confidence":0.75},
+             "triples":[{"subject":"dog","predicate":"see","object":"cat"}]}
+        ]"#;
+        let rows = parse_spo_triples(json);
+        assert_eq!(
+            rows.len(),
+            1,
+            "the zero-triple sentence must contribute no row"
+        );
+        assert_eq!(rows[0].sentence, "The dog sees the cat.");
+    }
+
+    /// Malformed or absent `spo_json` (the "no reasoner ran" state) must
+    /// degrade to an empty list, never panic the detail page.
+    #[test]
+    fn parse_spo_triples_degrades_on_malformed_json() {
+        assert!(parse_spo_triples("not json").is_empty());
+        assert!(parse_spo_triples("{}").is_empty());
+        assert!(parse_spo_triples("[]").is_empty());
     }
 }
