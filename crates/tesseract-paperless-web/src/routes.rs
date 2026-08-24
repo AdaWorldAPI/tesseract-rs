@@ -175,6 +175,14 @@ struct DocumentListItem {
     hash_hex: String,
     filename: String,
     preview: String,
+    /// `Some` only in search-result mode: the tantivy-generated `<b>`-
+    /// highlighted HTML snippet (see `search.rs`), pre-escaped by
+    /// `Snippet::to_html` (which HTML-entity-encodes the surrounding
+    /// document text and inserts only the `<b>`/`</b>` wrapper itself --
+    /// verified against the fork's own source, not assumed -- so it is safe
+    /// to render with `|safe` in the template). `None` for a plain listing,
+    /// where the template falls back to the auto-escaped `preview` field.
+    snippet_html: Option<String>,
     page_count: u16,
     confidence: String,
     low_confidence: bool,
@@ -186,9 +194,22 @@ impl From<DocumentRow> for DocumentListItem {
             hash_hex: r.content_sha256_hex,
             filename: r.filename.unwrap_or_else(|| "(untitled)".to_string()),
             preview: r.preview,
+            snippet_html: None,
             page_count: r.page_count,
             confidence: confidence_str(r.mean_confidence, &r.text),
             low_confidence: r.low_confidence,
+        }
+    }
+}
+
+impl DocumentListItem {
+    /// Build a search-result row: archive metadata from `row`, but the
+    /// preview slot filled by the search hit's ranked snippet instead of the
+    /// plain first-N-chars preview -- the paperless-ngx-shaped result.
+    fn from_search_hit(row: DocumentRow, hit: tesseract_paperless::search::SearchHit) -> Self {
+        Self {
+            snippet_html: Some(hit.snippet_html),
+            ..Self::from(row)
         }
     }
 }
@@ -222,25 +243,77 @@ async fn documents(
     Query(q): Query<DocumentsQuery>,
 ) -> Html<String> {
     let query = q.q.unwrap_or_default();
-    let result = if query.trim().is_empty() {
-        state.store.list(LIST_LIMIT).await
-    } else {
-        state.store.search(&query, LIST_LIMIT).await
-    };
-    match result {
-        Ok(rows) => render(&DocumentsTemplate {
-            query,
-            count: rows.len(),
-            documents: rows.into_iter().map(DocumentListItem::from).collect(),
-            error: None,
-        }),
-        Err(e) => render(&DocumentsTemplate {
-            query,
-            count: 0,
-            documents: Vec::new(),
-            error: Some(format!("archive read failed: {e}")),
-        }),
+
+    if query.trim().is_empty() {
+        return match state.store.list(LIST_LIMIT).await {
+            Ok(rows) => render(&DocumentsTemplate {
+                query,
+                count: rows.len(),
+                documents: rows.into_iter().map(DocumentListItem::from).collect(),
+                error: None,
+            }),
+            Err(e) => render(&DocumentsTemplate {
+                query,
+                count: 0,
+                documents: Vec::new(),
+                error: Some(format!("archive read failed: {e}")),
+            }),
+        };
     }
+
+    // Ranked full-text search (BM25 + snippet generation) is CPU/disk work,
+    // dispatched off the async runtime the same way OCR and the search-index
+    // write already are.
+    let st = state.clone();
+    let q_for_search = query.clone();
+    let hits = match tokio::task::spawn_blocking(move || {
+        st.search.search(&q_for_search, LIST_LIMIT)
+    })
+    .await
+    {
+        Ok(Ok(hits)) => hits,
+        Ok(Err(e)) => {
+            return render(&DocumentsTemplate {
+                query,
+                count: 0,
+                documents: Vec::new(),
+                error: Some(format!("search failed: {e}")),
+            })
+        }
+        Err(e) => {
+            return render(&DocumentsTemplate {
+                query,
+                count: 0,
+                documents: Vec::new(),
+                error: Some(format!("search task failed: {e}")),
+            })
+        }
+    };
+
+    // Each hit is joined back to its archive row for display metadata the
+    // search index does not carry (page_count/confidence/low_confidence).
+    // N+1 lookups over a LIST_LIMIT-bounded result set -- a named, honest
+    // cost rather than a hidden one; see `ingest.rs`'s doc comment on the
+    // store/index consistency gap this join can also surface (a hit with no
+    // matching row) via `Ok(None)` below.
+    let mut documents = Vec::with_capacity(hits.len());
+    for hit in hits {
+        match state.store.get(&hit.hash_hex).await {
+            Ok(Some(row)) => documents.push(DocumentListItem::from_search_hit(row, hit)),
+            Ok(None) => eprintln!(
+                "search hit {} has no matching archive row (index/archive drift)",
+                hit.hash_hex
+            ),
+            Err(e) => eprintln!("archive read failed for search hit {}: {e}", hit.hash_hex),
+        }
+    }
+
+    render(&DocumentsTemplate {
+        count: documents.len(),
+        query,
+        documents,
+        error: None,
+    })
 }
 
 /// One region, flattened for display — the detail page shows a document as a
@@ -379,7 +452,15 @@ async fn document_detail(
 
 async fn document_delete(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
     if let Err(e) = state.store.delete(&hash).await {
-        eprintln!("delete {hash} failed: {e}");
+        eprintln!("delete {hash} from archive failed: {e}");
+    }
+    // Same off-runtime dispatch as every other search-index write.
+    let st = state.clone();
+    let hash_for_index = hash.clone();
+    match tokio::task::spawn_blocking(move || st.search.delete_document(&hash_for_index)).await {
+        Ok(Err(e)) => eprintln!("delete {hash} from search index failed: {e}"),
+        Err(e) => eprintln!("delete {hash} from search index task failed: {e}"),
+        Ok(Ok(())) => {}
     }
     Redirect::to("/documents").into_response()
 }

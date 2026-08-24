@@ -21,6 +21,7 @@ use ogar_doc_ir::DocIr;
 use serde_json::Value;
 use tesseract_ogar::{BinarizeMode, OcrExecError, OcrRequest, OcrResponse};
 use tesseract_paperless::kv::{mint_document_root, preflight, MatchedOn, Verdict};
+use tesseract_paperless::search::SearchError;
 use tesseract_paperless::store::StoreError;
 
 use crate::decode::decode_grey;
@@ -80,6 +81,10 @@ pub enum IngestError {
     Convert(ogar_from_docv1::FromDocV1Error),
     /// The archive write failed.
     Store(StoreError),
+    /// The document was archived, but the search index write failed --
+    /// stored yet unsearchable. Reported rather than swallowed (see
+    /// [`ingest`]'s doc comment on why this is a real, if narrow, gap).
+    Search(SearchError),
 }
 
 impl std::fmt::Display for IngestError {
@@ -90,6 +95,7 @@ impl std::fmt::Display for IngestError {
             Self::Recognize(e) => write!(f, "recognition: {e:?}"),
             Self::Convert(e) => write!(f, "doc.v1 conversion: {e:?}"),
             Self::Store(e) => write!(f, "archive write: {e}"),
+            Self::Search(e) => write!(f, "search index write: {e}"),
         }
     }
 }
@@ -99,6 +105,17 @@ impl std::fmt::Display for IngestError {
 /// `mime` is the caller's best-effort guess at the source media type
 /// (informational, carried into [`DocIr::mime`] — the decoder itself sniffs
 /// the real image format independently and does not trust this value).
+///
+/// # A named gap: the archive write and the search-index write are not one
+/// transaction
+///
+/// `store.put` and `search.index_document` are two separate stores with no
+/// shared commit. If the process dies between them, the document is archived
+/// (findable by direct link, by `LanceStore::list`) but not yet in the search
+/// index -- an inconsistency, not data loss. `Err(IngestError::Search(_))`
+/// surfaces this rather than swallowing it; recovering from it (a periodic
+/// reconciliation pass diffing the archive against the index) is future
+/// work, filed rather than pretended away.
 pub async fn ingest(
     state: &Arc<AppState>,
     bytes: Vec<u8>,
@@ -170,6 +187,22 @@ pub async fn ingest(
         )
         .await
         .map_err(IngestError::Store)?;
+
+    // Same text `LanceStore::put` itself just computed and stored -- recomputed
+    // here rather than threaded through `put`'s return value, since it is a
+    // cheap linear walk over `ir` and keeps `LanceStore`'s API from having to
+    // know a search index exists at all.
+    let text_for_search = tesseract_paperless::render::plain_text(&ir);
+    let display_name = filename.clone().unwrap_or_default();
+    let st = state.clone();
+    let hex_for_index = hex.clone();
+    tokio::task::spawn_blocking(move || {
+        st.search
+            .index_document(&hex_for_index, &display_name, &text_for_search)
+    })
+    .await
+    .map_err(|e| IngestError::Task(e.to_string()))?
+    .map_err(IngestError::Search)?;
 
     Ok(IngestOutcome::Stored {
         hash_hex: hex,

@@ -35,6 +35,7 @@
   li.doc a.title { font-weight: 600; text-decoration: none; color: inherit; }
   li.doc a.title:hover { color: #2563eb; }
   .preview { color: color-mix(in srgb, CanvasText 60%, Canvas); font-size: .9rem; margin: .35rem 0 0; }
+  .preview b { background: color-mix(in srgb, #f59e0b 35%, transparent); color: CanvasText; font-weight: 600; border-radius: 3px; padding: 0 .15em; }
   .meta { font-size: .8rem; color: color-mix(in srgb, CanvasText 50%, Canvas); margin-top: .4rem; }
   .low-conf { color: #d97706; font-weight: 600; }
   .empty { color: color-mix(in srgb, CanvasText 55%, Canvas); padding: 2rem 0; text-align: center; }
@@ -70,7 +71,11 @@
     {% for d in documents %}
     <li class="doc">
       <a class="title" href="/documents/{{ d.hash_hex }}">{{ d.filename }}</a>
+      {% if let Some(html) = d.snippet_html %}
+      <p class="preview">{{ html|safe }}</p>
+      {% else %}
       <p class="preview">{{ d.preview }}</p>
+      {% endif %}
       <p class="meta">
         {{ d.page_count }} page{% if d.page_count != 1 %}s{% endif %}
         &middot; confidence {{ d.confidence }}

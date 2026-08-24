@@ -94,7 +94,11 @@ tesseract-ogar = { path = "../tesseract-ogar", optional = true }
 # indexes in RAM, so mmap/lz4/stemmer are dead weight — and
 # `columnar-zstd-compression` would drag `zstd-sys`, a C build, into a tree
 # whose entire proposition is that it contains no C.
-tantivy = { path = "../../../tantivy", optional = true, default-features = false }
+# `mmap`+`stopwords`+`stemmer`+`lz4-compression` are pure Rust (needed by
+# the `search` feature's persistent on-disk index below); the fork's ONLY
+# C dependency, `columnar-zstd-compression` (zstd-sys), is deliberately
+# excluded, same discipline `default-features = false` already stated.
+tantivy = { path = "../../../tantivy", optional = true, default-features = false, features = ["mmap", "stopwords", "stemmer", "lz4-compression"] }
 
 # The semantic consumer. It is a dependency of the PROBES and not of `src/`,
 # and that asymmetry is the measured finding rather than an oversight:
@@ -132,6 +136,10 @@ ocr = ["dep:tesseract-ogar"]
 # it `mint_for` silently falls back to the V1 tail — but it is a graph-wide
 # feature unification, so it is named here rather than discovered later.
 token = ["dep:tantivy", "dep:deepnsm-v2"]
+# The archive's full-text search: a real, persistent Tantivy index (BM25 +
+# snippets) — see `search.rs`'s module doc for why this is deliberately
+# NOT built on `token::seam_tantivy`'s resident-lane research seam.
+search = ["dep:tantivy"]
 store = ["dep:lancedb", "dep:lance", "dep:arrow", "dep:arrow-array", "dep:arrow-schema", "dep:futures", "dep:tokio", "dep:serde_json"]
 
 # The probes are the evidence for the `token` claims, so they are built with

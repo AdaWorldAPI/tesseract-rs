@@ -4,15 +4,22 @@
 # demo. Same upload story (multipart file / URL fetch, pure-Rust image
 # decode, no C image libs at runtime) plus the paperless functions this repo
 # added in `tesseract-paperless`: the S-2 dedup gate (hash first, recognize
-# only on a miss), `doc.v1` -> `DocIr` via OGAR's `ogar-from-docv1`, and
+# only on a miss), `doc.v1` -> `DocIr` via OGAR's `ogar-from-docv1`,
 # persistence via `lancedb` — the embedded columnar database `lance-graph`
 # itself is built on, consumed straight from crates.io per that repo's own
 # upstream-authoritative carve-out (`E-LANCE-IS-UPSTREAM-AUTHORITATIVE-1`),
-# NOT the forbidden `lance-graph` engine/planner "brain" crates. Still zero
-# C OCR libraries at runtime — this image is heavier than tesseract-ocr-web's
-# only because it carries the OGAR + lance-graph source tree through the
-# build (to resolve `tesseract-ogar`, `ogar-doc-ir`, `ogar-from-docv1`,
-# `lance-graph-contract`), not because it links any new native OCR library.
+# NOT the forbidden `lance-graph` engine/planner "brain" crates — AND real
+# ranked full-text search (BM25 + highlighted snippets) via a persistent
+# Tantivy index (`tesseract-paperless`'s `search` feature; the AdaWorldAPI
+# `tantivy` fork, an ordinary on-disk index, NOT the `token` feature's
+# resident-lane research seam — see `tesseract-paperless/src/search.rs`'s
+# module doc). This is the paperless-ngx-parity move: a document row +
+# search index pair, the same shape paperless-ngx itself runs (its DB +
+# Whoosh index). Still zero C OCR libraries at runtime — this image is
+# heavier than tesseract-ocr-web's only because it carries the OGAR +
+# lance-graph source tree through the build (to resolve `tesseract-ogar`,
+# `ogar-doc-ir`, `ogar-from-docv1`, `lance-graph-contract`), not because it
+# links any new native OCR library.
 #
 # ── The sibling-repo wrinkle (three siblings, same as tesseract-ogar's) ─────
 # This crate's transitive path deps escape the repo:
@@ -106,11 +113,13 @@ COPY --from=builder /usr/local/bin/tesseract-paperless-web /app/tesseract-paperl
 # The eng model (~4 MB): eng.lstm + unicharset + recoder + the three DAWGs.
 COPY --from=builder /src/tesseract-rs/corpus/model /app/model
 
-# The archive needs a writable, ideally PERSISTENT directory — on Railway,
-# mount a volume at /app/data (Railway's volume UI lets you pick the mount
-# path; point it here) or the archive is lost on every redeploy. Created and
-# owned by the non-root runtime user up front so `lancedb::connect` can create
-# the table on first boot without a permissions surprise.
+# Both the lancedb archive AND the Tantivy search index need a writable,
+# ideally PERSISTENT directory — on Railway, mount a volume at /app/data
+# (Railway's volume UI lets you pick the mount path; point it here) or both
+# are lost on every redeploy. Both live under the SAME mount so one volume
+# covers both stores. Created and owned by the non-root runtime user up
+# front so `lancedb::connect` / `SearchIndex::open_or_create` can create
+# their files on first boot without a permissions surprise.
 RUN mkdir -p /app/data \
     && useradd --system --uid 10001 --no-create-home appuser \
     && chown -R appuser:appuser /app/data
@@ -118,6 +127,7 @@ USER appuser
 
 ENV MODEL_DIR=/app/model
 ENV ARCHIVE_URI=/app/data/archive.lance
+ENV SEARCH_INDEX_DIR=/app/data/search_index
 # NOTE: the listen port is intentionally NOT set here. The binary binds
 # 0.0.0.0:$PORT at runtime; Railway injects PORT itself. For a local run pass
 # `-e PORT=8080`. Do not add `ENV PORT=...` — that would shadow Railway's value.

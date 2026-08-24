@@ -152,10 +152,22 @@ jobs:
     - name: Clippy (paperless, store)
       working-directory: tesseract-rs
       run: cargo clippy -p tesseract-paperless --features store --all-targets -- -D warnings
+    # A real, persistent Tantivy full-text index (BM25 + snippets) --
+    # deliberately a SEPARATE feature from `token` (which pins tantivy to
+    # `default-features = false`, RAM-only): `search` turns on `mmap` +
+    # `stemmer` + `stopwords` + `lz4-compression` on the SAME dependency
+    # entry, all pure Rust, so no C is introduced either way.
+    - name: Test (paperless, search)
+      working-directory: tesseract-rs
+      run: cargo test -p tesseract-paperless --features search --verbose
+    - name: Clippy (paperless, search)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-paperless --features search --all-targets -- -D warnings
     # tesseract-paperless-web: the Railway-deployable document archive —
-    # upload -> S-2 gate -> OCR -> DocIr -> lancedb, with the browse/search/
-    # delete UI. Depends on tesseract-paperless with ocr+store on, so this
-    # is the first CI line that exercises that pairing end to end.
+    # upload -> S-2 gate -> OCR -> DocIr -> lancedb + Tantivy search, with
+    # the browse/search/delete UI. Depends on tesseract-paperless with
+    # ocr+store+search on, so this is the first CI line that exercises that
+    # three-way feature pairing end to end.
     - name: Build (paperless-web)
       working-directory: tesseract-rs
       run: cargo build -p tesseract-paperless-web --verbose

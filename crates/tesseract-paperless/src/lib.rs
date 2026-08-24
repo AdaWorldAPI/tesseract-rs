@@ -45,6 +45,9 @@ pub mod intake;
 pub mod kv;
 pub mod render;
 
+#[cfg(feature = "search")]
+pub mod search;
+
 #[cfg(feature = "store")]
 pub mod store;
 

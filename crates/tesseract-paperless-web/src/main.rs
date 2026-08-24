@@ -25,21 +25,32 @@ async fn main() {
     // `cargo run` from the repo root works with zero configuration.
     let archive_uri =
         std::env::var("ARCHIVE_URI").unwrap_or_else(|_| "./archive.lance".to_string());
+    // Full-text search index (`tesseract_paperless::search::SearchIndex`) --
+    // a SEPARATE on-disk directory from the lancedb archive above, per
+    // `search.rs`'s module doc. Falls back the same way `ARCHIVE_URI` does.
+    let search_index_dir = PathBuf::from(
+        std::env::var("SEARCH_INDEX_DIR").unwrap_or_else(|_| "./search_index".to_string()),
+    );
 
     println!(
         "tesseract-paperless-web: loading model from {}",
         model_dir.display()
     );
     println!("tesseract-paperless-web: archive at {archive_uri}");
+    println!(
+        "tesseract-paperless-web: search index at {}",
+        search_index_dir.display()
+    );
 
-    let state = match AppState::load(&model_dir, &archive_uri).await {
+    let state = match AppState::load(&model_dir, &archive_uri, &search_index_dir).await {
         Ok(s) => Arc::new(s),
         Err(e) => {
             eprintln!("fatal: could not start: {e}");
             eprintln!(
                 "hint: set MODEL_DIR to a directory containing eng.lstm, \
                  eng.lstm-unicharset, eng.lstm-recoder (+ optional *-dawg files), \
-                 and ARCHIVE_URI to a writable lancedb location"
+                 ARCHIVE_URI to a writable lancedb location, \
+                 and SEARCH_INDEX_DIR to a writable directory"
             );
             std::process::exit(1);
         }

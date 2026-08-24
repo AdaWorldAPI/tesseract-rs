@@ -29,7 +29,7 @@ serde_json = "1"
 # The whole point of this crate: recognition through the ONE sanctioned
 # entry point, intake through the S-2 gate, storage through lancedb.
 tesseract-ogar = { path = "../tesseract-ogar" }
-tesseract-paperless = { path = "../tesseract-paperless", features = ["ocr", "store"] }
+tesseract-paperless = { path = "../tesseract-paperless", features = ["ocr", "store", "search"] }
 ogar-doc-ir = { path = "../../../OGAR/crates/ogar-doc-ir" }
 ogar-from-docv1 = { path = "../../../OGAR/crates/ogar-from-docv1" }
 
