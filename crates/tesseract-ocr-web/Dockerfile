@@ -58,10 +58,17 @@ WORKDIR /src/tesseract-rs
 # resolve without it. Cargo loads every workspace member's manifest (and its
 # path deps) even when building a single `-p` package, so `tesseract-ocr-python`
 # — which path-deps `tesseract-ogar` → OGAR — must be trimmed too, or the build
-# fails looking for the uncloned `/src/OGAR` sibling. The guard makes a silent
-# no-op (e.g. if the members line is ever reformatted one-entry-per-line) a hard
-# build failure instead of a confusing later "failed to load OGAR/Cargo.toml".
-RUN sed -i 's#, "crates/tesseract-ogar"##; s#, "crates/tesseract-ocr-python"##' Cargo.toml; \
+# fails looking for the uncloned `/src/OGAR` sibling.
+# Line-delete, not a `, "X"` substring substitution: the root Cargo.toml's
+# members list is ONE ENTRY PER LINE with a TRAILING comma
+# (`"crates/tesseract-ogar",`), so a leading `, "X"` pattern (written when
+# this list was single-line) never matches and the guard below fired FATAL on
+# every build — measured on a real Railway build log, the identical root
+# cause `tesseract-paperless-web/Dockerfile` already fixed for its own sed
+# line (codex P1 on PR #88) but this file was never updated to match. The
+# guard makes a silent no-op (e.g. a further reformat) a hard build failure
+# instead of a confusing later "failed to load OGAR/Cargo.toml".
+RUN sed -i '/"crates\/tesseract-ogar"/d; /"crates\/tesseract-ocr-python"/d' Cargo.toml; \
     if grep -q '"crates/tesseract-ogar"' Cargo.toml || grep -q '"crates/tesseract-ocr-python"' Cargo.toml; then \
       echo "FATAL: failed to trim tesseract-ogar/tesseract-ocr-python from workspace members (Cargo.toml reformatted?)" >&2; \
       exit 1; \
