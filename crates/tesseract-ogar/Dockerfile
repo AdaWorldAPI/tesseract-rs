@@ -70,7 +70,15 @@ WORKDIR /src/tesseract-rs
 # `-p` package, so a stale trim would fail loudly rather than silently — the
 # guard below makes that a hard build failure instead of a confusing later
 # "failed to load pyo3" error.
-RUN sed -i 's#, "crates/tesseract-ocr-python"##' Cargo.toml; \
+# Line-delete, not a `, "X"` substring substitution: the root Cargo.toml's
+# members list is ONE ENTRY PER LINE with a TRAILING comma
+# (`"crates/tesseract-ocr-python",`), so a leading `, "X"` pattern (written
+# when this list was single-line) never matches and the guard below fired
+# FATAL on every build — the identical root cause
+# `tesseract-paperless-web/Dockerfile` already fixed for its own sed line
+# (codex P1 on PR #88), measured here on a real Railway build log after this
+# file was never updated to match.
+RUN sed -i '/"crates\/tesseract-ocr-python"/d' Cargo.toml; \
     if grep -q '"crates/tesseract-ocr-python"' Cargo.toml; then \
       echo "FATAL: failed to trim tesseract-ocr-python from workspace members (Cargo.toml reformatted?)" >&2; \
       exit 1; \
