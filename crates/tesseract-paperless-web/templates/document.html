@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ filename }} — tesseract-paperless</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    line-height: 1.5; margin: 0; padding: 2rem 1rem;
+    background: Canvas; color: CanvasText;
+  }
+  main { max-width: 52rem; margin: 0 auto; }
+  nav.top { margin-bottom: 1.25rem; }
+  nav.top a { color: #2563eb; text-decoration: none; font-weight: 600; }
+  h1 { font-size: 1.5rem; margin: 0 0 .5rem; word-break: break-word; }
+  .meta {
+    display: flex; flex-wrap: wrap; gap: .5rem 1.2rem; font-size: .85rem;
+    color: color-mix(in srgb, CanvasText 55%, Canvas); margin-bottom: 1.25rem;
+  }
+  .low-conf { color: #d97706; font-weight: 600; }
+  .hash { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8em; }
+  .card {
+    border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
+    border-radius: 12px; padding: 1.25rem; margin-bottom: 1.25rem;
+  }
+  .card h2 { font-size: 1rem; margin: 0 0 .75rem; }
+  pre.text {
+    white-space: pre-wrap; word-break: break-word; font-family: inherit;
+    font-size: .95rem; margin: 0;
+  }
+  table.fields, table.regions { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  table.fields td, table.regions td { padding: .35rem .5rem; border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, Canvas); vertical-align: top; }
+  table.fields td:first-child { font-weight: 600; white-space: nowrap; }
+  .region-kind {
+    display: inline-block; font-size: .75rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .03em; color: color-mix(in srgb, CanvasText 55%, Canvas);
+    min-width: 4.5rem;
+  }
+  form.delete { margin-top: .5rem; }
+  button.danger {
+    padding: .55rem 1rem; font-weight: 600; border: 0; border-radius: 8px; cursor: pointer;
+    background: #ef4444; color: #fff;
+  }
+  button.danger:hover { filter: brightness(1.08); }
+  .error {
+    border: 1px solid #ef4444; background: color-mix(in srgb, #ef4444 12%, Canvas);
+    color: color-mix(in srgb, #ef4444 85%, CanvasText);
+    padding: .75rem 1rem; border-radius: 8px; margin-bottom: 1rem;
+  }
+</style>
+</head>
+<body>
+<main>
+  <nav class="top"><a href="/documents">&larr; All documents</a></nav>
+
+  {% if let Some(msg) = error %}
+  <div class="error">{{ msg }}</div>
+  {% else %}
+  <h1>{{ filename }}</h1>
+  <div class="meta">
+    <span>{{ mime }}</span>
+    <span>{{ source }}</span>
+    <span>{{ page_count }} page{% if page_count != 1 %}s{% endif %}</span>
+    <span>confidence {{ confidence }}{% if low_confidence %} <span class="low-conf">(low)</span>{% endif %}</span>
+    <span>ingested {{ ingested_at }}</span>
+    <span class="hash">{{ hash_hex }}</span>
+  </div>
+
+  {% if !fields.is_empty() %}
+  <div class="card">
+    <h2>Harvested fields</h2>
+    <table class="fields">
+      {% for (key, value) in fields %}
+      <tr><td>{{ key }}</td><td>{{ value }}</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <h2>Recognized text</h2>
+    <pre class="text">{{ text }}</pre>
+  </div>
+
+  {% if !regions.is_empty() %}
+  <div class="card">
+    <h2>Regions</h2>
+    <table class="regions">
+      {% for r in regions %}
+      <tr><td><span class="region-kind">{{ r.kind }}</span></td><td>{{ r.text }}</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% endif %}
+
+  <form class="delete" action="/documents/{{ hash_hex }}/delete" method="post" onsubmit="return confirm('Delete this document from the archive?');">
+    <button type="submit" class="danger">Delete document</button>
+  </form>
+  {% endif %}
+</main>
+</body>
+</html>

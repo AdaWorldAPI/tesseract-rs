@@ -74,6 +74,11 @@ lance-graph-contract = { path = "../../../lance-graph/crates/lance-graph-contrac
 # crate reads those rather than minting a parallel `source_id`/`span_id`.
 ogar-doc-ir = { path = "../../../OGAR/crates/ogar-doc-ir" }
 
+# The DOCUMENT concept (`0x080B`) this crate's root key is minted against —
+# pulled per the hard rule ("never mint a classid here"), never invented.
+# Near-zero-dep (`serde` optional, not enabled here).
+ogar-vocab = { path = "../../../OGAR/crates/ogar-vocab" }
+
 # The pixel retina's adapter: `doc.v1` JSON -> `DocIr`. serde-only. Note it
 # does NOT pull tesseract — a caller already holding doc.v1 from anywhere
 # converts with no OCR dependency at all, which is what makes `default` lean.
@@ -98,6 +103,27 @@ tantivy = { path = "../../../tantivy", optional = true, default-features = false
 # borrow the receipt. Nothing in this crate wraps it.
 deepnsm-v2 = { path = "../../../lance-graph/crates/deepnsm-v2", optional = true }
 
+# --- feature `store` --------------------------------------------------------
+# The document store: `lancedb` + `lance` + `arrow`, consumed from
+# crates.io — upstream-authoritative per lance-graph's own carve-out ruling
+# (`E-LANCE-IS-UPSTREAM-AUTHORITATIVE-1`: "lance and lancedb are never used
+# from forks... the upstream is authoritative"). This is NOT the
+# `AdaWorldAPI/lance-graph` ENGINE crate the BBB barrier forbids — it is the
+# embedded columnar database lance-graph itself is built on, with no
+# "brain"/thinking-engine code anywhere in its dependency tree. Version-pinned
+# to the exact workspace-wide sweep lance-graph's own CLAUDE.md documents:
+# lance =9.0.0 / lancedb =0.33.0 / arrow 58.
+lancedb = { version = "=0.33.0", default-features = false, optional = true }
+lance = { version = "=9.0.0", default-features = false, optional = true }
+arrow = { version = "58", default-features = false, optional = true }
+# `merge_insert`'s `execute` takes a `Box<dyn RecordBatchReader + Send>`; the
+# concrete `RecordBatchIterator` lives in `arrow-array` directly.
+arrow-array = { version = "58", default-features = false, optional = true }
+arrow-schema = { version = "58", default-features = false, optional = true }
+futures = { version = "0.3", default-features = false, features = ["std"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "fs", "macros"], optional = true }
+serde_json = { version = "1", optional = true }
+
 [features]
 default = []
 ocr = ["dep:tesseract-ogar"]
@@ -106,6 +132,7 @@ ocr = ["dep:tesseract-ogar"]
 # it `mint_for` silently falls back to the V1 tail — but it is a graph-wide
 # feature unification, so it is named here rather than discovered later.
 token = ["dep:tantivy", "dep:deepnsm-v2"]
+store = ["dep:lancedb", "dep:lance", "dep:arrow", "dep:arrow-array", "dep:arrow-schema", "dep:futures", "dep:tokio", "dep:serde_json"]
 
 # The probes are the evidence for the `token` claims, so they are built with
 # it and cannot be built without it.
@@ -120,6 +147,14 @@ required-features = ["token"]
 [[example]]
 name = "probe_wordid_vs_tokenid"
 required-features = ["token"]
+
+[dev-dependencies]
+# The `store` feature's tests need a throwaway on-disk table per
+# test and `serde_json` is already pulled by that feature at test
+# time (both are `--features store`-only via `#[cfg(test)]`, so
+# declaring them here rather than as optional-and-featured keeps
+# the default build untouched).
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

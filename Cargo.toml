@@ -24,5 +24,9 @@ members = [
     # a member so CI compiles it, gated so the default build stays lean. See
     # the crate's own Cargo.toml for why that pairing is deliberate.
     "crates/tesseract-paperless",
+    # The Railway-deployable document archive: upload -> S-2 gate -> OCR ->
+    # DocIr -> lancedb, with a paperless-ngx-shaped browse/search/delete UI.
+    # Depends on `tesseract-paperless` with the `ocr`+`store` features on.
+    "crates/tesseract-paperless-web",
 ]
 resolver = "2"

@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Documents — tesseract-paperless</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    line-height: 1.5; margin: 0; padding: 2rem 1rem;
+    background: Canvas; color: CanvasText;
+  }
+  main { max-width: 52rem; margin: 0 auto; }
+  h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+  nav.top { margin-bottom: 1.25rem; display: flex; justify-content: space-between; align-items: center; }
+  nav.top a { color: #2563eb; text-decoration: none; font-weight: 600; }
+  .count { color: color-mix(in srgb, CanvasText 55%, Canvas); font-size: .9rem; }
+  form.search { display: flex; gap: .5rem; margin-bottom: 1.25rem; }
+  form.search input[type=text] {
+    flex: 1; padding: .55rem; border-radius: 8px;
+    border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
+    background: Canvas; color: CanvasText; font-size: 1rem;
+  }
+  form.search button {
+    padding: .55rem 1rem; font-weight: 600; border: 0; border-radius: 8px;
+    cursor: pointer; background: #2563eb; color: #fff;
+  }
+  ul.docs { list-style: none; margin: 0; padding: 0; }
+  li.doc {
+    border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
+    border-radius: 10px; padding: .9rem 1.1rem; margin-bottom: .7rem;
+  }
+  li.doc a.title { font-weight: 600; text-decoration: none; color: inherit; }
+  li.doc a.title:hover { color: #2563eb; }
+  .preview { color: color-mix(in srgb, CanvasText 60%, Canvas); font-size: .9rem; margin: .35rem 0 0; }
+  .meta { font-size: .8rem; color: color-mix(in srgb, CanvasText 50%, Canvas); margin-top: .4rem; }
+  .low-conf { color: #d97706; font-weight: 600; }
+  .empty { color: color-mix(in srgb, CanvasText 55%, Canvas); padding: 2rem 0; text-align: center; }
+  .error {
+    border: 1px solid #ef4444; background: color-mix(in srgb, #ef4444 12%, Canvas);
+    color: color-mix(in srgb, #ef4444 85%, CanvasText);
+    padding: .75rem 1rem; border-radius: 8px; margin-bottom: 1rem;
+  }
+</style>
+</head>
+<body>
+<main>
+  <nav class="top">
+    <h1>Documents</h1>
+    <a href="/">&larr; Ingest another</a>
+  </nav>
+
+  {% if let Some(msg) = error %}
+  <div class="error">{{ msg }}</div>
+  {% endif %}
+
+  <form class="search" action="/documents" method="get">
+    <input type="text" name="q" value="{{ query }}" placeholder="Search recognized text&hellip;">
+    <button type="submit">Search</button>
+  </form>
+
+  <p class="count">{{ count }} document{% if count != 1 %}s{% endif %}{% if !query.is_empty() %} matching &ldquo;{{ query }}&rdquo;{% endif %}</p>
+
+  {% if documents.is_empty() %}
+  <p class="empty">No documents yet. <a href="/">Ingest one</a>.</p>
+  {% else %}
+  <ul class="docs">
+    {% for d in documents %}
+    <li class="doc">
+      <a class="title" href="/documents/{{ d.hash_hex }}">{{ d.filename }}</a>
+      <p class="preview">{{ d.preview }}</p>
+      <p class="meta">
+        {{ d.page_count }} page{% if d.page_count != 1 %}s{% endif %}
+        &middot; confidence {{ d.confidence }}
+        {% if d.low_confidence %}<span class="low-conf">&middot; low confidence</span>{% endif %}
+      </p>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</main>
+</body>
+</html>

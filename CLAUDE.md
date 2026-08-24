@@ -3737,3 +3737,197 @@ that names it rather than by collateral damage.
 `Vec<[u8;12]>`, not a lawful `SoaEnvelope` lane; the 8-bit vocabulary is
 CAP-bound at 255/255 on 75 KB of English; there is no callable PoS surface; and
 the probe still builds its `DocIr` from text rather than from a real retina.
+
+## ★ `tesseract-paperless-web` — the Railway document archive, and the `store` feature it needed (2026-08-24)
+
+Second Railway image, alongside `tesseract-ocr-web`'s lean OCR demo. The
+`tesseract-paperless` crate landed earlier this session with a real S-2
+dedup gate and a `doc.v1` -> `DocIr` seam but, per its own doc comment, "NO
+storage backend chosen (KV blob is the consumer's)" — `DedupIndex` was a
+trait with no implementation. This closes that: a `store` feature adds a
+real `lancedb`-backed archive, and `tesseract-paperless-web` is the consumer
+that wires upload -> gate -> OCR -> archive into a paperless-ngx-shaped
+browse/search/delete UI.
+
+### Why `lancedb` from crates.io does not breach the BBB barrier
+
+`tesseract-rs/CLAUDE.md`'s barrier forbids the `lance-graph` ENGINE — the
+planner, the thinking substrate, the cognitive columns — from ever entering
+a customer binary. `lancedb`/`lance` are a different thing entirely: the
+embedded columnar database `lance-graph` itself is built ON, consumed here
+straight from crates.io per lance-graph's own carve-out ruling
+(`E-LANCE-IS-UPSTREAM-AUTHORITATIVE-1`: *"lance and lancedb are never used
+from forks... the upstream is authoritative"*). Version-pinned to the exact
+workspace-wide sweep: `lance =9.0.0`, `lancedb =0.33.0`, `arrow 58`. Nothing
+in that dependency tree is the forbidden brain.
+
+### `store.rs` — the trait finally has a body
+
+`crates/tesseract-paperless/src/store.rs` (feature-gated `store`): a 12-column
+Arrow schema (`content_sha256_hex` primary key, `document_guid`, `filename`,
+`mime`, `source`, `page_count`, `mean_confidence`, `low_confidence`, `text`,
+`preview`, `doc_ir_json`, `ingested_at_unix_ms`), `LanceStore::{connect, put,
+list, search, get, delete, count}`, and `impl DedupIndex for LanceStore` —
+sync-at-the-boundary via `tokio::task::block_in_place` +
+`Handle::current().block_on`, because the trait predates any storage backend
+and stays I/O-shaped-agnostic on purpose. `put` uses `merge_insert` on the
+primary key, so a retry after a partial failure is an update, not a
+duplicate row.
+
+**`mint_document_root(&hash) -> DocumentKeys`** (in `kv.rs`) is the missing
+piece the port left unfinished: `DocumentKeys` existed but nothing minted
+one. Deterministic from the hash alone (`classid = DOCUMENT << 16` +
+first 12 bytes of the sha256 as the content-blind V3 facet payload) — pulls
+`ogar_vocab::class_ids::DOCUMENT` per the hard rule, never invents a concept.
+Being pure and deterministic means a caller never needs a store round-trip
+to learn a document's address; `ingest.rs`'s `Duplicate` branch computes it
+locally rather than paying for a second read.
+
+**`search` is honestly named a smaller thing than it sounds.** `LIKE
+'%term%' ESCAPE '\'` over `text` — a full scan, not an inverted index —
+with all four SQL-special characters escaped (`\`, `%`, `_`, and the quote
+delimiter itself; a search box is a direct injection surface otherwise).
+`lancedb` ships a real FTS index (`Index::FTS`) this first cut does not yet
+build. Filed as the gap to close, not hidden behind the method name.
+
+### Real lancedb API, not guessed — extracted and read from source
+
+No docs.rs access was assumed reliable; the `.crate` tarballs for
+`lancedb-0.33.0` and `lance-9.0.0` were extracted from the local registry
+cache and read directly (`examples/{simple,full_text_search}.rs`,
+`src/{query,table,connection}.rs`, `src/table/merge.rs`,
+`src/dataset/scanner.rs`) before writing a line of `store.rs` against it. A
+throwaway probe crate (`/tmp/lancedb-probe`) confirmed the three crates
+resolve and compile together in this environment first. The one thing
+neither `cargo check` nor `cargo test` caught — only `cargo clippy -D
+warnings` did — was two pedantic lints: a truncating `as u16` cast (fixed to
+`u16::try_from(...).unwrap_or(u16::MAX)`) and a helper returning
+`Result<Option<T>, E>` where the `Result` layer was never actually
+fallible (simplified to `Option<T>` directly, dropping the `?` at its one
+call site). Both are the kind of thing `cargo check` structurally cannot
+see, which is why the CI line is `clippy -- -D warnings`, not `check`.
+
+### `tesseract-paperless-web` — the four gates, wired
+
+`crates/tesseract-paperless-web/`, a new binary crate depending on
+`tesseract-ogar` (the sanctioned recognition entry point),
+`tesseract-paperless` with `features = ["ocr", "store"]`, and OGAR's
+`ogar-doc-ir` + `ogar-from-docv1` directly (the `DocIr` conversion this
+crate's own ingest pipeline drives).
+
+- **`decode.rs`** — image bytes -> grey raster, the exact same bomb-bounded
+  limits (`MAX_DIM`, `MAX_PIXELS`, `MAX_DECODE_ALLOC`, `MIN_DIM`) as
+  `tesseract-ocr-web::ocr::decode_grey`, copied rather than shared (that
+  crate is bin-only, no lib target) — the numbers are policy, not an
+  accident of layout.
+- **`fetch.rs`** — `tesseract-ocr-web/src/fetch.rs` verbatim, byte-identical
+  (`diff` confirms it): the SSRF-guarded URL-fetch arm for the "paste a
+  link" upload path.
+- **`ingest.rs`** — the pipeline: `preflight` (S-2) decides BEFORE anything
+  is spent; a `Duplicate` verdict returns without ever touching the
+  recognizer; a `Novel` verdict runs OCR off the async runtime
+  (`spawn_blocking`, bounded by the same `Semaphore`-permit pattern
+  `tesseract-ocr-web::routes` uses), converts `doc.v1` -> `DocIr`, and
+  writes through `LanceStore::put`. **A named gap closed here, not
+  deferred**: `ogar_from_docv1::from_doc_v1`'s conversion drops the page
+  `quality` object entirely (`DocIr` carries no confidence field at all —
+  confirmed by reading the conversion function's own body), so
+  `mean_confidence`/`low_confidence` are pulled from the RAW `doc.v1` JSON
+  string directly, via `quality_from_doc_json`, run alongside (not instead
+  of) the typed conversion. `recognize_document` always emits exactly one
+  page (`structured::render_doc` hardcodes `"page":1` and never loops), so
+  `pages[0]` is a safe read, not an assumption.
+- **`routes.rs`** — `/` (upload form), `/upload` (POST, redirects to the new
+  document on success), `/documents` (list + `?q=` search), `/documents/:hash`
+  (detail: text, harvested fields, a flattened reading-order region list,
+  delete button), `/documents/:hash/delete`. `flatten_regions` walks
+  `DocIr`'s recursive tree into a linear `Vec<RegionView>` because Askama
+  templates cannot recurse into a Rust-side tree without a second `Template`
+  type per level — a deliberate simplification, not a limitation hit by
+  accident. `format_unix_ms` hand-rolls the Howard Hinnant civil-from-days
+  algorithm rather than pulling `chrono`/`time` for one formatting call site,
+  tested against a known instant (not just "doesn't panic").
+- **`state.rs`** — `AppState { executor: OcrExecutor, store: LanceStore,
+  recognize_permits: Arc<Semaphore> }`, loaded once at startup.
+
+**Every `IngestOutcome` field is read, not just carried.** The first
+`cargo check` pass flagged `document_guid`/`page_count`/`mean_confidence`/
+`low_confidence`/`matched` as dead code — genuinely true at that point,
+since only `.hash_hex()` was ever called on the outcome. Rather than
+`#[allow(dead_code)]` the fields into silence, `log_ingest_outcome` in
+`routes.rs` prints one informational line per ingest to stdout (Railway
+logs): a stored document's page count and confidence (flagging low
+confidence), or a duplicate's matched-hash reason — the same "loss must be
+loud" instinct this repo's own doc-drop findings keep re-learning, applied
+here to a quieter case (nothing failed, but a duplicate silently skipping
+OCR, or a low-confidence page landing in the archive unflagged, are both
+worth a log line).
+
+### Templates — Askama, standalone, no shared layout
+
+`templates/{index,documents,document}.html`, each self-contained with its
+own `<style>` block (matching `tesseract-ocr-web`'s own convention — that
+crate's three templates don't share a layout either). paperless-ngx-shaped:
+upload form -> document list with inline search -> detail view with
+harvested fields, full text, a region table, and a delete button guarded by
+a JS `confirm()`.
+
+### The Dockerfile — three siblings, plus a new one
+
+`crates/tesseract-paperless-web/Dockerfile` mirrors `tesseract-ogar`'s
+three-sibling shape (`lance-graph`, `ndarray`, `OGAR` all cloned in the
+builder stage — this crate's dependency chain touches all three, the same
+as `tesseract-ogar` does) but trims only `tesseract-ocr-python` from the
+workspace (keeping both `tesseract-ogar` and `tesseract-paperless-web` in,
+unlike `tesseract-ocr-web`'s Dockerfile which trims `tesseract-ogar` out).
+Runtime stage creates `/app/data` (writable, owned by the non-root
+`appuser`) for the lancedb archive, with `ARCHIVE_URI=/app/data/archive.lance`
+as the default — documented as needing a Railway volume mount at that path
+for the archive to survive a redeploy. `PORT` stays unset, same as every
+other Dockerfile in this repo — Railway injects it, the binary reads it at
+runtime only.
+
+**A genuinely new build requirement, not present in either existing
+Dockerfile:** `lance-encoding` (pulled in transitively by `lancedb`/`lance`)
+compiles `.proto` files at build time. Debian's `protobuf-compiler` package
+alone ships the `protoc` binary but not the well-known includes
+(`google/protobuf/empty.proto` and friends) — the build fails with `File not
+found` without `libprotobuf-dev` installed alongside it. Measured this
+session via a throwaway probe crate before it was trusted enough to put in
+the Dockerfile or CI. Both packages are now in the builder stage's `apt-get
+install` line, and CI gained its own `Install protoc (for lance-encoding)`
+step ahead of the toolchain install, so every job that reaches the `store`
+feature or `tesseract-paperless-web` has it — not just the Dockerfile.
+
+### CI — every tier still gets a line
+
+Extended `.github/workflows/rust.yml`'s existing "every feature gets a CI
+line, or it rots invisibly" discipline: `Test`/`Clippy (paperless, store)`
+alongside the pre-existing default/ocr/token lines, and
+`Build`/`Test`/`Clippy (paperless-web)` for the new crate — the first CI
+line that exercises the `ocr`+`store` feature pairing end to end, since
+`tesseract-paperless`'s own CI only ever turns one feature on at a time.
+`cargo fmt -p tesseract-paperless-web -- --check` added to the formatting
+step, scoped like every other crate in that list (never `--all` — the path
+deps would walk into the sibling `lance-graph`/`ndarray` workspaces).
+
+### Status — honest
+
+- `store.rs`: 6 new async tests (`#[tokio::test(flavor = "multi_thread")]`,
+  `tempfile::tempdir()`-backed), all green; 25/25 total for
+  `tesseract-paperless --features store`; clippy `-D warnings` clean.
+- `tesseract-paperless-web`: compiles, clippy `-D warnings` clean, fmt clean.
+  Tests cover the pure-function surface (`quality_from_doc_json`,
+  `confidence_str`, `format_unix_ms`, `hex16`, `decode_grey`'s bomb guards)
+  — no end-to-end upload-through-archive integration test yet (would need a
+  running `AppState` with a real model + a `tempdir` archive; the individual
+  pieces it composes — `LanceStore`, `OcrExecutor`, `ogar_from_docv1` — are
+  each tested at their own layer).
+- **Not yet done**: an end-to-end `router()` + `tower::ServiceExt::oneshot`
+  integration test driving a real upload through to a stored document (the
+  `tower`/`tempfile` dev-deps are already in `Cargo.toml` for exactly this,
+  unused so far); a real `docker build` (no Docker daemon in this
+  environment, same limitation `tesseract-ogar/CLAUDE.md` already records
+  for its own Dockerfile — this one is simulated no further than a
+  standalone `cargo build --release -p tesseract-paperless-web`); the FTS
+  index `search` still only does a `LIKE` scan.

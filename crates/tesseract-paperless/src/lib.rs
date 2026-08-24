@@ -43,6 +43,10 @@
 
 pub mod intake;
 pub mod kv;
+pub mod render;
+
+#[cfg(feature = "store")]
+pub mod store;
 
 #[cfg(feature = "token")]
 pub mod token;

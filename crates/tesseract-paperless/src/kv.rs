@@ -234,6 +234,50 @@ pub struct DocumentKeys {
     pub content_sha256: ContentSha256,
 }
 
+/// Mint the document subtree's root key from its convergence hash.
+///
+/// # Where the classid comes from
+///
+/// `ogar_vocab::class_ids::DOCUMENT` (`0x080B`) — pulled, per this repo's own
+/// hard rule ("never mint a classid here; concepts are minted in ogar-vocab").
+/// Its own doc comment names exactly this call site: *"the generic,
+/// source-agnostic DOCUMENT concept … content-addressed via
+/// `DocIr::content_sha256`; the raw bytes live in a consumer content store,
+/// never as a concept slot."* Canon-high (`E-CLASSID-CANON-HIGH-FLIP`):
+/// `facet_classid = concept << 16 | APP_PREFIX`. `APP_PREFIX` is `0` — this
+/// consumer has no per-app render skin to select, and the zero-fallback
+/// ladder treats that as "no prefix routing", not an error.
+///
+/// # Why NOT `mint_for`
+///
+/// Trap 1 (above): `mint_for`'s V3 arm is feature-gated and its fallback is
+/// silent. This function builds the [`FacetCascade`] directly — the crate's
+/// own measured idiom — so a missing `guid-v3-tail` feature is structurally
+/// unreachable rather than a silent wrong-shape key.
+///
+/// # Why the hash's own bytes are the identity
+///
+/// The 12-byte payload is content-blind by design (`le-contract.md` §3): the
+/// classid's `ClassView` decides what it means. For a document root there is
+/// no coarser hierarchy to place it in — the document either exists or it
+/// doesn't — so the honest reading is the plainest one: the first 12 bytes of
+/// a cryptographic 32-byte hash, unchanged. Two different documents landing
+/// on the same 96 bits is far below any threshold this crate needs to defend
+/// against, and — unlike a counter or a timestamp — it makes the mint a pure
+/// function of the bytes already computed for [`preflight`], so minting twice
+/// for the same document is idempotent by construction rather than by an
+/// index doing the deduplicating work over again.
+#[must_use]
+pub fn mint_document_root(hash: &ContentSha256) -> DocumentKeys {
+    let mut raw = [0u8; 16];
+    raw[0..4].copy_from_slice(&((u32::from(ogar_vocab::class_ids::DOCUMENT)) << 16).to_le_bytes());
+    raw[4..16].copy_from_slice(&hash.0[0..12]);
+    DocumentKeys {
+        root: DocumentGuid(FacetCascade::from_bytes(&raw)),
+        content_sha256: *hash,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +365,45 @@ mod tests {
             Verdict::Novel,
             "the index must answer Novel for bytes it has not seen"
         );
+    }
+
+    /// The mint is a PURE function of the hash: minting twice for the same
+    /// document must yield the identical root, or persisting a document
+    /// twice would silently create two subtrees.
+    #[test]
+    fn minting_is_deterministic_and_the_classid_is_the_pulled_document_concept() {
+        let hash = ContentSha256::of(b"an invoice pdf");
+        let a = mint_document_root(&hash);
+        let b = mint_document_root(&hash);
+        assert_eq!(
+            a.root.0.to_bytes(),
+            b.root.0.to_bytes(),
+            "minting the same hash twice must yield the identical root"
+        );
+        assert_eq!(a.content_sha256, hash);
+        // facet_classid = concept << 16 | APP_PREFIX(0) — read back the high
+        // 16 bits and confirm they equal the PULLED constant, not a guess.
+        let classid = a.root.0.facet_classid;
+        assert_eq!(
+            (classid >> 16) as u16,
+            ogar_vocab::class_ids::DOCUMENT,
+            "the root's classid must carry the pulled DOCUMENT concept"
+        );
+        assert_eq!(
+            classid & 0xFFFF,
+            0,
+            "APP_PREFIX is 0 — no per-app render skin here"
+        );
+    }
+
+    /// Two DIFFERENT documents must mint to different roots — the identity
+    /// half of the payload actually varies with the hash rather than being a
+    /// constant that happens to satisfy the determinism test above.
+    #[test]
+    fn different_documents_mint_different_roots() {
+        let a = mint_document_root(&ContentSha256::of(b"document one"));
+        let b = mint_document_root(&ContentSha256::of(b"document two"));
+        assert_ne!(a.root.0.to_bytes(), b.root.0.to_bytes());
     }
 
     /// Trap 1, asserted rather than described: the facet is the 4+12 shape and

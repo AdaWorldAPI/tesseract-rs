@@ -1,0 +1,38 @@
+# tesseract-paperless-web — Railway-ready archive: upload a document, OCR it,
+# store it, search it, browse it. The paperless-ngx-shaped consumer of
+# `tesseract-paperless`.
+[package]
+name = "tesseract-paperless-web"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97.1"
+publish = false
+
+[[bin]]
+name = "tesseract-paperless-web"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["multipart"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs"] }
+askama = "0.12"
+tower-http = { version = "0.5", features = ["limit"] }
+# Image decode for uploads (same pure-Rust decoder set as tesseract-ocr-web —
+# no C image libraries at runtime).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "tiff", "gif", "bmp", "pnm"] }
+# URL fetch for the "web link" upload arm — rustls only.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+futures-util = { version = "0.3", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The whole point of this crate: recognition through the ONE sanctioned
+# entry point, intake through the S-2 gate, storage through lancedb.
+tesseract-ogar = { path = "../tesseract-ogar" }
+tesseract-paperless = { path = "../tesseract-paperless", features = ["ocr", "store"] }
+ogar-doc-ir = { path = "../../../OGAR/crates/ogar-doc-ir" }
+ogar-from-docv1 = { path = "../../../OGAR/crates/ogar-from-docv1" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
