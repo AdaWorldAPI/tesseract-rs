@@ -37,6 +37,18 @@ jobs:
       with:
         repository: AdaWorldAPI/OGAR
         path: OGAR
+    # NOTE: no sibling checkout for tantivy here. `tesseract-paperless`'s
+    # tantivy dependency is a pinned `git` dep (not the sibling `path` form
+    # lance-graph/ndarray/OGAR use), specifically so it needs no checkout
+    # step and no Dockerfile clone-and-trim stanza — see that Cargo.toml
+    # entry's own comment for why this one dependency is the exception.
+    # `lance-encoding` (pulled in by `tesseract-paperless --features store`
+    # and by `tesseract-paperless-web`) compiles .proto files at build time.
+    # `protobuf-compiler` alone ships `protoc` but not the well-known
+    # includes (google/protobuf/empty.proto etc.) — `libprotobuf-dev` is
+    # required alongside it, or the build fails with "File not found".
+    - name: Install protoc (for lance-encoding)
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
     # Workspace sweep pin (lance-graph #896 family): 1.97.1, matching the
     # repo's rust-toolchain.toml. ndarray's rust-version = 1.95 floor is
     # satisfied a fortiori.
@@ -103,6 +115,65 @@ jobs:
     - name: Clippy (ocr-web)
       working-directory: tesseract-rs
       run: cargo clippy -p tesseract-ocr-web --all-targets -- -D warnings
+    # tesseract-paperless: a CONSUMER crate whose two interesting halves are
+    # off by default. Every tier gets a line — a feature with no CI line is a
+    # feature that rots, which is exactly how `spider_doc_ir` sat broken
+    # against a field its own dependency had added.
+    - name: Build (paperless, default)
+      working-directory: tesseract-rs
+      run: cargo build -p tesseract-paperless --verbose
+    - name: Test (paperless, default)
+      working-directory: tesseract-rs
+      run: cargo test -p tesseract-paperless --verbose
+    - name: Clippy (paperless, default)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-paperless --all-targets -- -D warnings
+    - name: Clippy (paperless, ocr)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-paperless --features ocr --all-targets -- -D warnings
+    - name: Test (paperless, token)
+      working-directory: tesseract-rs
+      run: cargo test -p tesseract-paperless --features token --verbose
+    - name: Clippy (paperless, token)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-paperless --features token --all-targets -- -D warnings
+    # The probe IS the evidence for every `token` claim, and it carries its own
+    # 41 gates, so running it is the gate. Release: the debug build of a
+    # BPE merge loop over 170 KB is minutes slower for no added signal.
+    - name: Probe (paperless, token seam)
+      working-directory: tesseract-rs
+      run: cargo run --release -p tesseract-paperless --features token --example probe_token_seam
+    - name: Test (paperless, store)
+      working-directory: tesseract-rs
+      run: cargo test -p tesseract-paperless --features store --verbose
+    - name: Clippy (paperless, store)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-paperless --features store --all-targets -- -D warnings
+    # A real, persistent Tantivy full-text index (BM25 + snippets) --
+    # deliberately a SEPARATE feature from `token` (which pins tantivy to
+    # `default-features = false`, RAM-only): `search` turns on `mmap` +
+    # `stemmer` + `stopwords` + `lz4-compression` on the SAME dependency
+    # entry, all pure Rust, so no C is introduced either way.
+    - name: Test (paperless, search)
+      working-directory: tesseract-rs
+      run: cargo test -p tesseract-paperless --features search --verbose
+    - name: Clippy (paperless, search)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-paperless --features search --all-targets -- -D warnings
+    # tesseract-paperless-web: the Railway-deployable document archive —
+    # upload -> S-2 gate -> OCR -> DocIr -> lancedb + Tantivy search, with
+    # the browse/search/delete UI. Depends on tesseract-paperless with
+    # ocr+store+search on, so this is the first CI line that exercises that
+    # three-way feature pairing end to end.
+    - name: Build (paperless-web)
+      working-directory: tesseract-rs
+      run: cargo build -p tesseract-paperless-web --verbose
+    - name: Test (paperless-web)
+      working-directory: tesseract-rs
+      run: cargo test -p tesseract-paperless-web --verbose
+    - name: Clippy (paperless-web)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-paperless-web --all-targets -- -D warnings
     - name: Check formatting
       # SCOPED to -p (NOT --all): the path deps would walk into the sibling
       # lance-graph / ndarray workspaces.
@@ -114,6 +185,8 @@ jobs:
         cargo fmt -p tesseract-ocr-pdf -- --check
         cargo fmt -p tesseract-ogar -- --check
         cargo fmt -p tesseract-ocr-web -- --check
+        cargo fmt -p tesseract-paperless -- --check
+        cargo fmt -p tesseract-paperless-web -- --check
 
   quality:
     # Slow end-to-end quality-regression tests (~10 min total): the 8+7+0

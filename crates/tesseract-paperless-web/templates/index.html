@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tesseract-paperless — document archive</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    line-height: 1.5; margin: 0; padding: 2rem 1rem;
+    background: Canvas; color: CanvasText;
+  }
+  main { max-width: 42rem; margin: 0 auto; }
+  h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+  .tag { color: color-mix(in srgb, CanvasText 60%, Canvas); font-size: .95rem; margin: 0 0 1.5rem; }
+  nav.top { margin-bottom: 1.5rem; }
+  nav.top a { color: #2563eb; text-decoration: none; font-weight: 600; }
+  .card {
+    border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
+    border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem;
+  }
+  label { display: block; font-weight: 600; margin-bottom: .35rem; }
+  input[type=file], input[type=url] {
+    width: 100%; padding: .55rem; border-radius: 8px;
+    border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
+    background: Canvas; color: CanvasText; font-size: 1rem;
+  }
+  .or { text-align: center; color: color-mix(in srgb, CanvasText 50%, Canvas);
+        margin: .9rem 0; font-size: .85rem; letter-spacing: .05em; }
+  .btns { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: 1rem; }
+  button {
+    flex: 1 1 auto; padding: .7rem 1rem; font-size: 1rem;
+    font-weight: 600; border: 0; border-radius: 8px; cursor: pointer;
+    background: #2563eb; color: #fff;
+  }
+  button:hover { filter: brightness(1.08); }
+  .error {
+    border: 1px solid #ef4444; background: color-mix(in srgb, #ef4444 12%, Canvas);
+    color: color-mix(in srgb, #ef4444 85%, CanvasText);
+    padding: .75rem 1rem; border-radius: 8px; margin-bottom: 1rem;
+  }
+  .note { font-size: .85rem; color: color-mix(in srgb, CanvasText 55%, Canvas); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
+  footer { margin-top: 2rem; font-size: .8rem; color: color-mix(in srgb, CanvasText 50%, Canvas); }
+</style>
+</head>
+<body>
+<main>
+  <h1>tesseract-paperless</h1>
+  <p class="tag">Upload a scan or photo. It is OCR'd with the pure-Rust recognizer, deduplicated by content hash, and archived &mdash; searchable, browsable, paperless-ngx-shaped.</p>
+
+  <nav class="top"><a href="/documents">&rarr; Browse the archive</a></nav>
+
+  {% if let Some(msg) = error %}
+  <div class="error">{{ msg }}</div>
+  {% endif %}
+
+  <form class="card" action="/upload" method="post" enctype="multipart/form-data">
+    <label for="file">Upload a document image</label>
+    <input id="file" type="file" name="file" accept="image/png,image/jpeg,image/webp,image/tiff,image/gif,image/bmp,image/x-portable-graymap,image/*">
+
+    <div class="or">&mdash; OR &mdash;</div>
+
+    <label for="url">Fetch an image URL</label>
+    <input id="url" type="url" name="url" placeholder="https://example.com/scan.png">
+    <p class="note">Private, loopback, and link-local addresses are refused (SSRF guard); 10&nbsp;MB / 10&nbsp;s cap.</p>
+
+    <div class="btns">
+      <button type="submit">Ingest document</button>
+    </div>
+  </form>
+
+  <p class="note">A document already in the archive (byte-identical content) is recognized as a duplicate and skipped &mdash; no repeat OCR spend, and you land straight on the existing record.</p>
+
+  <footer>Pure-Rust OCR (no libtesseract/leptonica at runtime) &middot; <code>lancedb</code>-backed archive.</footer>
+</main>
+</body>
+</html>

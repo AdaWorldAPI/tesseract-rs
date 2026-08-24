@@ -3627,3 +3627,447 @@ dense or genuinely sparse but non-pathological page), which needs its own
 measurement pass against the full golden suite before landing, matching the
 standing rule that a heuristic gate needs evidence at the point it is turned
 on, not just at the point it is written.
+
+## ★ `tesseract-paperless` — document intake lands here, feature-gated (2026-08-24)
+
+Operator directive: *"can you add a paperless crate in Tesseract-rs instead and
+make it feature gated."* The work had been built in `AdaWorldAPI/paperless-rs`,
+whose push is denied at the GitHub-App level (403 through the session proxy AND
+proxy-bypassed; the in-environment `GH_TOKEN` is a 14-character placeholder, so
+the usual "a 403 here is the proxy" escape does not apply). It therefore had no
+durable home. **`crates/tesseract-paperless` is now the ONE source of truth**;
+the paperless-rs branch is a dead copy, archived as a patch under lance-graph
+`.claude/harvest/paperless-token-plateau/`. Do not sync the two — there is
+nothing to sync back to.
+
+### Why this does not breach the operator-set boundary
+
+This file already carries: *"tesseract-rs = faithful recognition → rich doc.v1
+… Store / graph / KV / PDF-from-data are NOT tesseract-rs concerns."* That rule
+stands, and three things keep the new crate on the right side of it:
+
+1. **It is a CONSUMER**, and this workspace already hosts consumers —
+   `tesseract-ocr-web`, `-pdf`, `-python`, `-ogar` are all downstream of
+   recognition rather than part of it.
+2. **No existing crate gains a dependency.** `tesseract-core`, `-recognizer`
+   and `-ocr` keep their exact dep sets. Recognition stays storage-less, which
+   is what the boundary actually protects.
+3. **There is no store.** `DedupIndex` is a trait and nothing here implements
+   it — the crate ships the GATE (a hash, a lookup contract, an ordering rule),
+   never the KV. That is the same line `OGAR-DOC-W4-BUILD-SPEC` draws: *"No
+   storage backend chosen (KV blob is the consumer's)."*
+
+### The three tiers, and why it is a MEMBER rather than excluded
+
+| tier | pulls | what it is |
+|---|---|---|
+| `default` | `sha2`, `lance-graph-contract`, `ogar-doc-ir`, `ogar-from-docv1` | the S-2 dedup gate + `doc.v1` → `DocIr` |
+| `ocr` | + `tesseract-ogar` | run the recognizer in-process |
+| `token` | + `tantivy`, `deepnsm-v2` | the lexical seam: one BPE tokenization per span, borrowed by several consumers |
+
+**Excluding it from the workspace would have been the wrong kind of gating.**
+An excluded crate is never compiled by CI, and an uncompiled crate rots
+invisibly — which this session watched happen for real to `spider_doc_ir`
+(a floating branch dep, no CI building the pair, broken for weeks by a field
+its own dependency added). A member with optional deps gets the opposite: the
+default build stays lean AND every tier has a CI line. All six lines are wired
+(`build`/`test`/`clippy` default, `clippy` ocr, `test`/`clippy` token) plus the
+probe itself, because the probe carries the evidence for every `token` claim.
+
+Note `token` turns on `lance-graph-contract/guid-v3-tail` transitively
+(deepnsm-v2 requires it, and requires it correctly — without it `mint_for`
+silently falls back to the V1 tail). Additive and correct, but it IS a
+graph-wide feature unification, so the manifest names it rather than leaving it
+to be discovered.
+
+### The DOM leg was replaced by something better, not dropped
+
+The paperless-rs version called `spider_doc_ir::harvest` directly, which both
+bound intake to one crawler and inherited its build — and that build is broken
+(`E0063: missing field 'confidence'`, a field `ogar-doc-ir` added after
+spider's only commit). The replacement is `ingest_doc_ir(bytes, index, build)`:
+the caller brings its own producer as a **closure**, so any producer that can
+build a `DocIr` is admitted and this crate depends on none of them. That is
+what a source-agnostic IR is FOR, and hard-coding one crawler had quietly spent
+the property.
+
+The closure — rather than an already-built `DocIr` — is what keeps S-2 true for
+a producer this crate has never heard of: on a duplicate it is **never called**.
+`a_duplicate_never_reaches_a_third_party_producer` proves it by passing a
+closure that PANICS, with the paired half proving the same closure DOES run on
+novel bytes (otherwise the first assertion would hold for a producer that is
+never called at all, which proves nothing about ordering).
+
+**One assertion was promoted to a runtime guard.** The old code merely *tested*
+that `spider_doc_ir`'s hash matched the gate's. `ingest_doc_ir` now REFUSES a
+mismatch (`IntakeError::IdentityMismatch`), because a producer that keys its IR
+by a normalised or re-encoded form of its input would otherwise leave the gate
+and the subtree silently addressing two different documents. Its falsifier uses
+exactly that realistic shape — a producer that hashes the trimmed input — and
+the paired half proves the guard is discriminating rather than always-on.
+
+### Evidence reproduced in the new home, not assumed
+
+The move is faithful, checked rather than trusted: `probe_token_seam` reports
+**ALL 41 GATES GREEN** with numbers identical to the paperless-rs run (Alice:
+75 513 B / 300 spans / 36 994 tokens / 245 uniq / 55 400 B resident), and both
+measurement probes reproduce (u8-vs-u16 rail: `alice-full` 1.95× cap-bound vs
+6.13× corpus-bound; WordId round-trips only 67.7 % of source bytes while
+TokenId is byte-exact). 13 lib tests, three tiers clippy-clean at
+`-D warnings`, fmt clean.
+
+Two things the move genuinely fixed rather than carried over: the whole
+`[patch]` section is **gone** (siblings are path deps here, which is this
+repo's convention, so the escaping-relative-path trap does not exist), and with
+it the branch-vs-rev unification problem — cargo does not unify a `branch` and
+a `rev` source even at the identical commit, and two SourceIds for
+`ogar-doc-ir` meant two incompatible `DocIr` types.
+
+### Disable table (both verified red-then-green)
+
+| assertion | disable | observed |
+|---|---|---|
+| a producer keyed by other bytes is refused | delete the `content_sha256 != hash` check | `a_producer_keyed_by_other_bytes_is_refused` FAILED |
+| a duplicate never reaches a third-party producer | move `build(source_bytes)` ahead of the short-circuit | `a_duplicate_never_reaches_a_third_party_producer` FAILED (the closure's own panic) |
+
+12 of 13 passed under each disable, so each one is pinned by exactly the test
+that names it rather than by collateral damage.
+
+**Still open, unchanged by the move:** the resident lane is a probe-local
+`Vec<[u8;12]>`, not a lawful `SoaEnvelope` lane; the 8-bit vocabulary is
+CAP-bound at 255/255 on 75 KB of English; there is no callable PoS surface; and
+the probe still builds its `DocIr` from text rather than from a real retina.
+
+## ★ `tesseract-paperless-web` — the Railway document archive, and the `store` feature it needed (2026-08-24)
+
+Second Railway image, alongside `tesseract-ocr-web`'s lean OCR demo. The
+`tesseract-paperless` crate landed earlier this session with a real S-2
+dedup gate and a `doc.v1` -> `DocIr` seam but, per its own doc comment, "NO
+storage backend chosen (KV blob is the consumer's)" — `DedupIndex` was a
+trait with no implementation. This closes that: a `store` feature adds a
+real `lancedb`-backed archive, and `tesseract-paperless-web` is the consumer
+that wires upload -> gate -> OCR -> archive into a paperless-ngx-shaped
+browse/search/delete UI.
+
+### Why `lancedb` from crates.io does not breach the BBB barrier
+
+`tesseract-rs/CLAUDE.md`'s barrier forbids the `lance-graph` ENGINE — the
+planner, the thinking substrate, the cognitive columns — from ever entering
+a customer binary. `lancedb`/`lance` are a different thing entirely: the
+embedded columnar database `lance-graph` itself is built ON, consumed here
+straight from crates.io per lance-graph's own carve-out ruling
+(`E-LANCE-IS-UPSTREAM-AUTHORITATIVE-1`: *"lance and lancedb are never used
+from forks... the upstream is authoritative"*). Version-pinned to the exact
+workspace-wide sweep: `lance =9.0.0`, `lancedb =0.33.0`, `arrow 58`. Nothing
+in that dependency tree is the forbidden brain.
+
+### `store.rs` — the trait finally has a body
+
+`crates/tesseract-paperless/src/store.rs` (feature-gated `store`): a 12-column
+Arrow schema (`content_sha256_hex` primary key, `document_guid`, `filename`,
+`mime`, `source`, `page_count`, `mean_confidence`, `low_confidence`, `text`,
+`preview`, `doc_ir_json`, `ingested_at_unix_ms`), `LanceStore::{connect, put,
+list, search, get, delete, count}`, and `impl DedupIndex for LanceStore` —
+sync-at-the-boundary via `tokio::task::block_in_place` +
+`Handle::current().block_on`, because the trait predates any storage backend
+and stays I/O-shaped-agnostic on purpose. `put` uses `merge_insert` on the
+primary key, so a retry after a partial failure is an update, not a
+duplicate row.
+
+**`mint_document_root(&hash) -> DocumentKeys`** (in `kv.rs`) is the missing
+piece the port left unfinished: `DocumentKeys` existed but nothing minted
+one. Deterministic from the hash alone (`classid = DOCUMENT << 16` +
+first 12 bytes of the sha256 as the content-blind V3 facet payload) — pulls
+`ogar_vocab::class_ids::DOCUMENT` per the hard rule, never invents a concept.
+Being pure and deterministic means a caller never needs a store round-trip
+to learn a document's address; `ingest.rs`'s `Duplicate` branch computes it
+locally rather than paying for a second read.
+
+**`search` is honestly named a smaller thing than it sounds.** `LIKE
+'%term%' ESCAPE '\'` over `text` — a full scan, not an inverted index —
+with all four SQL-special characters escaped (`\`, `%`, `_`, and the quote
+delimiter itself; a search box is a direct injection surface otherwise).
+`lancedb` ships a real FTS index (`Index::FTS`) this first cut does not yet
+build. Filed as the gap to close, not hidden behind the method name.
+
+### Real lancedb API, not guessed — extracted and read from source
+
+No docs.rs access was assumed reliable; the `.crate` tarballs for
+`lancedb-0.33.0` and `lance-9.0.0` were extracted from the local registry
+cache and read directly (`examples/{simple,full_text_search}.rs`,
+`src/{query,table,connection}.rs`, `src/table/merge.rs`,
+`src/dataset/scanner.rs`) before writing a line of `store.rs` against it. A
+throwaway probe crate (`/tmp/lancedb-probe`) confirmed the three crates
+resolve and compile together in this environment first. The one thing
+neither `cargo check` nor `cargo test` caught — only `cargo clippy -D
+warnings` did — was two pedantic lints: a truncating `as u16` cast (fixed to
+`u16::try_from(...).unwrap_or(u16::MAX)`) and a helper returning
+`Result<Option<T>, E>` where the `Result` layer was never actually
+fallible (simplified to `Option<T>` directly, dropping the `?` at its one
+call site). Both are the kind of thing `cargo check` structurally cannot
+see, which is why the CI line is `clippy -- -D warnings`, not `check`.
+
+### `tesseract-paperless-web` — the four gates, wired
+
+`crates/tesseract-paperless-web/`, a new binary crate depending on
+`tesseract-ogar` (the sanctioned recognition entry point),
+`tesseract-paperless` with `features = ["ocr", "store"]`, and OGAR's
+`ogar-doc-ir` + `ogar-from-docv1` directly (the `DocIr` conversion this
+crate's own ingest pipeline drives).
+
+- **`decode.rs`** — image bytes -> grey raster, the exact same bomb-bounded
+  limits (`MAX_DIM`, `MAX_PIXELS`, `MAX_DECODE_ALLOC`, `MIN_DIM`) as
+  `tesseract-ocr-web::ocr::decode_grey`, copied rather than shared (that
+  crate is bin-only, no lib target) — the numbers are policy, not an
+  accident of layout.
+- **`fetch.rs`** — `tesseract-ocr-web/src/fetch.rs` verbatim, byte-identical
+  (`diff` confirms it): the SSRF-guarded URL-fetch arm for the "paste a
+  link" upload path.
+- **`ingest.rs`** — the pipeline: `preflight` (S-2) decides BEFORE anything
+  is spent; a `Duplicate` verdict returns without ever touching the
+  recognizer; a `Novel` verdict runs OCR off the async runtime
+  (`spawn_blocking`, bounded by the same `Semaphore`-permit pattern
+  `tesseract-ocr-web::routes` uses), converts `doc.v1` -> `DocIr`, and
+  writes through `LanceStore::put`. **A named gap closed here, not
+  deferred**: `ogar_from_docv1::from_doc_v1`'s conversion drops the page
+  `quality` object entirely (`DocIr` carries no confidence field at all —
+  confirmed by reading the conversion function's own body), so
+  `mean_confidence`/`low_confidence` are pulled from the RAW `doc.v1` JSON
+  string directly, via `quality_from_doc_json`, run alongside (not instead
+  of) the typed conversion. `recognize_document` always emits exactly one
+  page (`structured::render_doc` hardcodes `"page":1` and never loops), so
+  `pages[0]` is a safe read, not an assumption.
+- **`routes.rs`** — `/` (upload form), `/upload` (POST, redirects to the new
+  document on success), `/documents` (list + `?q=` search), `/documents/:hash`
+  (detail: text, harvested fields, a flattened reading-order region list,
+  delete button), `/documents/:hash/delete`. `flatten_regions` walks
+  `DocIr`'s recursive tree into a linear `Vec<RegionView>` because Askama
+  templates cannot recurse into a Rust-side tree without a second `Template`
+  type per level — a deliberate simplification, not a limitation hit by
+  accident. `format_unix_ms` hand-rolls the Howard Hinnant civil-from-days
+  algorithm rather than pulling `chrono`/`time` for one formatting call site,
+  tested against a known instant (not just "doesn't panic").
+- **`state.rs`** — `AppState { executor: OcrExecutor, store: LanceStore,
+  recognize_permits: Arc<Semaphore> }`, loaded once at startup.
+
+**Every `IngestOutcome` field is read, not just carried.** The first
+`cargo check` pass flagged `document_guid`/`page_count`/`mean_confidence`/
+`low_confidence`/`matched` as dead code — genuinely true at that point,
+since only `.hash_hex()` was ever called on the outcome. Rather than
+`#[allow(dead_code)]` the fields into silence, `log_ingest_outcome` in
+`routes.rs` prints one informational line per ingest to stdout (Railway
+logs): a stored document's page count and confidence (flagging low
+confidence), or a duplicate's matched-hash reason — the same "loss must be
+loud" instinct this repo's own doc-drop findings keep re-learning, applied
+here to a quieter case (nothing failed, but a duplicate silently skipping
+OCR, or a low-confidence page landing in the archive unflagged, are both
+worth a log line).
+
+### Templates — Askama, standalone, no shared layout
+
+`templates/{index,documents,document}.html`, each self-contained with its
+own `<style>` block (matching `tesseract-ocr-web`'s own convention — that
+crate's three templates don't share a layout either). paperless-ngx-shaped:
+upload form -> document list with inline search -> detail view with
+harvested fields, full text, a region table, and a delete button guarded by
+a JS `confirm()`.
+
+### The Dockerfile — three siblings, plus a new one
+
+`crates/tesseract-paperless-web/Dockerfile` mirrors `tesseract-ogar`'s
+three-sibling shape (`lance-graph`, `ndarray`, `OGAR` all cloned in the
+builder stage — this crate's dependency chain touches all three, the same
+as `tesseract-ogar` does) but trims only `tesseract-ocr-python` from the
+workspace (keeping both `tesseract-ogar` and `tesseract-paperless-web` in,
+unlike `tesseract-ocr-web`'s Dockerfile which trims `tesseract-ogar` out).
+Runtime stage creates `/app/data` (writable, owned by the non-root
+`appuser`) for the lancedb archive, with `ARCHIVE_URI=/app/data/archive.lance`
+as the default — documented as needing a Railway volume mount at that path
+for the archive to survive a redeploy. `PORT` stays unset, same as every
+other Dockerfile in this repo — Railway injects it, the binary reads it at
+runtime only.
+
+**A genuinely new build requirement, not present in either existing
+Dockerfile:** `lance-encoding` (pulled in transitively by `lancedb`/`lance`)
+compiles `.proto` files at build time. Debian's `protobuf-compiler` package
+alone ships the `protoc` binary but not the well-known includes
+(`google/protobuf/empty.proto` and friends) — the build fails with `File not
+found` without `libprotobuf-dev` installed alongside it. Measured this
+session via a throwaway probe crate before it was trusted enough to put in
+the Dockerfile or CI. Both packages are now in the builder stage's `apt-get
+install` line, and CI gained its own `Install protoc (for lance-encoding)`
+step ahead of the toolchain install, so every job that reaches the `store`
+feature or `tesseract-paperless-web` has it — not just the Dockerfile.
+
+### CI — every tier still gets a line
+
+Extended `.github/workflows/rust.yml`'s existing "every feature gets a CI
+line, or it rots invisibly" discipline: `Test`/`Clippy (paperless, store)`
+alongside the pre-existing default/ocr/token lines, and
+`Build`/`Test`/`Clippy (paperless-web)` for the new crate — the first CI
+line that exercises the `ocr`+`store` feature pairing end to end, since
+`tesseract-paperless`'s own CI only ever turns one feature on at a time.
+`cargo fmt -p tesseract-paperless-web -- --check` added to the formatting
+step, scoped like every other crate in that list (never `--all` — the path
+deps would walk into the sibling `lance-graph`/`ndarray` workspaces).
+
+### Status — honest
+
+- `store.rs`: 6 new async tests (`#[tokio::test(flavor = "multi_thread")]`,
+  `tempfile::tempdir()`-backed), all green; 25/25 total for
+  `tesseract-paperless --features store`; clippy `-D warnings` clean.
+- `tesseract-paperless-web`: compiles, clippy `-D warnings` clean, fmt clean.
+  Tests cover the pure-function surface (`quality_from_doc_json`,
+  `confidence_str`, `format_unix_ms`, `hex16`, `decode_grey`'s bomb guards)
+  — no end-to-end upload-through-archive integration test yet (would need a
+  running `AppState` with a real model + a `tempdir` archive; the individual
+  pieces it composes — `LanceStore`, `OcrExecutor`, `ogar_from_docv1` — are
+  each tested at their own layer).
+- **Not yet done**: an end-to-end `router()` + `tower::ServiceExt::oneshot`
+  integration test driving a real upload through to a stored document (the
+  `tower`/`tempfile` dev-deps are already in `Cargo.toml` for exactly this,
+  unused so far); a real `docker build` (no Docker daemon in this
+  environment, same limitation `tesseract-ogar/CLAUDE.md` already records
+  for its own Dockerfile — this one is simulated no further than a
+  standalone `cargo build --release -p tesseract-paperless-web`); the FTS
+  index `search` still only does a `LIKE` scan.
+
+## ★ Real Tantivy search — the paperless-ngx-parity gap actually closed (2026-08-24)
+
+Follow-up to the `tesseract-paperless-web` archive above. The operator's
+correction, verbatim in spirit: *this is the main purpose* — wire Tantivy,
+lancedb, `ogar-doc-ir`, and tesseract-rs together for real, not defer it.
+
+### The framing error, and why it was wrong
+
+The first answer to "what about tantivy" said wiring it in would mean
+"building all of that from scratch" — WRONG, and worth recording why. That
+claim conflated two unrelated things: `token::seam_tantivy::ReceiptTokenizer`
+(a research probe — a `Tokenizer` reading pre-tokenized BPE ids out of an
+in-RAM `TokenLane`, no add/delete/persist story) is not the only way to use
+Tantivy in this repo. The ordinary way — a plain on-disk index over plain
+document text, the ~150-line pattern every Tantivy user writes — needed no
+new architecture at all, just reading the fork's own examples.
+
+### What was verified before writing a line of `search.rs`
+
+Read the pinned `AdaWorldAPI/tantivy` fork's source directly (not assumed
+from memory): `Index::open_or_create`/`create_in_dir` (gated behind the
+`mmap` feature — NOT on by default in `token`'s `default-features = false`
+entry), `IndexWriter::{add_document,delete_term,commit}` signatures,
+`TopDocs::with_limit(n).order_by_score()`, `QueryParser::for_index`,
+`SnippetGenerator::create` + `Snippet::to_html()` (confirmed via source that
+`to_html()` runs `encode_minimal` — HTML-entity-encoding — over BOTH the
+matched and surrounding text, inserting only the `<b>`/`</b>` wrapper
+unescaped, so the output is safe to render with Askama's `|safe` without a
+second escaping pass or an XSS hole from OCR'd or attacker-supplied text).
+
+### The one real dependency wrinkle, resolved without duplicating the crate
+
+`token`'s tantivy entry pins `default-features = false` deliberately (the
+resident-lane seam is RAM-only, `mmap`/`stemmer` are dead weight there). A
+persistent, restart-surviving index needs `mmap` for real, plus `stemmer` +
+`stopwords` for search quality. Cargo allows only ONE `[dependencies]`
+tantivy entry per crate, so rather than a second entry (impossible) or
+reusing `token`'s bare one (wrong features), the single entry's `features`
+list grew to `["mmap", "stopwords", "stemmer", "lz4-compression"]` — all
+four are pure Rust (`memmap2`, `frostem`, `lz4_flex`; `stopwords` has no
+deps at all) — while the fork's ONLY C dependency,
+`columnar-zstd-compression` (`zstd-sys`), stays off, matching this crate's
+existing "no C at runtime" discipline exactly. A new `search` feature
+(`["dep:tantivy"]`) gates it independently of `token`
+(`["dep:tantivy", "dep:deepnsm-v2"]`) — enabling one never drags in the
+other's weight.
+
+### `search.rs` — the index
+
+`crates/tesseract-paperless/src/search.rs`: three fields (`hash` —
+`STRING | STORED`, exact-match primary key; `filename` and `text` —
+`TEXT | STORED`, searched + the snippet source). `SearchIndex::open_or_create`
+opens or creates an `MmapDirectory`-backed index; `index_document` is
+idempotent (delete-by-hash-term then insert then commit, the same
+delete-then-insert shape `LanceStore::put`'s `merge_insert` already uses);
+`delete_document` is a no-op on an absent hash, not an error; `search` runs
+`QueryParser` + `TopDocs` + `SnippetGenerator`, returning `SearchHit {
+hash_hex, score, snippet_html }` ranked highest-score-first.
+
+**A real, measured bug caught by the test suite, not assumed away:** the
+first cut used `ReloadPolicy::OnCommitWithDelay`, and every test that wrote
+then immediately searched in the same call chain returned **zero hits** —
+5 of 28 tests red. `OnCommitWithDelay` reloads the reader ASYNCHRONOUSLY off
+a filesystem watcher, so a search running right after `commit()` races it
+and sees the pre-write snapshot. Root-caused by contrast: a SEPARATE test
+that dropped the `SearchIndex` and reopened a fresh one against the
+already-committed directory (no race, no delay — a fresh reader picks up
+on-disk state immediately) passed the whole time, which is what pointed at
+the reload policy rather than the indexing logic itself. Fixed with
+`ReloadPolicy::Manual` + an explicit synchronous `self.reader.reload()?`
+inside `index_document`/`delete_document`, right after `commit()` — makes a
+document searchable the instant the call returns, which is also the
+correct production behaviour for an archive (not just a test fix).
+
+28 tests: the basic round-trip, a true negative (unmatched term -> zero
+hits), BM25 ranking (repeated-term doc scores higher, not just "found"),
+idempotent re-index (same hash twice -> one searchable copy, snippet
+reflects the LATEST text), delete (removes from results; deleting an
+unindexed hash is not an error), snippet highlighting (`<b>` present, term
+present — proves `SnippetGenerator` is wired, not stubbed), a malformed
+query reporting `SearchError::Query` (not a panic, not silent zero), and
+persistence across a full close-and-reopen of the index directory.
+
+### Wired into `tesseract-paperless-web`
+
+`AppState` gains `search: SearchIndex`, loaded at startup from
+`SEARCH_INDEX_DIR` (env var, defaults to `./search_index`, mirroring
+`ARCHIVE_URI`'s own convention) alongside the lancedb connection.
+`ingest.rs`'s `ingest()` calls `search.index_document` (dispatched via
+`spawn_blocking`, same as OCR — tantivy's commit is synchronous disk I/O)
+right after `store.put` succeeds, using the identical `render::plain_text`
+text the archive itself just stored. `routes.rs`'s `document_delete` deletes
+from both stores. `documents()` now runs REAL ranked search
+(`state.search.search`) when `?q=` is non-empty instead of the old
+`LanceStore::search` `LIKE` scan (which stays defined and tested — an
+honest fallback shape, just no longer the web crate's path), joining each
+hit back to its `DocumentRow` for display metadata the index doesn't carry
+(page count, confidence) — an N+1 lookup over a `LIST_LIMIT`-bounded result
+set, named as a cost rather than hidden. `documents.html` renders the
+snippet HTML with `|safe` when present (search-result mode) and falls back
+to the plain auto-escaped preview otherwise (browse mode), with a
+highlight style on `<b>` matching paperless-ngx's own visual convention.
+
+**A named, honest consistency gap:** `store.put` and `search.index_document`
+are two separate stores with no shared transaction. A crash between them
+leaves a document archived-but-unsearchable (visible by direct link, absent
+from search) — an inconsistency, not data loss, and `IngestError::Search`
+surfaces it rather than swallowing it. A reconciliation pass is filed as
+future work, not built here.
+
+### Dockerfile + CI
+
+Both the lancedb archive and the Tantivy index now live under the SAME
+`/app/data` Railway volume mount (`ARCHIVE_URI=/app/data/archive.lance`,
+`SEARCH_INDEX_DIR=/app/data/search_index`) — one volume covers both stores,
+both owned by the non-root runtime user before `USER appuser`. CI gained
+`Test`/`Clippy (paperless, search)` lines (mirroring the `store` lines
+exactly) ahead of the existing `paperless-web` build/test/clippy lines,
+which now exercise the three-way `ocr`+`store`+`search` feature pairing.
+
+### Status — honest
+
+- `search.rs`: 28/28 tests green, clippy `-D warnings` clean, fmt clean.
+- `tesseract-paperless-web`: 11/11 tests green (unchanged count — the
+  wiring is exercised through `search.rs`'s own tests and the crate's
+  existing pure-function tests; no new web-crate-level test was added for
+  the ingest-then-search-then-delete round trip specifically — filed as a
+  gap, same shape as the store-only version's missing end-to-end test).
+- **Environment note, not a code issue:** this session hit disk-space
+  exhaustion (`ENOSPC`) three separate times while building the combined
+  `store`+`search`+`ocr` dependency tree (lancedb+lance+datafusion+tantivy+
+  ndarray in one binary is large under debug profiles). Recovered each time
+  by deleting `target/debug/{incremental,examples}`, `target/release`, and
+  a stale sibling repo's own `target/` — never by reducing what got built.
+- **Still open, same as before:** `LanceStore::search`'s `LIKE` scan is now
+  dead code from the web crate's perspective (untouched, still tested, kept
+  as the honest fallback the store type itself documents) rather than
+  removed — a deliberate choice to avoid coupling the store type's API to
+  whether a caller happens to have a search index available.
