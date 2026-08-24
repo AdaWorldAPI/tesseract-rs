@@ -64,6 +64,7 @@ mod col {
     pub const PREVIEW: &str = "preview";
     pub const DOC_IR_JSON: &str = "doc_ir_json";
     pub const INGESTED_AT_UNIX_MS: &str = "ingested_at_unix_ms";
+    pub const SPO_JSON: &str = "spo_json";
 }
 
 /// Why a store operation failed.
@@ -114,6 +115,11 @@ fn schema() -> SchemaRef {
         Field::new(col::PREVIEW, DataType::Utf8, false),
         Field::new(col::DOC_IR_JSON, DataType::Utf8, false),
         Field::new(col::INGESTED_AT_UNIX_MS, DataType::Int64, false),
+        // Nullable: absent whenever the caller ran without a loaded
+        // `SentenceReasoner` (no deepnsm vocabulary available) — the same
+        // graceful-degrade shape `filename` already uses on this table, not
+        // a new pattern.
+        Field::new(col::SPO_JSON, DataType::Utf8, true),
     ]))
 }
 
@@ -154,6 +160,16 @@ pub struct DocumentRow {
     pub doc_ir_json: String,
     /// Milliseconds since the Unix epoch, at ingest time.
     pub ingested_at_unix_ms: i64,
+    /// Sentence-assembled SPO triples + per-sentence [`NarsTruth`] belief,
+    /// serialized JSON (an array of objects; shape owned by the writer, not
+    /// this crate — see `tesseract-paperless-web::ingest`'s
+    /// `spo_beliefs_to_json`). `None` whenever the writer ran without a
+    /// loaded reasoner (deepnsm vocabulary absent) — a graceful degrade, not
+    /// an error; the archived document and its full text are unaffected
+    /// either way.
+    ///
+    /// [`NarsTruth`]: lance_graph_contract::exploration::NarsTruth
+    pub spo_json: Option<String>,
 }
 
 impl DocumentRow {
@@ -207,6 +223,11 @@ impl LanceStore {
     /// # Errors
     /// [`StoreError::Json`] if `ir` fails to serialize;
     /// [`StoreError::Db`] if the write fails.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one archive row's columns, threaded 1:1 -- a param-object \
+                  would only rename this list, not shorten it"
+    )]
     pub async fn put(
         &self,
         hash: &ContentSha256,
@@ -215,6 +236,7 @@ impl LanceStore {
         low_confidence: bool,
         ir: &DocIr,
         ingested_at_unix_ms: i64,
+        spo_json: Option<&str>,
     ) -> Result<DocumentGuid, StoreError> {
         let keys = mint_document_root(hash);
         let doc_ir_json = ogar_doc_ir::to_json(ir).map_err(StoreError::Json)?;
@@ -242,6 +264,7 @@ impl LanceStore {
                 Arc::new(StringArray::from(vec![preview])),
                 Arc::new(StringArray::from(vec![doc_ir_json])),
                 Arc::new(Int64Array::from(vec![ingested_at_unix_ms])),
+                Arc::new(StringArray::from(vec![spo_json])),
             ],
         )
         .map_err(|_| StoreError::Malformed("record batch assembly"))?;
@@ -371,6 +394,7 @@ fn rows_from_batches(batches: &[RecordBatch]) -> Result<Vec<DocumentRow>, StoreE
         let preview = downcast_str(batch, col::PREVIEW)?;
         let doc_ir_json = downcast_str(batch, col::DOC_IR_JSON)?;
         let ingested_at = downcast_i64(batch, col::INGESTED_AT_UNIX_MS)?;
+        let spo_json = downcast_str_opt(batch, col::SPO_JSON);
 
         for i in 0..batch.num_rows() {
             let mut g = [0u8; 16];
@@ -390,6 +414,9 @@ fn rows_from_batches(batches: &[RecordBatch]) -> Result<Vec<DocumentRow>, StoreE
                 preview: preview.value(i).to_string(),
                 doc_ir_json: doc_ir_json.value(i).to_string(),
                 ingested_at_unix_ms: ingested_at.value(i),
+                spo_json: spo_json
+                    .as_ref()
+                    .and_then(|a| (!a.is_null(i)).then(|| a.value(i).to_string())),
             });
         }
     }
@@ -545,7 +572,7 @@ mod tests {
         let hash = ContentSha256::of(b"invoice one");
         let ir = sample_ir("image/png");
         store
-            .put(&hash, Some("invoice.png"), 92, false, &ir, 1_000)
+            .put(&hash, Some("invoice.png"), 92, false, &ir, 1_000, None)
             .await
             .expect("put");
 
@@ -575,7 +602,7 @@ mod tests {
         let store = LanceStore::connect(&uri).await.expect("connect");
         let held = ContentSha256::of(b"already archived");
         store
-            .put(&held, None, 80, false, &sample_ir("image/png"), 1)
+            .put(&held, None, 80, false, &sample_ir("image/png"), 1, None)
             .await
             .expect("put");
 
@@ -593,11 +620,27 @@ mod tests {
         let store = LanceStore::connect(&uri).await.expect("connect");
         let hash = ContentSha256::of(b"same document, re-ingested");
         store
-            .put(&hash, Some("v1.png"), 50, true, &sample_ir("image/png"), 1)
+            .put(
+                &hash,
+                Some("v1.png"),
+                50,
+                true,
+                &sample_ir("image/png"),
+                1,
+                None,
+            )
             .await
             .expect("first put");
         store
-            .put(&hash, Some("v2.png"), 99, false, &sample_ir("image/png"), 2)
+            .put(
+                &hash,
+                Some("v2.png"),
+                99,
+                false,
+                &sample_ir("image/png"),
+                2,
+                None,
+            )
             .await
             .expect("second put");
 
@@ -631,6 +674,7 @@ mod tests {
                 false,
                 &sample_ir("image/png"),
                 1,
+                None,
             )
             .await
             .expect("put");
@@ -660,6 +704,7 @@ mod tests {
                 false,
                 &sample_ir("image/png"),
                 1,
+                None,
             )
             .await
             .expect("put");
@@ -681,7 +726,7 @@ mod tests {
         let store = LanceStore::connect(&uri).await.expect("connect");
         let hash = ContentSha256::of(b"to be deleted");
         store
-            .put(&hash, None, 90, false, &sample_ir("image/png"), 1)
+            .put(&hash, None, 90, false, &sample_ir("image/png"), 1, None)
             .await
             .expect("put");
         assert_eq!(store.count().await.expect("count"), 1);
@@ -692,5 +737,65 @@ mod tests {
             .await
             .expect("get")
             .is_none());
+    }
+
+    /// `spo_json` is nullable and must round-trip BOTH states: a document
+    /// stored with a reasoner present carries the JSON back out; a document
+    /// stored WITHOUT one (the graceful-degrade path, `None` at `put`)
+    /// reads back `None`, not an empty string or a decode error — the
+    /// distinction a caller needs to tell "no beliefs extracted" apart from
+    /// "extraction never ran".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spo_json_round_trips_present_and_absent() {
+        let (_dir, uri) = tmp_uri();
+        let store = LanceStore::connect(&uri).await.expect("connect");
+
+        let with_spo = ContentSha256::of(b"has beliefs");
+        store
+            .put(
+                &with_spo,
+                None,
+                90,
+                false,
+                &sample_ir("image/png"),
+                1,
+                Some(r#"[{"subject":"dog","predicate":"sees","object":"cat"}]"#),
+            )
+            .await
+            .expect("put with spo_json");
+
+        let without_spo = ContentSha256::of(b"no reasoner ran");
+        store
+            .put(
+                &without_spo,
+                None,
+                90,
+                false,
+                &sample_ir("image/png"),
+                2,
+                None,
+            )
+            .await
+            .expect("put without spo_json");
+
+        let with_row = store
+            .get(&format!("{with_spo:?}"))
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(
+            with_row.spo_json.as_deref(),
+            Some(r#"[{"subject":"dog","predicate":"sees","object":"cat"}]"#)
+        );
+
+        let without_row = store
+            .get(&format!("{without_spo:?}"))
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(
+            without_row.spo_json, None,
+            "no reasoner means no column value, not an empty-string placeholder"
+        );
     }
 }

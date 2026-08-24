@@ -31,6 +31,20 @@ async fn main() {
     let search_index_dir = PathBuf::from(
         std::env::var("SEARCH_INDEX_DIR").unwrap_or_else(|_| "./search_index".to_string()),
     );
+    // deepnsm's `word_frequency/` CSVs — the SPO/`NarsTruth` reasoning
+    // layer's vocabulary. Same env-var-then-sibling-path convention as
+    // `tesseract-ogar/examples/ocr_demo.rs`'s own step 6: the sibling path
+    // only resolves at BUILD time (inside a Docker builder stage's /src
+    // layout), so a runtime image sets `DEEPNSM_VOCAB_DIR` to wherever it
+    // copied the CSVs instead.
+    let deepnsm_vocab_dir =
+        PathBuf::from(std::env::var("DEEPNSM_VOCAB_DIR").unwrap_or_else(|_| {
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../lance-graph/crates/deepnsm/word_frequency"
+            )
+            .to_string()
+        }));
 
     println!(
         "tesseract-paperless-web: loading model from {}",
@@ -41,8 +55,19 @@ async fn main() {
         "tesseract-paperless-web: search index at {}",
         search_index_dir.display()
     );
+    println!(
+        "tesseract-paperless-web: deepnsm vocabulary at {}",
+        deepnsm_vocab_dir.display()
+    );
 
-    let state = match AppState::load(&model_dir, &archive_uri, &search_index_dir).await {
+    let state = match AppState::load(
+        &model_dir,
+        &archive_uri,
+        &search_index_dir,
+        &deepnsm_vocab_dir,
+    )
+    .await
+    {
         Ok(s) => Arc::new(s),
         Err(e) => {
             eprintln!("fatal: could not start: {e}");

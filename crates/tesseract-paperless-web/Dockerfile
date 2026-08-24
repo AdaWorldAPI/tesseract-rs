@@ -19,7 +19,13 @@
 # heavier than tesseract-ocr-web's only because it carries the OGAR +
 # lance-graph source tree through the build (to resolve `tesseract-ogar`,
 # `ogar-doc-ir`, `ogar-from-docv1`, `lance-graph-contract`), not because it
-# links any new native OCR library.
+# links any new native OCR library. `ingest.rs` also runs `tesseract-ogar`'s
+# sentence-assembly + deepnsm SPO/`NarsTruth` reasoning layer over every
+# recognized document (a SECOND `RecognizePageWords` pass alongside the
+# `RecognizeDocument` call, using the SAME decoded grey buffer), storing the
+# result as `spo_json` and rendering it on the document detail page —
+# gracefully absent (not a build/boot failure) when the deepnsm vocabulary
+# below isn't present at runtime.
 #
 # ── The sibling-repo wrinkle (three siblings, same as tesseract-ogar's) ─────
 # This crate's transitive path deps escape the repo:
@@ -125,6 +131,14 @@ WORKDIR /app
 COPY --from=builder /usr/local/bin/tesseract-paperless-web /app/tesseract-paperless-web
 # The eng model (~4 MB): eng.lstm + unicharset + recoder + the three DAWGs.
 COPY --from=builder /src/tesseract-rs/corpus/model /app/model
+# deepnsm's 4,096-word COCA vocabulary CSVs — the reasoning layer's SPO/
+# `NarsTruth` extraction ingest.rs runs alongside recognition (same file
+# tesseract-ogar's own Dockerfile already copies for its ocr_demo). Absence
+# here is NOT a build failure -- `AppState::load` degrades to
+# `reasoner: None` and archiving proceeds with `spo_json: None` -- this COPY
+# exists so a Railway deploy gets the real reasoning layer, not the
+# degraded fallback, by default.
+COPY --from=builder /src/lance-graph/crates/deepnsm/word_frequency /app/word_frequency
 
 # Both the lancedb archive AND the Tantivy search index need a writable,
 # ideally PERSISTENT directory — on Railway, mount a volume at /app/data
@@ -141,6 +155,7 @@ USER appuser
 ENV MODEL_DIR=/app/model
 ENV ARCHIVE_URI=/app/data/archive.lance
 ENV SEARCH_INDEX_DIR=/app/data/search_index
+ENV DEEPNSM_VOCAB_DIR=/app/word_frequency
 # NOTE: the listen port is intentionally NOT set here. The binary binds
 # 0.0.0.0:$PORT at runtime; Railway injects PORT itself. For a local run pass
 # `-e PORT=8080`. Do not add `ENV PORT=...` — that would shadow Railway's value.
