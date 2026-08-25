@@ -56,6 +56,17 @@
 # and the build fails with `File not found` without `libprotobuf-dev` too.
 # Measured this session: both packages are required together.
 #
+# ── Both wrinkles above apply OUTSIDE Docker too ─────────────────────────────
+# A bare `cargo build -p tesseract-paperless-web` in a dev container hits the
+# identical two problems, since it shares this crate's exact dependency tree
+# and path deps: `protobuf-compiler` + `libprotobuf-dev` must be installed
+# locally too (same error: `Could not find protoc`), and `lance-graph/`,
+# `ndarray/`, AND `OGAR/` must exist as literal sibling directories beside
+# `tesseract-rs` — a symlink to an already-checked-out clone works fine,
+# cargo just resolves the path. Verified 2026-08-25 in a fresh dev container
+# that had neither; debug build, clippy, fmt, tests (18/18), and a release
+# build all passed clean once both were in place.
+#
 # Local build (from the tesseract-rs repo root, using your own git credentials):
 #   docker build -f crates/tesseract-paperless-web/Dockerfile -t paperless-web .
 # Local run:
