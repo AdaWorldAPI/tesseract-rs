@@ -212,9 +212,37 @@ impl std::fmt::Display for GraphEngineError {
 impl std::error::Error for GraphEngineError {}
 
 /// Confidence threshold (0-100) below which a role-filler is a candidate for
-/// consistency recovery. Policy pin, not a measurement — same footing as
-/// `tesseract-ocr`'s own documented policy constants.
-pub const LOW_CONFIDENCE_THRESHOLD: f32 = 70.0;
+/// consistency recovery, AND below which it is excluded from the "trusted
+/// context" set used to judge OTHER roles in the same triple (`recover`
+/// applies the identical comparison both ways — a role at or above this bar
+/// is deemed simultaneously "doesn't need correction" and "good enough to
+/// anchor a correction elsewhere").
+///
+/// **Measured, not a bare policy pin** (`examples/conf_cliff_probe.rs`, the
+/// per-cell mean/min/max `DocWord::conf` on `corpus/quality/resgrid.pgm`'s
+/// 16-cell resolution ladder, the same fixture `quality_resolution_grid.rs`
+/// pins by CER). The confidence axis cliffs well before the CER axis does:
+///
+/// | cell | `mean_conf` | `min_conf` | CER |
+/// |---|---|---|---|
+/// | 0-12 (clean) | 99.45-99.54 | 99.32-99.47 | 0.000 |
+/// | 13 (wobbling, still correct) | 98.11 | 93.09 | 0.000 |
+/// | 14 (last legible rung) | 96.53 | 89.03 | 0.023 |
+/// | 15 (confident garbage) | 90.04 | 80.01 | 0.814 |
+///
+/// The previous value (`70.0`) sat BELOW cell 15's mean (90.04) — the
+/// pipeline's own "confident garbage" cell would have supplied trusted
+/// context for correcting other roles. `95.0` sits strictly between cell
+/// 12's floor (99.32, so genuinely clean text is never flagged) and cell
+/// 15's mean (90.04, so confident-garbage-grade text reliably is).
+///
+/// **Scope, stated honestly:** this is ONE degradation axis (image
+/// resolution/blur) on ONE fixture. It has not been checked against
+/// illumination, faded-contrast, or skew degradation (this crate's siblings
+/// have fixtures for those — `corpus/quality/{uneven,faded}_*.pgm` — but
+/// `conf_cliff_probe.rs` has not been run against them). Re-measure before
+/// defending this number outside the resolution axis.
+pub const LOW_CONFIDENCE_THRESHOLD: f32 = 95.0;
 
 /// A document's real path into lance-graph: v1's tagger (reused, not
 /// reimplemented) feeding v2's real FSM and trained CAM-PQ 96 space.
@@ -657,6 +685,47 @@ mod tests {
             (t.confidence - 0.8).abs() < 1e-6,
             "4/(4+1)=0.8, got {}",
             t.confidence
+        );
+    }
+
+    // ── LOW_CONFIDENCE_THRESHOLD: measured against the real resgrid.pgm
+    // resolution ladder (`examples/conf_cliff_probe.rs`), not asserted.
+    // Disable-verified: reverting to the old pin (70.0) makes
+    // `confident_garbage_grade_confidence_is_flagged_not_trusted_as_context`
+    // fail (90.04 >= 70.0, so cell 15's mean would NOT have been flagged —
+    // exactly the defect this constant was raised to close).
+
+    #[test]
+    fn clean_grade_confidence_is_never_flagged() {
+        // Cell 12's floor (every word across the clean 0-12 range sits at
+        // or above this) must never be treated as needing correction.
+        let cell_12_floor_min_conf: f32 = 99.32;
+        assert!(
+            cell_12_floor_min_conf >= LOW_CONFIDENCE_THRESHOLD,
+            "a perfectly-recognized cell's worst word must not be flagged"
+        );
+    }
+
+    #[test]
+    fn confident_garbage_grade_confidence_is_flagged_not_trusted_as_context() {
+        // Cell 15's mean (CER 0.814 — "decodes to confident garbage" per
+        // quality_resolution_grid.rs's own doc). Must fall below the bar so
+        // `recover()` neither skips correcting it NOR uses it as trusted
+        // context for another role in the same triple.
+        let cell_15_mean_conf: f32 = 90.04;
+        assert!(
+            cell_15_mean_conf < LOW_CONFIDENCE_THRESHOLD,
+            "confident-garbage-grade confidence must be flagged; the old \
+             70.0 pin let 90.04 through as trusted context"
+        );
+        // The regression this constant closes, stated directly: the OLD
+        // value would have compared as "clean enough".
+        let old_threshold: f32 = 70.0;
+        assert!(
+            cell_15_mean_conf >= old_threshold,
+            "if this fails, the OLD value already caught the case — the \
+             fixture numbers changed and this test needs re-deriving, not \
+             the threshold"
         );
     }
 
