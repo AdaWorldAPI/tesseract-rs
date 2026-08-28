@@ -4366,3 +4366,71 @@ No Core change (deepnsm-v2's public API — `Nsm`, `PaletteVocab`, `fsm`,
 `codebook` — was consumed as-is; `tesseract-ogar`'s two new re-exports are
 additive, no behavior change to any existing caller) → this file + the
 commit are the record.
+
+## ★ `LOW_CONFIDENCE_THRESHOLD` was measured against real evidence, and moved 70.0 → 95.0 (2026-08-28)
+
+Operator observation: *"LSTM muscle memory confidence often becomes garbage
+if not 97-100%. 87% is often already unreadable."* Then, sharpened against
+the real `resgrid.pgm` image: *"8 upper usually 100%, lower 7+1 usually 4
+readable and 3 unreadable and last empty."* Checked, not assumed —
+`examples/conf_cliff_probe.rs` (new, `tesseract-ocr`) dumps per-cell
+`DocWord::conf` (mean/min/max) alongside the already-pinned per-cell CER on
+the SAME 16-cell resolution ladder `quality_resolution_grid.rs` fences.
+
+**The confidence axis cliffs BEFORE the CER axis does — the LSTM is
+measurably less certain before it is measurably wrong:**
+
+| cell | mean_conf | min_conf | CER |
+|---|---|---|---|
+| 0-12 (clean) | 99.45-99.54 | 99.32-99.47 | 0.000 |
+| 13 (wobbling, still correct) | 98.11 | **93.09** | 0.000 |
+| 14 (last legible rung) | 96.53 | **89.03** | 0.023 |
+| 15 (confident garbage) | 90.04 | 80.01 | 0.814 |
+
+Cell 13 is the sharpest finding: min_conf drops 6 points below the cell-12
+floor while CER stays exactly 0.000 — confidence degrades as an EARLY
+WARNING, not merely a lagging readout of correctness. The operator's ~87%
+line lands almost exactly at cell 14's min (89.03) / cell 15's mean
+(90.04) — the precise seam between "last legible rung" and "confident
+garbage" in the already-pinned CER fence.
+
+**This directly falsified a constant merged hours earlier.**
+`tesseract-paperless::consistency::LOW_CONFIDENCE_THRESHOLD` — the bar
+`recover()` uses BOTH to decide "does this role-filler need correction" AND
+"is this role-filler trustworthy enough to be CONTEXT for correcting
+others" (same comparison, both directions) — was `70.0`, doc-commented
+honestly as "policy pin, not a measurement." Cell 15's mean (90.04) clears
+70 comfortably: the pipeline's own confident-garbage cell would have been
+used as trusted context for correcting OTHER roles in the same triple.
+
+**Fix, measured not asserted:** raised to `95.0` — strictly between cell
+12's floor (99.32, so genuinely clean text is never flagged) and cell 15's
+mean (90.04, so confident-garbage-grade text reliably is). Two disable-
+verified tests using the real measured numbers as fixture data (not
+synthetic): `clean_grade_confidence_is_never_flagged` (cell 12's floor
+must clear the bar) and
+`confident_garbage_grade_confidence_is_flagged_not_trusted_as_context`
+(cell 15's mean must NOT clear it — with the test's own second assertion
+proving the OLD value would have let it through, so a future revert to
+70.0 fails loudly rather than silently). Both hand-verified red-then-green
+against a literal revert to `70.0`, not merely written and trusted.
+
+**Scope, stated honestly (same discipline this file applies everywhere
+else):** ONE degradation axis (resolution/blur), ONE fixture. Not checked
+against illumination, faded-contrast, or skew degradation — this crate's
+siblings have fixtures for those (`corpus/quality/{uneven,faded}_*.pgm`)
+but `conf_cliff_probe.rs` has not been run against them. Re-measure before
+defending `95.0` outside the resolution axis; the doc comment on the
+constant says the same.
+
+`conf_cliff_probe.rs` is committed (not throwaway) — it is the cited
+source of record for the constant's doc comment, matching the
+`xy_gutter_probe.rs`/`raster_probe.rs`/`dropcap_probe.rs` precedent of
+keeping a measurement's instrument re-runnable rather than reporting a
+number and discarding how it was made.
+
+Gates: `tesseract-paperless --features ocr,token` 13/13 `consistency::`
+tests (32/32 crate total unaffected), clippy `-D warnings` clean on both
+touched crates, fmt clean. No Core change (both files are
+tesseract-paperless/tesseract-ocr local) → this file + the commit are the
+record.
