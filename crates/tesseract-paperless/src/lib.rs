@@ -53,3 +53,12 @@ pub mod store;
 
 #[cfg(feature = "token")]
 pub mod token;
+
+/// A document's real path into lance-graph, and back: v1's tagger feeding
+/// v2's real FSM + trained CAM-PQ 96 space, OCR confidence as the muscle-
+/// memory anchor, grammar/semantic-consistency-gated correction, byte-exact
+/// provenance throughout. Needs both `ocr` (the recognized `DocPage`
+/// surface) and `token` (deepnsm-v2's FSM/vocab/space) — see the module's
+/// own docs for the full design and its honestly-stated limits.
+#[cfg(all(feature = "ocr", feature = "token"))]
+pub mod consistency;

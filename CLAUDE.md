@@ -4228,3 +4228,141 @@ degraded fallback.
   in one test (write→store→read→render) — each half is proven, the seam
   between them is proven only by both halves agreeing on the same JSON shape
   by construction, not by a shared test.
+
+## ★ A document reaches lance-graph the way the KJV does — `consistency.rs`, and a real design gap found by running it (2026-08-28)
+
+Operator directive: *"try everything necessary to make the document reach
+lancegraph similar to KJV and then benefit from logical understanding the
+document, both as graph grammar consistency recovery and token recovery and
+LSTM as muscle memory for mechanical."* `crates/tesseract-paperless/src/
+consistency.rs` (feature-gated `ocr,token`) is that pipeline, run end-to-end
+on a real recognized page against the real KJV-trained CAM-PQ 96 codebook —
+not a plan, not a mock.
+
+### The three layers, honestly scoped
+
+- **LSTM = mechanical muscle memory.** `DocWord::conf` is read as given,
+  never re-derived. High-confidence words are the anchors the correction
+  pass depends on and never itself touches.
+- **Graph/grammar consistency recovery.** deepnsm-v2's REAL
+  `fsm::parse_to_spo` (not v1's) runs on every assembled sentence, addressed
+  to the document's own `(page, line_indices, bbox)` tree — the
+  generalization of KJV's book:chapter:verse over a document with no
+  pre-existing structure. **The PoS tagging step is NOT new** — it reuses
+  v1's same context-free COCA tagger (`SentenceReasoner::vocab`, newly
+  re-exported from `tesseract-ogar` for exactly this reuse), so it inherits
+  v1's documented noun/verb-homograph weakness. What v2 contributes that v1
+  structurally cannot is the FSM's clause machinery (relative clauses,
+  subject-carry chaining) and, above all, a TRAINED distributional semantic
+  space (`Nsm::word_similarity`) — v1 has no notion of meaning distance at
+  all. "Consistency recovery" means: a low-confidence role-filler's
+  Levenshtein candidate (from `tesseract_ogar::correction`, reused, not
+  reimplemented) is endorsed only when corroborated by the sentence's own
+  other high-confidence content words in the trained semantic space —
+  topical/semantic coherence, not syntactic selectional restriction, and it
+  declines outright wherever a word lacks a trained code rather than
+  fabricate a verdict.
+- **Token recovery.** `DocWord::text`/bbox are already byte-exact by
+  construction (`E-ONE-RECEIPT-MANY-BORROWED-CONSUMERS-1`) — no new
+  addressing scheme. Every `GraphTriple`/`ConsistencyCorrection` carries the
+  original text and its exact address alongside any endorsed candidate, so
+  the original is always recoverable regardless of what the module concludes.
+
+### Real numbers, not projected ones
+
+Two data-fetch steps, both via the established proxy-bypass recipe already
+in this file: the `v0.1.0-cam96-data` release assets (`bible_vocab.txt`,
+`cam96_codebook.bin`, `cam96_codes.bin`) and the real `eng` model already in
+`corpus/model/`. `examples/graph_recovery_demo.rs` runs the full pipeline on
+`corpus/pages/page_01.pgm` (7 real sentences):
+
+- **Vocabulary coverage: 33/41 tokens (80%)** against `bible_vocab.txt` — the
+  KJV's OWN 12,543-word vocabulary, not a general-English list, per its own
+  crate docs. Confirmed OOV on ordinary modern nouns/verbs: "clock",
+  "coffee", "boots", "hike", "rack", "ticked", "cooled" — measured, not
+  assumed, and reported per-sentence via `tokens_in_vocab`/`tokens_total`
+  rather than silently.
+- **Exactly ONE triple formed**: `SPO(birds, sang, dawn)` — the only
+  sentence with two content nouns flanking an in-vocab verb. Every other
+  sentence has an OOV subject or verb (structurally invisible to the FSM,
+  not merely uncertain) and forms nothing — an honest, mixed result, not a
+  synthetic success.
+- **Sentence 2 recognized as `"Acool wind moved past the door."`** — the
+  real `"A cool"` → `"Acool"` recognition regression this file already
+  documents (`noise_readmit_reach`'s one measured regression) surfacing
+  naturally in a brand-new pipeline, unprompted.
+- **Does the trained space carry signal on non-Biblical text at all? Mixed,
+  and reported as such.** 4 pairs measured: noun-noun topical pairs
+  discriminate clearly (`sim("dawn","morning")=0.614` vs
+  `sim("dawn","door")=0.357`; `sim("garden","grass")=0.688` vs
+  `sim("garden","night")=0.246`); the one noun-verb pair essentially does
+  not (`sim("birds","sang")=0.280` vs the "unrelated" control
+  `sim("birds","door")=0.318` — the control scored HIGHER). n=4, not a
+  general finding, but a real, measured, honest asymmetry recorded in
+  `ABSOLUTE_ENDORSE_THRESHOLD`'s own doc comment rather than smoothed over.
+
+### A real design gap, found by running it — not by review
+
+The first `recover()` endorse rule required BOTH the original recognized
+text and the lexical candidate to have a trained code
+(`(Some(o), Some(c)) if c > o + MARGIN`). Running a real simulated
+corruption (`"grasz"` → `suggest()` → `"grass"`, sim to `"garden"` = 0.688)
+showed `context_similarity_original` is **always `None`** for genuinely
+garbled non-word OCR output — meaning the rule could never confirm the most
+common, best-documented OCR failure mode this file already records
+repeatedly ("confident and wrong", the print-trained LSTM's characteristic
+failure). Fixed with a second route: `(None, Some(c)) =>
+c >= ABSOLUTE_ENDORSE_THRESHOLD` — endorse on the candidate's own measured
+strength when there is no original-side signal to compare against. Factored
+into a pure `GraphEngine::decide_endorse` for direct testing.
+
+**Five falsifiers, all disable-verified red-then-green** (the first attempt
+at disable 2 was itself vacuous — zeroing `ABSOLUTE_ENDORSE_THRESHOLD` left
+the test green because the test's own bound tracked the constant, exactly
+the "zeroing a constant is not a disable when the quantity can go negative"
+trap this file already names from the quality-wave-v1 arc; fixed by removing
+the comparison itself rather than the constant):
+
+| assertion | disable |
+|---|---|
+| comparative win endorses | n/a (positive control) |
+| comparative non-win declines (incl. candidate worse than original) | n/a (positive control) |
+| garbled-original absolute-strength route endorses | delete the `(None, Some(c))` arm entirely |
+| garbled-original below the bar declines | hardcode the `(None, Some(_))` arm to `true` (NOT zero the constant — that one is vacuous) |
+| no signal either direction declines | hardcode `decide_endorse` to always return `true` |
+
+### Gates
+
+`tesseract-paperless` `ocr,token` 11/11 new (`consistency::`) + 30/30 crate
+total; `tesseract-ogar` 37/37 unchanged; `tesseract-paperless-web` still
+builds (depends on the two new `tesseract-ogar` re-exports:
+`{PoS,Token,Vocabulary}` and `parse_pgm`, both additive, same "route through
+the one executor crate" precedent as `DocPage`/`BinarizeMode`/
+`decode_image`). Clippy `-D warnings` clean on `default`, `ocr`, `token`,
+and `store,search` (unaffected, confirmed rather than assumed) feature
+combinations; fmt clean. `[[example]] required-features = ["ocr","token"]`
+added for `graph_recovery_demo`, mirroring the three existing `token`-gated
+examples' own Cargo.toml pattern.
+
+### What this deliberately does NOT do — the fences
+
+**Nothing here mints, stores, or persists.** `GraphEngine`/`recover()` are
+pure post-processing over an already-recognized `DocPage`, same footing as
+`sentences.rs`/`reasoning.rs`/`correction.rs` — not wired into
+`tesseract-paperless-web`'s ingest path (that would be a SEPARATE, deliberate
+decision needing its own measurement pass, matching this file's own standing
+rule for heuristic gates). Nothing here touches the LSTM recognizer or the
+COCA tokenizer — both explicitly reused, neither modified ("don't kill"). No
+NARS *reasoning* (belief arena, revision) — that boundary from the AS-IS
+BOUNDARY section above is unchanged; this is v2's FSM + trained space only.
+`evidence.rs`'s `shuffle_beliefs_null`-style corpus-scale null testing was
+considered and set aside as the wrong tool for a single small document (it is
+built for "does THIS CORPUS's belief structure show more signal than random"
+at KJV scale, not "is this one candidate better than a shuffled alternative")
+— the `decide_endorse` disable table above is the falsifier that actually
+fits this scale.
+
+No Core change (deepnsm-v2's public API — `Nsm`, `PaletteVocab`, `fsm`,
+`codebook` — was consumed as-is; `tesseract-ogar`'s two new re-exports are
+additive, no behavior change to any existing caller) → this file + the
+commit are the record.

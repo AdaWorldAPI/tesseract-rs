@@ -155,6 +155,25 @@ pub use tesseract_ocr::BinarizeMode;
 /// caller has.
 pub use tesseract_ocr::DocPage;
 
+/// `deepnsm` v1's part-of-speech vocabulary type, re-exported for the same
+/// reason as [`DocPage`]/[`BinarizeMode`] above: a caller building a SECOND
+/// reasoning pipeline over v1's tokenizer (e.g. feeding a different FSM the
+/// same COCA-derived tags) reaches it through this one executor crate rather
+/// than adding a direct `deepnsm` dependency — `deepnsm` stays the same
+/// crate, addressed once. [`reasoning::SentenceReasoner::vocab`] is the
+/// paired accessor: [`SentenceReasoner`](reasoning::SentenceReasoner) already
+/// loads exactly this vocabulary; a second loader would re-parse the same
+/// CSVs for no reason.
+pub use deepnsm::pos::PoS;
+pub use deepnsm::vocabulary::{Token, Vocabulary};
+
+/// P5 (binary) PGM decode — re-exported so a caller building a `DocPage`
+/// from a raw PGM file (the `image-decode` feature's `decode_image` handles
+/// the general PNG/JPEG/… case; a caller that already has a PGM has no
+/// reason to pull that feature in) reaches it through this one executor
+/// crate, same reasoning as [`DocPage`] above.
+pub use tesseract_ocr::parse_pgm;
+
 /// One typed request per declared OGAR OCR capability. Plain Rust types,
 /// zero serialization — see the module docs.
 #[derive(Debug, Clone, Copy)]

@@ -164,6 +164,17 @@ impl SentenceReasoner {
         })
     }
 
+    /// The loaded vocabulary — the SAME instance [`Self::analyze`] tokenizes
+    /// against. Exposed so a caller building a SECOND reasoning pipeline over
+    /// the same COCA tags (e.g. feeding a different PoS-aware FSM) reuses
+    /// this loaded vocabulary instead of re-parsing `word_rank_lookup.csv` +
+    /// `word_forms.csv` a second time. Read-only: nothing outside this module
+    /// mutates a `SentenceReasoner`'s vocabulary once loaded.
+    #[must_use]
+    pub fn vocab(&self) -> &Vocabulary {
+        &self.vocab
+    }
+
     /// Resolve one [`SpoTriple`]'s vocabulary ranks to lemma text.
     fn resolve_triple(&self, t: &SpoTriple) -> ResolvedTriple {
         ResolvedTriple {
