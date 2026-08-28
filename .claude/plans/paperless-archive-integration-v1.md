@@ -447,6 +447,25 @@ that it structurally cannot yet carry.
   `ActionDef` ordinal on the document's class (once §2b's minted `document
   0x080B` class carries them — see Wave F) resolved server-side, never a
   URL — the T2 rule this repo already enforces elsewhere.
+- **Quality and loss ARE renderable — because a status is one byte.** The
+  same §2c ceiling that rules text out rules these in. A document's
+  confidence must reach a person as a *reading* (clean / check / suspect),
+  never as a raw `mean_conf` — the usability argument
+  (`AdaWorldAPI/paperless-rs` `docs/USABILITY.md`, from MedCare-rs's
+  `LabValue::classify` → `LabFlag`: a clinician reads "normal", not "13.2",
+  and this repo's own measurements put `mean_conf 99.47` on a page at
+  `CER 0.6154`). A status enum discriminant is **1 byte**; a raw `f32` conf
+  is not; text is not. So the shape usability wants is exactly the shape the
+  facet lane already carries, with no value-slab extension and no Wave F
+  dependency. Two fields, appended to `ogar-vocab::document()` at positions
+  7-8 (currently 7 attributes at 0..6, so nothing moves — the class-view
+  append-only rule): `quality: DocQuality` (1-byte enum) and `dropped: u8`
+  (knowingly-discarded content, **saturating at 255** — the signal is "look
+  at this", not an exact inventory). Both are source-agnostic: a DOM retina
+  reports `dropped = 0`. Both are `Badge`-shaped for the day the upstream
+  `enum FieldView{Text,Badge,Table,ObjectSlot,Geometry,…}` widening lands —
+  consumed then, never pre-empted now (**T1**). The class change itself is
+  an OGAR prerequisite, listed in Wave F.
 - **Document TEXT is explicitly NOT rendered through the a2ui wire in this
   wave.** It is served the way it already is — HTML, through the existing
   `Projection{delta,html}` path a2ui-server already ships, which needs zero
@@ -463,7 +482,12 @@ absent from the projected surface, not merely hidden client-side (disable:
 remove the `WideFieldMask` intersection, assert the field reappears). An
 action invocation resolves by ordinal and rejects an out-of-range one
 (disable: skip the range check, assert an invalid ordinal panics instead of
-refusing cleanly).
+refusing cleanly). `quality` and `dropped` round-trip through a single facet
+byte unchanged, and positions 0..6 still resolve to the same seven field
+names after the append (disable: widen `dropped` past `u8` or add a
+`DocQuality` variant past 255, assert the value is truncated rather than
+silently wrong — this is the regression the one-byte finding exists to
+prevent).
 
 ### Wave F — named OGAR/a2ui prerequisites this repo does not build
 
@@ -500,6 +524,15 @@ silently assumes they exist:
   session-role RBAC sidesteps this today; it becomes load-bearing only if
   a future wave routes document RBAC through `ClassRbac` instead of a2ui's
   own session mask.
+- **Append `quality` + `dropped` to `ogar-vocab::document()`**
+  (`lib.rs:4288-4307`) at positions 7-8 — the two status fields Wave E
+  renders. A small, scoped OGAR PR in the same shape as the
+  `typed_field 0x080A` mint above, and **append-only**: positions 0..6 are
+  the shipped basis and must not move (`ogar-class-view/src/lib.rs:34-48`).
+  It mints no classid — `DOCUMENT = 0x080B` already exists
+  (`ogar-vocab/src/lib.rs:1960`); this adds attributes to an existing
+  class. Blocks: Wave E's quality/loss bullet only — every other Wave E
+  deliverable is independent of it.
 
 ## 4. Corrections this design makes to the standing record
 
@@ -516,6 +549,22 @@ silently assumes they exist:
 - **`lance-graph-arm-discovery` remains correctly out of scope** (unrelated
   tabular rule-mining, already corrected in CLAUDE.md) — nothing in this
   design revisits that.
+- **A competing plan was started against the crates instead of against this
+  one, and is now subordinate to it (2026-08-25).** `a2ui-rs`
+  `.claude/plans/document-fields-to-a2ui-render-v1.md` began as a
+  standalone "wire the document fields into a2ui" plan. It duplicated Wave
+  E and got three things wrong that §2c already answers: it assumed the
+  wire could carry a status *string* (the lane is 12 bytes, one `u8` per
+  position); it reasoned carefully about `FieldMask`-64 vs `WideFieldMask`
+  while missing that the **12-byte value lane** is the ceiling that
+  actually binds; and it proposed hand-building a field basis that
+  `ogar_doc_ir::project::masked_values` + `Skin::Tile`/`BBoxRail` already
+  provide. It also filed Wave F's `typed_field 0x080A` mint as a surprise
+  precondition rather than the known prerequisite it is. That file is now
+  an **addendum subordinate to this Wave E**, carrying only the one-byte
+  finding folded in above. The generalizable miss: *design against the
+  plans, not only against the crates* — the answer was already written
+  down.
 
 ## 5. Execution model (unchanged from the operator's ruling this session)
 

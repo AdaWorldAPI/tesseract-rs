@@ -164,6 +164,10 @@ required-features = ["token"]
 name = "probe_wordid_vs_tokenid"
 required-features = ["token"]
 
+[[example]]
+name = "graph_recovery_demo"
+required-features = ["ocr", "token"]
+
 [dev-dependencies]
 # The `store` feature's tests need a throwaway on-disk table per
 # test and `serde_json` is already pulled by that feature at test
