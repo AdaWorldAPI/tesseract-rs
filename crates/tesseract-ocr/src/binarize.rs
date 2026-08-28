@@ -369,6 +369,35 @@ pub fn sauvola_binarize(grey: &[u8], w: usize, h: usize, whsize: usize, factor: 
 /// on a flat page is `t = m` (since `m == min_I`) and yields all-background.
 /// That is the right answer for a blank page, and it is what the `0/0` limit
 /// would give anyway.
+/// The global reduction half of [`wolf_get_threshold`], extracted as its own
+/// primitive: the maximum local standard deviation anywhere on the page.
+/// This is Wolf's own page-relative calibration constant (`s / max_s`
+/// replaces Sauvola's fixed `s / 128`) — computed standalone here so a
+/// caller can use it as a CHEAP PREDICTOR of Sauvola's fixed-reference
+/// failure mode (low `max_s` means the page's own best local contrast never
+/// approaches Sauvola's assumed full-contrast constant) without paying for
+/// Wolf's second (per-pixel) pass.
+///
+/// Costs exactly the same one `windowed_stats` pass every rung in this
+/// module already shares — no new O(w·h) work beyond what a caller who then
+/// runs Sauvola or Wolf anyway was already going to pay.
+///
+/// # Panics
+/// Same guards as [`sauvola_binarize`].
+#[must_use]
+pub fn global_max_local_stddev(grey: &[u8], w: usize, h: usize, whsize: usize) -> f32 {
+    assert_window_fits(grey, w, h, whsize);
+    let (mean, ms) = windowed_stats(grey, w, h, whsize);
+    let mut max_s = 0.0f32;
+    for idx in 0..mean.len() {
+        let sd = local_sd(mean[idx], ms[idx]);
+        if sd > max_s {
+            max_s = sd;
+        }
+    }
+    max_s
+}
+
 fn wolf_get_threshold(grey: &[u8], mean: &[u8], ms: &[u32], n: usize, k: f32) -> Vec<u8> {
     // Pass 1 — the two global reductions.
     let mut max_s = 0.0f32;
