@@ -413,9 +413,16 @@ impl SegmentCollector for SegmentMask {
     type Fruit = SearchMask;
 
     fn collect(&mut self, doc: DocId, _score: Score) {
-        match self.rows.first(doc) {
-            Some(r) if (r as usize) < self.n_rows => set(&mut self.mask.words, r as usize),
-            _ => self.mask.stray += 1,
+        // A row that does not fit `usize` is out of range by definition, so the
+        // conversion failing and the bound failing are the same stray.
+        match self
+            .rows
+            .first(doc)
+            .and_then(|r| usize::try_from(r).ok())
+            .filter(|&r| r < self.n_rows)
+        {
+            Some(r) => set(&mut self.mask.words, r),
+            None => self.mask.stray += 1,
         }
     }
 

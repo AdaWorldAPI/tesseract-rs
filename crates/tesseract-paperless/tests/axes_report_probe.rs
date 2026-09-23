@@ -21,6 +21,16 @@
 //! need a Django database here. The rules above are cited so the oracle can
 //! be read against them line by line.
 
+// Every value cast in this file is bounded by the fixture — `N` = 20 000 rows,
+// axis domains of at most 24, per-row counts no larger than `N` — so none of
+// these casts can truncate, wrap or lose sign. Allowed here rather than
+// sprinkled per line, the same way `src/consistency.rs` scopes its one cast.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+
 use std::sync::OnceLock;
 
 use lance_graph_report::{
@@ -405,12 +415,14 @@ fn correspondent_by_month_pivot_matches_the_oracle_cell_for_cell() {
     assert!((total as usize) * 3 < N);
 }
 
+/// Reads one single-valued axis off a document.
+type Get = fn(&ArchiveDoc) -> Option<u32>;
+
 #[test]
 fn every_single_valued_axis_facets_like_the_oracle_including_none() {
     let f = fixture();
     let who = Who::User(3);
     let batch = batch_for(f, None);
-    type Get = fn(&ArchiveDoc) -> Option<u32>;
     let axes: [(_, u32, Get); 3] = [
         (DOCUMENT_TYPE, DOMAINS.document_types, |d| d.document_type),
         (STORAGE_PATH, DOMAINS.storage_paths, |d| d.storage_path),
