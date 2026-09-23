@@ -107,8 +107,16 @@ fn fixture() -> &'static Fixture {
                 created_month: rng.below(24),
                 owner: rng.chance(70).then(|| rng.below(5)),
                 tags,
-                viewers: if rng.chance(10) { vec![rng.below(5)] } else { vec![] },
-                viewer_groups: if rng.chance(10) { vec![rng.below(3)] } else { vec![] },
+                viewers: if rng.chance(10) {
+                    vec![rng.below(5)]
+                } else {
+                    vec![]
+                },
+                viewer_groups: if rng.chance(10) {
+                    vec![rng.below(3)]
+                } else {
+                    vec![]
+                },
                 deleted: rng.chance(3),
             });
             words.push((0..4).map(|_| WORDS[rng.below(12) as usize]).collect());
@@ -312,8 +320,10 @@ fn a_stray_row_is_reported_not_folded() {
     let text = sb.add_text_field("text", TEXT);
     let index = Index::create_in_ram(sb.build());
     let mut w = index.writer(15_000_000).unwrap();
-    w.add_document(doc!(row => 1u64, text => "invoice")).unwrap();
-    w.add_document(doc!(row => 64u64, text => "invoice")).unwrap(); // outside 0..10
+    w.add_document(doc!(row => 1u64, text => "invoice"))
+        .unwrap();
+    w.add_document(doc!(row => 64u64, text => "invoice"))
+        .unwrap(); // outside 0..10
     w.add_document(doc!(text => "invoice")).unwrap(); // no row at all
     w.commit().unwrap();
     let q = QueryParser::for_index(&index, vec![text])

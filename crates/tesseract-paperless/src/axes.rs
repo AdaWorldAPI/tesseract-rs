@@ -208,9 +208,21 @@ pub fn build_batch(
     let mut groups = vec![vec![0u64; w]; domains.groups as usize];
     let mut deleted = vec![0u64; w];
     for (row, d) in docs.iter().enumerate() {
-        corr.push(nullable("correspondent", d.correspondent, domains.correspondents)?);
-        kind.push(nullable("document_type", d.document_type, domains.document_types)?);
-        path.push(nullable("storage_path", d.storage_path, domains.storage_paths)?);
+        corr.push(nullable(
+            "correspondent",
+            d.correspondent,
+            domains.correspondents,
+        )?);
+        kind.push(nullable(
+            "document_type",
+            d.document_type,
+            domains.document_types,
+        )?);
+        path.push(nullable(
+            "storage_path",
+            d.storage_path,
+            domains.storage_paths,
+        )?);
         check("created_month", d.created_month, domains.months)?;
         month.push(d.created_month);
         owner.push(nullable("owner", d.owner, domains.users)?);
@@ -246,7 +258,11 @@ pub fn build_batch(
             path.into(),
             domains.storage_paths + 1,
         ))?
-        .with_column(Column::coordinate(CREATED_MONTH, month.into(), domains.months))?
+        .with_column(Column::coordinate(
+            CREATED_MONTH,
+            month.into(),
+            domains.months,
+        ))?
         .with_column(Column::coordinate(OWNER, owner.into(), domains.users + 1))?
         .with_mask(DELETED, deleted.into())?;
     for (t, words) in tags.into_iter().enumerate() {
