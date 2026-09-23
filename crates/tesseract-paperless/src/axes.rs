@@ -63,18 +63,30 @@ const VIEWER_BASE: u32 = 2 * SPAN;
 const GROUP_BASE: u32 = 3 * SPAN;
 
 /// The resident mask holding every document carrying `tag`.
+///
+/// # Panics
+/// If `tag` is outside the mask id span (2^20).
+#[must_use]
 pub fn tag_mask(tag: u32) -> MaskId {
     assert!(tag < SPAN, "tag id {tag} exceeds the mask id span");
     MaskId(TAG_BASE + tag)
 }
 
 /// The resident mask of documents explicitly shared with `user`.
+///
+/// # Panics
+/// If `user` is outside the mask id span (2^20).
+#[must_use]
 pub fn viewer_mask(user: u32) -> MaskId {
     assert!(user < SPAN, "user id {user} exceeds the mask id span");
     MaskId(VIEWER_BASE + user)
 }
 
 /// The resident mask of documents shared with `group`.
+///
+/// # Panics
+/// If `group` is outside the mask id span (2^20).
+#[must_use]
 pub fn group_mask(group: u32) -> MaskId {
     assert!(group < SPAN, "group id {group} exceeds the mask id span");
     MaskId(GROUP_BASE + group)
@@ -265,14 +277,14 @@ pub fn build_batch(
         ))?
         .with_column(Column::coordinate(OWNER, owner.into(), domains.users + 1))?
         .with_mask(DELETED, deleted.into())?;
-    for (t, words) in tags.into_iter().enumerate() {
-        b = b.with_mask(tag_mask(t as u32), words.into())?;
+    for (t, words) in (0..domains.tags).zip(tags) {
+        b = b.with_mask(tag_mask(t), words.into())?;
     }
-    for (u, words) in viewers.into_iter().enumerate() {
-        b = b.with_mask(viewer_mask(u as u32), words.into())?;
+    for (u, words) in (0..domains.users).zip(viewers) {
+        b = b.with_mask(viewer_mask(u), words.into())?;
     }
-    for (g, words) in groups.into_iter().enumerate() {
-        b = b.with_mask(group_mask(g as u32), words.into())?;
+    for (g, words) in (0..domains.groups).zip(groups) {
+        b = b.with_mask(group_mask(g), words.into())?;
     }
     Ok(b)
 }
@@ -291,6 +303,7 @@ pub fn with_search(batch: &AbiBatch, words: Arc<[u64]>) -> Result<AbiBatch, Batc
 /// (`documents/search/_backend.py::build_permission_filter`): unowned, owned
 /// by `user`, shared with `user`, or shared with one of `groups` — and not in
 /// the trash. Lazy: nothing is evaluated until a plan folds it.
+#[must_use]
 pub fn visible_to(user: u32, groups: &[u32]) -> Selection {
     let mut s = Selection::cmp(OWNER, CmpOp::Eq, Scalar::Ordinal(0))
         .or(Selection::cmp(OWNER, CmpOp::Eq, Scalar::Ordinal(user + 1)))
@@ -303,6 +316,7 @@ pub fn visible_to(user: u32, groups: &[u32]) -> Selection {
 
 /// A superuser sees every document not in the trash
 /// (`documents/permissions.py::get_document_count_filter_for_user`).
+#[must_use]
 pub fn superuser() -> Selection {
     Selection::All.and_not(Selection::Mask(DELETED))
 }
@@ -322,6 +336,7 @@ pub struct SearchMaskCollector {
 impl SearchMaskCollector {
     /// Collect into a mask over `n_rows` archive rows, reading each match's
     /// row from the `u64` FAST field `row_field`.
+    #[must_use]
     pub fn new(row_field: impl Into<String>, n_rows: usize) -> Self {
         Self {
             row_field: row_field.into(),
@@ -343,6 +358,7 @@ pub struct SearchMask {
 
 impl SearchMask {
     /// Number of matched rows.
+    #[must_use]
     pub fn count(&self) -> u64 {
         self.words.iter().map(|w| u64::from(w.count_ones())).sum()
     }
