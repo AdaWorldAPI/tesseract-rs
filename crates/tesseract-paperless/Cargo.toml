@@ -128,7 +128,11 @@ deepnsm-v2 = { path = "../../../lance-graph/crates/deepnsm-v2", optional = true 
 # a `.0.0` exact pin (lance-graph pin ruling 2026-09-18): lancedb 0.38 itself
 # demands `lance = "=11.0.0"`, so a float resolves to exactly that today and
 # can never be narrower than the family. (Was `=0.33.0` / `=9.0.0`.)
-lancedb = { version = "0.38.*", default-features = false, optional = true }
+# `remote` is on for ONE reason: lancedb 0.38.0 does not compile without it —
+# `src/job.rs` builds `Error::Http` unconditionally while `error.rs` gates that
+# variant on `cfg(feature = "remote")` (E0599 at job.rs:56/66). 0.38.0 is the
+# only 0.38 release; drop the feature once a release gates `job.rs` too.
+lancedb = { version = "0.38.*", default-features = false, features = ["remote"], optional = true }
 lance = { version = "11.*", default-features = false, optional = true }
 arrow = { version = "58", default-features = false, optional = true }
 # `merge_insert`'s `execute` takes a `Box<dyn RecordBatchReader + Send>`; the
