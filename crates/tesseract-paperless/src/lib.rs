@@ -48,6 +48,9 @@ pub mod render;
 #[cfg(feature = "search")]
 pub mod search;
 
+#[cfg(feature = "report")]
+pub mod axes;
+
 #[cfg(feature = "store")]
 pub mod store;
 
