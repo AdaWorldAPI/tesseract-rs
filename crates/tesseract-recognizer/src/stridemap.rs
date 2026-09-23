@@ -85,9 +85,7 @@ impl StrideMap {
 
     /// `ReduceWidthTo1` (`stridemap.cpp:166-170`).
     pub fn reduce_width_to_1(&mut self) {
-        for w in &mut self.widths {
-            *w = 1;
-        }
+        self.widths.fill(1);
         self.shape[FlexDim::Width as usize] = 1;
         self.compute_t_increments();
     }

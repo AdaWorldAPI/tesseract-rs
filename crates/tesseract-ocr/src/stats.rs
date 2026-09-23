@@ -102,9 +102,7 @@ impl Stats {
     /// `STATS::clear` (`statistc.cpp:78-83`).
     pub fn clear(&mut self) {
         self.total_count = 0;
-        for b in &mut self.buckets {
-            *b = 0;
-        }
+        self.buckets.fill(0);
     }
 
     /// `STATS::add` (`statistc.cpp:99-105`). `value` is clipped into
