@@ -3,7 +3,7 @@ name = "tesseract-paperless"
 description = "Document intake for the pure-Rust OCR stack: the S-2 dedup gate, the doc.v1 -> DocIr seam, and an optional one-tokenization-many-consumers lexical receipt."
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.97.1"
+rust-version = "1.98.1"
 license = "Apache-2.0"
 repository = "https://github.com/AdaWorldAPI/tesseract-rs"
 

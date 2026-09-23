@@ -73,7 +73,7 @@
 #   docker run --rm -e PORT=8080 -p 8080:8080 -v paperless-data:/app/data paperless-web
 
 # ── builder ─────────────────────────────────────────────────────────────────
-FROM rust:1.97.1-bookworm AS builder
+FROM rust:1.98.1-bookworm AS builder
 
 # `git` for the sibling clones; `protobuf-compiler` + `libprotobuf-dev` for
 # `lance-encoding`'s build script (see the wrinkle above — both are required,

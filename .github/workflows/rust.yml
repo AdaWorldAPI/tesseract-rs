@@ -49,11 +49,11 @@ jobs:
     # required alongside it, or the build fails with "File not found".
     - name: Install protoc (for lance-encoding)
       run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
-    # Workspace sweep pin (lance-graph #896 family): 1.97.1, matching the
+    # Workspace sweep pin (lance-graph / ndarray 1.98.1 line): 1.98.1, matching the
     # repo's rust-toolchain.toml. ndarray's rust-version = 1.95 floor is
     # satisfied a fortiori.
-    - name: Rust 1.97.1 toolchain
-      run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt && rustup default 1.97.1
+    - name: Rust 1.98.1 toolchain
+      run: rustup toolchain install 1.98.1 --profile minimal --component clippy --component rustfmt && rustup default 1.98.1
     - name: Build (core)
       working-directory: tesseract-rs
       run: cargo build -p tesseract-core --verbose
@@ -160,6 +160,17 @@ jobs:
     - name: Clippy (paperless, search)
       working-directory: tesseract-rs
       run: cargo clippy -p tesseract-paperless --features search --all-targets -- -D warnings
+    # The S-7 axes on lance-graph's report substrate: a Tantivy match becomes
+    # a selection MASK (never an id list) and per-axis counts / pivots fold on
+    # the one mask-RISC evaluator, checked against a per-row oracle of
+    # paperless-ngx's count + permission rules. Needs the lance-graph + ndarray
+    # sibling checkouts above (lance-graph-report path-deps both).
+    - name: Test (paperless, report)
+      working-directory: tesseract-rs
+      run: cargo test -p tesseract-paperless --features report --verbose
+    - name: Clippy (paperless, report)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-paperless --features report --all-targets -- -D warnings
     # tesseract-paperless-web: the Railway-deployable document archive —
     # upload -> S-2 gate -> OCR -> DocIr -> lancedb + Tantivy search, with
     # the browse/search/delete UI. Depends on tesseract-paperless with
@@ -220,13 +231,13 @@ jobs:
       with:
         repository: AdaWorldAPI/OGAR
         path: OGAR
-    # Workspace sweep pin (lance-graph #896 family): 1.97.1, matching the
+    # Workspace sweep pin (lance-graph / ndarray 1.98.1 line): 1.98.1, matching the
     # repo's rust-toolchain.toml.
-    - name: Rust 1.97.1 toolchain
-      run: rustup toolchain install 1.97.1 --profile minimal && rustup default 1.97.1
+    - name: Rust 1.98.1 toolchain
+      run: rustup toolchain install 1.98.1 --profile minimal && rustup default 1.98.1
     - name: Quality (resolution ladder, ocr)
       working-directory: tesseract-rs
-      run: cargo +1.97.1 test -p tesseract-ocr --test quality_resolution_grid --verbose
+      run: cargo +1.98.1 test -p tesseract-ocr --test quality_resolution_grid --verbose
     - name: Quality (typography overlay, ocr-pdf)
       working-directory: tesseract-rs
-      run: cargo +1.97.1 test -p tesseract-ocr-pdf --test typography_overlay --verbose
+      run: cargo +1.98.1 test -p tesseract-ocr-pdf --test typography_overlay --verbose

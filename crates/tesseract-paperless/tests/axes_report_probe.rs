@@ -95,7 +95,7 @@ fn fixture() -> &'static Fixture {
     F.get_or_init(|| {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let mut docs = Vec::with_capacity(N);
-        let mut words = Vec::with_capacity(N);
+        let mut words: Vec<Vec<&'static str>> = Vec::with_capacity(N);
         for _ in 0..N {
             let mut tags: Vec<u32> = (0..rng.below(4)).map(|_| rng.below(16)).collect();
             tags.sort_unstable();
@@ -298,8 +298,10 @@ fn a_search_mask_is_exactly_the_ranked_hit_set() {
         // …and both equal the oracle's reading of the query.
         let oracle = f.words.iter().filter(|ws| matches(ws, s)).count() as u64;
         assert_eq!(m.count(), oracle, "{}", s.query);
-        // Anti-vacuity: a real, partial selection.
-        assert!(oracle > 0 && (oracle as usize) * 2 < N, "{}: {oracle}", s.query);
+        // Anti-vacuity: a real, partial selection — neither empty-ish nor
+        // near-total (`tax OR rent` is ~52% by construction: 4 words of 12).
+        let n = oracle as usize;
+        assert!(n * 100 > N && n * 10 < N * 9, "{}: {oracle}", s.query);
     }
 }
 

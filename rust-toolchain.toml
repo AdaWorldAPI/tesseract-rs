@@ -1,5 +1,9 @@
 [toolchain]
-channel = "1.97.1"
+channel = "1.98.1"
+# Bumped 1.97.1 -> 1.98.1 (2026-09-23): ndarray's `rust-version = "1.98"`
+# (ndarray 2095b76, 2026-09-05) made every path-dep on it refuse 1.97.1 —
+# tesseract-recognizer and the lance-graph-report chain alike. lance-graph and
+# ndarray both pin 1.98.1; this rejoins that line. History below is kept.
 # Pinned 1.97.1 (bumped from the unpinned-1.95 convention, 2026-08-05) —
 # joins the workspace-wide lance-9 / Rust-1.97.1 sweep (lance-graph #896;
 # siblings OGAR / ruff / MedCare-rs / woa-rs already pin 1.97.1). This repo
