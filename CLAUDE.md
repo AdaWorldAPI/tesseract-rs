@@ -4448,7 +4448,7 @@ names as blocking every later wave:
   whose run falls outside the particles or whose `particle_count` is not
   `ceil(token_count / 12)`.
 - **Handles.** `rcpt:<n>` (a lane POSITION) became
-  `rcpt:<sha256>:<page>:<reading_order>` — the span's address in the document
+  `rcpt:<sha256>:<page>:<reading_order>:<byte_from>` — the span's address in the document
   layer, which survives restart, re-ingest and lane reordering. Resolution is
   O(1) through two derived indexes rebuilt on load.
 - **A real bug fixed on the way.** `train` assigned base ids with

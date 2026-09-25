@@ -243,3 +243,94 @@ fn corrupted_persisted_bytes_are_refused() {
         ContractDecodeError::BadLength
     );
 }
+
+/// FAILS IF: two lawful sub-region receipts in the same region share a handle.
+/// They differ only by `byte_from`, so a handle that omits it resolves both to
+/// whichever was appended last.
+#[test]
+fn sub_region_receipts_in_one_region_get_distinct_handles() {
+    let contract = TokenizerContract::train(&corpus(), NormRule::Identity);
+    let mut lane = TokenLane::new();
+    let doc = lane.intern_document(DOC_A);
+    let key = SpanKey {
+        doc,
+        page: 1,
+        reading_order: 0,
+    };
+    let (first, _) = contract.try_encode(b"the invoice").expect("in alphabet");
+    let (second, _) = contract.try_encode(b"is due").expect("in alphabet");
+    let r1 = lane.append(key, 0, &contract, &first);
+    let r2 = lane.append(key, 12, &contract, &second);
+
+    let h1 = handle_for(&lane, &r1).expect("interned");
+    let h2 = handle_for(&lane, &r2).expect("interned");
+    assert_ne!(h1, h2);
+    assert_eq!(
+        decoded(&lane, &contract, &h1).as_deref(),
+        Some(&b"the invoice"[..])
+    );
+    assert_eq!(
+        decoded(&lane, &contract, &h2).as_deref(),
+        Some(&b"is due"[..])
+    );
+}
+
+/// FAILS IF: a loaded lane whose ids are framed correctly but not assigned by
+/// the contract (PAD, or past its vocabulary) reaches a consumer. Every
+/// consumer indexes the contract's tables by id, so it must panic there.
+#[test]
+fn a_loaded_lane_with_unassigned_ids_yields_no_view_instead_of_panicking() {
+    let contract = TokenizerContract::train(&corpus(), NormRule::Identity);
+    assert!(
+        contract.vocab_len() < 0xFE,
+        "anti-vacuity: 0xFE must be unassigned"
+    );
+    let lane = build(&[0], &contract);
+    let good = lane.to_bytes();
+    let control = TokenLane::from_bytes(&good).expect("control loads");
+    assert!(control.view(&control.receipts()[0], &contract).is_some());
+
+    // Header 20 B + one 32 B document; the first particle's first id follows.
+    let particles_at = 20 + 32;
+    for bad in [0xFE_u8, 0xFF] {
+        let mut bytes = good.clone();
+        bytes[particles_at] = bad;
+        let lane = TokenLane::from_bytes(&bytes).expect("framing is still valid");
+        let r = lane.receipts()[0];
+        assert!(
+            lane.view(&r, &contract).is_none(),
+            "id {bad:#04x} was viewed"
+        );
+        let h = handle_for(&lane, &r).expect("interned");
+        assert!(decoded(&lane, &contract, &h).is_none());
+    }
+}
+
+/// FAILS IF: a small crafted contract blob whose pairs keep doubling their
+/// surface is materialised instead of refused — 40 entries would ask for
+/// 2^39 bytes.
+#[test]
+fn a_doubling_expansion_chain_is_refused_before_it_allocates() {
+    let n: u32 = 40;
+    let mut bytes = b"PLTOKC01".to_vec();
+    bytes.push(0); // Identity
+    bytes.push(255); // VOCAB_CAP
+    bytes.extend_from_slice(&n.to_le_bytes());
+    bytes.extend_from_slice(&[0, b'a', 0]);
+    for i in 1..n {
+        let prev = u8::try_from(i - 1).expect("< 255");
+        bytes.extend_from_slice(&[1, prev, prev]);
+    }
+    assert_eq!(
+        TokenizerContract::from_bytes(&bytes).unwrap_err(),
+        ContractDecodeError::Invalid("surface too long")
+    );
+
+    // Silence twin: the same chain kept short enough is a lawful contract.
+    let short = 8u32;
+    let mut ok = bytes[..10].to_vec();
+    ok.extend_from_slice(&short.to_le_bytes());
+    ok.extend_from_slice(&bytes[14..14 + 3 * short as usize]);
+    let c = TokenizerContract::from_bytes(&ok).expect("a short chain loads");
+    assert_eq!(c.surface(7).len(), 128);
+}

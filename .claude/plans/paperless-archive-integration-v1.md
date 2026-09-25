@@ -268,7 +268,7 @@ C/D/E are then largely independent.
 > its own identity preimage (reload recomputes and so proves the id);
 > `TokenLane::{to_bytes,from_bytes}` persist the lane and refuse any receipt
 > that does not frame inside its own particles; handles are
-> `rcpt:<sha256>:<page>:<reading_order>` (`seam_tantivy::{handle_for,
+> `rcpt:<sha256>:<page>:<reading_order>:<byte_from>` (`seam_tantivy::{handle_for,
 > resolve_handle}`); alphabet choice (ii) — `train_reported` returns a
 > `TrainReport` and the base alphabet is capped at 255 ids (a 256-distinct-
 > byte corpus previously assigned one byte the PAD id, which decode then

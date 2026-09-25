@@ -29,6 +29,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sha2::{Digest, Sha256};
 
+/// Longest decoded surface a persisted contract may declare for one id. A
+/// trained surface is bounded by its training corpus (every merge needs two
+/// occurrences), so anything past this is a corrupt or crafted blob — and
+/// since each `Pair` may reference the previous id twice, surface lengths can
+/// double per entry, which is why the bound is checked BEFORE any surface is
+/// materialised.
+pub const MAX_SURFACE_BYTES: u64 = 1 << 20;
+
 /// Reserved id: padding inside a particle. Never emitted by encoding.
 pub const PAD: u8 = 0xFF;
 /// Ids `0..=254` are assignable; `255` is [`PAD`].
@@ -302,6 +310,26 @@ impl TokenizerContract {
         let n = usize::try_from(n).map_err(|_| ContractDecodeError::BadLength)?;
         if n > VOCAB_CAP || bytes.len() != HEADER + n * 3 {
             return Err(ContractDecodeError::BadLength);
+        }
+        // Validate structure and bound every surface length first, in u64,
+        // so a doubling chain is refused before anything is allocated.
+        let mut lens: Vec<u64> = Vec::with_capacity(n);
+        for (i, e) in bytes[HEADER..].as_chunks::<3>().0.iter().enumerate() {
+            let len = match e[0] {
+                0 => 1,
+                1 => {
+                    let (l, r) = (usize::from(e[1]), usize::from(e[2]));
+                    if l >= i || r >= i {
+                        return Err(ContractDecodeError::Invalid("pair refers forward"));
+                    }
+                    lens[l] + lens[r]
+                }
+                _ => return Err(ContractDecodeError::Invalid("expansion tag")),
+            };
+            if len > MAX_SURFACE_BYTES {
+                return Err(ContractDecodeError::Invalid("surface too long"));
+            }
+            lens.push(len);
         }
         let mut expand = Vec::with_capacity(n);
         let mut base_of = HashMap::new();

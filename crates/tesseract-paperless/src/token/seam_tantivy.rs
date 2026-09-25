@@ -7,7 +7,8 @@
 //! # Why this cannot silently re-tokenize
 //!
 //! The value put into the indexed text field is not the document text. It is a
-//! RECEIPT HANDLE (`rcpt:<sha256>:<page>:<reading_order>`, see [`handle_for`]). The tokenizer resolves the handle against the
+//! RECEIPT HANDLE (`rcpt:<sha256>:<page>:<reading_order>:<byte_from>`, see
+//! [`handle_for`]). The tokenizer resolves the handle against the
 //! lane and walks borrowed ids. Re-tokenizing the source is therefore not
 //! merely avoided by discipline — Tantivy is never handed the source at all.
 //!
@@ -88,7 +89,7 @@ impl SeamStore {
 }
 
 /// The CONTENT ADDRESS of a receipt, as a Tantivy field value:
-/// `rcpt:<hex content_sha256>:<page>:<reading_order>`.
+/// `rcpt:<hex content_sha256>:<page>:<reading_order>:<byte_from>`.
 ///
 /// It names the span by where it lives in the document layer, so it survives
 /// a restart, a re-ingest, and any reordering of the lane. A positional index
@@ -105,7 +106,11 @@ pub fn handle_for(lane: &TokenLane, r: &TokenStreamReceipt) -> Option<String> {
     for b in sha {
         let _ = write!(out, "{b:02x}");
     }
-    let _ = write!(out, ":{}:{}", r.key.page, r.key.reading_order);
+    let _ = write!(
+        out,
+        ":{}:{}:{}",
+        r.key.page, r.key.reading_order, r.byte_from
+    );
     Some(out)
 }
 
@@ -116,6 +121,7 @@ pub fn resolve_handle<'a>(lane: &'a TokenLane, handle: &str) -> Option<&'a Token
     let hex = parts.next()?;
     let page = parts.next()?.parse().ok()?;
     let reading_order = parts.next()?.parse().ok()?;
+    let byte_from = parts.next()?.parse().ok()?;
     if parts.next().is_some() || hex.len() != 64 {
         return None;
     }
@@ -124,11 +130,14 @@ pub fn resolve_handle<'a>(lane: &'a TokenLane, handle: &str) -> Option<&'a Token
         *b = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
     }
     let doc = lane.document_index(&sha)?;
-    lane.receipt_by_key(&SpanKey {
-        doc,
-        page,
-        reading_order,
-    })
+    lane.receipt_by_key(
+        &SpanKey {
+            doc,
+            page,
+            reading_order,
+        },
+        byte_from,
+    )
 }
 
 /// A `Tokenizer` that yields the resident lane's ids for a receipt handle, and

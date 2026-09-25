@@ -89,10 +89,12 @@ pub struct TokenLane {
     docs: Vec<[u8; 32]>,
     /// `content_sha256 -> docs index`. Derived; rebuilt on load, never saved.
     doc_index: HashMap<[u8; 32], u16>,
-    /// `SpanKey -> receipts index`, latest append wins. Derived like
-    /// `doc_index`. This is what makes a receipt addressable by WHERE it is in
-    /// the document layer rather than by where it happens to sit in the lane.
-    key_index: HashMap<SpanKey, usize>,
+    /// `(SpanKey, byte_from) -> receipts index`, latest append wins. Derived
+    /// like `doc_index`. This is what makes a receipt addressable by WHERE it
+    /// is in the document layer rather than by where it happens to sit in the
+    /// lane. `byte_from` is part of the key because sub-region spans are
+    /// lawful: two receipts in one region differ only by their offset.
+    key_index: HashMap<(SpanKey, u32), usize>,
 }
 
 /// Why persisted lane bytes were refused. A lane that loads is a lane whose
@@ -144,11 +146,14 @@ impl TokenLane {
         self.doc_index.get(content_sha256).copied()
     }
 
-    /// The receipt addressed by `key`, if one was appended. When the same key
-    /// was appended more than once, the latest append is the one returned.
+    /// The receipt addressed by `key` at region offset `byte_from`, if one was
+    /// appended. When the same address was appended more than once, the latest
+    /// append is the one returned.
     #[must_use]
-    pub fn receipt_by_key(&self, key: &SpanKey) -> Option<&TokenStreamReceipt> {
-        self.key_index.get(key).and_then(|&i| self.receipts.get(i))
+    pub fn receipt_by_key(&self, key: &SpanKey, byte_from: u32) -> Option<&TokenStreamReceipt> {
+        self.key_index
+            .get(&(*key, byte_from))
+            .and_then(|&i| self.receipts.get(i))
     }
 
     /// The `content_sha256` a receipt's key addresses.
@@ -193,7 +198,7 @@ impl TokenLane {
             particle_count: u32::try_from(self.particles.len()).expect("lane fits u32")
                 - first_particle,
         };
-        self.key_index.insert(key, self.receipts.len());
+        self.key_index.insert((key, byte_from), self.receipts.len());
         self.receipts.push(receipt);
         receipt
     }
@@ -324,7 +329,8 @@ impl TokenLane {
             if !framed {
                 return Err(LaneDecodeError::BadReceipt(i));
             }
-            lane.key_index.insert(receipt.key, lane.receipts.len());
+            lane.key_index
+                .insert((receipt.key, receipt.byte_from), lane.receipts.len());
             lane.receipts.push(receipt);
         }
         Ok(lane)
@@ -363,7 +369,11 @@ impl TokenLane {
     /// `token_count` rather than by looking for PAD.
     ///
     /// Returns `None` if the contract does not match the receipt — an id is
-    /// only interpretable under the codebook that assigned it.
+    /// only interpretable under the codebook that assigned it — or if any id
+    /// in the run is not assigned by that contract (PAD, or past its
+    /// vocabulary). A lane loaded from bytes is framed but not otherwise
+    /// trusted, and every consumer of a view indexes the contract's tables by
+    /// id, so an unassigned id must stop here rather than panic downstream.
     #[must_use]
     pub fn view<'a>(
         &'a self,
@@ -378,7 +388,13 @@ impl TokenLane {
         let flat = self.particles.get(start..end)?;
         // SAFETY-free reinterpretation: [[u8;12]] is contiguous, so a flat id
         // slice is a borrow, not a copy. `as_flattened` keeps it in safe Rust.
-        let ids = &flat.as_flattened()[..r.token_count as usize];
+        let ids = flat.as_flattened().get(..r.token_count as usize)?;
+        if ids
+            .iter()
+            .any(|&id| usize::from(id) >= contract.vocab_len())
+        {
+            return None;
+        }
         Some(TokenStreamView {
             ids,
             contract,
