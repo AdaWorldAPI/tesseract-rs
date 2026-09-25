@@ -197,20 +197,23 @@ impl Tokenizer for ReceiptTokenizer {
         let Self { store, mode, token } = self;
         token.reset();
         let contract = &store.contract;
-        let ids = resolve_handle(&store.lane, text)
-            .and_then(|r| store.lane.view(r, contract))
-            .map_or_else(
-                || {
-                    // Not a handle: this is a QUERY. Encoding it is a pass over
-                    // QUERY bytes, counted separately from source passes.
-                    let owned = contract
-                        .try_encode_query(text.as_bytes())
-                        .map(|(t, _)| t)
-                        .unwrap_or_default();
-                    Ids::Query(owned)
-                },
-                |v| Ids::Resident(v.ids()),
-            );
+        let ids = match resolve_handle(&store.lane, text).and_then(|r| store.lane.view(r, contract))
+        {
+            Some(v) => Ids::Resident(v.ids()),
+            // A value carrying the reserved prefix is a HANDLE, even a stale or
+            // malformed one. It yields nothing: encoding it as query text would
+            // index the handle's own characters as if they were document text.
+            None if text.starts_with(HANDLE_PREFIX) => Ids::Query(Vec::new()),
+            None => {
+                // Not a handle: this is a QUERY. Encoding it is a pass over
+                // QUERY bytes, counted separately from source passes.
+                let owned = contract
+                    .try_encode_query(text.as_bytes())
+                    .map(|(t, _)| t)
+                    .unwrap_or_default();
+                Ids::Query(owned)
+            }
+        };
         ReceiptTokenStream {
             ids,
             contract,

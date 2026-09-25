@@ -334,3 +334,46 @@ fn a_doubling_expansion_chain_is_refused_before_it_allocates() {
     let c = TokenizerContract::from_bytes(&ok).expect("a short chain loads");
     assert_eq!(c.surface(7).len(), 128);
 }
+
+/// FAILS IF: an unresolved handle falls back to query encoding and the
+/// tokenizer emits the handle's own characters as tokens. The contract here is
+/// deliberately trained on text that INCLUDES handle-shaped strings, so the
+/// fallback would succeed — without that, the test could pass by accident.
+#[test]
+fn an_unresolved_handle_yields_no_tokens_rather_than_its_own_characters() {
+    use std::sync::Arc;
+    use tantivy::tokenizer::{TokenStream as _, Tokenizer as _};
+    use tesseract_paperless::token::seam_tantivy::{ReceiptTokenizer, TermMode};
+
+    let lane_only = TokenizerContract::train(&corpus(), NormRule::Identity);
+    let mut lane = build(&[0], &lane_only);
+    let good = handle_for(&lane, &lane.receipts()[0]).expect("interned");
+    let stale = good.replacen(":1:0:0", ":7:0:0", 1);
+    assert!(
+        resolve_handle(&lane, &stale).is_none(),
+        "anti-vacuity: stale"
+    );
+
+    // Retrain over corpus + both handles, so every handle byte is encodable.
+    let mut wide = corpus();
+    wide.extend_from_slice(good.as_bytes());
+    wide.extend_from_slice(stale.as_bytes());
+    let contract = TokenizerContract::train(&wide, NormRule::Identity);
+    assert_eq!(contract.covers(stale.as_bytes()), Ok(()), "anti-vacuity: encodable");
+    lane = build(&[0], &contract);
+    let store = Arc::new(SeamStore { contract, lane });
+
+    let mut tok = ReceiptTokenizer::new(Arc::clone(&store), TermMode::TokenId);
+    let count = |tok: &mut ReceiptTokenizer, text: &str| {
+        let mut ts = tok.token_stream(text);
+        let mut n = 0;
+        while ts.advance() {
+            n += 1;
+        }
+        n
+    };
+    let good = handle_for(&store.lane, &store.lane.receipts()[0]).expect("interned");
+    assert!(count(&mut tok, &good) > 0, "the control resolves");
+    assert_eq!(count(&mut tok, &stale), 0);
+    assert!(count(&mut tok, "invoice") > 0, "plain queries still encode");
+}
