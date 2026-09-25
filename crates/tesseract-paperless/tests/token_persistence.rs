@@ -359,7 +359,11 @@ fn an_unresolved_handle_yields_no_tokens_rather_than_its_own_characters() {
     wide.extend_from_slice(good.as_bytes());
     wide.extend_from_slice(stale.as_bytes());
     let contract = TokenizerContract::train(&wide, NormRule::Identity);
-    assert_eq!(contract.covers(stale.as_bytes()), Ok(()), "anti-vacuity: encodable");
+    assert_eq!(
+        contract.covers(stale.as_bytes()),
+        Ok(()),
+        "anti-vacuity: encodable"
+    );
     lane = build(&[0], &contract);
     let store = Arc::new(SeamStore { contract, lane });
 
