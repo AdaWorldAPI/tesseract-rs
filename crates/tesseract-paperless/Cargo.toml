@@ -124,16 +124,17 @@ deepnsm-v2 = { path = "../../../lance-graph/crates/deepnsm-v2", optional = true 
 # embedded columnar database lance-graph itself is built on, with no
 # "brain"/thinking-engine code anywhere in its dependency tree. Pinned to the
 # workspace-wide line lance-graph's own CLAUDE.md documents (§ Key
-# Dependencies): lancedb 0.38 / lance 11 / arrow 58. The patch FLOATS — never
-# a `.0.0` exact pin (lance-graph pin ruling 2026-09-18): lancedb 0.38 itself
-# demands `lance = "=11.0.0"`, so a float resolves to exactly that today and
-# can never be narrower than the family. (Was `=0.33.0` / `=9.0.0`.)
-# `remote` is on for ONE reason: lancedb 0.38.0 does not compile without it —
+# Dependencies): lancedb 0.39 / lance 12 / arrow 58. The patch FLOATS — never
+# a `.0.0` exact pin (lance-graph pin ruling 2026-09-18): lancedb 0.39 itself
+# demands `lance = "=12.0.0"`, so a float resolves to exactly that today and
+# can never be narrower than the family. (Was 0.38 / 11, before that
+# `=0.33.0` / `=9.0.0`.) arrow stays 58: lancedb 0.39 still asks ^58.
+# `remote` is on for ONE reason: lancedb 0.39.0 does not compile without it —
 # `src/job.rs` builds `Error::Http` unconditionally while `error.rs` gates that
-# variant on `cfg(feature = "remote")` (E0599 at job.rs:56/66). 0.38.0 is the
-# only 0.38 release; drop the feature once a release gates `job.rs` too.
-lancedb = { version = "0.38.*", default-features = false, features = ["remote"], optional = true }
-lance = { version = "11.*", default-features = false, optional = true }
+# variant on `cfg(feature = "remote")` (E0599, same defect as 0.38.0). 0.39.0 is
+# the only 0.39 release; drop the feature once a release gates `job.rs` too.
+lancedb = { version = "0.39.*", default-features = false, features = ["remote"], optional = true }
+lance = { version = "12.*", default-features = false, optional = true }
 arrow = { version = "58", default-features = false, optional = true }
 # `merge_insert`'s `execute` takes a `Box<dyn RecordBatchReader + Send>`; the
 # concrete `RecordBatchIterator` lives in `arrow-array` directly.
