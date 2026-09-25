@@ -325,6 +325,35 @@ event exists (disable: remove the log call, assert silence).
 
 ### Wave B — kill the shipped duplication; the receipt lane becomes THE authority
 
+> **STATUS 2026-09-25: SHIPPED, with one deliberate deviation — the text
+> authority is the archived `DocIr`, not the receipt lane.** Why: the lane's
+> contract is trained per corpus and is closed over its alphabet (§2a). A
+> growing archive cannot rely on it as the only copy of its text: a new
+> document with one unseen byte is unencodable, and retraining mints a new
+> `contract_id`, invalidating every stored id. Wave A made that saturation
+> reportable, not survivable. `doc_ir_json` was already stored and
+> `text`/`preview` were already pure functions of it
+> (`render::{plain_text,preview}`), so the duplication is removed without
+> that dependency:
+> - `LanceStore` drops the `text`/`preview` columns; `DocumentRow::{text,
+>   preview}` derive them on read. `connect` opens before creating and
+>   drops the two columns from a pre-Wave-B table (rows kept).
+> - `SearchIndex` indexes `filename`/`text` without storing them; only the
+>   hash is stored. `search` returns `SearchResults`, whose `snippet_html`
+>   cuts the snippet from text the caller supplies (the archived `DocIr`'s).
+>   An index with a stale schema is discarded and rebuilt on open.
+> - New `reconcile` (`store`+`search`): indexes archived hashes the index
+>   lacks, drops indexed hashes the archive lacks; run at web startup.
+> Falsifiers, each disable-verified: no text column stored; a legacy table
+> migrates and still accepts writes; the index stores no text; the snippet
+> comes from the supplied text; a stale-schema index is rebuilt (and a
+> current one is not); an archived-but-unindexed document becomes searchable
+> with a snippet from the archive; an indexed-but-unarchived hash is
+> removed; a consistent pair changes nothing. The saturation-signal
+> falsifier below does not apply: word-level Tantivy has no closed alphabet.
+> The lane becomes the authority only once a contract can grow without
+> re-minting ids.
+
 **OBJECTIVE.** `search.rs` and `store.rs` stop each holding their own copy
 of the text. One authority; Tantivy is a lens over it, per NT-4, using the
 mechanism Wave A just made durable.

@@ -124,10 +124,9 @@ impl std::fmt::Display for IngestError {
 /// `store.put` and `search.index_document` are two separate stores with no
 /// shared commit. If the process dies between them, the document is archived
 /// (findable by direct link, by `LanceStore::list`) but not yet in the search
-/// index -- an inconsistency, not data loss. `Err(IngestError::Search(_))`
-/// surfaces this rather than swallowing it; recovering from it (a periodic
-/// reconciliation pass diffing the archive against the index) is future
-/// work, filed rather than pretended away.
+/// index -- an inconsistency, not data loss, because the index holds no text
+/// of its own. `Err(IngestError::Search(_))` surfaces it, and
+/// `tesseract_paperless::reconcile` repairs it on the next start.
 pub async fn ingest(
     state: &Arc<AppState>,
     bytes: Vec<u8>,

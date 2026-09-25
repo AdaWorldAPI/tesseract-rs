@@ -54,6 +54,10 @@ pub mod axes;
 #[cfg(feature = "store")]
 pub mod store;
 
+/// Keeps the search index in line with the archive it is a lens over.
+#[cfg(all(feature = "store", feature = "search"))]
+pub mod reconcile;
+
 #[cfg(feature = "token")]
 pub mod token;
 

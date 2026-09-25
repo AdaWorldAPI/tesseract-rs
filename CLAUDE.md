@@ -4467,3 +4467,31 @@ red-then-green (key-index rebuild, PAD cap, framing check, refusal counter).
 `probe_token_seam` still reports 41/41 with the new handles. Not yet: where
 the persisted bytes live — that is Wave B, which drops the duplicated
 `text`/`preview` columns and the Tantivy `STORED` text in favour of the lane.
+
+## ★ Paperless Wave B — the text is stored once, and the index is disposable (2026-09-25)
+
+The archive kept each document's text three times: inside `doc_ir_json`, in
+`text`/`preview` columns derived from it, and as Tantivy `STORED` fields. Now
+`doc_ir_json` is the only copy.
+
+- **Why the `DocIr` and not the receipt lane** (the plan's wording): the
+  lane's contract is closed over one corpus's alphabet, and retraining it
+  mints a new id. A growing archive would lose every document containing an
+  unseen byte. Wave A made that loss reportable; it did not make it go away.
+- `LanceStore` drops `text`/`preview`; `DocumentRow::{text, preview}` derive
+  them. `connect` opens an existing table before creating one, because
+  `create_empty_table(exist_ok)` refuses a table with a different schema,
+  and drops the two legacy columns in place.
+- `SearchIndex` stores only the hash; snippets come from
+  `SearchResults::snippet_html(text)`, given the archived text. An index with
+  a stale schema is wiped and rebuilt on open (`was_rebuilt`).
+- `reconcile::reconcile` (features `store`+`search`, own CI line) brings the
+  index back in line with the archive. The web app runs it on every start,
+  which closes the crash-between-two-stores gap the earlier section filed as
+  future work.
+
+Eight falsifiers, each disable-verified red-then-green. One of my disable
+runs came back green at first because I removed the wrong line: the index
+call had already run. Removing the call itself turned it red. The test was
+fine; the disable was not.
+

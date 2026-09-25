@@ -60,8 +60,11 @@ mod col {
     pub const PAGE_COUNT: &str = "page_count";
     pub const MEAN_CONFIDENCE: &str = "mean_confidence";
     pub const LOW_CONFIDENCE: &str = "low_confidence";
-    pub const TEXT: &str = "text";
-    pub const PREVIEW: &str = "preview";
+    /// Pre-Wave-B columns, named only so [`super::LanceStore::connect`] can
+    /// drop them from a legacy table. Nothing writes or reads them.
+    pub const LEGACY_TEXT: &str = "text";
+    /// See [`LEGACY_TEXT`].
+    pub const LEGACY_PREVIEW: &str = "preview";
     pub const DOC_IR_JSON: &str = "doc_ir_json";
     pub const INGESTED_AT_UNIX_MS: &str = "ingested_at_unix_ms";
     pub const SPO_JSON: &str = "spo_json";
@@ -111,8 +114,6 @@ fn schema() -> SchemaRef {
         Field::new(col::PAGE_COUNT, DataType::UInt16, false),
         Field::new(col::MEAN_CONFIDENCE, DataType::UInt32, false),
         Field::new(col::LOW_CONFIDENCE, DataType::Boolean, false),
-        Field::new(col::TEXT, DataType::Utf8, false),
-        Field::new(col::PREVIEW, DataType::Utf8, false),
         Field::new(col::DOC_IR_JSON, DataType::Utf8, false),
         Field::new(col::INGESTED_AT_UNIX_MS, DataType::Int64, false),
         // Nullable: absent whenever the caller ran without a loaded
@@ -150,13 +151,10 @@ pub struct DocumentRow {
     pub mean_confidence: u32,
     /// Whether the recognizer itself was not confident.
     pub low_confidence: bool,
-    /// The full plain text ([`crate::render::plain_text`]) — what search
-    /// matches against.
-    pub text: String,
-    /// A short preview ([`crate::render::preview`]) for the document list.
-    pub preview: String,
-    /// The `DocIr`, serialized ([`ogar_doc_ir::to_json`]) — the document
-    /// detail view's source of truth (regions, fields, bboxes).
+    /// The `DocIr`, serialized ([`ogar_doc_ir::to_json`]) — the ONE stored
+    /// copy of the document's text as well as its structure. The plain text
+    /// and the list preview are derived from it on read ([`Self::text`],
+    /// [`Self::preview`]); no second copy is stored beside it.
     pub doc_ir_json: String,
     /// Milliseconds since the Unix epoch, at ingest time.
     pub ingested_at_unix_ms: i64,
@@ -186,6 +184,25 @@ impl DocumentRow {
     pub fn doc_ir(&self) -> Result<DocIr, ogar_doc_ir::DocIrError> {
         ogar_doc_ir::from_json(&self.doc_ir_json)
     }
+
+    /// The full plain text ([`crate::render::plain_text`]), derived from
+    /// [`Self::doc_ir_json`] — what search indexes and snippets are cut from.
+    ///
+    /// # Errors
+    /// As [`Self::doc_ir`].
+    pub fn text(&self) -> Result<String, ogar_doc_ir::DocIrError> {
+        self.doc_ir().map(|ir| crate::render::plain_text(&ir))
+    }
+
+    /// A short preview ([`crate::render::preview`]) for the document list,
+    /// derived from [`Self::doc_ir_json`].
+    ///
+    /// # Errors
+    /// As [`Self::doc_ir`].
+    pub fn preview(&self, max_chars: usize) -> Result<String, ogar_doc_ir::DocIrError> {
+        self.doc_ir()
+            .map(|ir| crate::render::preview(&ir, max_chars))
+    }
 }
 
 /// An open connection to the document archive.
@@ -206,11 +223,31 @@ impl LanceStore {
     /// [`StoreError::Db`] if the connection or table creation fails.
     pub async fn connect(uri: &str) -> Result<Self, StoreError> {
         let db = connect(uri).execute().await?;
-        let table = db
-            .create_empty_table(TABLE, schema())
-            .mode(lancedb::database::CreateTableMode::exist_ok(|req| req))
-            .execute()
-            .await?;
+        // Open before creating: `create_empty_table` in `exist_ok` mode
+        // refuses an existing table whose schema differs, which is exactly
+        // the legacy table the migration below exists to fix.
+        let table = match db.open_table(TABLE).execute().await {
+            Ok(t) => t,
+            Err(lancedb::Error::TableNotFound { .. }) => {
+                db.create_empty_table(TABLE, schema())
+                    .mode(lancedb::database::CreateTableMode::exist_ok(|req| req))
+                    .execute()
+                    .await?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // A table created before Wave B carries `text`/`preview` beside
+        // `doc_ir_json` -- non-nullable columns this crate no longer writes,
+        // so every `put` against it would fail. Both are pure functions of
+        // `doc_ir_json`, so dropping them loses nothing; the rows stay intact.
+        let existing = table.schema().await?;
+        let legacy: Vec<&str> = [col::LEGACY_TEXT, col::LEGACY_PREVIEW]
+            .into_iter()
+            .filter(|c| existing.field_with_name(c).is_ok())
+            .collect();
+        if !legacy.is_empty() {
+            table.drop_columns(&legacy).await?;
+        }
         Ok(Self { db, table })
     }
 
@@ -240,8 +277,6 @@ impl LanceStore {
     ) -> Result<DocumentGuid, StoreError> {
         let keys = mint_document_root(hash);
         let doc_ir_json = ogar_doc_ir::to_json(ir).map_err(StoreError::Json)?;
-        let text = crate::render::plain_text(ir);
-        let preview = crate::render::preview(ir, 240);
         let hex = format!("{hash:?}");
 
         let batch = RecordBatch::try_new(
@@ -260,8 +295,6 @@ impl LanceStore {
                 ])),
                 Arc::new(UInt32Array::from(vec![mean_confidence])),
                 Arc::new(BooleanArray::from(vec![low_confidence])),
-                Arc::new(StringArray::from(vec![text])),
-                Arc::new(StringArray::from(vec![preview])),
                 Arc::new(StringArray::from(vec![doc_ir_json])),
                 Arc::new(Int64Array::from(vec![ingested_at_unix_ms])),
                 Arc::new(StringArray::from(vec![spo_json])),
@@ -300,38 +333,54 @@ impl LanceStore {
         rows_from_batches(&batches)
     }
 
-    /// Full-text search over [`DocumentRow::text`] — a plain SQL
-    /// case-sensitive substring match (`LIKE '%term%'`), not an FTS index.
-    /// Named honestly as the smaller of two options: `lancedb` ships a real
-    /// inverted-index FTS (`Index::FTS`, `full_text_search`), which needs an
-    /// index build step this first cut does not yet perform. `LIKE` is
-    /// correct-but-slow (full scan) rather than fast-but-absent — the
-    /// gap to close, not a permanent design.
+    /// Case-sensitive substring search over each document's derived
+    /// [`DocumentRow::text`], newest first. A full scan in Rust, not an
+    /// index: the text is no longer a column SQL could `LIKE` over, because
+    /// it is not stored twice. The ranked path is `crate::search`; this is
+    /// the correct-but-slow fallback for a build without it. A row whose
+    /// `doc_ir_json` does not parse never matches rather than failing the
+    /// whole search.
     ///
     /// # Errors
     /// Same as [`Self::list`].
     pub async fn search(&self, term: &str, limit: usize) -> Result<Vec<DocumentRow>, StoreError> {
-        // Escape the two characters SQL LIKE treats specially, and single
-        // quotes (the string delimiter) — a search box is a direct SQL
-        // injection surface otherwise ('; DROP ... is exactly this shape).
-        let escaped = term
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_")
-            .replace('\'', "''");
-        let predicate = format!("{} LIKE '%{escaped}%' ESCAPE '\\'", col::TEXT);
         let stream = self
             .table
             .query()
-            .only_if(predicate)
             .order_by(Some(vec![ColumnOrdering::desc_nulls_last(
                 col::INGESTED_AT_UNIX_MS.to_string(),
             )]))
-            .limit(limit)
             .execute()
             .await?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
-        rows_from_batches(&batches)
+        Ok(rows_from_batches(&batches)?
+            .into_iter()
+            .filter(|r| r.text().is_ok_and(|t| t.contains(term)))
+            .take(limit)
+            .collect())
+    }
+
+    /// Every archived document's hex `content_sha256`, projected alone --
+    /// what `crate::reconcile` compares the search index against without
+    /// reading every document body.
+    ///
+    /// # Errors
+    /// [`StoreError::Db`] on a read failure; [`StoreError::Malformed`] if the
+    /// column does not decode.
+    pub async fn hashes(&self) -> Result<Vec<String>, StoreError> {
+        let stream = self
+            .table
+            .query()
+            .select(lancedb::query::Select::columns(&[col::CONTENT_SHA256_HEX]))
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let mut out = Vec::new();
+        for batch in &batches {
+            let hex = downcast_str(batch, col::CONTENT_SHA256_HEX)?;
+            out.extend((0..batch.num_rows()).map(|i| hex.value(i).to_string()));
+        }
+        Ok(out)
     }
 
     /// Fetch one document by its hex `content_sha256` — the detail view.
@@ -390,8 +439,6 @@ fn rows_from_batches(batches: &[RecordBatch]) -> Result<Vec<DocumentRow>, StoreE
         let page_count = downcast_u16(batch, col::PAGE_COUNT)?;
         let mean_confidence = downcast_u32(batch, col::MEAN_CONFIDENCE)?;
         let low_confidence = downcast_bool(batch, col::LOW_CONFIDENCE)?;
-        let text = downcast_str(batch, col::TEXT)?;
-        let preview = downcast_str(batch, col::PREVIEW)?;
         let doc_ir_json = downcast_str(batch, col::DOC_IR_JSON)?;
         let ingested_at = downcast_i64(batch, col::INGESTED_AT_UNIX_MS)?;
         let spo_json = downcast_str_opt(batch, col::SPO_JSON);
@@ -410,8 +457,6 @@ fn rows_from_batches(batches: &[RecordBatch]) -> Result<Vec<DocumentRow>, StoreE
                 page_count: page_count.value(i),
                 mean_confidence: mean_confidence.value(i),
                 low_confidence: low_confidence.value(i),
-                text: text.value(i).to_string(),
-                preview: preview.value(i).to_string(),
                 doc_ir_json: doc_ir_json.value(i).to_string(),
                 ingested_at_unix_ms: ingested_at.value(i),
                 spo_json: spo_json
@@ -580,7 +625,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].filename.as_deref(), Some("invoice.png"));
         assert_eq!(listed[0].mean_confidence, 92);
-        assert!(listed[0].text.contains("Rechnung"));
+        assert!(listed[0].text().expect("text").contains("Rechnung"));
 
         let got = store
             .get(&format!("{hash:?}"))
@@ -689,9 +734,9 @@ mod tests {
         );
     }
 
-    /// A search term crafted to break out of the `LIKE` string literal must
-    /// be treated as DATA, not as SQL — otherwise the search box is an
-    /// injection point into `only_if`'s raw predicate string.
+    /// A search term shaped like SQL injection must be treated as data. The
+    /// scan no longer builds a predicate from the term at all, so this now
+    /// pins that it never regresses into one.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_search_term_containing_a_quote_does_not_break_the_predicate() {
         let (_dir, uri) = tmp_uri();
@@ -718,6 +763,115 @@ mod tests {
                 "an injection-shaped term must not match a document that never contained it"
             );
         }
+    }
+
+    /// The text is stored ONCE, inside `doc_ir_json`. A `text` or `preview`
+    /// column reappearing would be the duplication Wave B removed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_text_copy_is_stored_beside_the_doc_ir() {
+        let (_dir, uri) = tmp_uri();
+        let store = LanceStore::connect(&uri).await.expect("connect");
+        let schema = store.table.schema().await.expect("schema");
+        for legacy in [col::LEGACY_TEXT, col::LEGACY_PREVIEW] {
+            assert!(
+                schema.field_with_name(legacy).is_err(),
+                "`{legacy}` must not be a stored column"
+            );
+        }
+        assert!(schema.field_with_name(col::DOC_IR_JSON).is_ok());
+    }
+
+    /// An archive written before Wave B still opens, keeps its rows, and
+    /// accepts new writes. Without the migration `put` fails, because the
+    /// legacy `text`/`preview` columns are non-nullable and no longer written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_legacy_table_with_text_columns_is_migrated_on_connect() {
+        let (_dir, uri) = tmp_uri();
+        let old_hash = ContentSha256::of(b"archived before wave b");
+        {
+            let mut fields: Vec<Field> = schema()
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone())
+                .collect();
+            fields.push(Field::new(col::LEGACY_TEXT, DataType::Utf8, false));
+            fields.push(Field::new(col::LEGACY_PREVIEW, DataType::Utf8, false));
+            let legacy_schema = Arc::new(Schema::new(fields));
+            let ir = sample_ir("image/png");
+            let batch = RecordBatch::try_new(
+                legacy_schema,
+                vec![
+                    Arc::new(StringArray::from(vec![format!("{old_hash:?}")])),
+                    Arc::new(
+                        FixedSizeBinaryArray::try_from_iter(std::iter::once([0u8; 16]))
+                            .expect("guid"),
+                    ),
+                    Arc::new(StringArray::from(vec![Some("old.png")])),
+                    Arc::new(StringArray::from(vec!["image/png"])),
+                    Arc::new(StringArray::from(vec!["ocr"])),
+                    Arc::new(UInt16Array::from(vec![1u16])),
+                    Arc::new(UInt32Array::from(vec![90u32])),
+                    Arc::new(BooleanArray::from(vec![false])),
+                    Arc::new(StringArray::from(vec![
+                        ogar_doc_ir::to_json(&ir).expect("json")
+                    ])),
+                    Arc::new(Int64Array::from(vec![1i64])),
+                    Arc::new(StringArray::from(vec![None::<&str>])),
+                    Arc::new(StringArray::from(vec!["old copy of the text"])),
+                    Arc::new(StringArray::from(vec!["old preview"])),
+                ],
+            )
+            .expect("legacy batch");
+            let db = connect(&uri).execute().await.expect("connect raw");
+            db.create_table(TABLE, batch)
+                .execute()
+                .await
+                .expect("create legacy table");
+        }
+
+        let store = LanceStore::connect(&uri).await.expect("connect migrates");
+        store
+            .put(
+                &ContentSha256::of(b"archived after wave b"),
+                None,
+                95,
+                false,
+                &sample_ir("image/png"),
+                2,
+                None,
+            )
+            .await
+            .expect("a write after migration must succeed");
+        let old = store
+            .get(&format!("{old_hash:?}"))
+            .await
+            .expect("get")
+            .expect("the pre-migration row survives");
+        assert!(
+            old.text().expect("text").contains("Rechnung"),
+            "text is derived from doc_ir_json, not the dropped column"
+        );
+        assert_eq!(store.count().await.expect("count"), 2);
+    }
+
+    /// `hashes` lists exactly the archived documents.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hashes_lists_every_archived_document() {
+        let (_dir, uri) = tmp_uri();
+        let store = LanceStore::connect(&uri).await.expect("connect");
+        assert!(store.hashes().await.expect("hashes").is_empty());
+        let (a, b) = (ContentSha256::of(b"a"), ContentSha256::of(b"b"));
+        for (h, t) in [(&a, 1), (&b, 2)] {
+            store
+                .put(h, None, 90, false, &sample_ir("image/png"), t, None)
+                .await
+                .expect("put");
+        }
+        let mut got = store.hashes().await.expect("hashes");
+        got.sort();
+        let mut want = vec![format!("{a:?}"), format!("{b:?}")];
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[tokio::test(flavor = "multi_thread")]
