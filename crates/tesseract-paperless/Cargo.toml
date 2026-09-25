@@ -155,6 +155,11 @@ serde_json = { version = "1", optional = true }
 # lance-graph-quack / -mask-risc and the ndarray sibling (already a CI checkout).
 lance-graph-report = { path = "../../../lance-graph/crates/lance-graph-report", optional = true }
 
+# --- feature `matching` -----------------------------------------------------
+# S-8's rule vocabulary (paperless-ngx `matching.py`). Linear-time regex, so a
+# user's pattern cannot stall ingestion the way a backtracking engine can.
+regex = { version = "1", optional = true }
+
 [features]
 default = []
 ocr = ["dep:tesseract-ogar"]
@@ -170,6 +175,9 @@ search = ["dep:tantivy"]
 store = ["dep:lancedb", "dep:lance", "dep:arrow", "dep:arrow-array", "dep:arrow-schema", "dep:futures", "dep:tokio", "dep:serde_json"]
 # The four-axis organizing layer on the report substrate — see `axes.rs`.
 report = ["search", "dep:lance-graph-report"]
+# S-8: the matching rule a tag / correspondent / document type carries —
+# see `matching.rs`.
+matching = ["dep:regex"]
 
 # The probes are the evidence for the `token` claims, so they are built with
 # it and cannot be built without it.

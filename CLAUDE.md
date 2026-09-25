@@ -4495,3 +4495,30 @@ runs came back green at first because I removed the wrong line: the index
 call had already run. Removing the call itself turned it red. The test was
 fine; the disable was not.
 
+## ★ S-8 matching rules — paperless-ngx `matching_algorithm`, transcribed (2026-09-25)
+
+`tesseract-paperless::matching` (feature `matching`, dep `regex` only) is the
+rule a tag or correspondent carries: `MatchRule { algorithm, pattern,
+case_insensitive }` → `compile()` → `CompiledRule::matches(text)`, plus
+`matching(rules, text)` returning the rules that fire, in input order.
+Algorithms keep paperless-ngx's numbers (`from_paperless`): NONE, ANY, ALL,
+LITERAL, REGEX, FUZZY, AUTO. AUTO is the classifier tier and never matches
+here.
+
+- ANY/ALL use paperless's `_split_match`: quoted phrases stay whole, inner
+  spaces become `\s+`, every term is matched between word boundaries.
+- A blank pattern never matches. An invalid regex never matches.
+- REGEX needs no timeout: the `regex` crate is linear-time, so paperless's
+  catastrophic-backtracking case `(a+)+$` is a test here, not a guard. The
+  cost is no look-around or back-references; such a pattern is invalid and
+  never matches.
+- FUZZY strips punctuation from both sides and matches when
+  `partial_ratio >= 90`. `partial_ratio` is rapidfuzz's, including the
+  windows that overhang either end of the text.
+
+Tests use paperless-ngx's own `test_matchables.py` cases. Guards
+disable-verified red-then-green: word boundaries, phrase `\s+`, blank
+pattern, case flag, fuzzy cutoff, punctuation stripping, overhang windows.
+The first punctuation disable came back green; `fuzzy_ignores_punctuation_between_letters`
+was added so it goes red. Not wired into ingest yet.
+
