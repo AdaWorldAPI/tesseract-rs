@@ -42,8 +42,9 @@ use tantivy::query::QueryParser;
 use tantivy::schema::{Field, Schema, FAST, INDEXED, TEXT};
 use tantivy::{doc, Index, IndexReader};
 use tesseract_paperless::axes::{
-    self, build_batch, superuser, tag_mask, visible_to, with_search, ArchiveDoc, AxisDomains,
-    SearchMaskCollector, CORRESPONDENT, CREATED_MONTH, DOCUMENT_TYPE, SEARCH, STORAGE_PATH,
+    self, build_batch, superuser, tag_mask, tags_axis, visible_to, with_search, ArchiveDoc,
+    AxisDomains, SearchMaskCollector, CORRESPONDENT, CREATED_MONTH, DOCUMENT_TYPE, SEARCH,
+    STORAGE_PATH,
 };
 
 const N: usize = 20_000;
@@ -379,6 +380,56 @@ fn per_tag_counts_match_paperless_ngx_semantics() {
                     .count() as i64;
                 assert_eq!(got, want, "tag {t}, {who:?}, {:?}", s.map(|s| s.query));
             }
+        }
+    }
+}
+
+/// The tag axis as ONE plan: every tag's count comes out of a single report,
+/// and crossing it with an ordinal axis gives the tag-by-correspondent table
+/// the per-tag scalar folds could not express.
+#[test]
+fn a_tag_by_correspondent_pivot_matches_the_oracle_cell_for_cell() {
+    let f = fixture();
+    let count = Measure::count();
+    for s in [None, Some(&SEARCHES[2])] {
+        let batch = batch_for(f, s);
+        for who in [Who::Super, Who::User(1)] {
+            let (r, _) = plan(base_selection(who, s))
+                .axis(tags_axis(&DOMAINS), AxisRole::Row)
+                .axis(CoordSpec::Field(CORRESPONDENT), AxisRole::Column)
+                .execute(&batch, &PlannerPolicy::default())
+                .expect("fold");
+            let cols = DOMAINS.correspondents as usize + 1;
+            let mut want = vec![vec![0i64; cols]; DOMAINS.tags as usize];
+            let (mut untagged, mut multi, mut memberships) = (0, 0, 0i64);
+            for d in oracle_rows(f, who, s) {
+                untagged += usize::from(d.tags.is_empty());
+                multi += usize::from(d.tags.len() >= 2);
+                let c = d.correspondent.map_or(0, |c| c + 1) as usize;
+                for &t in &d.tags {
+                    want[t as usize][c] += 1;
+                    memberships += 1;
+                }
+            }
+            let mut per_tag_sum = 0;
+            for (t, row) in want.iter().enumerate() {
+                for (c, &w) in row.iter().enumerate() {
+                    let got = as_count(r.value(&count, &[], &[t as u32], &[c as u32]));
+                    assert_eq!(got, w, "tag {t}, correspondent ordinal {c}, {who:?}");
+                }
+                // The tag's own total equals its per-tag scalar fold.
+                let total = as_count(r.value(&count, &[], &[t as u32], &[]));
+                let scalar = fold_count(
+                    &batch,
+                    base_selection(who, s).and(Selection::Mask(tag_mask(t as u32))),
+                );
+                assert_eq!(total, scalar, "tag {t} total, {who:?}");
+                per_tag_sum += total;
+            }
+            // Set semantics: cells count memberships, not rows. The selection
+            // holds both untagged and multi-tag documents, so the two differ.
+            assert_eq!(per_tag_sum, memberships);
+            assert!(untagged > 0 && multi > 0, "the fixture must exercise both");
         }
     }
 }

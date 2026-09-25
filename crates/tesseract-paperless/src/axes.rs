@@ -27,15 +27,20 @@
 //! WHERE the axes live. The fold is `lance-graph-report`'s, lowered into the
 //! one mask-RISC evaluator.
 //!
-//! **Known gap, stated where it bites:** a report coordinate holds ONE ordinal
-//! per row, so "count per tag" is one scalar fold per tag (each reading the
-//! tag's mask), not one pivot. A coordinate provider backed by a SET of masks
-//! would make it one pass; it does not exist yet.
+//! Tags are a SET coordinate ([`tags_axis`], lance-graph's
+//! `CoordSpec::MaskSet`): one plan puts a document in every tag it carries, so
+//! "count per tag" and "tag by correspondent" are ordinary pivots. A tag cell
+//! does not sum to the selected population — a document with two tags counts
+//! in both, one with none counts in neither, as in paperless-ngx.
+//!
+//! **Known gap, stated where it bites:** the substrate still runs one
+//! population pass per tag. Folding every tag in one pass needs a keyed
+//! multi-membership aggregation that mask-RISC does not have yet.
 
 use std::sync::Arc;
 
 use lance_graph_report::{
-    AbiBatch, BatchError, CmpOp, Column, FieldId, MaskId, Scalar, Selection, SourceId,
+    AbiBatch, BatchError, CmpOp, Column, CoordSpec, FieldId, MaskId, Scalar, Selection, SourceId,
 };
 use tantivy::collector::{Collector, SegmentCollector};
 use tantivy::columnar::Column as FastColumn;
@@ -70,6 +75,17 @@ const GROUP_BASE: u32 = 3 * SPAN;
 pub fn tag_mask(tag: u32) -> MaskId {
     assert!(tag < SPAN, "tag id {tag} exceeds the mask id span");
     MaskId(TAG_BASE + tag)
+}
+
+/// The tag axis: a set coordinate over the tag masks [`build_batch`] attaches,
+/// member `t` being tag `t`. A plan over an archive with no tags is refused
+/// (`ReportError::EmptyMaskSet`) rather than read as an empty axis.
+#[must_use]
+pub fn tags_axis(domains: &AxisDomains) -> CoordSpec {
+    CoordSpec::MaskSet {
+        base: tag_mask(0),
+        count: domains.tags,
+    }
 }
 
 /// The resident mask of documents explicitly shared with `user`.
