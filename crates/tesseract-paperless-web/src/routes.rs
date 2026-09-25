@@ -201,20 +201,11 @@ const PREVIEW_CHARS: usize = 240;
 
 impl From<DocumentRow> for DocumentListItem {
     fn from(r: DocumentRow) -> Self {
-        // Text and preview are derived from the archived `DocIr`, the one
-        // stored copy. A row whose IR does not parse lists with an empty
-        // preview rather than failing the whole page.
+        // Text is derived from the archived `DocIr`, the one stored copy. A
+        // row whose IR does not parse lists with an empty preview rather than
+        // failing the whole page.
         let text = r.text().unwrap_or_default();
-        let preview = r.preview(PREVIEW_CHARS).unwrap_or_default();
-        Self {
-            hash_hex: r.content_sha256_hex,
-            filename: r.filename.unwrap_or_else(|| "(untitled)".to_string()),
-            preview,
-            snippet_html: None,
-            page_count: r.page_count,
-            confidence: confidence_str(r.mean_confidence, &text),
-            low_confidence: r.low_confidence,
-        }
+        Self::from_row_with_text(r, &text)
     }
 }
 
@@ -228,10 +219,24 @@ impl DocumentListItem {
         row: DocumentRow,
         results: &tesseract_paperless::search::SearchResults,
     ) -> Self {
-        let snippet = results.snippet_html(&row.text().unwrap_or_default());
+        let text = row.text().unwrap_or_default();
         Self {
-            snippet_html: Some(snippet),
-            ..Self::from(row)
+            snippet_html: Some(results.snippet_html(&text)),
+            ..Self::from_row_with_text(row, &text)
+        }
+    }
+
+    /// Build a row from text already derived from its IR, so the IR is
+    /// parsed once per row rather than once per field.
+    fn from_row_with_text(r: DocumentRow, text: &str) -> Self {
+        Self {
+            hash_hex: r.content_sha256_hex,
+            filename: r.filename.unwrap_or_else(|| "(untitled)".to_string()),
+            preview: tesseract_paperless::render::preview_of_text(text, PREVIEW_CHARS),
+            snippet_html: None,
+            page_count: r.page_count,
+            confidence: confidence_str(r.mean_confidence, text),
+            low_confidence: r.low_confidence,
         }
     }
 }

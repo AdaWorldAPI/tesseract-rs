@@ -170,6 +170,8 @@ pub struct SearchIndex {
     writer: Mutex<IndexWriter>,
     reader: IndexReader,
     rebuilt: bool,
+    #[cfg(test)]
+    commits: std::sync::atomic::AtomicUsize,
 }
 
 impl SearchIndex {
@@ -228,6 +230,8 @@ impl SearchIndex {
             writer: Mutex::new(writer),
             reader,
             rebuilt,
+            #[cfg(test)]
+            commits: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -268,20 +272,52 @@ impl SearchIndex {
         filename: &str,
         text: &str,
     ) -> Result<(), SearchError> {
+        self.apply_batch(&[(hash_hex, filename, text)], &[])
+    }
+
+    /// Index every `(hash, filename, text)` in `upserts` and remove every
+    /// hash in `deletes`, under one writer lock and ONE commit. A commit
+    /// writes and fsyncs a segment, so doing this per document would cost
+    /// one segment per document -- which is what rebuilding a whole index
+    /// through [`Self::index_document`] would do. Upserts are idempotent, as
+    /// in [`Self::index_document`].
+    ///
+    /// # Errors
+    /// [`SearchError::Tantivy`] on a write/commit failure.
+    pub fn apply_batch(
+        &self,
+        upserts: &[(&str, &str, &str)],
+        deletes: &[&str],
+    ) -> Result<(), SearchError> {
         let mut writer = self
             .writer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        writer.delete_term(Term::from_field_text(self.fields.hash, hash_hex));
-        writer.add_document(doc!(
-            self.fields.hash => hash_hex,
-            self.fields.filename => filename,
-            self.fields.text => text,
-        ))?;
+        for hash_hex in deletes {
+            writer.delete_term(Term::from_field_text(self.fields.hash, hash_hex));
+        }
+        for &(hash_hex, filename, text) in upserts {
+            writer.delete_term(Term::from_field_text(self.fields.hash, hash_hex));
+            writer.add_document(doc!(
+                self.fields.hash => hash_hex,
+                self.fields.filename => filename,
+                self.fields.text => text,
+            ))?;
+        }
         writer.commit()?;
         drop(writer);
+        #[cfg(test)]
+        self.commits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.reader.reload()?;
         Ok(())
+    }
+
+    /// Commits made through this handle. Segment count cannot stand in for
+    /// it: one commit yields a segment per indexing thread.
+    #[cfg(all(test, feature = "store"))]
+    pub(crate) fn commit_count(&self) -> usize {
+        self.commits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Remove a document from the index by its hash. A no-op (not an error)
@@ -291,15 +327,7 @@ impl SearchIndex {
     /// # Errors
     /// [`SearchError::Tantivy`] on a delete/commit failure.
     pub fn delete_document(&self, hash_hex: &str) -> Result<(), SearchError> {
-        let mut writer = self
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        writer.delete_term(Term::from_field_text(self.fields.hash, hash_hex));
-        writer.commit()?;
-        drop(writer);
-        self.reader.reload()?;
-        Ok(())
+        self.apply_batch(&[], &[hash_hex])
     }
 
     /// Ranked full-text search over `filename` + `text`, highest score

@@ -52,9 +52,15 @@ fn walk(r: &Region, out: &mut String) {
 /// with an ellipsis when truncated.
 #[must_use]
 pub fn preview(ir: &DocIr, max_chars: usize) -> String {
-    let text = plain_text(ir);
+    preview_of_text(&plain_text(ir), max_chars)
+}
+
+/// [`preview`] for text already derived with [`plain_text`], so a caller
+/// holding the text does not parse and walk the IR a second time.
+#[must_use]
+pub fn preview_of_text(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
-        return text;
+        return text.to_string();
     }
     let cut: String = text.chars().take(max_chars).collect();
     format!("{cut}…")

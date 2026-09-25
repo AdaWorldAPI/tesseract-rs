@@ -80,6 +80,12 @@ pub async fn reconcile(
     let indexed: HashSet<String> = index.indexed_hashes()?.into_iter().collect();
     let mut report = ReconcileReport::default();
 
+    // One commit per chunk, not per document: after a schema rebuild every
+    // archived document is missing, and a commit per document would write
+    // one segment each. Chunking bounds the text held in memory.
+    let removed: Vec<&str> = indexed.difference(&archived).map(String::as_str).collect();
+    let mut pending: Vec<(String, String, String)> = Vec::new();
+    let mut deletes_flushed = removed.is_empty();
     for hash in archived.difference(&indexed) {
         let Some(row) = store.get(hash).await? else {
             continue;
@@ -88,14 +94,50 @@ pub async fn reconcile(
             report.unreadable += 1;
             continue;
         };
-        index.index_document(hash, row.filename.as_deref().unwrap_or_default(), &text)?;
-        report.indexed += 1;
+        pending.push((hash.clone(), row.filename.unwrap_or_default(), text));
+        if pending.len() == RECONCILE_CHUNK {
+            flush(
+                index,
+                &mut pending,
+                &removed,
+                &mut deletes_flushed,
+                &mut report,
+            )?;
+        }
     }
-    for hash in indexed.difference(&archived) {
-        index.delete_document(hash)?;
-        report.removed += 1;
+    if !pending.is_empty() || !deletes_flushed {
+        flush(
+            index,
+            &mut pending,
+            &removed,
+            &mut deletes_flushed,
+            &mut report,
+        )?;
     }
+    report.removed = removed.len();
     Ok(report)
+}
+
+/// Documents indexed per commit during [`reconcile`].
+const RECONCILE_CHUNK: usize = 256;
+
+fn flush(
+    index: &SearchIndex,
+    pending: &mut Vec<(String, String, String)>,
+    removed: &[&str],
+    deletes_flushed: &mut bool,
+    report: &mut ReconcileReport,
+) -> Result<(), SearchError> {
+    let upserts: Vec<(&str, &str, &str)> = pending
+        .iter()
+        .map(|(h, f, t)| (h.as_str(), f.as_str(), t.as_str()))
+        .collect();
+    let deletes = if *deletes_flushed { &[][..] } else { removed };
+    index.apply_batch(&upserts, deletes)?;
+    *deletes_flushed = true;
+    report.indexed += pending.len();
+    pending.clear();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -195,6 +237,31 @@ mod tests {
             .expect("search")
             .hits
             .is_empty());
+    }
+
+    /// Refilling an empty index is one commit, not one per document -- the
+    /// cost that made a schema rebuild scale with archive size.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconcile_indexes_missing_documents_in_one_commit() {
+        let (_dir, store, index) = open().await;
+        for i in 0..5u8 {
+            store
+                .put(
+                    &ContentSha256::of(&[i]),
+                    None,
+                    95,
+                    false,
+                    &ir(&format!("document number {i}")),
+                    i64::from(i),
+                    None,
+                )
+                .await
+                .expect("put");
+        }
+        let report = reconcile(&store, &index).await.expect("reconcile");
+        assert_eq!(report.indexed, 5);
+        assert_eq!(index.search("document", 10).expect("search").hits.len(), 5);
+        assert_eq!(index.commit_count(), 1, "five documents, one commit");
     }
 
     /// A consistent pair is left alone -- the pass does not re-index
