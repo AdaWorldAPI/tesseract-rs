@@ -41,7 +41,7 @@ use ogar_doc_ir::{DocIr, Region};
 /// table rather than a repeated 32-byte hash: at these span sizes a receipt is
 /// already a third of the resident bytes, and stamping the sha256 on every one
 /// of them would more than double that for no addressing gain.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SpanKey {
     /// Index into the lane's document table (which holds the `content_sha256`).
     pub doc: u16,

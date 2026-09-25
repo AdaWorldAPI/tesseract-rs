@@ -29,6 +29,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sha2::{Digest, Sha256};
 
+/// Longest decoded surface a persisted contract may declare for one id. A
+/// trained surface is bounded by its training corpus (every merge needs two
+/// occurrences), so anything past this is a corrupt or crafted blob — and
+/// since each `Pair` may reference the previous id twice, surface lengths can
+/// double per entry, which is why the bound is checked BEFORE any surface is
+/// materialised.
+pub const MAX_SURFACE_BYTES: u64 = 1 << 20;
+
 /// Reserved id: padding inside a particle. Never emitted by encoding.
 pub const PAD: u8 = 0xFF;
 /// Ids `0..=254` are assignable; `255` is [`PAD`].
@@ -36,6 +44,24 @@ pub const VOCAB_CAP: usize = 255;
 
 static SOURCE_PASSES: AtomicUsize = AtomicUsize::new(0);
 static QUERY_PASSES: AtomicUsize = AtomicUsize::new(0);
+static SOURCE_REFUSALS: AtomicUsize = AtomicUsize::new(0);
+static QUERY_REFUSALS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many SOURCE encodes were refused because a byte fell outside the
+/// trained alphabet. A refusal is a saturation signal, never a silent empty
+/// stream: a lane that drops it would make search silently miss the document.
+#[must_use]
+pub fn source_refusals() -> usize {
+    SOURCE_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// How many QUERY encodes were refused for the same reason. Kept apart from
+/// [`source_refusals`] so "the archive saturated" and "a user typed a byte the
+/// archive never saw" stay distinguishable.
+#[must_use]
+pub fn query_refusals() -> usize {
+    QUERY_REFUSALS.load(Ordering::Relaxed)
+}
 
 /// How many times SOURCE bytes have been tokenized in this process.
 #[must_use]
@@ -89,6 +115,42 @@ impl NormRule {
     }
 }
 
+/// What training observed about the alphabet — the saturation report.
+///
+/// The cap is 255 assignable ids, base bytes first. A corpus with more distinct
+/// bytes than that cannot be represented at all, and one that reaches the cap
+/// leaves no room for merges; both are reported here so the condition is
+/// visible at training time instead of surfacing later as an empty search.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrainReport {
+    /// Distinct bytes seen in the normalised corpus.
+    pub distinct_bytes: usize,
+    /// Bytes that did not fit the base alphabet, in first-seen order. Any
+    /// later encode containing one of them is refused.
+    pub excluded_bytes: Vec<u8>,
+    /// Whether the vocabulary reached [`VOCAB_CAP`].
+    pub vocab_full: bool,
+}
+
+impl TrainReport {
+    /// Whether training hit either limit.
+    #[must_use]
+    pub fn saturated(&self) -> bool {
+        self.vocab_full || !self.excluded_bytes.is_empty()
+    }
+}
+
+/// Why persisted contract bytes were refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContractDecodeError {
+    /// Not a contract serialisation (magic mismatch).
+    BadMagic,
+    /// Truncated, or trailing bytes after the table.
+    BadLength,
+    /// A field held a value no contract can produce.
+    Invalid(&'static str),
+}
+
 /// A trained, immutable tokenizer codebook plus the identity that makes its
 /// output interpretable.
 #[derive(Clone, Debug)]
@@ -112,19 +174,49 @@ impl TokenizerContract {
     /// and `encode` will then reject every byte (see [`Self::try_encode`]).
     #[must_use]
     pub fn train(corpus: &[u8], norm: NormRule) -> Self {
+        Self::train_reported(corpus, norm).0
+    }
+
+    /// [`Self::train`], also returning what training observed about the
+    /// alphabet. Use this on any archive-scale corpus: a saturated contract
+    /// is lawful, but it must be a logged decision, not a discovery.
+    ///
+    /// # Panics
+    /// Never; the base alphabet is capped at [`VOCAB_CAP`] ids so no byte can
+    /// be assigned the reserved [`PAD`] id.
+    #[must_use]
+    pub fn train_reported(corpus: &[u8], norm: NormRule) -> (Self, TrainReport) {
         let corpus = norm.apply(corpus);
         let corpus = corpus.as_slice();
         let mut base_of: HashMap<u8, u8> = HashMap::new();
         let mut expand: Vec<Expansion> = Vec::new();
         let mut strings: Vec<Vec<u8>> = Vec::new();
+        let mut seen = [false; 256];
+        let mut report = TrainReport::default();
         for &b in corpus {
-            base_of.entry(b).or_insert_with(|| {
-                expand.push(Expansion::Base(b));
-                strings.push(vec![b]);
-                u8::try_from(expand.len() - 1).expect("alphabet <= 256 distinct bytes")
-            });
+            if std::mem::replace(&mut seen[b as usize], true) {
+                continue;
+            }
+            report.distinct_bytes += 1;
+            // Ids 0..=254 are assignable; a 256th distinct byte would land on
+            // PAD and vanish on decode, so it is excluded and reported instead.
+            if expand.len() >= VOCAB_CAP {
+                report.excluded_bytes.push(b);
+                continue;
+            }
+            expand.push(Expansion::Base(b));
+            strings.push(vec![b]);
+            base_of.insert(
+                b,
+                u8::try_from(expand.len() - 1).expect("bounded by VOCAB_CAP"),
+            );
         }
-        let mut stream: Vec<u8> = corpus.iter().map(|b| base_of[b]).collect();
+        // Excluded bytes are dropped from the training stream only; they can
+        // never be encoded, and every encode containing one is refused.
+        let mut stream: Vec<u8> = corpus
+            .iter()
+            .filter_map(|b| base_of.get(b).copied())
+            .collect();
         let mut merges = Vec::new();
         while expand.len() < VOCAB_CAP {
             let mut pf: HashMap<(u8, u8), usize> = HashMap::new();
@@ -175,7 +267,138 @@ impl TokenizerContract {
             contract_id: [0; 32],
         };
         me.contract_id = me.compute_contract_id();
-        me
+        report.vocab_full = me.expand.len() >= VOCAB_CAP;
+        (me, report)
+    }
+
+    /// The persisted form: exactly the canonical serialisation the contract id
+    /// digests. Persisting the identity's own preimage means a reload can
+    /// PROVE it restored the same codebook by recomputing the id.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.canonical_bytes()
+    }
+
+    /// Rebuild a contract from [`Self::to_bytes`]. Every derived table
+    /// (`base_of`, `merges`, `strings`, `byte_len`) is recomputed from the
+    /// expansion list, and the id is recomputed from the bytes, so a restored
+    /// contract cannot disagree with the one that was saved.
+    ///
+    /// # Errors
+    /// [`ContractDecodeError`] on a wrong magic, a length mismatch, an unknown
+    /// normalisation rule, a pair referring forward, or a duplicate base byte.
+    ///
+    /// # Panics
+    /// Never: every slice conversion is on a length checked just above it.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ContractDecodeError> {
+        const HEADER: usize = 8 + 1 + 1 + 4;
+        if bytes.len() < HEADER {
+            return Err(ContractDecodeError::BadLength);
+        }
+        if &bytes[..8] != b"PLTOKC01" {
+            return Err(ContractDecodeError::BadMagic);
+        }
+        let norm = match bytes[8] {
+            0 => NormRule::Identity,
+            1 => NormRule::AsciiLowercase,
+            _ => return Err(ContractDecodeError::Invalid("normalisation rule")),
+        };
+        if usize::from(bytes[9]) != VOCAB_CAP {
+            return Err(ContractDecodeError::Invalid("vocabulary cap"));
+        }
+        let n = u32::from_le_bytes(bytes[10..14].try_into().expect("4 bytes"));
+        let n = usize::try_from(n).map_err(|_| ContractDecodeError::BadLength)?;
+        if n > VOCAB_CAP || bytes.len() != HEADER + n * 3 {
+            return Err(ContractDecodeError::BadLength);
+        }
+        // Validate structure and bound every surface length first, in u64,
+        // so a doubling chain is refused before anything is allocated.
+        let mut lens: Vec<u64> = Vec::with_capacity(n);
+        for (i, e) in bytes[HEADER..].as_chunks::<3>().0.iter().enumerate() {
+            let len = match e[0] {
+                0 => 1,
+                1 => {
+                    let (l, r) = (usize::from(e[1]), usize::from(e[2]));
+                    if l >= i || r >= i {
+                        return Err(ContractDecodeError::Invalid("pair refers forward"));
+                    }
+                    lens[l] + lens[r]
+                }
+                _ => return Err(ContractDecodeError::Invalid("expansion tag")),
+            };
+            if len > MAX_SURFACE_BYTES {
+                return Err(ContractDecodeError::Invalid("surface too long"));
+            }
+            lens.push(len);
+        }
+        let mut expand = Vec::with_capacity(n);
+        let mut base_of = HashMap::new();
+        let mut merges = Vec::new();
+        let mut strings: Vec<Vec<u8>> = Vec::with_capacity(n);
+        for (i, e) in bytes[HEADER..].as_chunks::<3>().0.iter().enumerate() {
+            let id = u8::try_from(i).expect("n <= VOCAB_CAP");
+            match e[0] {
+                0 => {
+                    if base_of.insert(e[1], id).is_some() {
+                        return Err(ContractDecodeError::Invalid("duplicate base byte"));
+                    }
+                    expand.push(Expansion::Base(e[1]));
+                    strings.push(vec![e[1]]);
+                }
+                1 => {
+                    let (l, r) = (e[1], e[2]);
+                    if l >= id || r >= id {
+                        return Err(ContractDecodeError::Invalid("pair refers forward"));
+                    }
+                    let mut s = strings[l as usize].clone();
+                    s.extend_from_slice(&strings[r as usize]);
+                    strings.push(s);
+                    expand.push(Expansion::Pair(l, r));
+                    merges.push(((l, r), id));
+                }
+                _ => return Err(ContractDecodeError::Invalid("expansion tag")),
+            }
+        }
+        let byte_len = strings
+            .iter()
+            .map(|s| u32::try_from(s.len()).expect("token surface is short"))
+            .collect();
+        let mut me = Self {
+            expand,
+            base_of,
+            merges,
+            strings,
+            byte_len,
+            norm,
+            contract_id: [0; 32],
+        };
+        me.contract_id = me.compute_contract_id();
+        Ok(me)
+    }
+
+    /// Whether the vocabulary is at [`VOCAB_CAP`] — no merge can be added.
+    #[must_use]
+    pub fn vocab_full(&self) -> bool {
+        self.expand.len() >= VOCAB_CAP
+    }
+
+    /// Whether every byte of `q` (after normalisation) is in the trained
+    /// alphabet. `Err(offset)` names the first byte that is not — the signal a
+    /// search response carries so "no match" and "unencodable query" are never
+    /// the same empty result.
+    ///
+    /// # Errors
+    /// The byte offset (in the normalised query) of the first unknown byte.
+    pub fn covers(&self, q: &[u8]) -> Result<(), usize> {
+        match self
+            .norm
+            .apply(q)
+            .iter()
+            .position(|b| !self.base_of.contains_key(b))
+        {
+            None => Ok(()),
+            Some(i) => Err(i),
+        }
     }
 
     /// The canonical serialisation the contract id digests. Stated explicitly so
@@ -268,14 +491,22 @@ impl TokenizerContract {
     /// and silently dropping an unknown byte would break reconstruction.
     pub fn try_encode(&self, src: &[u8]) -> Option<(Vec<u8>, usize)> {
         SOURCE_PASSES.fetch_add(1, Ordering::Relaxed);
-        self.encode_inner(src)
+        let out = self.encode_inner(src);
+        if out.is_none() {
+            SOURCE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        }
+        out
     }
 
     /// Encode QUERY bytes. Counted by [`query_passes`], never by
     /// [`source_passes`].
     pub fn try_encode_query(&self, q: &[u8]) -> Option<(Vec<u8>, usize)> {
         QUERY_PASSES.fetch_add(1, Ordering::Relaxed);
-        self.encode_inner(q)
+        let out = self.encode_inner(q);
+        if out.is_none() {
+            QUERY_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        }
+        out
     }
 
     fn encode_inner(&self, src: &[u8]) -> Option<(Vec<u8>, usize)> {

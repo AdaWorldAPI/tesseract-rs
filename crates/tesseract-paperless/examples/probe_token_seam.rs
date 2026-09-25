@@ -61,7 +61,7 @@ use tesseract_paperless::token::docir::{spans, SpanKey};
 use tesseract_paperless::token::forward::{score, windows, CountPredictor};
 use tesseract_paperless::token::lane::{TokenLane, TokenStreamReceipt, IDS_PER_PARTICLE};
 use tesseract_paperless::token::lexical::project;
-use tesseract_paperless::token::seam_tantivy::{handle, ReceiptTokenizer, SeamStore, TermMode};
+use tesseract_paperless::token::seam_tantivy::{handle_for, ReceiptTokenizer, SeamStore, TermMode};
 
 /// The real KJV Genesis 2-3 scene, carried verbatim from
 /// `PROBE-TOKEN-BPE-GEOMETRY-1` so the two probes measure the same bytes.
@@ -622,7 +622,10 @@ fn tantivy_arm(
             // The FIELD VALUE IS A HANDLE, not the text. This is what makes
             // re-tokenization structurally impossible rather than merely
             // discouraged.
-            d.add_text(body, handle(i));
+            d.add_text(
+                body,
+                handle_for(&store.lane, &store.lane.receipts()[i]).expect("interned"),
+            );
             w.add_document(d).expect("add");
         }
         w.commit().expect("commit");
@@ -653,7 +656,7 @@ fn tantivy_arm(
 
     // ---- positions must BE the receipt's positions ----
     let mut analyzer = index.tokenizers().get("receipt").expect("registered");
-    let h = handle(probe_receipt);
+    let h = handle_for(&store.lane, &store.lane.receipts()[probe_receipt]).expect("interned");
     let mut seen: Vec<usize> = Vec::new();
     {
         let mut ts = analyzer.token_stream(&h);
@@ -719,7 +722,7 @@ fn tantivy_arm(
     };
     g.run(
         &format!("T-TANTIVY-PHRASE[{label}] a phrase over the shared segmentation retrieves"),
-        hits > 0 && stored == handle(probe_receipt),
+        hits > 0 && stored == h,
         &format!(
             "a 3-token phrase taken straight out of receipt {probe_receipt}'s ids matched {hits} \
              document(s) via POSITIONS ONLY, and the top hit's stored field is exactly \

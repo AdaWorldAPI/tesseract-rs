@@ -196,28 +196,47 @@ struct DocumentListItem {
     low_confidence: bool,
 }
 
+/// Characters of document text shown as a list preview.
+const PREVIEW_CHARS: usize = 240;
+
 impl From<DocumentRow> for DocumentListItem {
     fn from(r: DocumentRow) -> Self {
-        Self {
-            hash_hex: r.content_sha256_hex,
-            filename: r.filename.unwrap_or_else(|| "(untitled)".to_string()),
-            preview: r.preview,
-            snippet_html: None,
-            page_count: r.page_count,
-            confidence: confidence_str(r.mean_confidence, &r.text),
-            low_confidence: r.low_confidence,
-        }
+        // Text is derived from the archived `DocIr`, the one stored copy. A
+        // row whose IR does not parse lists with an empty preview rather than
+        // failing the whole page.
+        let text = r.text().unwrap_or_default();
+        Self::from_row_with_text(r, &text)
     }
 }
 
 impl DocumentListItem {
     /// Build a search-result row: archive metadata from `row`, but the
-    /// preview slot filled by the search hit's ranked snippet instead of the
-    /// plain first-N-chars preview -- the paperless-ngx-shaped result.
-    fn from_search_hit(row: DocumentRow, hit: tesseract_paperless::search::SearchHit) -> Self {
+    /// preview slot filled by the hit's highlighted snippet instead of the
+    /// plain first-N-chars preview -- the paperless-ngx-shaped result. The
+    /// snippet is cut from the row's archived text, since the index keeps
+    /// no copy of it.
+    fn from_search_hit(
+        row: DocumentRow,
+        results: &tesseract_paperless::search::SearchResults,
+    ) -> Self {
+        let text = row.text().unwrap_or_default();
         Self {
-            snippet_html: Some(hit.snippet_html),
-            ..Self::from(row)
+            snippet_html: Some(results.snippet_html(&text)),
+            ..Self::from_row_with_text(row, &text)
+        }
+    }
+
+    /// Build a row from text already derived from its IR, so the IR is
+    /// parsed once per row rather than once per field.
+    fn from_row_with_text(r: DocumentRow, text: &str) -> Self {
+        Self {
+            hash_hex: r.content_sha256_hex,
+            filename: r.filename.unwrap_or_else(|| "(untitled)".to_string()),
+            preview: tesseract_paperless::render::preview_of_text(text, PREVIEW_CHARS),
+            snippet_html: None,
+            page_count: r.page_count,
+            confidence: confidence_str(r.mean_confidence, text),
+            low_confidence: r.low_confidence,
         }
     }
 }
@@ -274,12 +293,12 @@ async fn documents(
     // write already are.
     let st = state.clone();
     let q_for_search = query.clone();
-    let hits = match tokio::task::spawn_blocking(move || {
+    let results = match tokio::task::spawn_blocking(move || {
         st.search.search(&q_for_search, LIST_LIMIT)
     })
     .await
     {
-        Ok(Ok(hits)) => hits,
+        Ok(Ok(results)) => results,
         Ok(Err(e)) => {
             return render(&DocumentsTemplate {
                 query,
@@ -304,10 +323,10 @@ async fn documents(
     // cost rather than a hidden one; see `ingest.rs`'s doc comment on the
     // store/index consistency gap this join can also surface (a hit with no
     // matching row) via `Ok(None)` below.
-    let mut documents = Vec::with_capacity(hits.len());
-    for hit in hits {
+    let mut documents = Vec::with_capacity(results.hits.len());
+    for hit in &results.hits {
         match state.store.get(&hit.hash_hex).await {
-            Ok(Some(row)) => documents.push(DocumentListItem::from_search_hit(row, hit)),
+            Ok(Some(row)) => documents.push(DocumentListItem::from_search_hit(row, &results)),
             Ok(None) => eprintln!(
                 "search hit {} has no matching archive row (index/archive drift)",
                 hit.hash_hex
@@ -486,6 +505,7 @@ async fn document_detail(
         }
     };
 
+    let text = tesseract_paperless::render::plain_text(&ir);
     let mut regions = Vec::new();
     flatten_regions(&ir, &mut regions);
     let fields = ir
@@ -505,10 +525,10 @@ async fn document_detail(
         mime: row.mime,
         source: row.source,
         page_count: row.page_count,
-        confidence: confidence_str(row.mean_confidence, &row.text),
+        confidence: confidence_str(row.mean_confidence, &text),
         low_confidence: row.low_confidence,
         ingested_at: format_unix_ms(row.ingested_at_unix_ms),
-        text: row.text,
+        text,
         regions,
         fields,
         triples,

@@ -48,11 +48,20 @@ pub mod render;
 #[cfg(feature = "search")]
 pub mod search;
 
+/// S-8: the matching rule a tag, correspondent or document type carries,
+/// transcribed from paperless-ngx's `matching.py`.
+#[cfg(feature = "matching")]
+pub mod matching;
+
 #[cfg(feature = "report")]
 pub mod axes;
 
 #[cfg(feature = "store")]
 pub mod store;
+
+/// Keeps the search index in line with the archive it is a lens over.
+#[cfg(all(feature = "store", feature = "search"))]
+pub mod reconcile;
 
 #[cfg(feature = "token")]
 pub mod token;

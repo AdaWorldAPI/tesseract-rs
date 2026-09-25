@@ -7,7 +7,8 @@
 //! # Why this cannot silently re-tokenize
 //!
 //! The value put into the indexed text field is not the document text. It is a
-//! RECEIPT HANDLE (`rcpt:<n>`). The tokenizer resolves the handle against the
+//! RECEIPT HANDLE (`rcpt:<sha256>:<page>:<reading_order>:<byte_from>`, see
+//! [`handle_for`]). The tokenizer resolves the handle against the
 //! lane and walks borrowed ids. Re-tokenizing the source is therefore not
 //! merely avoided by discipline — Tantivy is never handed the source at all.
 //!
@@ -47,7 +48,8 @@ use std::sync::Arc;
 use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 
 use crate::token::contract::TokenizerContract;
-use crate::token::lane::TokenLane;
+use crate::token::docir::SpanKey;
+use crate::token::lane::{TokenLane, TokenStreamReceipt};
 
 /// The prefix that marks an indexed field value as a receipt handle.
 pub const HANDLE_PREFIX: &str = "rcpt:";
@@ -73,10 +75,69 @@ pub struct SeamStore {
     pub lane: TokenLane,
 }
 
-/// Format the field value for a receipt index.
+impl SeamStore {
+    /// Whether `query` is encodable under this store's contract. A search
+    /// path calls this before searching, so a query containing a byte the
+    /// archive never trained on is REPORTED as such rather than returning the
+    /// same empty result as a genuine miss.
+    ///
+    /// # Errors
+    /// The offset of the first byte outside the trained alphabet.
+    pub fn covers(&self, query: &str) -> Result<(), usize> {
+        self.contract.covers(query.as_bytes())
+    }
+}
+
+/// The CONTENT ADDRESS of a receipt, as a Tantivy field value:
+/// `rcpt:<hex content_sha256>:<page>:<reading_order>:<byte_from>`.
+///
+/// It names the span by where it lives in the document layer, so it survives
+/// a restart, a re-ingest, and any reordering of the lane. A positional index
+/// (the earlier `rcpt:<n>`) did none of those — it silently re-pointed at
+/// whatever receipt happened to sit at `n`.
+///
+/// Returns `None` if the receipt's document is not interned in `lane`.
 #[must_use]
-pub fn handle(receipt_index: usize) -> String {
-    format!("{HANDLE_PREFIX}{receipt_index}")
+pub fn handle_for(lane: &TokenLane, r: &TokenStreamReceipt) -> Option<String> {
+    use std::fmt::Write as _;
+    let sha = lane.document_of(r)?;
+    let mut out = String::with_capacity(HANDLE_PREFIX.len() + 64 + 12);
+    out.push_str(HANDLE_PREFIX);
+    for b in sha {
+        let _ = write!(out, "{b:02x}");
+    }
+    let _ = write!(
+        out,
+        ":{}:{}:{}",
+        r.key.page, r.key.reading_order, r.byte_from
+    );
+    Some(out)
+}
+
+/// Resolve a [`handle_for`] value back to its receipt in `lane`.
+#[must_use]
+pub fn resolve_handle<'a>(lane: &'a TokenLane, handle: &str) -> Option<&'a TokenStreamReceipt> {
+    let mut parts = handle.strip_prefix(HANDLE_PREFIX)?.split(':');
+    let hex = parts.next()?;
+    let page = parts.next()?.parse().ok()?;
+    let reading_order = parts.next()?.parse().ok()?;
+    let byte_from = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || hex.len() != 64 {
+        return None;
+    }
+    let mut sha = [0u8; 32];
+    for (i, b) in sha.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    let doc = lane.document_index(&sha)?;
+    lane.receipt_by_key(
+        &SpanKey {
+            doc,
+            page,
+            reading_order,
+        },
+        byte_from,
+    )
 }
 
 /// A `Tokenizer` that yields the resident lane's ids for a receipt handle, and
@@ -136,23 +197,23 @@ impl Tokenizer for ReceiptTokenizer {
         let Self { store, mode, token } = self;
         token.reset();
         let contract = &store.contract;
-        let ids = text
-            .strip_prefix(HANDLE_PREFIX)
-            .and_then(|n| n.parse::<usize>().ok())
-            .and_then(|i| store.lane.receipts().get(i))
-            .and_then(|r| store.lane.view(r, contract))
-            .map_or_else(
-                || {
-                    // Not a handle: this is a QUERY. Encoding it is a pass over
-                    // QUERY bytes, counted separately from source passes.
-                    let owned = contract
-                        .try_encode_query(text.as_bytes())
-                        .map(|(t, _)| t)
-                        .unwrap_or_default();
-                    Ids::Query(owned)
-                },
-                |v| Ids::Resident(v.ids()),
-            );
+        let ids = match resolve_handle(&store.lane, text).and_then(|r| store.lane.view(r, contract))
+        {
+            Some(v) => Ids::Resident(v.ids()),
+            // A value carrying the reserved prefix is a HANDLE, even a stale or
+            // malformed one. It yields nothing: encoding it as query text would
+            // index the handle's own characters as if they were document text.
+            None if text.starts_with(HANDLE_PREFIX) => Ids::Query(Vec::new()),
+            None => {
+                // Not a handle: this is a QUERY. Encoding it is a pass over
+                // QUERY bytes, counted separately from source passes.
+                let owned = contract
+                    .try_encode_query(text.as_bytes())
+                    .map(|(t, _)| t)
+                    .unwrap_or_default();
+                Ids::Query(owned)
+            }
+        };
         ReceiptTokenStream {
             ids,
             contract,

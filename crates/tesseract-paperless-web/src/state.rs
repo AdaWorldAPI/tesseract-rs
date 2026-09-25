@@ -77,6 +77,28 @@ impl AppState {
         let search = SearchIndex::open_or_create(search_index_dir)
             .map_err(|e| format!("open search index at {}: {e}", search_index_dir.display()))?;
 
+        // The index holds references into the archive, never text of its
+        // own, so it is brought back in line with the archive on every start:
+        // documents archived before a crash reached the index are indexed,
+        // entries whose document was deleted are dropped, and an index rebuilt
+        // for a schema change is refilled. A failure here degrades search,
+        // never the archive, so it is logged rather than fatal.
+        if search.was_rebuilt() {
+            eprintln!(
+                "tesseract-paperless-web: search index at {} had a stale schema and was rebuilt",
+                search_index_dir.display()
+            );
+        }
+        match tesseract_paperless::reconcile::reconcile(&store, &search).await {
+            Ok(r) if r != tesseract_paperless::reconcile::ReconcileReport::default() => eprintln!(
+                "tesseract-paperless-web: search index reconciled: {} indexed, {} removed, \
+                 {} unreadable",
+                r.indexed, r.removed, r.unreadable
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("tesseract-paperless-web: search index reconcile failed: {e}"),
+        }
+
         // Graceful degrade, not a startup failure — mirrors
         // `tesseract-ogar/examples/ocr_demo.rs`'s own step 6: absence of the
         // deepnsm vocabulary means SPO extraction is skipped per-document,

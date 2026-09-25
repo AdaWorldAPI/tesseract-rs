@@ -127,12 +127,13 @@ deepnsm-v2 = { path = "../../../lance-graph/crates/deepnsm-v2", optional = true 
 # Dependencies): lancedb 0.39 / lance 12 / arrow 58. The patch FLOATS — never
 # a `.0.0` exact pin (lance-graph pin ruling 2026-09-18): lancedb 0.39 itself
 # demands `lance = "=12.0.0"`, so a float resolves to exactly that today and
-# can never be narrower than the family. (Was `0.38.*` / `11.*`, before that `=0.33.0` / `=9.0.0`.)
-# `remote` is on for ONE reason: lancedb 0.38.0 does not compile without it —
+# can never be narrower than the family. (Was `0.38.*` / `11.*`, before that
+# `=0.33.0` / `=9.0.0`.)
+# `remote` is on for ONE reason: lancedb 0.39.0 does not compile without it —
 # `src/job.rs` builds `Error::Http` unconditionally while `error.rs` gates that
-# variant on `cfg(feature = "remote")` (E0599 at job.rs:56/66). 0.38.0 is the
-# only 0.38 release; 0.39.0 still has the same defect (`pub mod job;` ungated).
-# Drop the feature once a release gates `job.rs` too.
+# variant on `cfg(feature = "remote")` (E0599; the same defect 0.38.0 had).
+# 0.39.0 is the only 0.39 release; drop the feature once a release gates
+# `job.rs` too.
 lancedb = { version = "0.39.*", default-features = false, features = ["remote"], optional = true }
 lance = { version = "12.*", default-features = false, optional = true }
 arrow = { version = "58", default-features = false, optional = true }
@@ -154,6 +155,11 @@ serde_json = { version = "1", optional = true }
 # lance-graph-quack / -mask-risc and the ndarray sibling (already a CI checkout).
 lance-graph-report = { path = "../../../lance-graph/crates/lance-graph-report", optional = true }
 
+# --- feature `matching` -----------------------------------------------------
+# S-8's rule vocabulary (paperless-ngx `matching.py`). Linear-time regex, so a
+# user's pattern cannot stall ingestion the way a backtracking engine can.
+regex = { version = "1", optional = true }
+
 [features]
 default = []
 ocr = ["dep:tesseract-ogar"]
@@ -169,6 +175,9 @@ search = ["dep:tantivy"]
 store = ["dep:lancedb", "dep:lance", "dep:arrow", "dep:arrow-array", "dep:arrow-schema", "dep:futures", "dep:tokio", "dep:serde_json"]
 # The four-axis organizing layer on the report substrate — see `axes.rs`.
 report = ["search", "dep:lance-graph-report"]
+# S-8: the matching rule a tag / correspondent / document type carries —
+# see `matching.rs`.
+matching = ["dep:regex"]
 
 # The probes are the evidence for the `token` claims, so they are built with
 # it and cannot be built without it.
@@ -177,6 +186,10 @@ report = ["search", "dep:lance-graph-report"]
 [[test]]
 name = "axes_report_probe"
 required-features = ["report"]
+
+[[test]]
+name = "token_persistence"
+required-features = ["token"]
 
 [[example]]
 name = "probe_token_seam"

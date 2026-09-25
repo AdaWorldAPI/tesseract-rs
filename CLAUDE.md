@@ -4434,3 +4434,91 @@ tests (32/32 crate total unaffected), clippy `-D warnings` clean on both
 touched crates, fmt clean. No Core change (both files are
 tesseract-paperless/tesseract-ocr local) → this file + the commit are the
 record.
+
+## ★ Paperless Wave A — the token lane persists and its handles are content addresses (2026-09-25)
+
+`.claude/plans/paperless-archive-integration-v1.md` Wave A, which the plan
+names as blocking every later wave:
+
+- **Persistence.** `TokenizerContract::to_bytes` IS the canonical
+  serialisation the contract id digests, so `from_bytes` rebuilds every
+  derived table and recomputes the id — a reload proves it restored the same
+  codebook rather than trusting it. `TokenLane::{to_bytes,from_bytes}` write
+  documents/particles/receipts little-endian and refuse, on load, any receipt
+  whose run falls outside the particles or whose `particle_count` is not
+  `ceil(token_count / 12)`.
+- **Handles.** `rcpt:<n>` (a lane POSITION) became
+  `rcpt:<sha256>:<page>:<reading_order>:<byte_from>` — the span's address in the document
+  layer, which survives restart, re-ingest and lane reordering. Resolution is
+  O(1) through two derived indexes rebuilt on load.
+- **A real bug fixed on the way.** `train` assigned base ids with
+  `u8::try_from(len - 1)`, which accepts 255 — the reserved PAD id. A corpus
+  with 256 distinct bytes therefore gave one byte the PAD id, and `decode`
+  skips PAD, so that byte vanished on every round trip. The base alphabet is
+  now capped at 255, the overflow is reported in `TrainReport`, and any encode
+  containing it is refused and counted.
+- **Silence becomes a signal.** `source_refusals`/`query_refusals` count
+  out-of-alphabet encodes; `SeamStore::covers` gives a search path the offset
+  of the first untrained byte, so "no match" and "unencodable query" are no
+  longer the same empty result.
+
+Falsifiers in `tests/token_persistence.rs`, four guards disable-verified
+red-then-green (key-index rebuild, PAD cap, framing check, refusal counter).
+`probe_token_seam` still reports 41/41 with the new handles. Not yet: where
+the persisted bytes live — that is Wave B, which drops the duplicated
+`text`/`preview` columns and the Tantivy `STORED` text in favour of the lane.
+
+## ★ Paperless Wave B — the text is stored once, and the index is disposable (2026-09-25)
+
+The archive kept each document's text three times: inside `doc_ir_json`, in
+`text`/`preview` columns derived from it, and as Tantivy `STORED` fields. Now
+`doc_ir_json` is the only copy.
+
+- **Why the `DocIr` and not the receipt lane** (the plan's wording): the
+  lane's contract is closed over one corpus's alphabet, and retraining it
+  mints a new id. A growing archive would lose every document containing an
+  unseen byte. Wave A made that loss reportable; it did not make it go away.
+- `LanceStore` drops `text`/`preview`; `DocumentRow::{text, preview}` derive
+  them. `connect` opens an existing table before creating one, because
+  `create_empty_table(exist_ok)` refuses a table with a different schema,
+  and drops the two legacy columns in place.
+- `SearchIndex` stores only the hash; snippets come from
+  `SearchResults::snippet_html(text)`, given the archived text. An index with
+  a stale schema is wiped and rebuilt on open (`was_rebuilt`).
+- `reconcile::reconcile` (features `store`+`search`, own CI line) brings the
+  index back in line with the archive. The web app runs it on every start,
+  which closes the crash-between-two-stores gap the earlier section filed as
+  future work.
+
+Eight falsifiers, each disable-verified red-then-green. One of my disable
+runs came back green at first because I removed the wrong line: the index
+call had already run. Removing the call itself turned it red. The test was
+fine; the disable was not.
+
+## ★ S-8 matching rules — paperless-ngx `matching_algorithm`, transcribed (2026-09-25)
+
+`tesseract-paperless::matching` (feature `matching`, dep `regex` only) is the
+rule a tag or correspondent carries: `MatchRule { algorithm, pattern,
+case_insensitive }` → `compile()` → `CompiledRule::matches(text)`, plus
+`matching(rules, text)` returning the rules that fire, in input order.
+Algorithms keep paperless-ngx's numbers (`from_paperless`): NONE, ANY, ALL,
+LITERAL, REGEX, FUZZY, AUTO. AUTO is the classifier tier and never matches
+here.
+
+- ANY/ALL use paperless's `_split_match`: quoted phrases stay whole, inner
+  spaces become `\s+`, every term is matched between word boundaries.
+- A blank pattern never matches. An invalid regex never matches.
+- REGEX needs no timeout: the `regex` crate is linear-time, so paperless's
+  catastrophic-backtracking case `(a+)+$` is a test here, not a guard. The
+  cost is no look-around or back-references; such a pattern is invalid and
+  never matches.
+- FUZZY strips punctuation from both sides and matches when
+  `partial_ratio >= 90`. `partial_ratio` is rapidfuzz's, including the
+  windows that overhang either end of the text.
+
+Tests use paperless-ngx's own `test_matchables.py` cases. Guards
+disable-verified red-then-green: word boundaries, phrase `\s+`, blank
+pattern, case flag, fuzzy cutoff, punctuation stripping, overhang windows.
+The first punctuation disable came back green; `fuzzy_ignores_punctuation_between_letters`
+was added so it goes red. Not wired into ingest yet.
+

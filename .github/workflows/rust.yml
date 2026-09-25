@@ -160,6 +160,22 @@ jobs:
     - name: Clippy (paperless, search)
       working-directory: tesseract-rs
       run: cargo clippy -p tesseract-paperless --features search --all-targets -- -D warnings
+    # `reconcile` exists only when BOTH halves do (the archive and the index
+    # it keeps in line), so neither single-feature line above compiles it.
+    - name: Test (paperless, store+search)
+      working-directory: tesseract-rs
+      run: cargo test -p tesseract-paperless --features store,search --verbose
+    - name: Clippy (paperless, store+search)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-paperless --features store,search --all-targets -- -D warnings
+    # S-8 matching rules (paperless-ngx `matching_algorithm`): pure regex, no
+    # store or index, so it gets its own line rather than riding another tier.
+    - name: Test (paperless, matching)
+      working-directory: tesseract-rs
+      run: cargo test -p tesseract-paperless --features matching --verbose
+    - name: Clippy (paperless, matching)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-paperless --features matching --all-targets -- -D warnings
     # The S-7 axes on lance-graph's report substrate: a Tantivy match becomes
     # a selection MASK (never an id list) and per-axis counts / pivots fold on
     # the one mask-RISC evaluator, checked against a per-row oracle of
