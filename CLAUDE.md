@@ -4434,3 +4434,36 @@ tests (32/32 crate total unaffected), clippy `-D warnings` clean on both
 touched crates, fmt clean. No Core change (both files are
 tesseract-paperless/tesseract-ocr local) → this file + the commit are the
 record.
+
+## ★ Paperless Wave A — the token lane persists and its handles are content addresses (2026-09-25)
+
+`.claude/plans/paperless-archive-integration-v1.md` Wave A, which the plan
+names as blocking every later wave:
+
+- **Persistence.** `TokenizerContract::to_bytes` IS the canonical
+  serialisation the contract id digests, so `from_bytes` rebuilds every
+  derived table and recomputes the id — a reload proves it restored the same
+  codebook rather than trusting it. `TokenLane::{to_bytes,from_bytes}` write
+  documents/particles/receipts little-endian and refuse, on load, any receipt
+  whose run falls outside the particles or whose `particle_count` is not
+  `ceil(token_count / 12)`.
+- **Handles.** `rcpt:<n>` (a lane POSITION) became
+  `rcpt:<sha256>:<page>:<reading_order>` — the span's address in the document
+  layer, which survives restart, re-ingest and lane reordering. Resolution is
+  O(1) through two derived indexes rebuilt on load.
+- **A real bug fixed on the way.** `train` assigned base ids with
+  `u8::try_from(len - 1)`, which accepts 255 — the reserved PAD id. A corpus
+  with 256 distinct bytes therefore gave one byte the PAD id, and `decode`
+  skips PAD, so that byte vanished on every round trip. The base alphabet is
+  now capped at 255, the overflow is reported in `TrainReport`, and any encode
+  containing it is refused and counted.
+- **Silence becomes a signal.** `source_refusals`/`query_refusals` count
+  out-of-alphabet encodes; `SeamStore::covers` gives a search path the offset
+  of the first untrained byte, so "no match" and "unencodable query" are no
+  longer the same empty result.
+
+Falsifiers in `tests/token_persistence.rs`, four guards disable-verified
+red-then-green (key-index rebuild, PAD cap, framing check, refusal counter).
+`probe_token_seam` still reports 41/41 with the new handles. Not yet: where
+the persisted bytes live — that is Wave B, which drops the duplicated
+`text`/`preview` columns and the Tantivy `STORED` text in favour of the lane.

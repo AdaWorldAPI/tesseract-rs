@@ -263,6 +263,21 @@ C/D/E are then largely independent.
 
 ### Wave A — the lane persists, keyed correctly, closes its two structural holes
 
+> **STATUS 2026-09-25: SHIPPED** (the persistence + handle + saturation
+> half). `TokenizerContract::{to_bytes,from_bytes}` persist the contract as
+> its own identity preimage (reload recomputes and so proves the id);
+> `TokenLane::{to_bytes,from_bytes}` persist the lane and refuse any receipt
+> that does not frame inside its own particles; handles are
+> `rcpt:<sha256>:<page>:<reading_order>` (`seam_tantivy::{handle_for,
+> resolve_handle}`); alphabet choice (ii) — `train_reported` returns a
+> `TrainReport` and the base alphabet is capped at 255 ids (a 256-distinct-
+> byte corpus previously assigned one byte the PAD id, which decode then
+> skipped); refusals are counted (`source_refusals`/`query_refusals`) and
+> `SeamStore::covers` lets a search path report an unencodable query instead
+> of an empty result. Falsifiers: `tests/token_persistence.rs` (7), each
+> guard disable-verified. Not yet: WHERE the bytes live on disk — that is
+> Wave B's store integration.
+
 **OBJECTIVE.** `TokenLane`/`TokenStreamReceipt`/`TokenizerContract` survive
 a restart, and the two probe-honest gaps (positional handles, alphabet
 closure) get real answers rather than silently shipping as-is.

@@ -29,6 +29,8 @@
 //! 12 contains no PAD at all, and inferring its end from padding would read
 //! straight into the next receipt. The probe exercises exactly that case.
 
+use std::collections::HashMap;
+
 use crate::token::contract::{TokenizerContract, PAD};
 use crate::token::docir::SpanKey;
 
@@ -85,7 +87,32 @@ pub struct TokenLane {
     /// `content_sha256` per document, interned once. A receipt carries a
     /// `u16` index into this, not the hash itself.
     docs: Vec<[u8; 32]>,
+    /// `content_sha256 -> docs index`. Derived; rebuilt on load, never saved.
+    doc_index: HashMap<[u8; 32], u16>,
+    /// `SpanKey -> receipts index`, latest append wins. Derived like
+    /// `doc_index`. This is what makes a receipt addressable by WHERE it is in
+    /// the document layer rather than by where it happens to sit in the lane.
+    key_index: HashMap<SpanKey, usize>,
 }
+
+/// Why persisted lane bytes were refused. A lane that loads is a lane whose
+/// every receipt frames a run inside its own particles — nothing is trusted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaneDecodeError {
+    /// Not a lane serialisation (magic mismatch).
+    BadMagic,
+    /// Truncated, or trailing bytes.
+    BadLength,
+    /// A receipt that cannot be framed against this lane.
+    BadReceipt(usize),
+    /// The same `content_sha256` twice in the document table.
+    DuplicateDocument(usize),
+}
+
+const LANE_MAGIC: &[u8; 8] = b"PLTOKL01";
+/// Serialised receipt: doc, page, reading order (3 x u16), contract id (32),
+/// `byte_from`, `token_count`, `first_particle`, `particle_count` (4 x u32).
+const RECEIPT_BYTES: usize = 6 + 32 + 16;
 
 impl TokenLane {
     /// Empty lane.
@@ -102,11 +129,26 @@ impl TokenLane {
     /// # Panics
     /// If a lane accumulates more than `u16::MAX` documents.
     pub fn intern_document(&mut self, content_sha256: [u8; 32]) -> u16 {
-        if let Some(i) = self.docs.iter().position(|d| *d == content_sha256) {
-            return u16::try_from(i).expect("bounded by the check below");
+        if let Some(&i) = self.doc_index.get(&content_sha256) {
+            return i;
         }
+        let i = u16::try_from(self.docs.len()).expect("lane holds <= u16::MAX documents");
         self.docs.push(content_sha256);
-        u16::try_from(self.docs.len() - 1).expect("lane holds <= u16::MAX documents")
+        self.doc_index.insert(content_sha256, i);
+        i
+    }
+
+    /// The document-table index of `content_sha256`, if it was interned.
+    #[must_use]
+    pub fn document_index(&self, content_sha256: &[u8; 32]) -> Option<u16> {
+        self.doc_index.get(content_sha256).copied()
+    }
+
+    /// The receipt addressed by `key`, if one was appended. When the same key
+    /// was appended more than once, the latest append is the one returned.
+    #[must_use]
+    pub fn receipt_by_key(&self, key: &SpanKey) -> Option<&TokenStreamReceipt> {
+        self.key_index.get(key).and_then(|&i| self.receipts.get(i))
     }
 
     /// The `content_sha256` a receipt's key addresses.
@@ -151,8 +193,141 @@ impl TokenLane {
             particle_count: u32::try_from(self.particles.len()).expect("lane fits u32")
                 - first_particle,
         };
+        self.key_index.insert(key, self.receipts.len());
         self.receipts.push(receipt);
         receipt
+    }
+
+    /// The persisted form: documents, particles, receipts, little-endian.
+    /// The derived indexes are not written; [`Self::from_bytes`] rebuilds them.
+    ///
+    /// # Panics
+    /// Never for a lane built through [`Self::append`], whose counts already
+    /// fit `u32`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            8 + 12
+                + self.docs.len() * 32
+                + self.particles.len() * IDS_PER_PARTICLE
+                + self.receipts.len() * RECEIPT_BYTES,
+        );
+        out.extend_from_slice(LANE_MAGIC);
+        for n in [self.docs.len(), self.particles.len(), self.receipts.len()] {
+            out.extend_from_slice(&u32::try_from(n).expect("lane fits u32").to_le_bytes());
+        }
+        for d in &self.docs {
+            out.extend_from_slice(d);
+        }
+        out.extend_from_slice(self.particles.as_flattened());
+        for r in &self.receipts {
+            out.extend_from_slice(&r.key.doc.to_le_bytes());
+            out.extend_from_slice(&r.key.page.to_le_bytes());
+            out.extend_from_slice(&r.key.reading_order.to_le_bytes());
+            out.extend_from_slice(&r.tokenizer_contract_id);
+            for v in [
+                r.byte_from,
+                r.token_count,
+                r.first_particle,
+                r.particle_count,
+            ] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Rebuild a lane from [`Self::to_bytes`], validating every receipt's
+    /// framing: its document exists, its run lies inside the particles, and
+    /// `particle_count == ceil(token_count / 12)`.
+    ///
+    /// # Errors
+    /// [`LaneDecodeError`] on any structural mismatch.
+    ///
+    /// # Panics
+    /// Never: every slice conversion is on a length checked just above it.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, LaneDecodeError> {
+        let rd_u32 = |at: usize| -> Option<u32> {
+            bytes
+                .get(at..at + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+        };
+        if bytes.len() < 20 {
+            return Err(LaneDecodeError::BadLength);
+        }
+        if &bytes[..8] != LANE_MAGIC {
+            return Err(LaneDecodeError::BadMagic);
+        }
+        let count = |at: usize| -> Result<usize, LaneDecodeError> {
+            rd_u32(at)
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or(LaneDecodeError::BadLength)
+        };
+        let (n_docs, n_parts, n_rcpts) = (count(8)?, count(12)?, count(16)?);
+        let docs_at = 20usize;
+        let parts_at = n_docs
+            .checked_mul(32)
+            .and_then(|n| n.checked_add(docs_at))
+            .ok_or(LaneDecodeError::BadLength)?;
+        let rcpts_at = n_parts
+            .checked_mul(IDS_PER_PARTICLE)
+            .and_then(|n| n.checked_add(parts_at))
+            .ok_or(LaneDecodeError::BadLength)?;
+        let end = n_rcpts
+            .checked_mul(RECEIPT_BYTES)
+            .and_then(|n| n.checked_add(rcpts_at))
+            .ok_or(LaneDecodeError::BadLength)?;
+        if bytes.len() != end || n_docs > usize::from(u16::MAX) + 1 {
+            return Err(LaneDecodeError::BadLength);
+        }
+        let mut lane = Self::new();
+        for (i, d) in bytes[docs_at..parts_at]
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            if lane.document_index(d).is_some() {
+                return Err(LaneDecodeError::DuplicateDocument(i));
+            }
+            lane.intern_document(*d);
+        }
+        lane.particles = bytes[parts_at..rcpts_at]
+            .as_chunks::<IDS_PER_PARTICLE>()
+            .0
+            .to_vec();
+        for (i, r) in bytes[rcpts_at..end]
+            .as_chunks::<RECEIPT_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            let u16_at = |at: usize| u16::from_le_bytes([r[at], r[at + 1]]);
+            let u32_at = |at: usize| u32::from_le_bytes(r[at..at + 4].try_into().expect("4 bytes"));
+            let receipt = TokenStreamReceipt {
+                key: SpanKey {
+                    doc: u16_at(0),
+                    page: u16_at(2),
+                    reading_order: u16_at(4),
+                },
+                tokenizer_contract_id: r[6..38].try_into().expect("32 bytes"),
+                byte_from: u32_at(38),
+                token_count: u32_at(42),
+                first_particle: u32_at(46),
+                particle_count: u32_at(50),
+            };
+            let framed = usize::from(receipt.key.doc) < lane.docs.len()
+                && receipt.particle_count == receipt.token_count.div_ceil(IDS_PER_PARTICLE_U32)
+                && (receipt.first_particle as usize)
+                    .checked_add(receipt.particle_count as usize)
+                    .is_some_and(|e| e <= lane.particles.len());
+            if !framed {
+                return Err(LaneDecodeError::BadReceipt(i));
+            }
+            lane.key_index.insert(receipt.key, lane.receipts.len());
+            lane.receipts.push(receipt);
+        }
+        Ok(lane)
     }
 
     /// Every receipt, in append order.
