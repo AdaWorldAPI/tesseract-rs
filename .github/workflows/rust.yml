@@ -12,6 +12,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Debug info is the build-time and disk cost here, not the code: every step
+  # compiles lance-graph + ndarray + OGAR + lancedb/datafusion/tantivy, and
+  # nothing in CI reads a backtrace's line numbers. Incremental state is
+  # useless on a fresh runner. Release steps already default to debug = 0.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_INCREMENTAL: 0
 
 jobs:
   build:
