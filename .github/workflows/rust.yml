@@ -87,7 +87,12 @@ jobs:
       # read the committed corpus/ fixtures. Hermetic: no network, no C++
       # tesseract at any point.
       working-directory: tesseract-rs
-      run: cargo test -p tesseract-ocr --verbose
+      # Release: the debug profile runs recognition ~55x slower (this step
+      # dominated the job). Overflow checks stay ON so release keeps the
+      # arithmetic safety net the debug run gave the goldens.
+      env:
+        CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: true
+      run: cargo test --release -p tesseract-ocr --verbose
     - name: Clippy (ocr)
       working-directory: tesseract-rs
       run: cargo clippy -p tesseract-ocr --all-targets -- -D warnings
@@ -99,7 +104,12 @@ jobs:
       run: cargo build -p tesseract-ocr-pdf --verbose
     - name: Test (ocr-pdf)
       working-directory: tesseract-rs
-      run: cargo test -p tesseract-ocr-pdf --verbose
+      # Release: the debug profile runs recognition ~55x slower (this step
+      # dominated the job). Overflow checks stay ON so release keeps the
+      # arithmetic safety net the debug run gave the goldens.
+      env:
+        CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: true
+      run: cargo test --release -p tesseract-ocr-pdf --verbose
     - name: Clippy (ocr-pdf)
       working-directory: tesseract-rs
       run: cargo clippy -p tesseract-ocr-pdf --all-targets -- -D warnings
@@ -118,7 +128,12 @@ jobs:
     - name: Test (ocr-web)
       # Uses the committed corpus/ model + pages; hermetic, no network.
       working-directory: tesseract-rs
-      run: cargo test -p tesseract-ocr-web --verbose
+      # Release: the debug profile runs recognition ~55x slower (this step
+      # dominated the job). Overflow checks stay ON so release keeps the
+      # arithmetic safety net the debug run gave the goldens.
+      env:
+        CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: true
+      run: cargo test --release -p tesseract-ocr-web --verbose
     - name: Clippy (ocr-web)
       working-directory: tesseract-rs
       run: cargo clippy -p tesseract-ocr-web --all-targets -- -D warnings
