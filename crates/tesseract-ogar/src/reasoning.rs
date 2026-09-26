@@ -298,7 +298,9 @@ impl SentenceReasoner {
     /// decides the reading. A determiner/adjective/preposition before it
     /// means Noun (the filler of a noun phrase — "the bites", "big runs",
     /// "of bites"); a nominal ([`PoS::is_nominal`]) or [`PoS::Modal`]
-    /// subject means Verb ("dog bites", "he runs", "will run"). Anything
+    /// subject means Verb ("dog bites", "he runs", "will run") — except that
+    /// after a nominal, a verb or modal as the NEXT token means Noun instead
+    /// (a noun compound: "the dog runs are open"). Anything
     /// else — including no previous token at all, at sentence start — is
     /// left unchanged. Each decision is made against the PREVIOUS token's
     /// pos as already decided by this same left-to-right pass, which is
@@ -326,7 +328,18 @@ impl SentenceReasoner {
                 continue;
             };
 
-            if matches!(prev_pos, PoS::Article | PoS::Adjective | PoS::Preposition) {
+            // After a nominal, the word may be the verb ("dog bites") or the
+            // head of a noun compound ("dog runs are open"). A verb or modal
+            // right after it means the clause's verb is still to come, so
+            // the homograph belongs to the noun phrase.
+            let next_is_verbal = tokens[i + 1..]
+                .iter()
+                .find(|t| t.pos != PoS::Adverb)
+                .is_some_and(|t| matches!(t.pos, PoS::Verb | PoS::Modal));
+
+            if matches!(prev_pos, PoS::Article | PoS::Adjective | PoS::Preposition)
+                || (prev_pos.is_nominal() && next_is_verbal)
+            {
                 tokens[i].pos = PoS::Noun;
                 tokens[i].rank = Some(noun);
             } else if prev_pos.is_nominal() || prev_pos == PoS::Modal {
@@ -651,6 +664,49 @@ mod tests {
             Some(reasoner.homographs["plan"].noun),
             "the rank must move to the noun lemma together with the PoS"
         );
+    }
+
+    /// A nominal before the homograph does not make it a verb when a verb
+    /// follows: in "The dog runs are open." `runs` heads a noun compound
+    /// (enclosures) and `are` is the clause's verb.
+    #[test]
+    fn homograph_in_a_noun_compound_stays_a_noun() {
+        let dir = vocab_dir();
+        if !dir.join("word_rank_lookup.csv").exists() {
+            eprintln!(
+                "homograph_in_a_noun_compound_stays_a_noun: skipping — \
+                 {} not present in this environment",
+                dir.display()
+            );
+            return;
+        }
+        let reasoner =
+            SentenceReasoner::from_vocab_dir(&dir).expect("load the real deepnsm vocabulary");
+
+        let mut tokens = reasoner.vocab().tokenize("The dog runs are open.");
+        let pos_of = |ts: &[Token], w: &str| ts.iter().find(|t| t.surface == w).map(|t| t.pos);
+        assert!(
+            pos_of(&tokens, "dog").is_some_and(PoS::is_nominal),
+            "fixture needs 'dog' to be nominal, got {:?}",
+            pos_of(&tokens, "dog")
+        );
+        assert_eq!(
+            pos_of(&tokens, "are"),
+            Some(PoS::Verb),
+            "fixture needs 'are' to be tagged a verb, or it does not exercise the next-token check"
+        );
+
+        reasoner.disambiguate(&mut tokens);
+        let runs = tokens
+            .iter()
+            .find(|t| t.surface == "runs")
+            .expect("'runs' must tokenize to a real token");
+        assert_eq!(
+            runs.pos,
+            PoS::Noun,
+            "'runs' between a noun and a verb heads a noun compound"
+        );
+        assert_eq!(runs.rank, Some(reasoner.homographs["runs"].noun));
     }
 
     #[test]

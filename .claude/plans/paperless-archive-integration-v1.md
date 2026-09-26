@@ -447,7 +447,8 @@ the Stop-injection pre-pass, assert cross-sentence fabrication reappears).
 > It uses a side table of surface forms that have both readings in COCA, and
 > it decides from the previous token: after a determiner, adjective or
 > preposition it picks the noun; after a subject noun, pronoun or modal it
-> picks the verb. It fixes "The dog bites the man." and keeps "The bites were
+> picks the verb, unless a verb follows a noun ("the dog runs are open" is a
+> noun compound). It fixes "The dog bites the man." and keeps "The bites were
 > painful." a noun. The rule does not depend on the chain, so a later v2 wiring
 > can reuse it.
 >
