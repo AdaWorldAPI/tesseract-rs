@@ -432,6 +432,41 @@ span with real sentence-ending punctuation must yield triples that do NOT
 chain the second sentence's subject from the first's object (disable: skip
 the Stop-injection pre-pass, assert cross-sentence fabrication reappears).
 
+> **⊘ CORRECTION (2026-09-26) — the v1→v2 swap does NOT fix the homograph
+> bug, so Wave C is re-scoped.** Read before building: deepnsm-v2's own PoS
+> side table (`bible_wave.rs::load_pos`) is context-free too. It keeps the
+> FIRST COCA row per surface form, and rows are in frequency order. Both the
+> v1 tagger and the v2 table give each word one reading with no look at its
+> neighbours, so swapping chains moves the bug rather than fixing it. The swap
+> also changes the vocabulary: 12.5k KJV words cover 80% of a modern page
+> (measured, `consistency.rs`), against the COCA 4096 + forms v1 uses in
+> production ingest.
+>
+> **What shipped instead:** a noun/verb context disambiguator on the existing
+> v1 chain (`tesseract-ogar/src/reasoning.rs`, `SentenceReasoner::disambiguate`).
+> It uses a side table of surface forms that have both readings in COCA, and
+> it decides from the previous token: after a determiner, adjective or
+> preposition it picks the noun; after a subject noun, pronoun or modal it
+> picks the verb. It fixes "The dog bites the man." and keeps "The bites were
+> painful." a noun. The rule does not depend on the chain, so a later v2 wiring
+> can reuse it.
+>
+> Measured while pinning it: the context-free tagger reads most homographs as
+> nouns (`run`, `walk`, `work`, `use`, …) and a few as verbs (`plan`, `study`,
+> `answer`, `attack`). So a noun-branch test needs a verb-read word such as
+> `plan`; a test on `bites` after `the` passes with or without the rule. Five
+> guards are disable-verified red-then-green: noun branch, verb branch, the
+> call in `analyze`, the rank move, the sentence-start skip.
+>
+> **Still open:** `tesseract-paperless/src/consistency.rs` tokenizes and
+> parses on its own path and does not call the disambiguator yet, so it keeps
+> the context-free weakness.
+>
+> **Stop injection is not needed on this path:** `analyze` parses one
+> `AssembledSentence` at a time, so no two sentences share an FSM run. It only
+> becomes necessary if a future caller feeds a multi-sentence lane span
+> straight to the FSM. That falsifier stays with that work.
+
 ### Wave D — cross-document belief accumulation, without the planner
 
 **OBJECTIVE.** The AS-IS BOUNDARY's stated gap — "reasoning over what was
