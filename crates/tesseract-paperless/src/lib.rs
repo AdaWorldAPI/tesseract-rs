@@ -53,6 +53,11 @@ pub mod search;
 #[cfg(feature = "matching")]
 pub mod matching;
 
+/// paperless-ngx's AUTO matching tier as association rules mined over the
+/// archive: suggestions with a NARS truth, never applied on their own.
+#[cfg(feature = "auto-match")]
+pub mod auto_match;
+
 #[cfg(feature = "report")]
 pub mod axes;
 

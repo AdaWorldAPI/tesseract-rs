@@ -160,6 +160,12 @@ lance-graph-report = { path = "../../../lance-graph/crates/lance-graph-report", 
 # user's pattern cannot stall ingestion the way a backtracking engine can.
 regex = { version = "1", optional = true }
 
+# --- feature `auto-match` ---------------------------------------------------
+# Aerial+ rule discovery over one row per archived document. Zero-dependency
+# and excluded from the lance-graph workspace, so this edge adds nothing
+# transitive; same sibling-path form as lance-graph-contract above.
+lance-graph-arm-discovery = { path = "../../../lance-graph/crates/lance-graph-arm-discovery", optional = true }
+
 [features]
 default = []
 ocr = ["dep:tesseract-ogar"]
@@ -178,6 +184,10 @@ report = ["search", "dep:lance-graph-report"]
 # S-8: the matching rule a tag / correspondent / document type carries —
 # see `matching.rs`.
 matching = ["dep:regex"]
+# Piece 1 of `arm-discovery-and-coca-prior-v1.md`: paperless-ngx's AUTO
+# matching tier as integer association rules mined over the archive — see
+# `auto_match.rs`.
+auto-match = ["dep:lance-graph-arm-discovery"]
 
 # The probes are the evidence for the `token` claims, so they are built with
 # it and cannot be built without it.

@@ -4522,3 +4522,46 @@ pattern, case flag, fuzzy cutoff, punctuation stripping, overhang windows.
 The first punctuation disable came back green; `fuzzy_ignores_punctuation_between_letters`
 was added so it goes red. Not wired into ingest yet.
 
+
+## ★ AUTO matching tier — association rules over the archive (2026-09-29)
+
+`tesseract-paperless::auto_match` (feature `auto-match`, dep
+`lance-graph-arm-discovery`, zero-dep sibling) fills paperless-ngx's
+`matching_algorithm = AUTO`, the tier S-8 left never-matching. One row per
+archived document: correspondent, document type, tags, field keys and content
+terms. `AutoMatcher::mine` mines single-fact rules; `suggest` returns
+suggestions with a `NarsTruth` and the cues that fired. It never applies one:
+the API is `&self` and returns values. Plan:
+`.claude/plans/arm-discovery-and-coca-prior-v1.md`, piece 1.
+
+Three design facts, each measured or caught in review rather than assumed:
+
+- **The oracle comes from the data.** Aerial+'s probe proposes only the
+  nearest category per feature, first minimum wins. A uniform oracle therefore
+  always proposes category 0, which for a tag is "absent". The distance is
+  `PPM − P(b | a)·PPM`, counted from the same rows. Disabling it (uniform
+  distance) breaks 9 of the 12 tests.
+- **Cues must be observable at ingest** (PR #101 review). An unassigned
+  document has no correspondent, type or tags to key a rule on, so rows carry
+  caller-supplied content terms. Terms and field keys are cues, never targets.
+- **Independence is a lift question** (PR #101 review). An independent cue for
+  a tag with an 80% base rate clears a 0.7 confidence floor. Rules must also
+  clear `lift >= 1.5`. `min_evidence 5`, `min_confidence 0.7`, `min_lift 1.5`
+  and `k 5` are policy pins until measured on a real archive.
+
+Tests: 12. Seven guards disable-verified red-then-green: lift filter,
+explicit evidence filter (see below), assigned-target skip, single-valued cap,
+id validation, positive-only targets, the data-built oracle.
+
+The evidence filter first came back green when removed. The ppm support floor
+handed to `extract_rules` rounds down, and below about a million documents it
+already rejects any rule under `min_evidence`. The explicit
+`cooccur >= min_evidence` filter only binds above that, so its test runs at
+3,000,000 rows (4.5 s in debug), where `floor(4·PPM/n) == floor(5·PPM/n)`.
+
+The worker's first common-tag fixture used 7 correspondents against a 5-wide
+domain. `IdOutOfRange` caught it instead of a panic, which is the guard doing
+its job.
+
+Not yet: the web app does not call it, nothing picks the content terms, and
+the thresholds are unmeasured.
