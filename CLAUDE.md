@@ -4563,5 +4563,17 @@ The worker's first common-tag fixture used 7 correspondents against a 5-wide
 domain. `IdOutOfRange` caught it instead of a panic, which is the guard doing
 its job.
 
+**Scale (PR #101 review).** The first oracle counted every item pair in every
+row (`rows × width²`, a `dim²` table). It now counts only the items a row
+states (the two multi-category values and the present binaries) and derives
+every count that involves an absent binary from `n` by inclusion-exclusion.
+`sparse_counts_equal_dense_counts_for_every_item_pair` checks it against the
+dense count for every item pair; each of the four branches is disable-verified.
+That test also caught a real bug: the both-absent branch computed
+`n - a - b + both`, which goes below zero before the `+ both`. The miner
+itself stays dense (a 4-bytes-per-feature table and a width² probe), so
+`MAX_BINARY_FEATURES = 256` refuses a larger vocabulary with an error instead of
+letting it stall; a policy pin.
+
 Not yet: the web app does not call it, nothing picks the content terms, and
 the thresholds are unmeasured.

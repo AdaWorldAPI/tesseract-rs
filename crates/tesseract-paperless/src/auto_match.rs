@@ -70,7 +70,7 @@
 //! facts grow combinatorially in the number of tags and fields, and a single
 //! fact is also the only rule whose `because` a person can read at a glance.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub use lance_graph_arm_discovery::NarsTruth;
 use lance_graph_arm_discovery::{
@@ -190,7 +190,25 @@ pub enum AutoMatchError {
     },
     /// `k` was zero, which would make any single co-occurrence dogmatic.
     ZeroK,
+    /// `tags + field_keys + terms` exceeds [`MAX_BINARY_FEATURES`].
+    TooManyFeatures {
+        /// The binary feature count the domains asked for.
+        features: u64,
+        /// The cap.
+        max: u32,
+    },
 }
+
+/// The most binary features (tags + field keys + terms) one mining run takes.
+///
+/// A policy pin, not a measurement. The miner holds the archive as a dense
+/// table (4 bytes per feature per document) plus one bitset per item, and
+/// probes every feature for every antecedent, so its cost grows with the
+/// square of the width. At the cap and 100,000 documents that is about 100 MB
+/// and a width² of about 66,000 probes. A larger vocabulary is refused with
+/// [`AutoMatchError::TooManyFeatures`] rather than allowed to stall; mine a
+/// smaller term set, or one tag family at a time.
+pub const MAX_BINARY_FEATURES: u32 = 256;
 
 impl core::fmt::Display for AutoMatchError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -199,6 +217,10 @@ impl core::fmt::Display for AutoMatchError {
                 write!(f, "{what} id {id} is outside its domain of {domain}")
             }
             Self::ZeroK => write!(f, "NARS personality constant k must be positive"),
+            Self::TooManyFeatures { features, max } => write!(
+                f,
+                "{features} binary features (tags + field keys + terms) exceed the cap of {max}"
+            ),
         }
     }
 }
@@ -211,42 +233,110 @@ impl std::error::Error for AutoMatchError {}
 /// Items of one feature are never each other's consequent, so they are
 /// `u32::MAX` apart unless identical. An item that never occurs is
 /// `u32::MAX` from everything.
+///
+/// **Counts are sparse.** A row states one category for each of features 0-1
+/// (correspondent, document type; category 0 is "none") and, for every binary
+/// feature (tags, field keys, terms), whether it is present. Only the *stated*
+/// items are counted: the two multi-category values and the present binaries.
+/// A row with `p` stated items costs `p²` pair updates, not `width²`. Counts
+/// that involve an absent binary are derived from `n` and the stated counts
+/// (inclusion-exclusion), so every distance is still exact.
 struct CooccurrenceDistance {
     spec: FeatureSpec,
-    dim: usize,
-    /// `dim x dim` co-occurrence counts; the diagonal is the item's own count.
-    counts: Vec<u32>,
+    /// Rows counted.
+    n: u32,
+    /// Per slot, how many rows state that item. Only meaningful for stated
+    /// items; an absent binary's count is derived in [`Self::item_count`].
+    singles: Vec<u32>,
+    /// Per unordered pair of stated slots `(lo, hi)`, how many rows state both.
+    pairs: HashMap<(u32, u32), u32>,
+}
+
+/// Binary features (tags, field keys, terms) start after correspondent and
+/// document type.
+const FIRST_BINARY_FEATURE: u32 = 2;
+
+/// Is `item` the "absent" category of a binary feature?
+fn is_absent_binary(item: Item) -> bool {
+    item.feature >= FIRST_BINARY_FEATURE && item.category == 0
 }
 
 impl CooccurrenceDistance {
-    /// Count item and item-pair occurrences over `data`.
+    /// Count stated items and stated-item pairs over `data`.
     fn build(data: &Dataset) -> Self {
         let spec = data.spec.clone();
-        let dim = spec.dim();
-        let mut counts = vec![0u32; dim * dim];
+        let mut singles = vec![0u32; spec.dim()];
+        let mut pairs: HashMap<(u32, u32), u32> = HashMap::new();
+        let mut stated: Vec<u32> = Vec::new();
         for row in &data.rows {
-            let slots: Vec<usize> = row
-                .iter()
-                .enumerate()
-                .map(|(f, &c)| {
-                    let f = u32::try_from(f)
-                        .expect("feature index fits u32: the spec is built from u32 domains");
-                    spec.slot(Item::new(f, c))
-                })
-                .collect();
-            for &a in &slots {
-                for &b in &slots {
-                    counts[a * dim + b] += 1;
+            stated.clear();
+            for (f, &c) in row.iter().enumerate() {
+                let f = u32::try_from(f)
+                    .expect("feature index fits u32: the spec is built from u32 domains");
+                let item = Item::new(f, c);
+                if !is_absent_binary(item) {
+                    let slot = u32::try_from(spec.slot(item))
+                        .expect("slot fits u32: the spec is built from u32 domains");
+                    stated.push(slot);
+                }
+            }
+            for (i, &a) in stated.iter().enumerate() {
+                singles[a as usize] += 1;
+                for &b in &stated[i + 1..] {
+                    *pairs.entry((a.min(b), a.max(b))).or_insert(0) += 1;
                 }
             }
         }
-        Self { spec, dim, counts }
+        Self {
+            spec,
+            n: u32::try_from(data.len()).expect("row count fits u32"),
+            singles,
+            pairs,
+        }
+    }
+
+    /// The stated item this item is about: itself, or for an absent binary
+    /// its present twin.
+    fn stated_twin(item: Item) -> Item {
+        if is_absent_binary(item) {
+            Item::new(item.feature, 1)
+        } else {
+            item
+        }
     }
 
     /// How many rows contain `item`.
     fn item_count(&self, item: Item) -> u32 {
-        let s = self.spec.slot(item);
-        self.counts[s * self.dim + s]
+        let stated = self.singles[self.spec.slot(Self::stated_twin(item))];
+        if is_absent_binary(item) {
+            self.n - stated
+        } else {
+            stated
+        }
+    }
+
+    /// How many rows contain both `a` and `b` (different features).
+    fn pair_count(&self, a: Item, b: Item) -> u32 {
+        let (ta, tb) = (Self::stated_twin(a), Self::stated_twin(b));
+        let (sa, sb) = (self.spec.slot(ta), self.spec.slot(tb));
+        let key = (
+            u32::try_from(sa.min(sb)).expect("slot fits u32"),
+            u32::try_from(sa.max(sb)).expect("slot fits u32"),
+        );
+        let both = self.pairs.get(&key).copied().unwrap_or(0);
+        match (is_absent_binary(a), is_absent_binary(b)) {
+            (false, false) => both,
+            (true, false) => self.singles[sb] - both,
+            (false, true) => self.singles[sa] - both,
+            // Add before subtracting (`n - a - b` alone can go below zero), in
+            // u64 so `n + both` cannot overflow. The result is a row count.
+            (true, true) => {
+                let rows = u64::from(self.n) + u64::from(both)
+                    - u64::from(self.singles[sa])
+                    - u64::from(self.singles[sb]);
+                u32::try_from(rows).expect("a pair count is at most n")
+            }
+        }
     }
 }
 
@@ -259,12 +349,11 @@ impl CodebookDistance for CooccurrenceDistance {
                 u32::MAX
             };
         }
-        let (sa, sb) = (self.spec.slot(a), self.spec.slot(b));
-        let count_a = u64::from(self.counts[sa * self.dim + sa]);
+        let count_a = u64::from(self.item_count(a));
         if count_a == 0 {
             return u32::MAX;
         }
-        let both = u64::from(self.counts[sa * self.dim + sb]);
+        let both = u64::from(self.pair_count(a, b));
         // At most PPM (1_000_000), so it always fits.
         u32::try_from(PPM - both * PPM / count_a).unwrap_or(u32::MAX)
     }
@@ -392,8 +481,10 @@ impl AutoMatcher {
     ///
     /// # Errors
     ///
-    /// [`AutoMatchError::IdOutOfRange`] for an id outside its domain and
-    /// [`AutoMatchError::ZeroK`] when `params.k == 0`.
+    /// - [`AutoMatchError::IdOutOfRange`] for an id outside its domain.
+    /// - [`AutoMatchError::ZeroK`] when `params.k == 0`.
+    /// - [`AutoMatchError::TooManyFeatures`] when `tags + field_keys + terms`
+    ///   exceeds [`MAX_BINARY_FEATURES`].
     pub fn mine(
         domains: &ArchiveDomains,
         rows: &[ArchiveRow],
@@ -401,6 +492,14 @@ impl AutoMatcher {
     ) -> Result<Self, AutoMatchError> {
         if params.k == 0 {
             return Err(AutoMatchError::ZeroK);
+        }
+        let features =
+            u64::from(domains.tags) + u64::from(domains.field_keys) + u64::from(domains.terms);
+        if features > u64::from(MAX_BINARY_FEATURES) {
+            return Err(AutoMatchError::TooManyFeatures {
+                features,
+                max: MAX_BINARY_FEATURES,
+            });
         }
         validate(domains, rows)?;
         if rows.is_empty() {
@@ -777,6 +876,94 @@ mod tests {
         };
         assert!(rules(4) > 0, "can fire: 4 documents meet min_evidence 4");
         assert_eq!(rules(5), 0, "4 documents must not meet min_evidence 5");
+    }
+
+    /// The sparse oracle must give exactly the counts a dense `width²` count
+    /// would. The fixture mixes present and absent binaries, correspondent
+    /// "none" and several types, so all four inclusion-exclusion branches of
+    /// `pair_count` (absent on either side, both, neither) are exercised.
+    #[test]
+    fn sparse_counts_equal_dense_counts_for_every_item_pair() {
+        let rows: Vec<ArchiveRow> = (0..97u32)
+            .map(|i| ArchiveRow {
+                correspondent: (i % 4 != 0).then_some(i % 5),
+                document_type: (i % 3 != 0).then_some(i % 3),
+                tags: (0..5).filter(|t| (i + t) % (t + 2) == 0).collect(),
+                field_keys: (0..2).filter(|k| (i * (k + 1)) % 7 < 3).collect(),
+                terms: (0..10).filter(|t| (i * 3 + t) % (t + 3) == 0).collect(),
+            })
+            .collect();
+        let data = encode(&DOMAINS, &rows);
+        let oracle = CooccurrenceDistance::build(&data);
+
+        // The dense reference: count every pair of items in every row.
+        let spec = &data.spec;
+        let dim = spec.dim();
+        let mut dense = vec![0u32; dim * dim];
+        for row in &data.rows {
+            let slots: Vec<usize> = row
+                .iter()
+                .enumerate()
+                .map(|(f, &c)| spec.slot(Item::new(u32::try_from(f).unwrap(), c)))
+                .collect();
+            for &a in &slots {
+                for &b in &slots {
+                    dense[a * dim + b] += 1;
+                }
+            }
+        }
+
+        let items: Vec<Item> = (0..spec.num_features())
+            .flat_map(|f| {
+                let f32_ = u32::try_from(f).unwrap();
+                (0..spec.cardinality(f)).map(move |c| Item::new(f32_, c))
+            })
+            .collect();
+        let mut absent_pairs = 0;
+        for &a in &items {
+            let sa = spec.slot(a);
+            assert_eq!(oracle.item_count(a), dense[sa * dim + sa], "count {a:?}");
+            for &b in &items {
+                if a.feature == b.feature {
+                    continue;
+                }
+                let sb = spec.slot(b);
+                assert_eq!(
+                    oracle.pair_count(a, b),
+                    dense[sa * dim + sb],
+                    "pair {a:?} {b:?}"
+                );
+                if is_absent_binary(a) && is_absent_binary(b) && dense[sa * dim + sb] > 0 {
+                    absent_pairs += 1;
+                }
+            }
+        }
+        // Anti-vacuity: the both-absent branch was reached with a non-zero count.
+        assert!(absent_pairs > 0);
+    }
+
+    #[test]
+    fn a_vocabulary_past_the_cap_is_refused_not_mined() {
+        let at_cap = ArchiveDomains {
+            correspondents: 1,
+            document_types: 0,
+            tags: 1,
+            field_keys: 0,
+            terms: MAX_BINARY_FEATURES - 1,
+        };
+        let rows = vec![row(Some(0), None, &[0])];
+        assert!(AutoMatcher::mine(&at_cap, &rows, AutoMatchParams::default()).is_ok());
+        let past = ArchiveDomains {
+            terms: MAX_BINARY_FEATURES,
+            ..at_cap
+        };
+        assert_eq!(
+            AutoMatcher::mine(&past, &rows, AutoMatchParams::default()).unwrap_err(),
+            AutoMatchError::TooManyFeatures {
+                features: u64::from(MAX_BINARY_FEATURES) + 1,
+                max: MAX_BINARY_FEATURES,
+            }
+        );
     }
 
     #[test]

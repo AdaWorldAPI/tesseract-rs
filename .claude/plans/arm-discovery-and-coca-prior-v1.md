@@ -60,8 +60,9 @@ and clippy line (every tier gets a CI line — see CLAUDE.md, paperless sections
    There is no codebook for archive metadata. Options: (a) a uniform oracle, so
    every item is a candidate and the integer confirm step does all the work
    (fine at archive scale, feature count in the tens to low hundreds); (b) a
-   distance table from co-occurrence counts. Start with (a) and measure the
-   candidate count.
+   distance table from co-occurrence counts. ~~Start with (a) and measure the
+   candidate count.~~ **Use (b)**; (a) cannot propose a tag, see the correction
+   below.
 
    > **⊘ CORRECTION (2026-09-29, found while specifying the build) — (a) cannot
    > work.** `extract_rules`' probe proposes, per feature, only the single
@@ -84,8 +85,11 @@ and clippy line (every tier gets a CI line — see CLAUDE.md, paperless sections
 - On a synthetic archive where correspondent X always carries tag Y, the rule
   `X → Y` appears with confidence 1.0 (can fire).
 - On a synthetic archive where tags are assigned independently of correspondent,
-  no rule clears the evidence floor (can stay silent). Must use a non-trivial
-  archive, not an empty one.
+  no rule is suggested (can stay silent). ~~no rule clears the evidence floor~~:
+  an independent cue can clear the evidence floor, so the case that matters is
+  an 80%-base-rate tag, whose rules clear the confidence floor too and are
+  rejected only by `min_lift` (see the corrections under this piece). Must use a
+  non-trivial archive, not an empty one.
 - Raising the evidence floor removes rules; lowering it admits rules
   (the knob is not decoration).
 - A suggestion is never written as an assignment (the ingest path is read-only
