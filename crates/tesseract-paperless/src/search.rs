@@ -235,6 +235,25 @@ impl SearchIndex {
         })
     }
 
+    /// Split `text` into tokens exactly as the index splits its `text` field.
+    ///
+    /// The AUTO matcher's vocabulary is built with this, so its content terms
+    /// are the index's own tokens, not a second tokenizer's guess at them
+    /// (spec `archive-metadata-auto-match-v3.md` R5). Tokens come back in
+    /// order, repeats included.
+    ///
+    /// # Errors
+    /// [`SearchError::Tantivy`] if the field has no registered analyzer.
+    pub fn tokenize_text(&self, text: &str) -> Result<Vec<String>, SearchError> {
+        let mut analyzer = self.index.tokenizer_for_field(self.fields.text)?;
+        let mut stream = analyzer.token_stream(text);
+        let mut out = Vec::new();
+        while stream.advance() {
+            out.push(stream.token().text.clone());
+        }
+        Ok(out)
+    }
+
     /// Whether [`Self::open_or_create`] discarded an index with a stale
     /// schema. When true the index is empty until reconciled.
     #[must_use]
@@ -367,6 +386,23 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let idx = SearchIndex::open_or_create(dir.path()).expect("open_or_create");
         (dir, idx)
+    }
+
+    /// `tokenize_text` is the index's own analyzer, not a whitespace split:
+    /// it lower-cases, splits on punctuation, and drops tokens over 40 bytes.
+    /// A plain `split_whitespace` fails all three. And every token it returns
+    /// is findable, which is the property the AUTO vocabulary relies on.
+    #[test]
+    fn tokenize_text_is_the_index_analyzer() {
+        let (_dir, idx) = index();
+        let long = "x".repeat(41);
+        let text = format!("Invoice, STADTWERKE; invoice {long}");
+        let tokens = idx.tokenize_text(&text).expect("tokenize");
+        assert_eq!(tokens, vec!["invoice", "stadtwerke", "invoice"]);
+        idx.index_document("aa11", "a.pdf", &text).expect("index");
+        for t in &tokens {
+            assert_eq!(idx.search(t, 10).expect("search").hits.len(), 1, "{t}");
+        }
     }
 
     /// The basic round-trip: index one document, find it by a word that
