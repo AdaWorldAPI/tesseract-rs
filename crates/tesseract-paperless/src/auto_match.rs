@@ -485,6 +485,33 @@ fn encode(domains: &ArchiveDomains, rows: &[ArchiveRow]) -> Dataset {
     Dataset::new(spec, data_rows)
 }
 
+/// Which targets and cues a mining run may use; see
+/// [`AutoMatcher::mine_eligible`].
+#[derive(Clone, Copy)]
+pub struct MineScope<'a> {
+    /// May this target be a rule's consequent?
+    pub target: &'a dyn Fn(Target) -> bool,
+    /// May this fact be a rule's antecedent?
+    pub cue: &'a dyn Fn(Cue) -> bool,
+}
+
+impl MineScope<'static> {
+    /// Every target and every cue: what [`AutoMatcher::mine`] uses.
+    #[must_use]
+    pub fn everything() -> Self {
+        Self {
+            target: &|_| true,
+            cue: &|_| true,
+        }
+    }
+}
+
+impl core::fmt::Debug for MineScope<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("MineScope { .. }")
+    }
+}
+
 /// One mined rule, decoded.
 #[derive(Debug, Clone)]
 struct MinedRule {
@@ -519,16 +546,22 @@ impl AutoMatcher {
         rows: &[ArchiveRow],
         params: AutoMatchParams,
     ) -> Result<Self, AutoMatchError> {
-        Self::mine_eligible(domains, rows, params, &|_| true)
+        Self::mine_eligible(domains, rows, params, MineScope::everything())
     }
 
-    /// [`Self::mine`], proposing only targets that `eligible` accepts.
+    /// [`Self::mine`], restricted by `scope`.
     ///
-    /// Ineligible targets still count as cues and as assignments; they are
-    /// just never a rule's consequent. This is how the archive restricts
-    /// suggestions to definitions whose matching algorithm is AUTO: filtering
-    /// the suggestions afterwards would lose every eligible target that an
-    /// ineligible one of the same kind out-ranked.
+    /// - `scope.target` decides which targets may be a rule's consequent. It
+    ///   acts inside the oracle: filtering the suggestions afterwards would
+    ///   lose every eligible target that an ineligible one of the same kind
+    ///   out-ranked. Ineligible targets still count as assignments.
+    /// - `scope.cue` decides which facts may be a rule's antecedent. Dropping
+    ///   a rule by its antecedent never affects another antecedent's rules, so
+    ///   this one is a plain filter on the mined rules.
+    ///
+    /// The archive passes "AUTO definitions only" for the target and "never an
+    /// AUTO definition" for the cue, so a suggestion is never chained back as
+    /// the evidence for another suggestion.
     ///
     /// # Errors
     ///
@@ -537,8 +570,9 @@ impl AutoMatcher {
         domains: &ArchiveDomains,
         rows: &[ArchiveRow],
         params: AutoMatchParams,
-        eligible: &dyn Fn(Target) -> bool,
+        scope: MineScope<'_>,
     ) -> Result<Self, AutoMatchError> {
+        let eligible = scope.target;
         if params.k == 0 {
             return Err(AutoMatchError::ZeroK);
         }
@@ -595,6 +629,9 @@ impl AutoMatcher {
             })
             .filter_map(|r| {
                 let cue = layout.cue(*r.antecedent.first()?)?;
+                if !(scope.cue)(cue) {
+                    return None;
+                }
                 let target = layout.target(*r.consequent.first()?)?;
                 Some(MinedRule {
                     cue,
@@ -1206,7 +1243,10 @@ mod tests {
             &DOMAINS,
             &preemption_archive(),
             preemption_params(),
-            &only_corr1,
+            MineScope {
+                target: &only_corr1,
+                cue: &|_| true,
+            },
         )
         .unwrap();
         let s = m.suggest(&new_doc_with_term0());
@@ -1232,7 +1272,10 @@ mod tests {
             &DOMAINS,
             &preemption_archive(),
             preemption_params(),
-            &only_corr1,
+            MineScope {
+                target: &only_corr1,
+                cue: &|_| true,
+            },
         )
         .unwrap();
         let s = m.suggest(&new_doc_with_term0());
@@ -1260,11 +1303,42 @@ mod tests {
         // Correspondent 0 is ineligible as a target but its documents carry
         // tag 2: the cue must still fire.
         let rows = corr0_archive(10, 0, 30);
-        let m = AutoMatcher::mine_eligible(&DOMAINS, &rows, AutoMatchParams::default(), &|t| {
-            !matches!(t, Target::Correspondent(_))
-        })
+        let m = AutoMatcher::mine_eligible(
+            &DOMAINS,
+            &rows,
+            AutoMatchParams::default(),
+            MineScope {
+                target: &|t| !matches!(t, Target::Correspondent(_)),
+                cue: &|_| true,
+            },
+        )
         .unwrap();
         let s = m.suggest(&row(Some(0), None, &[]));
         assert_eq!(tag_targets(&s), vec![2], "{s:?}");
+    }
+
+    #[test]
+    fn an_excluded_cue_never_carries_a_rule() {
+        // G13: correspondent 0 predicts tag 2 perfectly; with correspondents
+        // excluded as cues that rule must not exist, and a document carrying
+        // only correspondent 0 gets no tag suggestion.
+        let rows = corr0_archive(10, 0, 30);
+        let everything = AutoMatcher::mine(&DOMAINS, &rows, AutoMatchParams::default()).unwrap();
+        // Anti-vacuity: without the exclusion the rule exists.
+        assert_eq!(
+            tag_targets(&everything.suggest(&row(Some(0), None, &[]))),
+            vec![2]
+        );
+        let m = AutoMatcher::mine_eligible(
+            &DOMAINS,
+            &rows,
+            AutoMatchParams::default(),
+            MineScope {
+                target: &|_| true,
+                cue: &|c| !matches!(c, Cue::Correspondent(_)),
+            },
+        )
+        .unwrap();
+        assert!(tag_targets(&m.suggest(&row(Some(0), None, &[]))).is_empty());
     }
 }
