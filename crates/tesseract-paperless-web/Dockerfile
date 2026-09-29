@@ -33,6 +33,9 @@
 #   tesseract-recognizer  → ../../../ndarray
 #   tesseract-ogar        → ../../../OGAR/crates/ogar-vocab (+ reasoning deps)
 #   tesseract-paperless   → ../../../lance-graph/crates/lance-graph-contract
+#                          → ../../../lance-graph/crates/lance-graph-arm-discovery
+#                            (feature `auto-match`, the AUTO tier's miner)
+#                          → ../../../lance-graph/crates/deepnsm-v2 (feature `token`)
 #                          → ../../../OGAR/crates/{ogar-doc-ir,ogar-vocab}
 #   tesseract-paperless-web → ../../../OGAR/crates/{ogar-doc-ir,ogar-from-docv1}
 # i.e. cargo expects `lance-graph/`, `ndarray/`, AND `OGAR/` as SIBLINGS of the

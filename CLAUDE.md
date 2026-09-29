@@ -4474,6 +4474,13 @@ The archive kept each document's text three times: inside `doc_ir_json`, in
 `text`/`preview` columns derived from it, and as Tantivy `STORED` fields. Now
 `doc_ir_json` is the only copy.
 
+> **⊘ Corrected 2026-09-29 (5+3 council, overclaim audit):** "the only copy" is
+> not true while `spo_json` is written. `tesseract-paperless-web/src/ingest.rs`
+> stores each assembled sentence's `text` in that column, so sentence text
+> exists twice. `doc_ir_json` is the canonical copy; `spo_json` is derived
+> from it and never read as text by anything else (the AUTO vocabulary reads
+> the `DocIr`).
+
 - **Why the `DocIr` and not the receipt lane** (the plan's wording): the
   lane's contract is closed over one corpus's alphabet, and retraining it
   mints a new id. A growing archive would lose every document containing an

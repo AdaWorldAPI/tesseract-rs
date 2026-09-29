@@ -16,14 +16,21 @@
 //! | [`kv`] | — | the S-2 dedup gate and the document subtree's keys |
 //! | [`intake`] | — (`ocr` adds the in-process recognizer) | the gate in front of every producer |
 //! | [`token`] | `token` | ONE versioned BPE tokenization per span, borrowed by several consumers |
+//! | `store` / `archive_meta` | `store` | the archive, and its definitions, assignments and review flags |
+//! | `matching` | `matching` | S-8: paperless-ngx's matching rules |
+//! | `auto_match` / `auto_rows` | `auto-match` | the AUTO tier's miner and its input rows |
+//! | `auto_model` | `store` + `search` + `matching` + `auto-match` | the mined AUTO model and S-8 at ingest |
 //!
 //! # What this crate deliberately is NOT
 //!
-//! **It holds no store.** [`kv::DedupIndex`] is a trait and nothing here
-//! implements it. That is not an omission to be filled in later by this crate;
-//! it is the boundary — `OGAR-DOC-W4-BUILD-SPEC` puts the KV blob on the
-//! consumer, and recognition in this workspace stays storage-less. What ships
-//! here is the *gate*: a hash, a lookup contract, and an ordering rule.
+//! **Without the `store` feature it holds no store.** In the default build
+//! [`kv::DedupIndex`] is a trait and nothing implements it, so recognition in
+//! this workspace stays storage-less (`OGAR-DOC-W4-BUILD-SPEC` puts the KV blob
+//! on the consumer). What ships by default is the *gate*: a hash, a lookup
+//! contract, and an ordering rule. The consumer's archive is the opt-in
+//! `store` feature (`store::LanceStore` implements the trait, and
+//! `archive_meta` holds its filing metadata); nothing in the default build or
+//! in any recognition crate depends on it.
 //!
 //! **It recognizes nothing.** Under `ocr` it calls
 //! `tesseract_ogar::OcrExecutor`, the one sanctioned entry point, and never
