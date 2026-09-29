@@ -41,6 +41,23 @@
     letter-spacing: .03em; color: color-mix(in srgb, CanvasText 55%, Canvas);
     min-width: 4.5rem;
   }
+  .card h3 { font-size: .9rem; margin: 1rem 0 .4rem; }
+  .card h3:first-of-type { margin-top: 0; }
+  .none, .note { color: color-mix(in srgb, CanvasText 55%, Canvas); font-size: .85rem; margin: .25rem 0; }
+  ul.assigned, ul.suggestions { list-style: none; margin: 0 0 .5rem; padding: 0; }
+  ul.assigned li, ul.suggestions li { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .8rem; padding: .3rem 0; }
+  .src { font-size: .75rem; color: color-mix(in srgb, CanvasText 55%, Canvas); border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas); border-radius: 999px; padding: 0 .5rem; }
+  .cues { flex-basis: 100%; font-size: .8rem; color: color-mix(in srgb, CanvasText 55%, Canvas); }
+  form.inline { display: inline-flex; gap: .4rem; align-items: center; margin: 0; }
+  form.inline select { padding: .3rem; border-radius: 6px; border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas); background: Canvas; color: CanvasText; }
+  button.act {
+    padding: .3rem .8rem; font-weight: 600; border: 0; border-radius: 6px; cursor: pointer;
+    background: #2563eb; color: #fff;
+  }
+  button.secondary {
+    padding: .3rem .8rem; font-weight: 600; border-radius: 6px; cursor: pointer;
+    background: transparent; color: inherit; border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
+  }
   form.delete { margin-top: .5rem; }
   button.danger {
     padding: .55rem 1rem; font-weight: 600; border: 0; border-radius: 8px; cursor: pointer;
@@ -69,6 +86,82 @@
     <span>confidence {{ confidence }}{% if low_confidence %} <span class="low-conf">(low)</span>{% endif %}</span>
     <span>ingested {{ ingested_at }}</span>
     <span class="hash">{{ hash_hex }}</span>
+  </div>
+
+  <div class="card">
+    <h2>Metadata</h2>
+    <div>
+      {% if reviewed %}
+      <strong>Reviewed</strong>
+      <form class="inline" action="/documents/{{ hash_hex }}/review" method="post">
+        <input type="hidden" name="reviewed" value="false">
+        <button type="submit" class="secondary">Mark unreviewed</button>
+      </form>
+      {% else %}
+      <strong>Not reviewed</strong>
+      <form class="inline" action="/documents/{{ hash_hex }}/review" method="post">
+        <input type="hidden" name="reviewed" value="true">
+        <button type="submit" class="secondary">Mark reviewed</button>
+      </form>
+      {% endif %}
+    </div>
+    {% for g in groups %}
+    <h3>{{ g.label }}</h3>
+    {% if g.assigned.is_empty() %}
+    <p class="none">None assigned.</p>
+    {% else %}
+    <ul class="assigned">
+      {% for a in g.assigned %}
+      <li>
+        <span>{{ a.name }}</span>
+        <span class="src">{{ a.source }}</span>
+        <form class="inline" action="/documents/{{ hash_hex }}/unassign" method="post">
+          <input type="hidden" name="kind" value="{{ g.kind }}">
+          <input type="hidden" name="definition_id" value="{{ a.definition_id }}">
+          <button type="submit" class="secondary">Unassign</button>
+        </form>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% if g.options.is_empty() %}
+    <p class="none">No definitions yet &mdash; <a href="/definitions">create one</a>.</p>
+    {% else %}
+    <form class="inline" action="/documents/{{ hash_hex }}/assign" method="post">
+      <input type="hidden" name="kind" value="{{ g.kind }}">
+      <select name="definition_id">
+        {% for o in g.options %}
+        <option value="{{ o.definition_id }}">{{ o.name }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit" class="act">Assign</button>
+    </form>
+    {% endif %}
+    {% endfor %}
+  </div>
+
+  <div class="card">
+    <h2>Suggestions</h2>
+    {% if let Some(note) = suggestions_note %}
+    <p class="none">{{ note }}</p>
+    {% endif %}
+    {% if !suggestions.is_empty() %}
+    <ul class="suggestions">
+      {% for s in suggestions %}
+      <li>
+        <strong>{{ s.label }}: {{ s.name }}</strong>
+        <span>{{ s.percent }}% expected &middot; evidence {{ s.evidence }}</span>
+        <form class="inline" action="/documents/{{ hash_hex }}/accept" method="post">
+          <input type="hidden" name="kind" value="{{ s.kind }}">
+          <input type="hidden" name="definition_id" value="{{ s.definition_id }}">
+          <button type="submit" class="act">Accept</button>
+        </form>
+        <span class="cues">because: {{ s.cues }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    <p class="note">Ignoring a suggestion stores nothing.</p>
   </div>
 
   {% if !fields.is_empty() %}

@@ -218,10 +218,7 @@ pub async fn ingest(
     let page_count = ir.pages.len();
     let spo_extraction_ran = state.reasoner.is_some();
 
-    let ingested_at_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0);
+    let ingested_at_unix_ms = now_unix_ms();
 
     let guid = state
         .store
@@ -242,6 +239,7 @@ pub async fn ingest(
     // cheap linear walk over `ir` and keeps `LanceStore`'s API from having to
     // know a search index exists at all.
     let text_for_search = tesseract_paperless::render::plain_text(&ir);
+    let text_for_s8 = text_for_search.clone();
     let display_name = filename.clone().unwrap_or_default();
     let st = state.clone();
     let hex_for_index = hex.clone();
@@ -253,6 +251,11 @@ pub async fn ingest(
     .map_err(|e| IngestError::Task(e.to_string()))?
     .map_err(IngestError::Search)?;
 
+    // S-8 at ingest (spec R8): assign what the non-AUTO definitions' rules
+    // match. The document is already archived, so a failure here is logged,
+    // never turned into a failed upload.
+    s8_assign(state, &hex, &text_for_s8).await;
+
     Ok(IngestOutcome::Stored {
         hash_hex: hex,
         document_guid: guid.0.to_bytes(),
@@ -262,6 +265,38 @@ pub async fn ingest(
         triple_count,
         spo_extraction_ran,
     })
+}
+
+/// Milliseconds since the Unix epoch; 0 if the clock is before it.
+pub(crate) fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Run S-8 on a freshly archived document and write what it matched, with
+/// `source = rule`. Never marks the document reviewed (spec R3a).
+async fn s8_assign(state: &AppState, hash_hex: &str, text: &str) {
+    use tesseract_paperless::archive_meta::Source;
+    let meta = state.store.meta();
+    let defs = match meta.definitions().await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("tesseract-paperless-web: S-8 skipped for {hash_hex}: {e}");
+            return;
+        }
+    };
+    let existing = meta.assignments_for(hash_hex).await.unwrap_or_default();
+    let now = now_unix_ms();
+    for (kind, id) in tesseract_paperless::auto_model::s8_matches(&defs, &existing, text) {
+        if let Err(e) = meta.assign(hash_hex, kind, id, Source::Rule, now).await {
+            eprintln!(
+                "tesseract-paperless-web: S-8 could not assign {} {id} to {hash_hex}: {e}",
+                kind.as_str()
+            );
+        }
+    }
 }
 
 /// Serialize the reasoning layer's per-sentence output to the JSON shape

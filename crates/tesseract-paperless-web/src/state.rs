@@ -6,6 +6,9 @@ use std::sync::Arc;
 
 use tesseract_ogar::reasoning::SentenceReasoner;
 use tesseract_ogar::OcrExecutor;
+use tesseract_paperless::auto_match::AutoMatchParams;
+use tesseract_paperless::auto_model::{index_tokenizer, AutoModel, MineInputs};
+use tesseract_paperless::auto_rows::VocabParams;
 use tesseract_paperless::search::SearchIndex;
 use tesseract_paperless::store::LanceStore;
 use tokio::sync::Semaphore;
@@ -39,6 +42,23 @@ pub struct AppState {
     /// Bounds concurrent CPU-bound recognitions, same reasoning as
     /// `tesseract-ocr-web::AppState::recognize_permits`.
     pub recognize_permits: Arc<Semaphore>,
+    /// The AUTO model (spec `archive-metadata-auto-match-v3.md` R7). Swapped
+    /// whole on every re-mine; a reader clones the slot and never holds the
+    /// lock across an `.await`.
+    pub auto: std::sync::RwLock<AutoSlot>,
+}
+
+/// Where the AUTO model stands.
+#[derive(Clone)]
+pub enum AutoSlot {
+    /// No mine has finished yet. Mining runs off the boot path, so the app
+    /// serves before it has a model (spec R7).
+    Pending,
+    /// The current model.
+    Ready(Arc<AutoModel>),
+    /// The last mine was refused; the text is shown on the definitions page
+    /// (for example "no content term survived", spec R5).
+    Refused(String),
 }
 
 impl AppState {
@@ -156,6 +176,63 @@ impl AppState {
             search,
             reasoner,
             recognize_permits: Arc::new(Semaphore::new(permits)),
+            auto: std::sync::RwLock::new(AutoSlot::Pending),
         })
+    }
+
+    /// The current AUTO slot.
+    #[must_use]
+    pub fn auto_slot(&self) -> AutoSlot {
+        self.auto
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Mine a fresh AUTO model from the archive and swap it in.
+    ///
+    /// The archive is read on the async runtime; the CPU-bound build runs on
+    /// a blocking thread. A refusal replaces the slot with its reason (the
+    /// previous model is dropped: it was mined from an archive that no longer
+    /// exists). A read failure leaves the slot as it was.
+    pub async fn remine(self: Arc<Self>) {
+        let inputs = match MineInputs::load(&self.store).await {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("tesseract-paperless-web: AUTO mine could not read the archive: {e}");
+                return;
+            }
+        };
+        let st = self.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            AutoModel::build(
+                &inputs,
+                &index_tokenizer(&st.search),
+                AutoMatchParams::default(),
+                VocabParams::default(),
+            )
+        })
+        .await;
+        let slot = match built {
+            Ok(Ok(model)) => {
+                eprintln!(
+                    "tesseract-paperless-web: AUTO model mined, {} rules",
+                    model.rule_count()
+                );
+                AutoSlot::Ready(Arc::new(model))
+            }
+            Ok(Err(e)) => {
+                eprintln!("tesseract-paperless-web: AUTO mine refused: {e}");
+                AutoSlot::Refused(e.to_string())
+            }
+            Err(e) => {
+                eprintln!("tesseract-paperless-web: AUTO mine task failed: {e}");
+                return;
+            }
+        };
+        *self
+            .auto
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = slot;
     }
 }
