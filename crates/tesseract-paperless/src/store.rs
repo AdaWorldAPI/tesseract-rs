@@ -210,6 +210,7 @@ pub struct LanceStore {
     #[allow(dead_code)] // kept for `open_table`/reconnect; not read elsewhere yet
     db: Connection,
     table: Table,
+    meta: crate::archive_meta::MetaStore,
 }
 
 impl LanceStore {
@@ -248,7 +249,8 @@ impl LanceStore {
         if !legacy.is_empty() {
             table.drop_columns(&legacy).await?;
         }
-        Ok(Self { db, table })
+        let meta = crate::archive_meta::MetaStore::open(&db).await?;
+        Ok(Self { db, table, meta })
     }
 
     /// Persist a novel document — S-5's write-order guard lives at the
@@ -401,7 +403,14 @@ impl LanceStore {
         Ok(rows_from_batches(&batches)?.into_iter().next())
     }
 
-    /// Delete a document by its hex `content_sha256`.
+    /// Delete a document by its hex `content_sha256`, then its metadata.
+    ///
+    /// The document row goes first (spec `archive-metadata-auto-match-v3.md`
+    /// R2a). If the metadata delete then fails, the worst case is orphan
+    /// assignment and review rows, which
+    /// [`crate::archive_meta::MetaStore::reconcile`] removes on the next
+    /// start. The other order could leave a live document whose metadata is
+    /// already gone, with nothing to bring it back.
     ///
     /// # Errors
     /// [`StoreError::Db`] on a delete failure.
@@ -409,7 +418,14 @@ impl LanceStore {
         let safe = hash_hex.replace('\'', "''");
         let predicate = format!("{} = '{safe}'", col::CONTENT_SHA256_HEX);
         self.table.delete(&predicate).await?;
+        self.meta.forget_document(hash_hex).await?;
         Ok(())
+    }
+
+    /// The archive's metadata: definitions, assignments and review flags.
+    #[must_use]
+    pub fn meta(&self) -> &crate::archive_meta::MetaStore {
+        &self.meta
     }
 
     /// Total document count — for the list page's header.
@@ -891,6 +907,106 @@ mod tests {
             .await
             .expect("get")
             .is_none());
+    }
+
+    /// G6: deleting a document removes its assignments and its review flag,
+    /// and only its own. Red if `delete` skips `forget_document`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_cascades_to_that_documents_metadata_only() {
+        use crate::archive_meta::{MetaKind, Source};
+        let (_dir, uri) = tmp_uri();
+        let store = LanceStore::connect(&uri).await.expect("connect");
+        let (gone, kept) = (ContentSha256::of(b"gone"), ContentSha256::of(b"kept"));
+        let (gone_hex, kept_hex) = (format!("{gone:?}"), format!("{kept:?}"));
+        for h in [&gone, &kept] {
+            store
+                .put(h, None, 90, false, &sample_ir("image/png"), 1, None)
+                .await
+                .expect("put");
+        }
+        let tag = store
+            .meta()
+            .create_definition(MetaKind::Tag, "Energie", 1)
+            .await
+            .expect("create");
+        for h in [&gone_hex, &kept_hex] {
+            store
+                .meta()
+                .assign(h, MetaKind::Tag, tag.definition_id, Source::Manual, 1)
+                .await
+                .expect("assign");
+            store.meta().mark_reviewed(h, 1).await.expect("review");
+        }
+
+        store.delete(&gone_hex).await.expect("delete");
+
+        assert!(store
+            .meta()
+            .assignments_for(&gone_hex)
+            .await
+            .expect("read")
+            .is_empty());
+        assert!(!store.meta().is_reviewed(&gone_hex).await.expect("read"));
+        assert_eq!(
+            store
+                .meta()
+                .assignments_for(&kept_hex)
+                .await
+                .expect("read")
+                .len(),
+            1
+        );
+        assert!(store.meta().is_reviewed(&kept_hex).await.expect("read"));
+    }
+
+    /// G1: a direct re-`put` of an archived document, which rewrites its
+    /// whole row, keeps its assignments and review flag. Red if metadata were
+    /// stored as `documents` columns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_re_put_keeps_the_documents_metadata() {
+        use crate::archive_meta::{MetaKind, Source};
+        let (_dir, uri) = tmp_uri();
+        let store = LanceStore::connect(&uri).await.expect("connect");
+        let hash = ContentSha256::of(b"re-put");
+        let hex = format!("{hash:?}");
+        let ir = sample_ir("image/png");
+        store
+            .put(&hash, None, 90, false, &ir, 1, None)
+            .await
+            .expect("put");
+        let c = store
+            .meta()
+            .create_definition(MetaKind::Correspondent, "Stadtwerke", 1)
+            .await
+            .expect("create");
+        store
+            .meta()
+            .assign(
+                &hex,
+                MetaKind::Correspondent,
+                c.definition_id,
+                Source::Manual,
+                1,
+            )
+            .await
+            .expect("assign");
+        store.meta().mark_reviewed(&hex, 1).await.expect("review");
+
+        store
+            .put(&hash, Some("again.png"), 80, true, &ir, 2, None)
+            .await
+            .expect("re-put");
+
+        assert_eq!(
+            store
+                .meta()
+                .assignments_for(&hex)
+                .await
+                .expect("read")
+                .len(),
+            1
+        );
+        assert!(store.meta().is_reviewed(&hex).await.expect("read"));
     }
 
     /// `spo_json` is nullable and must round-trip BOTH states: a document

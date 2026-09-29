@@ -99,6 +99,28 @@ impl AppState {
             Err(e) => eprintln!("tesseract-paperless-web: search index reconcile failed: {e}"),
         }
 
+        // Assignment and review rows whose document is gone are orphans: a
+        // delete that failed between the document row and its metadata leaves
+        // them (spec `archive-metadata-auto-match-v3.md` R2a). Sweeping them
+        // here also keeps a re-upload of a deleted hash from inheriting its old
+        // review flag. Logged, never fatal, like the index reconcile above.
+        let live = store
+            .hashes()
+            .await
+            .map(|h| h.into_iter().collect::<std::collections::HashSet<_>>());
+        match live {
+            Ok(live) => match store.meta().reconcile(&live).await {
+                Ok(r) if r.assignments_removed + r.reviews_removed > 0 => eprintln!(
+                    "tesseract-paperless-web: metadata reconciled: {} assignments, {} reviews \
+                     removed",
+                    r.assignments_removed, r.reviews_removed
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!("tesseract-paperless-web: metadata reconcile failed: {e}"),
+            },
+            Err(e) => eprintln!("tesseract-paperless-web: metadata reconcile skipped: {e}"),
+        }
+
         // Graceful degrade, not a startup failure — mirrors
         // `tesseract-ogar/examples/ocr_demo.rs`'s own step 6: absence of the
         // deepnsm vocabulary means SPO extraction is skipped per-document,
