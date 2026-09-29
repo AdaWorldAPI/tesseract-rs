@@ -250,6 +250,10 @@ struct CooccurrenceDistance {
     singles: Vec<u32>,
     /// Per unordered pair of stated slots `(lo, hi)`, how many rows state both.
     pairs: HashMap<(u32, u32), u32>,
+    /// Per slot, is this item an ineligible target? Such an item is never a
+    /// consequent (every distance TO it is `u32::MAX`), but stays an
+    /// antecedent: distances FROM it are unchanged.
+    blocked: Vec<bool>,
 }
 
 /// Binary features (tags, field keys, terms) start after correspondent and
@@ -287,11 +291,33 @@ impl CooccurrenceDistance {
                 }
             }
         }
+        let blocked = vec![false; spec.dim()];
         Self {
             spec,
             n: u32::try_from(data.len()).expect("row count fits u32"),
             singles,
             pairs,
+            blocked,
+        }
+    }
+
+    /// Block every item whose target `eligible` rejects.
+    ///
+    /// Eligibility has to act here, inside the probe, and not on the mined
+    /// rules or the suggestions: the probe proposes only the nearest category
+    /// of each feature, so an ineligible correspondent that is nearer than an
+    /// eligible one would pre-empt it, and no later filter could bring the
+    /// eligible rule back.
+    fn block_ineligible(&mut self, layout: Layout, eligible: &dyn Fn(Target) -> bool) {
+        for f in 0..self.spec.num_features() {
+            let f = u32::try_from(f).expect("feature index fits u32");
+            for c in 0..self.spec.cardinality(f as usize) {
+                let item = Item::new(f, c);
+                if layout.target(item).is_some_and(|t| !eligible(t)) {
+                    let slot = self.spec.slot(item);
+                    self.blocked[slot] = true;
+                }
+            }
         }
     }
 
@@ -342,6 +368,9 @@ impl CooccurrenceDistance {
 
 impl CodebookDistance for CooccurrenceDistance {
     fn distance(&self, a: Item, b: Item) -> u32 {
+        if self.blocked[self.spec.slot(b)] {
+            return u32::MAX;
+        }
         if a.feature == b.feature {
             return if a.category == b.category {
                 0
@@ -490,6 +519,26 @@ impl AutoMatcher {
         rows: &[ArchiveRow],
         params: AutoMatchParams,
     ) -> Result<Self, AutoMatchError> {
+        Self::mine_eligible(domains, rows, params, &|_| true)
+    }
+
+    /// [`Self::mine`], proposing only targets that `eligible` accepts.
+    ///
+    /// Ineligible targets still count as cues and as assignments; they are
+    /// just never a rule's consequent. This is how the archive restricts
+    /// suggestions to definitions whose matching algorithm is AUTO: filtering
+    /// the suggestions afterwards would lose every eligible target that an
+    /// ineligible one of the same kind out-ranked.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::mine`].
+    pub fn mine_eligible(
+        domains: &ArchiveDomains,
+        rows: &[ArchiveRow],
+        params: AutoMatchParams,
+        eligible: &dyn Fn(Target) -> bool,
+    ) -> Result<Self, AutoMatchError> {
         if params.k == 0 {
             return Err(AutoMatchError::ZeroK);
         }
@@ -509,7 +558,12 @@ impl AutoMatcher {
             });
         }
         let data = encode(domains, rows);
-        let oracle = CooccurrenceDistance::build(&data);
+        let layout = Layout {
+            tags: domains.tags,
+            field_keys: domains.field_keys,
+        };
+        let mut oracle = CooccurrenceDistance::build(&data);
+        oracle.block_ineligible(layout, eligible);
         let n = rows.len() as u64;
         // Floor, not ceil: `passes` compares the FLOORED support of a rule, so
         // a ceiling could reject a rule sitting exactly on `min_evidence`.
@@ -523,10 +577,6 @@ impl AutoMatcher {
             max_antecedent: 1,
             min_support_ppm,
             min_confidence_ppm: params.min_confidence_ppm,
-        };
-        let layout = Layout {
-            tags: domains.tags,
-            field_keys: domains.field_keys,
         };
         let window = rows.len() as u128;
         let min_lift = u128::from(params.min_lift_ppm);
@@ -1109,5 +1159,112 @@ mod tests {
             .collect();
         assert_eq!(types.len(), 1);
         assert_eq!(types[0].target, Target::DocumentType(0));
+    }
+
+    /// Term 0 on 20 documents: 12 carry correspondent 0 (NOT eligible, e.g.
+    /// an S-8 definition), 8 carry correspondent 1 (eligible, AUTO). 40
+    /// filler documents have neither the term nor a correspondent, so both
+    /// targets clear lift easily.
+    fn preemption_archive() -> Vec<ArchiveRow> {
+        let mut rows = Vec::new();
+        for i in 0..20 {
+            let corr = u32::from(i >= 12);
+            rows.push(ArchiveRow {
+                correspondent: Some(corr),
+                terms: vec![0],
+                ..ArchiveRow::default()
+            });
+        }
+        for _ in 0..40 {
+            rows.push(ArchiveRow::default());
+        }
+        rows
+    }
+
+    fn preemption_params() -> AutoMatchParams {
+        AutoMatchParams {
+            min_confidence_ppm: 300_000,
+            ..AutoMatchParams::default()
+        }
+    }
+
+    fn only_corr1(t: Target) -> bool {
+        !matches!(t, Target::Correspondent(0))
+    }
+
+    fn new_doc_with_term0() -> ArchiveRow {
+        ArchiveRow {
+            terms: vec![0],
+            ..ArchiveRow::default()
+        }
+    }
+
+    #[test]
+    fn an_ineligible_target_is_never_suggested() {
+        // G2a: correspondent 0 has the strongest rule, but it is not eligible.
+        let m = AutoMatcher::mine_eligible(
+            &DOMAINS,
+            &preemption_archive(),
+            preemption_params(),
+            &only_corr1,
+        )
+        .unwrap();
+        let s = m.suggest(&new_doc_with_term0());
+        assert!(
+            s.iter().all(|x| x.target != Target::Correspondent(0)),
+            "{s:?}"
+        );
+        // Anti-vacuity: with everything eligible, correspondent 0 IS suggested,
+        // so the fixture really has a rule for it.
+        let all = AutoMatcher::mine(&DOMAINS, &preemption_archive(), preemption_params()).unwrap();
+        assert!(all
+            .suggest(&new_doc_with_term0())
+            .iter()
+            .any(|x| x.target == Target::Correspondent(0)));
+    }
+
+    #[test]
+    fn an_eligible_target_outranked_by_an_ineligible_one_still_comes_back() {
+        // G2b: correspondent 0 (P = 0.6) is nearer than correspondent 1
+        // (P = 0.4), so the probe proposes only correspondent 0. Filtering the
+        // mined rules or the suggestions afterwards would leave nothing.
+        let m = AutoMatcher::mine_eligible(
+            &DOMAINS,
+            &preemption_archive(),
+            preemption_params(),
+            &only_corr1,
+        )
+        .unwrap();
+        let s = m.suggest(&new_doc_with_term0());
+        assert!(
+            s.iter().any(|x| x.target == Target::Correspondent(1)),
+            "the eligible correspondent was pre-empted: {s:?}"
+        );
+        // The post-filter shape this replaces really does lose it.
+        let all = AutoMatcher::mine(&DOMAINS, &preemption_archive(), preemption_params()).unwrap();
+        let post_filtered: Vec<_> = all
+            .suggest(&new_doc_with_term0())
+            .into_iter()
+            .filter(|x| only_corr1(x.target))
+            .collect();
+        assert!(
+            post_filtered
+                .iter()
+                .all(|x| !matches!(x.target, Target::Correspondent(_))),
+            "{post_filtered:?}"
+        );
+    }
+
+    #[test]
+    fn an_ineligible_target_still_works_as_a_cue() {
+        // Correspondent 0 is ineligible as a target but its documents carry
+        // tag 2: the cue must still fire.
+        let rows = corr0_archive(10, 0, 30);
+        let m = AutoMatcher::mine_eligible(&DOMAINS, &rows, AutoMatchParams::default(), &|t| {
+            !matches!(t, Target::Correspondent(_))
+        })
+        .unwrap();
+        let s = m.suggest(&row(Some(0), None, &[]));
+        assert_eq!(tag_targets(&s), vec![2], "{s:?}");
     }
 }
