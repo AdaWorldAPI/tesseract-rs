@@ -1,11 +1,11 @@
 # Agent cards — the lessons this repo paid for
 
-Seven specialist cards. Each one exists because a specific mistake cost real
+Eight specialist cards. Each one exists because a specific mistake cost real
 time in this repo, and the card is the shape of that mistake written down so it
 does not get made twice. Every rule in them carries its incident: what was
 measured, what the wrong answer was, and what it cost.
 
-Read the one whose triggers match before starting; do not read all seven.
+Read the one whose triggers match before starting; do not read all eight.
 
 | Card | Fires when you are about to... |
 |---|---|
@@ -16,6 +16,7 @@ Read the one whose triggers match before starting; do not read all seven.
 | `render-typography-engineer` | touch font size, baseline placement, or overlay fidelity in the PDF/HTML surfaces |
 | `subagent-output-auditor` | synthesize fanned-out agent output into a deliverable |
 | `transcode-scope-warden` | decide if something is a transcode or our own synthesis, or run cargo |
+| `source-inquisitor` | publish ANY claim (commit, PR, plan, spec, board, chat conclusion): it re-reads every cited source, verifies every quote, and blocks unread, grep-derived or open-negative claims |
 
 ## The four rules that generalize past their own card
 

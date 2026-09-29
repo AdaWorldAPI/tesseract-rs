@@ -198,6 +198,29 @@ jobs:
     - name: Clippy (paperless, matching)
       working-directory: tesseract-rs
       run: cargo clippy -p tesseract-paperless --features matching --all-targets -- -D warnings
+    # AUTO matching tier: association rules mined over the archive
+    # (lance-graph-arm-discovery, zero-dep sibling).
+    - name: Test (paperless, auto-match)
+      working-directory: tesseract-rs
+      run: cargo test -p tesseract-paperless --features auto-match --verbose
+    - name: Clippy (paperless, auto-match)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-paperless --features auto-match --all-targets -- -D warnings
+    # The archive wiring (archive-metadata-auto-match-v3.md R9): every module
+    # has its own gate, so the full union runs the unit tests, and the two
+    # half-unions catch a module gated on the wrong feature.
+    - name: Test (paperless, store+search+matching+auto-match)
+      working-directory: tesseract-rs
+      run: cargo test -p tesseract-paperless --features store,search,matching,auto-match --verbose
+    - name: Clippy (paperless, store+search+matching+auto-match)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-paperless --features store,search,matching,auto-match --all-targets -- -D warnings
+    - name: Clippy (paperless, store+auto-match)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-paperless --features store,auto-match --all-targets -- -D warnings
+    - name: Clippy (paperless, search+auto-match)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-paperless --features search,auto-match --all-targets -- -D warnings
     # The S-7 axes on lance-graph's report substrate: a Tantivy match becomes
     # a selection MASK (never an id list) and per-axis counts / pivots fold on
     # the one mask-RISC evaluator, checked against a per-row oracle of

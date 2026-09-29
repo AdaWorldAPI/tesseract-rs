@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Definitions — tesseract-paperless</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    line-height: 1.5; margin: 0; padding: 2rem 1rem;
+    background: Canvas; color: CanvasText;
+  }
+  main { max-width: 52rem; margin: 0 auto; }
+  h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+  nav.top { margin-bottom: 1.25rem; display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+  nav.top a { color: #2563eb; text-decoration: none; font-weight: 600; }
+  .card {
+    border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
+    border-radius: 12px; padding: 1.25rem; margin-bottom: 1.25rem;
+  }
+  .card h2 { font-size: 1rem; margin: 0 0 .75rem; }
+  .muted, .none { color: color-mix(in srgb, CanvasText 55%, Canvas); font-size: .85rem; margin: .25rem 0; }
+  .def { border-top: 1px solid color-mix(in srgb, CanvasText 12%, Canvas); padding: .75rem 0; }
+  .def.retired { opacity: .6; }
+  .badge {
+    font-size: .75rem; border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas);
+    border-radius: 999px; padding: 0 .5rem; margin-left: .4rem;
+    color: color-mix(in srgb, CanvasText 60%, Canvas);
+  }
+  .badge.warn { color: #d97706; border-color: #d97706; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
+  .forms { display: flex; flex-wrap: wrap; gap: .5rem 1rem; margin-top: .5rem; }
+  form.inline { display: inline-flex; flex-wrap: wrap; gap: .4rem; align-items: center; margin: 0; }
+  input[type=text], select {
+    padding: .35rem .5rem; border-radius: 6px;
+    border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
+    background: Canvas; color: CanvasText; font-size: .9rem;
+  }
+  button {
+    padding: .35rem .8rem; font-weight: 600; border: 0; border-radius: 6px; cursor: pointer;
+    background: #2563eb; color: #fff;
+  }
+  button.secondary {
+    background: transparent; color: inherit;
+    border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
+  }
+  button.danger { background: #ef4444; color: #fff; }
+</style>
+</head>
+<body>
+<main>
+  <nav class="top">
+    <h1>Definitions</h1>
+    <span><a href="/documents">Documents</a> &middot; <a href="/">Ingest</a></span>
+  </nav>
+
+  <div class="card">
+    <h2>AUTO model</h2>
+    <p class="muted">{{ auto_status }}</p>
+    <form class="inline" action="/auto/mine" method="post">
+      <button type="submit">Re-mine now</button>
+    </form>
+    <p class="muted">A new definition is AUTO: it is suggested from reviewed documents, never assigned without a person accepting it.</p>
+  </div>
+
+  {% for s in sections %}
+  <div class="card">
+    <h2>{{ s.label }}</h2>
+    {% if s.rows.is_empty() %}
+    <p class="none">None yet.</p>
+    {% endif %}
+    {% for d in s.rows %}
+    <div class="def{% if d.retired %} retired{% endif %}">
+      <div>
+        <strong>{{ d.name }}</strong>
+        <span class="badge">{{ d.algorithm_name }}</span>
+        {% if d.retired %}<span class="badge warn">retired</span>{% endif %}
+      </div>
+      <div class="muted">
+        pattern <code>{{ d.pattern }}</code> &middot;
+        case-insensitive: {% if d.case_insensitive %}yes{% else %}no{% endif %}
+      </div>
+      {% if !d.retired %}
+      <div class="forms">
+        <form class="inline" action="/definitions/rename" method="post">
+          <input type="hidden" name="kind" value="{{ s.kind }}">
+          <input type="hidden" name="definition_id" value="{{ d.definition_id }}">
+          <input type="text" name="name" value="{{ d.name }}" required>
+          <button type="submit" class="secondary">Rename</button>
+        </form>
+        <form class="inline" action="/definitions/rule" method="post">
+          <input type="hidden" name="kind" value="{{ s.kind }}">
+          <input type="hidden" name="definition_id" value="{{ d.definition_id }}">
+          <select name="match_algorithm">
+            {% for o in d.alg_options %}
+            <option value="{{ o.value }}"{% if o.selected %} selected{% endif %}>{{ o.name }}</option>
+            {% endfor %}
+          </select>
+          <input type="text" name="match_pattern" value="{{ d.pattern }}" placeholder="pattern">
+          <label><input type="checkbox" name="case_insensitive" value="on"{% if d.case_insensitive %} checked{% endif %}> ignore case</label>
+          <button type="submit" class="secondary">Save rule</button>
+        </form>
+        <form class="inline" action="/definitions/retire" method="post" onsubmit="return confirm('Retire this definition? Its id is never reused.');">
+          <input type="hidden" name="kind" value="{{ s.kind }}">
+          <input type="hidden" name="definition_id" value="{{ d.definition_id }}">
+          <button type="submit" class="danger">Retire</button>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+    <form class="inline" action="/definitions/create" method="post" style="margin-top:.75rem">
+      <input type="hidden" name="kind" value="{{ s.kind }}">
+      <input type="text" name="name" placeholder="New name" required>
+      <button type="submit">Create</button>
+    </form>
+  </div>
+  {% endfor %}
+</main>
+</body>
+</html>
