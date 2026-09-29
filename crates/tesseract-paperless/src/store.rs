@@ -151,10 +151,12 @@ pub struct DocumentRow {
     pub mean_confidence: u32,
     /// Whether the recognizer itself was not confident.
     pub low_confidence: bool,
-    /// The `DocIr`, serialized ([`ogar_doc_ir::to_json`]) — the ONE stored
+    /// The `DocIr`, serialized ([`ogar_doc_ir::to_json`]) — the canonical
     /// copy of the document's text as well as its structure. The plain text
     /// and the list preview are derived from it on read ([`Self::text`],
-    /// [`Self::preview`]); no second copy is stored beside it.
+    /// [`Self::preview`]). [`Self::spo_json`] also carries each assembled
+    /// sentence's text, derived from this at ingest; nothing reads it back as
+    /// the document's text.
     pub doc_ir_json: String,
     /// Milliseconds since the Unix epoch, at ingest time.
     pub ingested_at_unix_ms: i64,
