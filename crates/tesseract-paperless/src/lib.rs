@@ -58,11 +58,19 @@ pub mod matching;
 #[cfg(feature = "auto-match")]
 pub mod auto_match;
 
+/// Archive metadata to mining input: dense ids, eligibility, vocabulary.
+#[cfg(feature = "auto-match")]
+pub mod auto_rows;
+
 #[cfg(feature = "report")]
 pub mod axes;
 
 #[cfg(feature = "store")]
 pub mod store;
+
+/// Definitions, assignments and the review flag the AUTO tier learns from.
+#[cfg(feature = "store")]
+pub mod archive_meta;
 
 /// Keeps the search index in line with the archive it is a lens over.
 #[cfg(all(feature = "store", feature = "search"))]
