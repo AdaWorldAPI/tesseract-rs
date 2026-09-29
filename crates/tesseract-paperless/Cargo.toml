@@ -142,7 +142,7 @@ arrow = { version = "58", default-features = false, optional = true }
 arrow-array = { version = "58", default-features = false, optional = true }
 arrow-schema = { version = "58", default-features = false, optional = true }
 futures = { version = "0.3", default-features = false, features = ["std"], optional = true }
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "fs", "macros"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "fs", "macros", "sync"], optional = true }
 serde_json = { version = "1", optional = true }
 
 # --- feature `report` -------------------------------------------------------

@@ -51,9 +51,14 @@
 //!
 //! # Concurrency
 //!
-//! Read-then-write operations (`create_definition`, `rename_definition`,
-//! `assign` on a single-valued kind) are not atomic across calls. One
-//! `MetaStore` per process with serialized writers is assumed.
+//! Every write goes through one async mutex inside [`MetaStore`], so the
+//! read-then-write operations are serialized by the store itself, not by an
+//! assumption about its callers. A web server serves requests concurrently:
+//! without the lock, two `create_definition` calls for one kind can read the
+//! same `max`, mint the same `definition_id`, and the second `merge_insert`
+//! silently overwrites the first definition (and a single-valued `assign`
+//! racing another can leave two rows). Reads take no lock. The lock is
+//! per process: two processes on one archive are still not serialized.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -445,6 +450,8 @@ pub struct MetaStore {
     taxonomy: Table,
     assignments: Table,
     reviews: Table,
+    /// Serializes every write (see the module doc's Concurrency section).
+    writes: tokio::sync::Mutex<()>,
 }
 
 impl MetaStore {
@@ -461,6 +468,7 @@ impl MetaStore {
             taxonomy,
             assignments,
             reviews,
+            writes: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -506,6 +514,7 @@ impl MetaStore {
         name: &str,
         now_ms: i64,
     ) -> Result<DefinitionRow, MetaError> {
+        let _write = self.writes.lock().await;
         let name = name.trim();
         let existing = self.definitions().await?;
         let of_kind = || existing.iter().filter(|d| d.kind == kind);
@@ -547,6 +556,7 @@ impl MetaStore {
         definition_id: u32,
         name: &str,
     ) -> Result<(), MetaError> {
+        let _write = self.writes.lock().await;
         let name = name.trim();
         let all = self.definitions().await?;
         let mut row = all
@@ -583,6 +593,7 @@ impl MetaStore {
         match_pattern: &str,
         case_insensitive: bool,
     ) -> Result<(), MetaError> {
+        let _write = self.writes.lock().await;
         let mut row = self.find_definition(kind, definition_id).await?;
         row.match_algorithm = match_algorithm;
         row.match_pattern = match_pattern.to_string();
@@ -600,6 +611,7 @@ impl MetaStore {
         kind: MetaKind,
         definition_id: u32,
     ) -> Result<(), MetaError> {
+        let _write = self.writes.lock().await;
         let mut row = self.find_definition(kind, definition_id).await?;
         row.retired = true;
         self.upsert_definition(&row).await?;
@@ -646,6 +658,7 @@ impl MetaStore {
         source: Source,
         now_ms: i64,
     ) -> Result<(), MetaError> {
+        let _write = self.writes.lock().await;
         let def = self.find_definition(kind, definition_id).await?;
         if def.retired {
             return Err(MetaError::UnknownDefinition {
@@ -694,6 +707,7 @@ impl MetaStore {
         kind: MetaKind,
         definition_id: u32,
     ) -> Result<(), StoreError> {
+        let _write = self.writes.lock().await;
         let predicate = format!(
             "{} = '{}' AND {} = '{}' AND {} = {}",
             col::HASH,
@@ -732,6 +746,7 @@ impl MetaStore {
     /// # Errors
     /// [`StoreError::Db`] on a write failure.
     pub async fn mark_reviewed(&self, hash: &str, now_ms: i64) -> Result<(), StoreError> {
+        let _write = self.writes.lock().await;
         let batch = RecordBatch::try_new(
             reviews_schema(),
             vec![
@@ -748,6 +763,7 @@ impl MetaStore {
     /// # Errors
     /// [`StoreError::Db`] on a delete failure.
     pub async fn mark_unreviewed(&self, hash: &str) -> Result<(), StoreError> {
+        let _write = self.writes.lock().await;
         let predicate = format!("{} = '{}'", col::HASH, sql_quote(hash));
         self.reviews.delete(&predicate).await?;
         Ok(())
@@ -792,6 +808,7 @@ impl MetaStore {
     /// # Errors
     /// [`StoreError::Db`] on a delete failure.
     pub async fn forget_document(&self, hash: &str) -> Result<(), StoreError> {
+        let _write = self.writes.lock().await;
         let predicate = format!("{} = '{}'", col::HASH, sql_quote(hash));
         self.assignments.delete(&predicate).await?;
         self.reviews.delete(&predicate).await?;
@@ -808,6 +825,7 @@ impl MetaStore {
         &self,
         live_hashes: &HashSet<String>,
     ) -> Result<MetaReconcileReport, StoreError> {
+        let _write = self.writes.lock().await;
         let assignment_rows = self.all_assignments().await?;
         let dead_assigned: HashSet<&str> = assignment_rows
             .iter()
@@ -1277,6 +1295,68 @@ mod tests {
             .await
             .expect("create");
         assert_eq!(next.definition_id, 1);
+    }
+
+    /// Concurrent creates, as a web server issues them, each get their own
+    /// id and all survive. Without the write lock two creates read the same
+    /// `max`, mint the same id, and the second `merge_insert` overwrites the
+    /// first definition. Disable: drop `self.writes.lock()` from
+    /// `create_definition`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_creates_never_overwrite_each_other() {
+        const N: u32 = 24;
+        let (_d, s) = fresh().await;
+        let s = Arc::new(s);
+        let tasks: Vec<_> = (0..N)
+            .map(|i| {
+                let s = s.clone();
+                tokio::spawn(async move {
+                    s.create_definition(MetaKind::Tag, &format!("tag {i}"), 1)
+                        .await
+                        .expect("create")
+                        .definition_id
+                })
+            })
+            .collect();
+        let mut ids = Vec::new();
+        for t in tasks {
+            ids.push(t.await.expect("join"));
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, (0..N).collect::<Vec<_>>(), "ids were minted twice");
+        assert_eq!(
+            s.definitions().await.expect("definitions").len(),
+            N as usize,
+            "a definition was overwritten"
+        );
+    }
+
+    /// Concurrent single-valued assigns to one document leave exactly one
+    /// row. Disable: drop `self.writes.lock()` from `assign`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_single_valued_assigns_leave_one_row() {
+        const N: u32 = 16;
+        let (_d, s) = fresh().await;
+        for i in 0..N {
+            s.create_definition(MetaKind::Correspondent, &format!("c {i}"), 1)
+                .await
+                .expect("create");
+        }
+        let s = Arc::new(s);
+        let tasks: Vec<_> = (0..N)
+            .map(|i| {
+                let s = s.clone();
+                tokio::spawn(async move {
+                    s.assign("h", MetaKind::Correspondent, i, Source::Manual, 2)
+                        .await
+                        .expect("assign");
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.expect("join");
+        }
+        assert_eq!(s.assignments_for("h").await.expect("for").len(), 1);
     }
 
     #[test]
