@@ -62,6 +62,16 @@ and clippy line (every tier gets a CI line — see CLAUDE.md, paperless sections
    (fine at archive scale, feature count in the tens to low hundreds); (b) a
    distance table from co-occurrence counts. Start with (a) and measure the
    candidate count.
+
+   > **⊘ CORRECTION (2026-09-29, found while specifying the build) — (a) cannot
+   > work.** `extract_rules`' probe proposes, per feature, only the single
+   > category with the minimum distance (`aerial/extract.rs`, first minimum
+   > wins). A uniform oracle makes every distance equal, so it always proposes
+   > category 0. For a tag, category 0 is "absent", so option (a) could never
+   > suggest a tag. **(b) is what ships:** `distance(a, b) = PPM − P(b | a)·PPM`,
+   > counted from the same rows, so the probe proposes the category most likely
+   > given the antecedent (Aerial+'s reconstruction query) and the integer
+   > confirm step gates it.
 2. **Minimum evidence.** A rule from 2 documents is noise. Default proposal:
    `cooccur >= 5` and `k` chosen so that 5 documents give `c ≈ 0.5`, i.e. `k = 5`.
    This is a policy pin until measured on a real archive.
