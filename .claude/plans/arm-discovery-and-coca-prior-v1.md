@@ -91,6 +91,27 @@ and clippy line (every tier gets a CI line — see CLAUDE.md, paperless sections
 - A suggestion is never written as an assignment (the ingest path is read-only
   with respect to tags unless the caller accepts).
 
+> **⊘ CORRECTIONS (2026-09-29, PR #101 review, both accepted).**
+>
+> 1. **Antecedents must be observable at ingest.** For a newly ingested
+>    document the correspondent, type and tags are exactly the unknowns, so
+>    rules keyed only on them (`correspondent=Stadtwerke → tag:Energie`) rarely
+>    fire, and suggestions are never chained back in as antecedents. The row
+>    gains **content terms**: caller-supplied term ids (for example the
+>    archive's top-N document-frequency words), one binary feature each. Terms
+>    and field keys are the ingest-time cues; an already-assigned correspondent,
+>    type or tag (manual or S-8) is still a valid cue. Terms and field keys are
+>    never consequents. This is what paperless-ngx's own AUTO classifier learns
+>    from, expressed as integer rules.
+> 2. **Independence is a lift question, not an evidence floor.** With a common
+>    consequent (base rate 0.8) an independent antecedent still clears a 0.7
+>    confidence floor with plenty of evidence and predicts nothing. Rules must
+>    also clear `lift = confidence / P(consequent) >= min_lift` (default 1.5,
+>    a policy pin until measured). A consequent too common for any rule to
+>    reach that lift produces no rules, which is correct. The can-stay-silent
+>    falsifier uses exactly that case: an independent cue for an 80%-base-rate
+>    tag, with the test asserting its confidence would have cleared the floor.
+
 ## Piece 2 — COCA frequency as a prior, revised with the context rule
 
 **What.** PR #100's `SentenceReasoner::disambiguate` makes a hard choice from
