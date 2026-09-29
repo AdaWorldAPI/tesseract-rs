@@ -62,6 +62,15 @@ pub mod auto_match;
 #[cfg(feature = "auto-match")]
 pub mod auto_rows;
 
+/// The AUTO model and S-8 at ingest: archive metadata in, suggestions out.
+#[cfg(all(
+    feature = "store",
+    feature = "search",
+    feature = "matching",
+    feature = "auto-match"
+))]
+pub mod auto_model;
+
 #[cfg(feature = "report")]
 pub mod axes;
 
