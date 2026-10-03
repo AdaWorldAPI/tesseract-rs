@@ -70,7 +70,7 @@ pub use lance_graph_contract::exploration::NarsTruth;
 use tesseract_ogar::correction::{suggest, CorrectionPolicy, Lexicon};
 use tesseract_ogar::reasoning::{ReasoningError, SentenceReasoner};
 use tesseract_ogar::sentences::{assemble_sentences, AssembledSentence};
-use tesseract_ogar::{DocPage, PoS as V1Pos};
+use tesseract_ogar::{DocPage, PoS as V1Pos, Token as V1Token};
 
 /// Which SPO role a word occupies — the address a [`ConsistencyCorrection`]
 /// reports itself against.
@@ -404,6 +404,25 @@ impl GraphEngine {
         }
     }
 
+    /// The v1 → v2 seam: each v1 token whose surface is in v2's routing
+    /// vocabulary becomes one v2 [`Tagged`], tagged by [`Self::map_pos`].
+    /// Tokens outside the vocabulary are dropped here (the FSM never sees
+    /// them); the returned index is the token's position in `tokens`, so a
+    /// caller can line it up with per-token data such as OCR confidence.
+    ///
+    /// Pure and asset-free, so the seam can be tested without the cam96
+    /// release data.
+    fn seam_tags(vocab: &PaletteVocab, tokens: &[V1Token]) -> Vec<(usize, Tagged)> {
+        tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(i, tok)| {
+                let id = vocab.id(&tok.surface)?;
+                Some((i, Tagged::new(id, Self::map_pos(tok.pos, &tok.surface))))
+            })
+            .collect()
+    }
+
     /// Strip leading/trailing non-alphanumeric characters and lowercase —
     /// the normalization used to align a v1 token's `surface` against a
     /// flattened `DocWord.text`.
@@ -453,24 +472,21 @@ impl GraphEngine {
                 .zip(flat_words.iter())
                 .all(|(t, w)| Self::normalize(&t.surface) == Self::normalize(w));
 
-        let mut tagged = Vec::with_capacity(tokens.len() + 1);
+        let seam = Self::seam_tags(&self.nsm.vocab, &tokens);
+        let mut tagged = Vec::with_capacity(seam.len() + 1);
         let mut conf_by_id: HashMap<WordId, (f32, u32)> = HashMap::new();
-        let mut tokens_in_vocab = 0usize;
+        let tokens_in_vocab = seam.len();
 
-        for (i, tok) in tokens.iter().enumerate() {
-            let Some(id) = self.nsm.vocab.id(&tok.surface) else {
-                continue;
-            };
-            tokens_in_vocab += 1;
+        for (i, t) in seam {
             let conf = if well_aligned {
                 flat_confs[i]
             } else {
                 sentence.mean_conf
             };
-            let entry = conf_by_id.entry(id).or_insert((0.0, 0));
+            let entry = conf_by_id.entry(t.id).or_insert((0.0, 0));
             entry.0 += conf;
             entry.1 += 1;
-            tagged.push(Tagged::new(id, Self::map_pos(tok.pos, &tok.surface)));
+            tagged.push(t);
         }
         tagged.push(Tagged::new(0, V2Pos::Stop));
 
@@ -799,6 +815,99 @@ mod tests {
         // nothing (correction.rs itself declined) — never endorse from a
         // one-sided original-only signal.
         assert!(!GraphEngine::decide_endorse(Some(0.9), None));
+    }
+
+    /// The committed v1 COCA vocabulary in the sibling lance-graph checkout.
+    /// The seam test needs no other asset, so a missing directory is a
+    /// broken checkout and fails loudly rather than skipping.
+    fn v1_vocab_dir() -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../lance-graph/crates/deepnsm/word_frequency");
+        assert!(
+            dir.join("word_rank_lookup.csv").exists(),
+            "v1 vocabulary missing at {} — the lance-graph sibling checkout is required",
+            dir.display()
+        );
+        dir
+    }
+
+    /// One fixed sentence through the current v1 → v2 seam: v1 tokenizer and
+    /// tags, [`GraphEngine::map_pos`], a v2 routing vocabulary built from the
+    /// fixture's own surfaces, then v2's [`parse_to_spo`]. Rendered as
+    /// `surface:Pos …` plus the triples as words, so a pin reads as text.
+    fn seam_snapshot(reasoner: &SentenceReasoner, text: &str) -> String {
+        let tokens = reasoner.vocab().tokenize(text);
+        let mut vocab = PaletteVocab::new();
+        vocab.from_frequency_ranked(tokens.iter().map(|t| t.surface.as_str()));
+        let seam = GraphEngine::seam_tags(&vocab, &tokens);
+        let mut tagged: Vec<Tagged> = seam.iter().map(|(_, t)| *t).collect();
+        tagged.push(Tagged::new(0, V2Pos::Stop));
+        let word = |id: WordId| vocab.word(id).unwrap_or("?");
+        let tags: Vec<String> = seam
+            .iter()
+            .map(|(_, t)| format!("{}:{:?}", word(t.id), t.pos))
+            .collect();
+        let triples: Vec<String> = parse_to_spo(&tagged)
+            .into_iter()
+            .map(|s| {
+                format!(
+                    "({},{},{})",
+                    word(s.subject),
+                    word(s.predicate),
+                    word(s.object)
+                )
+            })
+            .collect();
+        format!("{} | {}", tags.join(" "), triples.join(" "))
+    }
+
+    /// W0 seam pin: the CURRENT v1-tag → `map_pos` → v2 FSM behaviour on fixed
+    /// input, recorded before the multi-reading decoder lands. It must go red
+    /// if the v1 tagger, `map_pos` or the v2 FSM changes what this path emits.
+    ///
+    /// Recorded facts, not endorsements:
+    /// - COCA `d` (determiner) never leaves `map_pos` as `Det`: `some` arrives
+    ///   from v1 as `Modal`, `this` and `all` as `Adverb` (an earlier COCA row
+    ///   wins), and all three leave as `Other`.
+    /// - Relativizers become `Rel` by surface; pronouns become `Noun`.
+    /// - v1's context-free tagger reads `slept` as a noun, so the relative
+    ///   clause yields the wrong triple `(slept,woke,man)`.
+    /// - `record` arrives as one tag (`Verb`) wherever it stands, so "that
+    ///   record" closes no triple.
+    #[test]
+    fn v1_to_v2_seam_is_pinned_on_fixed_input() {
+        let reasoner = SentenceReasoner::from_vocab_dir(&v1_vocab_dir()).expect("load v1 vocab");
+        let cases: [(&str, &str); 4] = [
+            ("This dog saw all the men.", "this:Other dog:Noun saw:Verb all:Other the:Det men:Noun | (dog,saw,men)"),
+            ("The man who slept woke the child.", "the:Det man:Noun who:Rel slept:Noun woke:Verb the:Det child:Noun | (slept,woke,man)"),
+            ("They record the deeds.", "they:Noun record:Verb the:Det deeds:Noun | (they,record,deeds)"),
+            ("Some people found that record.", "some:Other people:Noun found:Verb that:Rel record:Verb | "),
+        ];
+        let got: Vec<String> = cases
+            .iter()
+            .map(|(text, _)| seam_snapshot(&reasoner, text))
+            .collect();
+        let want: Vec<&str> = cases.iter().map(|(_, w)| *w).collect();
+        assert_eq!(got, want, "the v1 → v2 seam drifted");
+    }
+
+    /// A token outside the v2 vocabulary is dropped, and the tokens after it
+    /// keep their ORIGINAL v1 positions: `tag_sentence` indexes per-word OCR
+    /// confidence by these positions.
+    #[test]
+    fn seam_tags_skips_oov_and_keeps_original_positions() {
+        let reasoner = SentenceReasoner::from_vocab_dir(&v1_vocab_dir()).expect("load v1 vocab");
+        let tokens = reasoner.vocab().tokenize("The dog saw the men.");
+        assert_eq!(tokens.len(), 5, "fixture tokenization changed");
+        let mut vocab = PaletteVocab::new();
+        // `saw` (position 2) is left out of the v2 vocabulary.
+        vocab.from_frequency_ranked(["the", "dog", "men"]);
+        let seam = GraphEngine::seam_tags(&vocab, &tokens);
+        let got: Vec<(usize, &str)> = seam
+            .iter()
+            .map(|(i, t)| (*i, vocab.word(t.id).unwrap_or("?")))
+            .collect();
+        assert_eq!(got, [(0, "the"), (1, "dog"), (3, "the"), (4, "men")]);
     }
 
     #[test]

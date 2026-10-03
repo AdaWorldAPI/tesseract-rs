@@ -165,6 +165,27 @@ jobs:
     - name: Probe (paperless, token seam)
       working-directory: tesseract-rs
       run: cargo run --release -p tesseract-paperless --features token --example probe_token_seam
+    # `consistency` is `#[cfg(all(feature = "ocr", feature = "token"))]`: the
+    # one place v1 (tesseract-ogar's COCA tagger) meets v2 (deepnsm-v2's FSM).
+    # Neither single-feature line above compiles it, so it needs its own.
+    # The cam96 release assets are fetched so the real-data test runs instead
+    # of skipping; the seam pin itself needs only the lance-graph checkout.
+    # Release: the real-data test recognizes a page.
+    - name: Fetch cam96 data (paperless, ocr+token)
+      run: |
+        mkdir -p cam96
+        BASE=https://github.com/AdaWorldAPI/lance-graph/releases/download/v0.1.0-cam96-data
+        for f in cam96_codebook.bin cam96_codes.bin bible_vocab.txt; do
+          curl -fsSL --retry 3 -o "cam96/$f" "$BASE/$f"
+        done
+    - name: Test (paperless, ocr+token)
+      working-directory: tesseract-rs
+      env:
+        DEEPNSM_V2_CAM96_DIR: ${{ github.workspace }}/cam96
+      run: cargo test --release -p tesseract-paperless --features ocr,token --lib consistency
+    - name: Clippy (paperless, ocr+token)
+      working-directory: tesseract-rs
+      run: cargo clippy -p tesseract-paperless --features ocr,token --all-targets -- -D warnings
     - name: Test (paperless, store)
       working-directory: tesseract-rs
       run: cargo test -p tesseract-paperless --features store --verbose

@@ -4617,3 +4617,33 @@ Postings only; no text is stored.
 Falsifiers (disable-verified red-then-green): `a_german_plural_finds_its_singular`,
 `an_english_plural_finds_its_singular`, `a_stemmed_match_is_highlighted`,
 `a_reopened_index_still_stems`; silence twin `stemming_does_not_match_unrelated_words`.
+
+## ★ v1 ↔ v2 seam guards — before the multi-reading decoder (2026-10-03)
+
+`tesseract-paperless::consistency` is the one place v1 (tesseract-ogar's COCA
+tagger) meets v2 (deepnsm-v2's FSM), and it is gated on `ocr` AND `token`. No
+CI line enabled both, so it was never compiled. Now:
+
+- CI: `Test (paperless, ocr+token)` (release, cam96 release assets fetched so
+  the real-data test runs instead of skipping) and `Clippy (paperless,
+  ocr+token)`.
+- `consistency::seam_tags` — the v1-tag → `map_pos` → v2 `Tagged` loop pulled
+  out of `tag_sentence` unchanged, so it is testable without cam96 data.
+- `v1_to_v2_seam_is_pinned_on_fixed_input` pins four sentences as they are
+  today, defects included: `some`/`this`/`all` leave as `Other`, never `Det`;
+  v1 tags `slept` a noun, so "the man who slept woke the child" yields
+  `(slept,woke,man)`; "that record" closes no triple. Disable run: mapping
+  `Modal` to `Det` turns it red.
+- `tesseract-ogar/tests/v1_coca_d_baseline.rs` pins v1's COCA `d` handling
+  before any fix. 34 `d` lemmas, 24 tagged `Modal` (10 lose to an earlier
+  row: `this`, `that`, `all`, `both` and `much` as `Adverb`, the rest
+  otherwise; pinned by name). "Each man took any bread" yields the bogus
+  `(man,any,bread)`. The committed OCR ground truth's only `d` lemmas are
+  `all` and `this`, both tagged `Adverb`, so it has 0 `d`-lemma tokens tagged
+  `Modal`: a fix that only remaps `Modal` does not move the corpus goldens,
+  one that changes which row wins for `all`/`this` would. Disable run: `d` → `Article` in
+  deepnsm v1 turns the census and exact-case pins red and gives
+  `(man,take,bread)`.
+
+The `d` fix itself is not in this change; it changes shipped v1 /
+`spo_json` behaviour and belongs in its own measured PR.
