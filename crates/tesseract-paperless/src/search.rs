@@ -196,15 +196,19 @@ impl SearchResults {
     /// to render unescaped.
     #[must_use]
     pub fn snippet_html(&self, text: &str) -> String {
-        // The first field whose terms actually occur in `text` wins; if none
-        // highlights anything, fall back to the plain field's excerpt.
-        self.snippets
-            .iter()
-            .map(|g| g.snippet(text))
-            .find(|s| !s.highlighted().is_empty())
-            .or_else(|| self.snippets.first().map(|g| g.snippet(text)))
-            .map(|s| s.to_html())
-            .unwrap_or_default()
+        // Each generator highlights only the terms its own field produced, so
+        // a query mixing an exact term with a stem-only term is highlighted
+        // in full only by the stem field's generator. Take the snippet with
+        // the most highlighted ranges; on a tie (including none at all) keep
+        // the earliest, which is the plain field.
+        let mut best: Option<(usize, tantivy::snippet::Snippet)> = None;
+        for snippet in self.snippets.iter().map(|g| g.snippet(text)) {
+            let count = snippet.highlighted().len();
+            if best.as_ref().is_none_or(|(n, _)| count > *n) {
+                best = Some((count, snippet));
+            }
+        }
+        best.map(|(_, s)| s.to_html()).unwrap_or_default()
     }
 }
 
@@ -816,6 +820,21 @@ mod tests {
             "{}",
             results.snippet_html(text)
         );
+    }
+
+    /// A query that mixes an exact term with a stem-only term must still mark
+    /// the stem match. The plain field highlights only `paid`; the English
+    /// field highlights `invoice` and `paid`. Taking the first generator that
+    /// highlights anything would return the plain snippet and hide `invoice`.
+    #[test]
+    fn a_stem_match_is_highlighted_beside_an_exact_match() {
+        let (_dir, idx) = index();
+        let text = "The invoice was paid";
+        idx.index_document("en01", "a.pdf", text).expect("index");
+        let results = idx.search("invoices paid", 10).expect("search");
+        let html = results.snippet_html(text);
+        assert!(html.contains("<b>invoice</b>"), "{html}");
+        assert!(html.contains("<b>paid</b>"), "{html}");
     }
 
     /// Analyzers are not persisted by Tantivy; they are registered on every
