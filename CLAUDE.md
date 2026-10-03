@@ -4590,10 +4590,19 @@ the thresholds are unmeasured.
 `tesseract-paperless::search` now indexes the body text into one stemmed
 field per language (`text_en`, English Snowball; `text_de`, German Snowball)
 beside the plain `text` field (`STEM_LANGUAGES`). The archive records no
-per-document language — it OCRs with one model — so instead of picking a
-stemmer per document, every field analyzes the QUERY with its own stemmer:
-`Rechnungen` reaches `rechnung` through `text_de`, `invoices` reaches
-`invoice` through `text_en`. Postings only; no text is stored.
+per-document language — it OCRs with one model — so `stem_languages_for`
+attributes each document by its Snowball stopword counts and indexes it only
+into the dominant language's stem field (≥ 2× the other's count, a policy
+pin); a text with no clear language goes into every stem field. Every stem
+field analyzes the QUERY with its own stemmer: `Rechnungen` reaches
+`rechnung` through `text_de`, `invoices` reaches `invoice` through `text_en`.
+Postings only; no text is stored.
+
+- **Why attribution, not "every document into every field":** stemming German
+  text with the English stemmer lets `died` match the article `die`
+  (Bugbot, #102). Pinned by `an_english_query_does_not_reach_german_function_words`
+  and `a_german_query_does_not_reach_english_stems`; the fallback by
+  `a_text_without_function_words_is_indexed_for_every_language`.
 
 - **AUTO does not move.** `tokenize_text` still reads the plain field, so the
   AUTO vocabulary and its min_df/max_df cut-offs are unchanged. Mining on
