@@ -4584,3 +4584,27 @@ letting it stall; a policy pin.
 
 Not yet: the web app does not call it, nothing picks the content terms, and
 the thresholds are unmeasured.
+
+## ★ Search stems per language — and the choice is made at query time (2026-10-03)
+
+`tesseract-paperless::search` now indexes the body text into one stemmed
+field per language (`text_en`, English Snowball; `text_de`, German Snowball)
+beside the plain `text` field (`STEM_LANGUAGES`). The archive records no
+per-document language — it OCRs with one model — so instead of picking a
+stemmer per document, every field analyzes the QUERY with its own stemmer:
+`Rechnungen` reaches `rechnung` through `text_de`, `invoices` reaches
+`invoice` through `text_en`. Postings only; no text is stored.
+
+- **AUTO does not move.** `tokenize_text` still reads the plain field, so the
+  AUTO vocabulary and its min_df/max_df cut-offs are unchanged. Mining on
+  stemmed terms is a separate, measured decision.
+- **Analyzers are not persisted by Tantivy** and are registered on every
+  `open_or_create`; `a_reopened_index_still_stems` pins it.
+- **Migration is automatic:** the schema gains two fields, so an existing
+  index is wiped on open and `reconcile` rebuilds it from the archive.
+- **Snippets** try each field's generator and use the first that highlights,
+  so a match reached only through a stem is still marked.
+
+Falsifiers (disable-verified red-then-green): `a_german_plural_finds_its_singular`,
+`an_english_plural_finds_its_singular`, `a_stemmed_match_is_highlighted`,
+`a_reopened_index_still_stems`; silence twin `stemming_does_not_match_unrelated_words`.
