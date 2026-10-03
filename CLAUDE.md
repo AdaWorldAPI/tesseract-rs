@@ -4585,6 +4585,39 @@ letting it stall; a policy pin.
 Not yet: the web app does not call it, nothing picks the content terms, and
 the thresholds are unmeasured.
 
+## ★ Search stems per language — routed at index time, fanned out at query time (2026-10-03)
+
+`tesseract-paperless::search` now indexes the body text into one stemmed
+field per language (`text_en`, English Snowball; `text_de`, German Snowball)
+beside the plain `text` field (`STEM_LANGUAGES`). The archive records no
+per-document language — it OCRs with one model — so `stem_languages_for`
+attributes each document by its Snowball stopword counts and indexes it only
+into the dominant language's stem field (≥ 2× the other's count, a policy
+pin); a text with no clear language goes into every stem field. Every stem
+field analyzes the QUERY with its own stemmer: `Rechnungen` reaches
+`rechnung` through `text_de`, `invoices` reaches `invoice` through `text_en`.
+Postings only; no text is stored.
+
+- **Why attribution, not "every document into every field":** stemming German
+  text with the English stemmer lets `died` match the article `die`
+  (Bugbot, #102). Pinned by `an_english_query_does_not_reach_german_function_words`
+  and `a_german_query_does_not_reach_english_stems`; the fallback by
+  `a_text_without_function_words_is_indexed_for_every_language`.
+
+- **AUTO does not move.** `tokenize_text` still reads the plain field, so the
+  AUTO vocabulary and its min_df/max_df cut-offs are unchanged. Mining on
+  stemmed terms is a separate, measured decision.
+- **Analyzers are not persisted by Tantivy** and are registered on every
+  `open_or_create`; `a_reopened_index_still_stems` pins it.
+- **Migration is automatic:** the schema gains two fields, so an existing
+  index is wiped on open and `reconcile` rebuilds it from the archive.
+- **Snippets** try each field's generator and use the first that highlights,
+  so a match reached only through a stem is still marked.
+
+Falsifiers (disable-verified red-then-green): `a_german_plural_finds_its_singular`,
+`an_english_plural_finds_its_singular`, `a_stemmed_match_is_highlighted`,
+`a_reopened_index_still_stems`; silence twin `stemming_does_not_match_unrelated_words`.
+
 ## ★ v1 ↔ v2 seam guards — before the multi-reading decoder (2026-10-03)
 
 `tesseract-paperless::consistency` is the one place v1 (tesseract-ogar's COCA

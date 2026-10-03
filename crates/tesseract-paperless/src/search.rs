@@ -37,6 +37,35 @@
 //! which is also how a schema change is handled
 //! ([`SearchIndex::open_or_create`]).
 //!
+//! # Stemming, per language
+//!
+//! The body text is indexed three times: `text` with Tantivy's default
+//! analyzer (exact surface, and the analyzer the AUTO vocabulary reads via
+//! [`SearchIndex::tokenize_text`], so AUTO's terms do not move), plus one
+//! stemmed field per language in [`STEM_LANGUAGES`] (`text_en`, `text_de`).
+//! The text is owned by the archived `DocIr`; these fields are postings over
+//! it (lenses), never a second owner of the document.
+//!
+//! Two steps, at two different times:
+//!
+//! - **Index time — morphological routing.** [`stem_languages_for`] picks
+//!   which stem field(s) a document's postings go into, from observed
+//!   Snowball stopword evidence. If one language's stopwords clearly
+//!   outnumber the other's, the document goes only into that stem field. If
+//!   the evidence is ambiguous (no function words, or no clear winner), it
+//!   goes into every stem field, so recall in either language is kept. This
+//!   is a heuristic for choosing a stemmer, not a statement about the
+//!   document: the archive records no per-document language (it OCRs with
+//!   one model). The point of routing is to stop cross-language stem
+//!   collisions: stemming German text with the English stemmer would let
+//!   `died` match the article `die`.
+//! - **Query time — fan-out over the lenses.** A query is analyzed by every
+//!   field's own analyzer. `Rechnungen` reaches `rechnung` through the German
+//!   field, and `invoices` reaches `invoice` through the English one.
+//!
+//! Only postings are added; no text is stored. Tantivy does not persist
+//! analyzers, so they are registered on every [`SearchIndex::open_or_create`].
+//!
 //! Indexing is idempotent: [`SearchIndex::index_document`] deletes any
 //! existing doc with the same hash before adding the new one, then commits --
 //! the same delete-then-insert shape [`crate::store::LanceStore::put`]'s
@@ -56,9 +85,89 @@ use std::sync::Mutex;
 use tantivy::collector::{DocSetCollector, TopDocs};
 use tantivy::directory::MmapDirectory;
 use tantivy::query::{AllQuery, QueryParser};
-use tantivy::schema::{Field, Schema, Value, STORED, STRING, TEXT};
+use tantivy::schema::{
+    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED, STRING, TEXT,
+};
 use tantivy::snippet::SnippetGenerator;
+use tantivy::tokenizer::{
+    Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer,
+};
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+
+/// The languages the body text is stemmed for, each into its own field:
+/// `(field name, registered analyzer name, Snowball language)`. English and
+/// German match the two OCR models this workspace ships (`eng`, `deu`).
+pub const STEM_LANGUAGES: [(&str, &str, Language); 2] = [
+    ("text_en", "paperless_stem_en", Language::English),
+    ("text_de", "paperless_stem_de", Language::German),
+];
+
+/// The stemmed analyzer for one language: Tantivy's default chain
+/// (simple tokenizer, drop tokens over 40 bytes, lowercase) plus a Snowball
+/// stemmer. The stemmer does not lowercase, so the order matters.
+fn stem_analyzer(language: Language) -> TextAnalyzer {
+    TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(RemoveLongFilter::limit(40))
+        .filter(LowerCaser)
+        .filter(Stemmer::new(language))
+        .build()
+}
+
+/// How many times one language's function words must outnumber every other
+/// language's before a text is attributed to it alone. A policy pin, not a
+/// measurement: below it the text is indexed for every language.
+const LANGUAGE_DOMINANCE: usize = 2;
+
+/// How many of `text`'s tokens are Snowball stopwords of `language`: tokens
+/// in, minus tokens left after the stopword filter.
+fn stopword_hits(text: &str, language: Language) -> usize {
+    let count = |mut a: TextAnalyzer| {
+        let mut stream = a.token_stream(text);
+        let mut n = 0;
+        while stream.advance() {
+            n += 1;
+        }
+        n
+    };
+    let Some(stop) = StopWordFilter::new(language) else {
+        return 0;
+    };
+    let plain = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(LowerCaser)
+        .build();
+    let filtered = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(LowerCaser)
+        .filter(stop)
+        .build();
+    count(plain) - count(filtered)
+}
+
+/// Which [`STEM_LANGUAGES`] fields a document's text is indexed into -- an
+/// index-time morphological routing heuristic, not a language classification.
+///
+/// Stemming a text with another language's stemmer makes unrelated words
+/// collide (English `died` stems to `die`, the German article), so a text is
+/// indexed only for the language whose function words clearly dominate it.
+/// A text with none, or with no clear winner, is indexed for every language:
+/// it cannot be attributed, and dropping it from every stem field would lose
+/// recall rather than gain precision.
+#[must_use]
+pub fn stem_languages_for(text: &str) -> [bool; STEM_LANGUAGES.len()] {
+    let hits = STEM_LANGUAGES.map(|(_, _, language)| stopword_hits(text, language));
+    let mut out = [true; STEM_LANGUAGES.len()];
+    for (i, &h) in hits.iter().enumerate() {
+        let dominates = h > 0
+            && hits.iter().enumerate().all(|(j, &other)| {
+                j == i || h >= other.saturating_mul(LANGUAGE_DOMINANCE).max(1) && h > other
+            });
+        if dominates {
+            out = [false; STEM_LANGUAGES.len()];
+            out[i] = true;
+            break;
+        }
+    }
+    out
+}
 
 /// One ranked search result: a reference into the archive, never text.
 #[derive(Debug, Clone)]
@@ -74,7 +183,10 @@ pub struct SearchHit {
 pub struct SearchResults {
     /// Hits, highest score first.
     pub hits: Vec<SearchHit>,
-    snippets: SnippetGenerator,
+    /// One generator per body field (plain, then each stem field): a query
+    /// can match a document only through a stem field, and a generator only
+    /// highlights the terms its own field produced.
+    snippets: Vec<SnippetGenerator>,
 }
 
 impl SearchResults {
@@ -84,7 +196,19 @@ impl SearchResults {
     /// to render unescaped.
     #[must_use]
     pub fn snippet_html(&self, text: &str) -> String {
-        self.snippets.snippet(text).to_html()
+        // Each generator highlights only the terms its own field produced, so
+        // a query mixing an exact term with a stem-only term is highlighted
+        // in full only by the stem field's generator. Take the snippet with
+        // the most highlighted ranges; on a tie (including none at all) keep
+        // the earliest, which is the plain field.
+        let mut best: Option<(usize, tantivy::snippet::Snippet)> = None;
+        for snippet in self.snippets.iter().map(|g| g.snippet(text)) {
+            let count = snippet.highlighted().len();
+            if best.as_ref().is_none_or(|(n, _)| count > *n) {
+                best = Some((count, snippet));
+            }
+        }
+        best.map(|(_, s)| s.to_html()).unwrap_or_default()
     }
 }
 
@@ -146,6 +270,8 @@ struct Fields {
     hash: Field,
     filename: Field,
     text: Field,
+    /// One per [`STEM_LANGUAGES`] entry, in that order.
+    text_stem: [Field; STEM_LANGUAGES.len()],
 }
 
 fn schema_and_fields() -> (Schema, Fields) {
@@ -153,12 +279,19 @@ fn schema_and_fields() -> (Schema, Fields) {
     let hash = b.add_text_field("hash", STRING | STORED);
     let filename = b.add_text_field("filename", TEXT);
     let text = b.add_text_field("text", TEXT);
+    let text_stem = STEM_LANGUAGES.map(|(field, analyzer, _)| {
+        let indexing = TextFieldIndexing::default()
+            .set_tokenizer(analyzer)
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+        b.add_text_field(field, TextOptions::default().set_indexing_options(indexing))
+    });
     (
         b.build(),
         Fields {
             hash,
             filename,
             text,
+            text_stem,
         },
     )
 }
@@ -209,6 +342,11 @@ impl SearchIndex {
         }
         let mmap = MmapDirectory::open(dir)?;
         let index = Index::open_or_create(mmap, schema)?;
+        for (_, analyzer, language) in STEM_LANGUAGES {
+            index
+                .tokenizers()
+                .register(analyzer, stem_analyzer(language));
+        }
         let writer: IndexWriter = index.writer(50_000_000)?;
         // `Manual`, not `OnCommitWithDelay`: the delayed policy reloads the
         // reader ASYNCHRONOUSLY off a filesystem watcher, so a search that
@@ -317,11 +455,18 @@ impl SearchIndex {
         }
         for &(hash_hex, filename, text) in upserts {
             writer.delete_term(Term::from_field_text(self.fields.hash, hash_hex));
-            writer.add_document(doc!(
+            let mut d = doc!(
                 self.fields.hash => hash_hex,
                 self.fields.filename => filename,
                 self.fields.text => text,
-            ))?;
+            );
+            let languages = stem_languages_for(text);
+            for (field, on) in self.fields.text_stem.into_iter().zip(languages) {
+                if on {
+                    d.add_text(field, text);
+                }
+            }
+            writer.add_document(d)?;
         }
         writer.commit()?;
         drop(writer);
@@ -358,11 +503,19 @@ impl SearchIndex {
     /// [`SearchError::Tantivy`] on a search failure.
     pub fn search(&self, query_str: &str, limit: usize) -> Result<SearchResults, SearchError> {
         let searcher = self.reader.searcher();
-        let query_parser =
-            QueryParser::for_index(&self.index, vec![self.fields.filename, self.fields.text]);
+        let mut fields = vec![self.fields.filename, self.fields.text];
+        fields.extend(self.fields.text_stem);
+        let query_parser = QueryParser::for_index(&self.index, fields);
         let query = query_parser.parse_query(query_str)?;
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
-        let snippets = SnippetGenerator::create(&searcher, &*query, self.fields.text)?;
+        let mut snippets = vec![SnippetGenerator::create(
+            &searcher,
+            &*query,
+            self.fields.text,
+        )?];
+        for field in self.fields.text_stem {
+            snippets.push(SnippetGenerator::create(&searcher, &*query, field)?);
+        }
 
         let mut hits = Vec::with_capacity(top_docs.len());
         for (score, addr) in top_docs {
@@ -617,5 +770,202 @@ mod tests {
             idx.indexed_hashes().expect("hashes"),
             vec!["aa11".to_string()]
         );
+    }
+
+    /// German inflection reaches the German stem field: the plural finds a
+    /// document that only has the singular. The plain `text` field alone
+    /// cannot do this (`rechnungen` != `rechnung`).
+    #[test]
+    fn a_german_plural_finds_its_singular() {
+        let (_dir, idx) = index();
+        idx.index_document("de01", "a.pdf", "Die Rechnung vom Mai")
+            .expect("index");
+        let hits = idx.search("Rechnungen", 10).expect("search").hits;
+        assert_eq!(hits.len(), 1, "German plural must match the singular");
+        assert_eq!(hits[0].hash_hex, "de01");
+    }
+
+    /// The English half of the same rule.
+    #[test]
+    fn an_english_plural_finds_its_singular() {
+        let (_dir, idx) = index();
+        idx.index_document("en01", "a.pdf", "one invoice attached")
+            .expect("index");
+        let hits = idx.search("invoices", 10).expect("search").hits;
+        assert_eq!(hits.len(), 1, "English plural must match the singular");
+    }
+
+    /// The silence twin: stemming widens a word to its own family, not to
+    /// unrelated words. A stem field that matched everything would pass the
+    /// two tests above and fail this one.
+    #[test]
+    fn stemming_does_not_match_unrelated_words() {
+        let (_dir, idx) = index();
+        idx.index_document("de01", "a.pdf", "Die Rechnung vom Mai")
+            .expect("index");
+        assert!(idx.search("Vertrag", 10).expect("search").hits.is_empty());
+        assert!(idx.search("contracts", 10).expect("search").hits.is_empty());
+    }
+
+    /// A stemmed match is highlighted: the snippet marks the surface word the
+    /// query reached through its stem, not nothing.
+    #[test]
+    fn a_stemmed_match_is_highlighted() {
+        let (_dir, idx) = index();
+        let text = "one invoice attached";
+        idx.index_document("en01", "a.pdf", text).expect("index");
+        let results = idx.search("invoices", 10).expect("search");
+        assert!(
+            results.snippet_html(text).contains("<b>invoice</b>"),
+            "{}",
+            results.snippet_html(text)
+        );
+    }
+
+    /// A query that mixes an exact term with a stem-only term must still mark
+    /// the stem match. The plain field highlights only `paid`; the English
+    /// field highlights `invoice` and `paid`. Taking the first generator that
+    /// highlights anything would return the plain snippet and hide `invoice`.
+    #[test]
+    fn a_stem_match_is_highlighted_beside_an_exact_match() {
+        let (_dir, idx) = index();
+        let text = "The invoice was paid";
+        idx.index_document("en01", "a.pdf", text).expect("index");
+        let results = idx.search("invoices paid", 10).expect("search");
+        let html = results.snippet_html(text);
+        assert!(html.contains("<b>invoice</b>"), "{html}");
+        assert!(html.contains("<b>paid</b>"), "{html}");
+    }
+
+    /// Analyzers are not persisted by Tantivy; they are registered on every
+    /// open. A reopened index must still stem, or a restart would silently
+    /// fall back to unknown-tokenizer errors or exact matching.
+    #[test]
+    fn a_reopened_index_still_stems() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        SearchIndex::open_or_create(dir.path())
+            .expect("first open")
+            .index_document("de01", "a.pdf", "Die Rechnung vom Mai")
+            .expect("index");
+        let idx = SearchIndex::open_or_create(dir.path()).expect("reopen");
+        assert_eq!(idx.search("Rechnungen", 10).expect("search").hits.len(), 1);
+    }
+
+    /// Cross-language collisions stay out (review on #102): English stemming
+    /// of German text would turn the article `die` into a match for `died`.
+    /// A German document is indexed for German only, so the English query
+    /// reaches nothing in it.
+    #[test]
+    fn an_english_query_does_not_reach_german_function_words() {
+        let (_dir, idx) = index();
+        idx.index_document("de01", "a.pdf", "Die Rechnung vom Mai und die Mahnung")
+            .expect("index");
+        assert!(idx.search("died", 10).expect("search").hits.is_empty());
+        // ...while the German family still matches it.
+        assert_eq!(idx.search("Rechnungen", 10).expect("search").hits.len(), 1);
+    }
+
+    /// The reverse direction: an English document is not stemmed as German.
+    #[test]
+    fn a_german_query_does_not_reach_english_stems() {
+        let (_dir, idx) = index();
+        idx.index_document(
+            "en01",
+            "a.pdf",
+            "The invoice was paid and the receipt is attached",
+        )
+        .expect("index");
+        assert_eq!(idx.search("invoices", 10).expect("search").hits.len(), 1);
+        assert_eq!(
+            stem_languages_for("The invoice was paid and the receipt is attached"),
+            [true, false]
+        );
+    }
+
+    /// A text with no function words in either language (a bare keyword
+    /// list, a filename-like line) cannot be attributed, so it is indexed for
+    /// every language rather than for none.
+    #[test]
+    fn a_text_without_function_words_is_indexed_for_every_language() {
+        assert_eq!(stem_languages_for("Rechnung invoice 2026"), [true, true]);
+        let (_dir, idx) = index();
+        idx.index_document("xx01", "a.pdf", "Rechnung invoice 2026")
+            .expect("index");
+        assert_eq!(idx.search("Rechnungen", 10).expect("search").hits.len(), 1);
+        assert_eq!(idx.search("invoices", 10).expect("search").hits.len(), 1);
+    }
+
+    /// Controlled ranking falsifier: does the number of equivalent indexed
+    /// lenses change a document's score?
+    ///
+    /// Both documents carry the same source text, the same filename, the same
+    /// plain `text` field and the same `text_en` field. Doc B additionally
+    /// carries `text_de`. The token `alpha` analyzes to `alpha` in every
+    /// lens (asserted below), so the extra field shows the same single
+    /// observation again -- nothing more. The documents are written directly
+    /// through the writer to bypass [`stem_languages_for`]: routing a document
+    /// differently would require changing its text, which would change its
+    /// length, stopword counts and BM25 statistics.
+    ///
+    /// Measured: A = 0.364643, B = 0.856554. The query parser joins the
+    /// fields as optional clauses, and their BM25 scores are summed.
+    /// A = 2 x ln(1.2) (`text` + `text_en`, df 2 of 2); B adds the `text_de`
+    /// term, ln(2) x 0.70968 (df 1, average field length 0.5). So the same
+    /// observation counts once per lens it is visible through, and a sparser
+    /// lens counts for more. Equivalent lenses should combine as alternative
+    /// readings (MAX-like), not as independent relevance evidence.
+    ///
+    /// This test PINS THE KNOWN VIOLATION; it does not endorse it. A ranking
+    /// change that combines equivalent lenses as alternatives makes it fail,
+    /// and it must then be re-pinned to equal scores.
+    #[test]
+    fn equivalent_lens_multiplicity_currently_adds_score() {
+        let token = "alpha";
+        for (_, _, language) in STEM_LANGUAGES {
+            let mut analyzer = stem_analyzer(language);
+            let mut stream = analyzer.token_stream(token);
+            let mut out = Vec::new();
+            while let Some(t) = stream.next() {
+                out.push(t.text.clone());
+            }
+            assert_eq!(out, [token], "{language:?} must preserve {token}");
+        }
+
+        let (_dir, idx) = index();
+        assert_eq!(idx.tokenize_text(token).expect("tokenize"), [token]);
+        let [en, de] = idx.fields.text_stem;
+        {
+            let mut w = idx.writer.lock().expect("writer");
+            w.add_document(doc!(
+                idx.fields.hash => "docA",
+                idx.fields.filename => "doc.pdf",
+                idx.fields.text => token,
+                en => token,
+            ))
+            .expect("add A");
+            w.add_document(doc!(
+                idx.fields.hash => "docB",
+                idx.fields.filename => "doc.pdf",
+                idx.fields.text => token,
+                en => token,
+                de => token,
+            ))
+            .expect("add B");
+            w.commit().expect("commit");
+        }
+        idx.reader.reload().expect("reload");
+
+        let hits = idx.search(token, 10).expect("search").hits;
+        let score = |h: &str| {
+            hits.iter()
+                .find(|x| x.hash_hex == h)
+                .map(|x| x.score)
+                .expect("both documents match")
+        };
+        let (a, b) = (score("docA"), score("docB"));
+        // Doc A alone already sums two equivalent lenses.
+        assert!((a - 2.0 * 1.2f32.ln()).abs() < 1e-4, "A = {a}");
+        // The extra equivalent lens raises B above A.
+        assert!(b > a + 0.4, "A = {a}, B = {b}");
     }
 }
