@@ -60,9 +60,10 @@ fn sentence(text: &str) -> AssembledSentence {
 }
 
 /// The `d` census: 34 distinct `d` lemmas, 24 of which reach the tagger as
-/// `Modal`. The other 10 (`that`, `more`, `most`, `less`, `enough`, `little`,
-/// `either`, `neither`, `matter`, `no`) have an earlier row with another PoS,
-/// and v1's first row wins.
+/// `Modal`. The other 10 have an earlier row with another PoS, and v1's first
+/// row wins; they are pinned by name below. `this`, `that`, `all` and `both`
+/// are among them (tagged `Adverb`), which is why the corpus ground truth,
+/// whose only `d` lemmas are `all` and `this`, has no `Modal` token.
 #[test]
 fn every_coca_d_lemma_is_tagged_modal_today() {
     let dir = vocab_dir();
@@ -82,6 +83,16 @@ fn every_coca_d_lemma_is_tagged_modal_today() {
         (lemmas.len(), modal.len()),
         (34, 24),
         "d lemmas / tagged Modal: {lemmas:?}"
+    );
+    let not_modal: Vec<&str> = lemmas
+        .iter()
+        .filter(|w| !modal.contains(w))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        not_modal,
+        ["this", "that", "all", "much", "own", "another", "such", "each", "both", "half"],
+        "d lemmas an earlier row tags as something other than Modal"
     );
     // Anti-vacuity: the census must contain the determiners named above, so a
     // file or parse change cannot empty it unnoticed.
@@ -138,9 +149,12 @@ fn determiner_sentences_through_analyze_are_pinned() {
 /// tokens are `d` lemmas tagged `Modal`, and how many triples `analyze`
 /// extracts in total.
 ///
-/// Measured: the ground truth has NO `d`-lemma token tagged `Modal`, so a
-/// `d` fix is not expected to move this test at all; it guards the corpus
-/// goldens against collateral change. The exact cases above carry the teeth.
+/// Measured: the ground truth's only `d` lemmas are `all` (twice) and `this`
+/// (once), and v1 tags both `Adverb`, so no `d`-lemma token is tagged `Modal`.
+/// A fix that only remaps `Modal` therefore does not move this test; a fix that
+/// also changes which COCA row wins for `all`/`this` would. It guards the
+/// corpus goldens against collateral change; the exact cases above carry the
+/// teeth.
 #[test]
 fn corpus_ground_truth_d_statistics_are_pinned() {
     let dir = vocab_dir();

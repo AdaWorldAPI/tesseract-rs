@@ -4636,9 +4636,12 @@ CI line enabled both, so it was never compiled. Now:
   `Modal` to `Det` turns it red.
 - `tesseract-ogar/tests/v1_coca_d_baseline.rs` pins v1's COCA `d` handling
   before any fix. 34 `d` lemmas, 24 tagged `Modal` (10 lose to an earlier
-  row). "Each man took any bread" yields the bogus `(man,any,bread)`. The
-  committed OCR ground truth has 0 `d`-lemma tokens tagged `Modal`, so a `d`
-  fix should not move the corpus goldens. Disable run: `d` → `Article` in
+  row: `this`, `that`, `all`, `both` and `much` as `Adverb`, the rest
+  otherwise; pinned by name). "Each man took any bread" yields the bogus
+  `(man,any,bread)`. The committed OCR ground truth's only `d` lemmas are
+  `all` and `this`, both tagged `Adverb`, so it has 0 `d`-lemma tokens tagged
+  `Modal`: a fix that only remaps `Modal` does not move the corpus goldens,
+  one that changes which row wins for `all`/`this` would. Disable run: `d` → `Article` in
   deepnsm v1 turns the census and exact-case pins red and gives
   `(man,take,bread)`.
 

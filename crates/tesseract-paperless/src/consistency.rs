@@ -866,8 +866,9 @@ mod tests {
     /// if the v1 tagger, `map_pos` or the v2 FSM changes what this path emits.
     ///
     /// Recorded facts, not endorsements:
-    /// - COCA `d` (determiner) arrives from v1 as `Modal` and leaves `map_pos`
-    ///   as `Other` (`this`, `all`, `some`), never as `Det`.
+    /// - COCA `d` (determiner) never leaves `map_pos` as `Det`: `some` arrives
+    ///   from v1 as `Modal`, `this` and `all` as `Adverb` (an earlier COCA row
+    ///   wins), and all three leave as `Other`.
     /// - Relativizers become `Rel` by surface; pronouns become `Noun`.
     /// - v1's context-free tagger reads `slept` as a noun, so the relative
     ///   clause yields the wrong triple `(slept,woke,man)`.
@@ -888,6 +889,25 @@ mod tests {
             .collect();
         let want: Vec<&str> = cases.iter().map(|(_, w)| *w).collect();
         assert_eq!(got, want, "the v1 → v2 seam drifted");
+    }
+
+    /// A token outside the v2 vocabulary is dropped, and the tokens after it
+    /// keep their ORIGINAL v1 positions: `tag_sentence` indexes per-word OCR
+    /// confidence by these positions.
+    #[test]
+    fn seam_tags_skips_oov_and_keeps_original_positions() {
+        let reasoner = SentenceReasoner::from_vocab_dir(&v1_vocab_dir()).expect("load v1 vocab");
+        let tokens = reasoner.vocab().tokenize("The dog saw the men.");
+        assert_eq!(tokens.len(), 5, "fixture tokenization changed");
+        let mut vocab = PaletteVocab::new();
+        // `saw` (position 2) is left out of the v2 vocabulary.
+        vocab.from_frequency_ranked(["the", "dog", "men"]);
+        let seam = GraphEngine::seam_tags(&vocab, &tokens);
+        let got: Vec<(usize, &str)> = seam
+            .iter()
+            .map(|(i, t)| (*i, vocab.word(t.id).unwrap_or("?")))
+            .collect();
+        assert_eq!(got, [(0, "the"), (1, "dog"), (3, "the"), (4, "men")]);
     }
 
     #[test]
