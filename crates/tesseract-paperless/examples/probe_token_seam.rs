@@ -183,22 +183,11 @@ fn alice(max_spans: usize) -> Corpus {
     }
 }
 
-/// `word -> Pos`, from the committed COCA projection. The COCA letter mapping is
-/// `DeepNSM`'s own; it lives in BOTH of that crate's examples, byte-identical,
-/// because `deepnsm_v2::lexicon` was DELETED by an earlier audit on the ground
-/// that `lance-graph-planner`'s `insight_coca_read` already grounds it. That
-/// grounding does not reach here: `insight_coca_read` is itself an example
-/// binary in a crate outside this repo's dependency barrier. So re-stating the
-/// twenty-line tagger is the ONE duplication this seam forces, and the report
-/// records the deletion rather than quietly re-adding the module.
+/// `word -> Pos`, from the committed COCA projection. The COCA letter fold is
+/// deepnsm-v2's own `coca` module (D-LXC-2); the copy that used to live here is
+/// gone.
 fn coca_pos(letter: &str) -> Pos {
-    match letter {
-        "n" | "p" => Pos::Noun,
-        "v" => Pos::Verb,
-        "j" => Pos::Adj,
-        "a" | "d" => Pos::Det,
-        _ => Pos::Other,
-    }
+    deepnsm_v2::coca::fsm_pos_tag(letter)
 }
 
 fn load_vocab() -> (PaletteVocab, HashMap<String, Pos>) {
