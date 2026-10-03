@@ -11,18 +11,20 @@
 //!   given, and HIGH-confidence words are the anchors this whole module
 //!   depends on and never itself corrects. Fast, first-pass, load-bearing.
 //! - **Graph/grammar consistency recovery.** deepnsm-v2's REAL
-//!   [`deepnsm_v2::fsm::parse_to_spo`] (not v1's) runs on every assembled
+//!   multi-reading FSM (not v1's parser) runs on every assembled
 //!   sentence, producing role-typed (subject/predicate/object) triples
 //!   addressed to `(page, line_indices, bbox)` — a document's own natural
-//!   tree in place of the KJV's book:chapter:verse. **Honest scope, stated
-//!   once and not glossed over below:** the PoS TAGGING step is NOT new —
-//!   it reuses v1's SAME context-free COCA tagger (`SentenceReasoner::vocab`,
-//!   re-exported for exactly this reuse), so it carries v1's SAME
-//!   noun/verb-homograph weakness (documented in `reasoning.rs`). What v2
-//!   contributes that v1 structurally cannot is the FSM's clause machinery
-//!   (relative clauses, subject-carry chaining) and, above all, a TRAINED
-//!   distributional semantic space (`Nsm::word_similarity`) — v1 has no
-//!   notion of meaning distance at all. "Consistency recovery" here means:
+//!   tree in place of the KJV's book:chapter:verse. **Honest scope:** v1
+//!   (`SentenceReasoner::vocab`) only splits the sentence into surfaces; the
+//!   readings come from v2's own lexical layer — the COCA lemma table first
+//!   (F9), then every `word_forms.csv` reading, folded by
+//!   [`deepnsm_v2::coca`] — and v2's multi-reading FSM
+//!   ([`deepnsm_v2::fsm::parse_readings`]) keeps the readings the structure
+//!   cannot separate. Triples found on every surviving reading are
+//!   [`GraphSentence::triples`]; the rest are only counted
+//!   ([`GraphSentence::alternative_triples`]). What v2 contributes beyond
+//!   that is the clause machinery (relative clauses, subject-carry chaining)
+//!   and a TRAINED distributional semantic space (`Nsm::word_similarity`). "Consistency recovery" here means:
 //!   a low-confidence role-filler's Levenshtein candidate (from
 //!   [`tesseract_ogar::correction`]) is endorsed only when it is
 //!   MEANING-CLOSER to the sentence's own other high-confidence content
@@ -60,8 +62,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use deepnsm_v2::coca::{fsm_pos_tag, reading_set};
 use deepnsm_v2::codebook::{load_cam96_codes, load_cam96_space, CodebookError};
-use deepnsm_v2::fsm::{parse_to_spo, Pos as V2Pos, Tagged};
+use deepnsm_v2::fsm::{parse_readings, Pos as V2Pos, PosSet, Reading};
+#[cfg(test)]
+use deepnsm_v2::fsm::{parse_to_spo, Tagged};
+use deepnsm_v2::lexical::{load_word_forms_csv, LexicalEvidence};
 use deepnsm_v2::vocab::WordId;
 use deepnsm_v2::{Nsm, PaletteVocab};
 
@@ -70,7 +76,9 @@ pub use lance_graph_contract::exploration::NarsTruth;
 use tesseract_ogar::correction::{suggest, CorrectionPolicy, Lexicon};
 use tesseract_ogar::reasoning::{ReasoningError, SentenceReasoner};
 use tesseract_ogar::sentences::{assemble_sentences, AssembledSentence};
-use tesseract_ogar::{DocPage, PoS as V1Pos, Token as V1Token};
+#[cfg(test)]
+use tesseract_ogar::PoS as V1Pos;
+use tesseract_ogar::{DocPage, Token as V1Token};
 
 /// Which SPO role a word occupies — the address a [`ConsistencyCorrection`]
 /// reports itself against.
@@ -138,8 +146,13 @@ impl GraphTriple {
 pub struct GraphSentence {
     /// The source sentence (text, bbox, contributing lines, OCR `mean_conf`).
     pub sentence: AssembledSentence,
-    /// SPO triples the v2 FSM resolved from this sentence's tokens.
+    /// SPO triples the v2 FSM resolved from this sentence's tokens: those
+    /// found on every reading the structure could not rule out.
     pub triples: Vec<GraphTriple>,
+    /// Triples found on only some readings (a homograph the structure could
+    /// not separate). Counted, not built: no confidence or truth is attached
+    /// to a reading that may not hold.
+    pub alternative_triples: usize,
     /// Tokens the v1 tagger produced for this sentence.
     pub tokens_total: usize,
     /// Of those, how many resolved to a `WordId` in v2's trained vocabulary
@@ -192,6 +205,8 @@ pub enum GraphEngineError {
     Reasoning(ReasoningError),
     /// Building the correction lexicon from the same vocab dir failed.
     Lexicon(String),
+    /// Loading v2's lexical evidence (`word_forms.csv`) failed.
+    Evidence(deepnsm_v2::lexical::EvidenceError),
     /// Loading the trained CAM-PQ 96 codebook failed.
     Codebook(CodebookError),
     /// Reading one of the asset files failed.
@@ -203,6 +218,7 @@ impl std::fmt::Display for GraphEngineError {
         match self {
             Self::Reasoning(e) => write!(f, "v1 vocabulary: {e}"),
             Self::Lexicon(e) => write!(f, "correction lexicon: {e}"),
+            Self::Evidence(e) => write!(f, "lexical evidence: {e}"),
             Self::Codebook(e) => write!(f, "cam96 codebook: {e:?}"),
             Self::Io(e) => write!(f, "io: {e}"),
         }
@@ -210,6 +226,49 @@ impl std::fmt::Display for GraphEngineError {
 }
 
 impl std::error::Error for GraphEngineError {}
+
+/// v2's lexical layer for `vocab`, from the COCA tables in `vocab_dir`: every
+/// `word_forms.csv` reading of each in-vocabulary surface, and the lemma
+/// table's first-row tag per lemma, both folded by [`deepnsm_v2::coca`].
+fn load_lexical(
+    vocab_dir: &Path,
+    vocab: &PaletteVocab,
+) -> Result<(LexicalEvidence, HashMap<String, V2Pos>), GraphEngineError> {
+    let read = |name: &str| std::fs::read_to_string(vocab_dir.join(name));
+    let lemmas_csv = read("lemmas_5k.csv").map_err(GraphEngineError::Io)?;
+    let forms_csv = read("word_forms.csv").map_err(GraphEngineError::Io)?;
+    let mut lemma_tags = HashMap::new();
+    for line in lemmas_csv.lines().skip(1) {
+        let f: Vec<&str> = line.split(',').collect();
+        if let (Some(lemma), Some(pos)) = (f.get(1), f.get(2)) {
+            lemma_tags
+                .entry(lemma.to_lowercase())
+                .or_insert_with(|| fsm_pos_tag(pos));
+        }
+    }
+    let (evidence, _report) = load_word_forms_csv(&lowercase_word_column(&forms_csv), vocab)
+        .map_err(GraphEngineError::Evidence)?;
+    Ok((evidence, lemma_tags))
+}
+
+/// Lowercase the `word` column of `word_forms.csv`, leaving the header and the
+/// other fields as they are: `load_word_forms_csv` matches surfaces exactly,
+/// and the tokenizer lowercases. Same rule as deepnsm-v2's `bible_wave`.
+fn lowercase_word_column(forms_csv: &str) -> String {
+    let mut out = String::with_capacity(forms_csv.len());
+    for (i, line) in forms_csv.lines().enumerate() {
+        match line.rsplit_once(',') {
+            Some((head, word)) if i > 0 => {
+                out.push_str(head);
+                out.push(',');
+                out.push_str(&word.to_lowercase());
+            }
+            _ => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
 
 /// Confidence threshold (0-100) below which a role-filler is a candidate for
 /// consistency recovery, AND below which it is excluded from the "trusted
@@ -251,13 +310,19 @@ pub struct GraphEngine {
     lexicon: Lexicon,
     policy: CorrectionPolicy,
     nsm: Nsm,
+    /// v2's lexical layer over the same routing vocabulary: every COCA
+    /// reading of every in-vocabulary surface (`word_forms.csv`).
+    evidence: LexicalEvidence,
+    /// The COCA lemma table (`lemmas_5k.csv`), first row per lemma, folded by
+    /// [`deepnsm_v2::coca`] — consulted before the forms readings (F9).
+    lemma_tags: HashMap<String, V2Pos>,
 }
 
 /// [`GraphEngine::tag_sentence`]'s result — its own struct purely for
 /// readability (clippy's `type_complexity` on the equivalent 5-tuple);
 /// every field is read at the one call site via destructuring.
 struct TaggedSentence {
-    tagged: Vec<Tagged>,
+    readings: Vec<Reading>,
     conf_by_id: HashMap<WordId, (f32, u32)>,
     tokens_total: usize,
     tokens_in_vocab: usize,
@@ -318,11 +383,15 @@ impl GraphEngine {
 
         let nsm = Nsm::with_codes(vocab, space, codes);
 
+        let (evidence, lemma_tags) = load_lexical(vocab_dir, &nsm.vocab)?;
+
         Ok(Self {
             reasoner,
             lexicon,
             policy: CorrectionPolicy::default(),
             nsm,
+            evidence,
+            lemma_tags,
         })
     }
 
@@ -384,6 +453,7 @@ impl GraphEngine {
     /// [`V2Pos::Rel`] regardless of their v1 tag (Pronoun or Conjunction —
     /// v1's tag set does not distinguish a relativizer from either), since
     /// v2's relative-clause machinery is exactly what those words feed.
+    #[cfg(test)]
     fn map_pos(pos: V1Pos, surface: &str) -> V2Pos {
         if matches!(surface, "that" | "which" | "who" | "whom" | "whose") {
             return V2Pos::Rel;
@@ -412,6 +482,7 @@ impl GraphEngine {
     ///
     /// Pure and asset-free, so the seam can be tested without the cam96
     /// release data.
+    #[cfg(test)]
     fn seam_tags(vocab: &PaletteVocab, tokens: &[V1Token]) -> Vec<(usize, Tagged)> {
         tokens
             .iter()
@@ -419,6 +490,39 @@ impl GraphEngine {
             .filter_map(|(i, tok)| {
                 let id = vocab.id(&tok.surface)?;
                 Some((i, Tagged::new(id, Self::map_pos(tok.pos, &tok.surface))))
+            })
+            .collect()
+    }
+
+    /// The v2 lexical seam: each v1 token whose surface is in v2's routing
+    /// vocabulary becomes one v2 [`Reading`] carrying EVERY reading v2's
+    /// lexical layer admits. v1 contributes only the surface split; its tags
+    /// are not read.
+    ///
+    /// Readings, in order: a relativizer surface (`that`, `which`, `who`,
+    /// `whom`, `whose`) is [`V2Pos::Rel`]; else the lemma table's tag (F9);
+    /// else every [`LexicalEvidence`] reading, folded by [`deepnsm_v2::coca`];
+    /// else [`PosSet::EMPTY`] (unknown — never a guessed reading).
+    fn seam_readings(
+        vocab: &PaletteVocab,
+        evidence: &LexicalEvidence,
+        lemma_tags: &HashMap<String, V2Pos>,
+        tokens: &[V1Token],
+    ) -> Vec<(usize, Reading)> {
+        tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(i, tok)| {
+                let id = vocab.id(&tok.surface)?;
+                let s = tok.surface.as_str();
+                let pos = if matches!(s, "that" | "which" | "who" | "whom" | "whose") {
+                    PosSet::single(V2Pos::Rel)
+                } else if let Some(&p) = lemma_tags.get(s) {
+                    PosSet::single(p)
+                } else {
+                    reading_set(evidence, id).unwrap_or(PosSet::EMPTY)
+                };
+                Some((i, Reading::new(id, pos)))
             })
             .collect()
     }
@@ -472,8 +576,8 @@ impl GraphEngine {
                 .zip(flat_words.iter())
                 .all(|(t, w)| Self::normalize(&t.surface) == Self::normalize(w));
 
-        let seam = Self::seam_tags(&self.nsm.vocab, &tokens);
-        let mut tagged = Vec::with_capacity(seam.len() + 1);
+        let seam = Self::seam_readings(&self.nsm.vocab, &self.evidence, &self.lemma_tags, &tokens);
+        let mut readings = Vec::with_capacity(seam.len() + 1);
         let mut conf_by_id: HashMap<WordId, (f32, u32)> = HashMap::new();
         let tokens_in_vocab = seam.len();
 
@@ -486,12 +590,12 @@ impl GraphEngine {
             let entry = conf_by_id.entry(t.id).or_insert((0.0, 0));
             entry.0 += conf;
             entry.1 += 1;
-            tagged.push(t);
+            readings.push(t);
         }
-        tagged.push(Tagged::new(0, V2Pos::Stop));
+        readings.push(Reading::stop());
 
         TaggedSentence {
-            tagged,
+            readings,
             conf_by_id,
             tokens_total: tokens.len(),
             tokens_in_vocab,
@@ -507,13 +611,15 @@ impl GraphEngine {
             .into_iter()
             .map(|sentence| {
                 let TaggedSentence {
-                    tagged,
+                    readings,
                     conf_by_id,
                     tokens_total,
                     tokens_in_vocab,
                     well_aligned,
                 } = self.tag_sentence(page, &sentence);
-                let spos = parse_to_spo(&tagged);
+                let parse = parse_readings(&readings);
+                let alternative_triples = parse.alternative.len();
+                let spos = parse.certain;
 
                 let conf_of = |id: WordId| -> f32 {
                     conf_by_id
@@ -565,6 +671,7 @@ impl GraphEngine {
                 GraphSentence {
                     sentence,
                     triples,
+                    alternative_triples,
                     tokens_total,
                     tokens_in_vocab,
                     well_aligned,
@@ -908,6 +1015,143 @@ mod tests {
             .map(|(i, t)| (*i, vocab.word(t.id).unwrap_or("?")))
             .collect();
         assert_eq!(got, [(0, "the"), (1, "dog"), (3, "the"), (4, "men")]);
+    }
+
+    /// The same guarantee on the production path: [`GraphEngine::seam_readings`]
+    /// drops a token outside the v2 vocabulary and keeps the original v1
+    /// positions of the tokens after it.
+    #[test]
+    fn seam_readings_skips_oov_and_keeps_original_positions() {
+        let reasoner = SentenceReasoner::from_vocab_dir(&v1_vocab_dir()).expect("load v1 vocab");
+        let tokens = reasoner.vocab().tokenize("The dog saw the men.");
+        assert_eq!(tokens.len(), 5, "fixture tokenization changed");
+        let mut vocab = PaletteVocab::new();
+        vocab.from_frequency_ranked(["the", "dog", "men"]);
+        let (evidence, lemma_tags) = load_lexical(&v1_vocab_dir(), &vocab).expect("lexical layer");
+        let seam = GraphEngine::seam_readings(&vocab, &evidence, &lemma_tags, &tokens);
+        let got: Vec<(usize, &str)> = seam
+            .iter()
+            .map(|(i, r)| (*i, vocab.word(r.id).unwrap_or("?")))
+            .collect();
+        assert_eq!(got, [(0, "the"), (1, "dog"), (3, "the"), (4, "men")]);
+    }
+
+    /// `PosSet` as `Noun|Verb`, in the FSM's tag order.
+    fn set_name(set: PosSet) -> String {
+        if set.is_empty() {
+            return "unknown".into();
+        }
+        set.iter()
+            .map(|p| format!("{p:?}"))
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// The same fixed sentence through the v2 lexical seam
+    /// ([`GraphEngine::seam_readings`] → [`parse_readings`]): readings per
+    /// token as `surface:entered>survived` where the structure narrowed them,
+    /// then the certain triples and, after `~`, the alternatives.
+    fn v2_seam_snapshot(reasoner: &SentenceReasoner, text: &str) -> String {
+        let tokens = reasoner.vocab().tokenize(text);
+        let mut vocab = PaletteVocab::new();
+        vocab.from_frequency_ranked(tokens.iter().map(|t| t.surface.as_str()));
+        let (evidence, lemma_tags) = load_lexical(&v1_vocab_dir(), &vocab).expect("lexical layer");
+        let seam = GraphEngine::seam_readings(&vocab, &evidence, &lemma_tags, &tokens);
+        let mut readings: Vec<Reading> = seam.iter().map(|(_, r)| *r).collect();
+        readings.push(Reading::stop());
+        let parse = parse_readings(&readings);
+        let word = |id: WordId| vocab.word(id).unwrap_or("?");
+        let tags: Vec<String> = seam
+            .iter()
+            .enumerate()
+            .map(|(k, (_, r))| {
+                let narrowed = parse
+                    .ambiguous
+                    .iter()
+                    .find(|sv| sv.index == k && sv.survived != sv.entered);
+                match narrowed {
+                    Some(sv) => format!(
+                        "{}:{}>{}",
+                        word(r.id),
+                        set_name(sv.entered),
+                        set_name(sv.survived)
+                    ),
+                    None => format!("{}:{}", word(r.id), set_name(r.pos)),
+                }
+            })
+            .collect();
+        let fmt = |v: &[deepnsm_v2::Spo]| -> String {
+            v.iter()
+                .map(|s| {
+                    format!(
+                        "({},{},{})",
+                        word(s.subject),
+                        word(s.predicate),
+                        word(s.object)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        format!(
+            "{} | {} ~ {}",
+            tags.join(" "),
+            fmt(&parse.certain),
+            fmt(&parse.alternative)
+        )
+    }
+
+    /// T8 — the seam after D-LXC-2: v2's own lexical layer and multi-reading
+    /// FSM on the four sentences pinned by
+    /// [`v1_to_v2_seam_is_pinned_on_fixed_input`], plus two that exercise a
+    /// homograph the lemma table does not decide. Measured change against
+    /// that pin:
+    /// - `this`/`all`/`some` arrive as `Det` (COCA `d`), not `Other`.
+    /// - `slept` is a verb, so the relative clause is intransitive and the
+    ///   matrix triple is `(man,woke,child)` instead of `(slept,woke,man)`.
+    /// - "found that record" now closes `(people,found,record)`.
+    /// - Regression, recorded: "They record the deeds" loses its triple. The
+    ///   lemma table's first row tags `record` a noun (F9, kept by D-LXC-3)
+    ///   and `deeds` is not in the COCA tables, so nothing is left to close
+    ///   the clause; v1's own tagger had read `record` as a verb.
+    /// - `locks` (not in the lemma table; noun and verb in `word_forms.csv`)
+    ///   loses its verb reading after `the`, and keeps both after a subject
+    ///   noun, where its triple is an alternative.
+    #[test]
+    fn v2_lexical_seam_is_pinned_on_fixed_input() {
+        let reasoner = SentenceReasoner::from_vocab_dir(&v1_vocab_dir()).expect("load v1 vocab");
+        let cases: [(&str, &str); 6] = [
+            (
+                "This dog saw all the men.",
+                "this:Det dog:Noun saw:Verb all:Det the:Det men:Noun | (dog,saw,men) ~ ",
+            ),
+            (
+                "The man who slept woke the child.",
+                "the:Det man:Noun who:Rel slept:Verb woke:Verb the:Det child:Noun | (man,woke,child) ~ ",
+            ),
+            (
+                "They record the deeds.",
+                "they:Noun record:Noun the:Det deeds:unknown |  ~ ",
+            ),
+            (
+                "Some people found that record.",
+                "some:Det people:Noun found:Verb that:Rel record:Noun | (people,found,record) ~ ",
+            ),
+            (
+                "The locks held the door.",
+                "the:Det locks:Noun|Verb>Noun held:Verb the:Det door:Noun | (locks,held,door) ~ ",
+            ),
+            (
+                "The guard locks the door.",
+                "the:Det guard:Noun locks:Noun|Verb the:Det door:Noun |  ~ (guard,locks,door)",
+            ),
+        ];
+        let got: Vec<String> = cases
+            .iter()
+            .map(|(text, _)| v2_seam_snapshot(&reasoner, text))
+            .collect();
+        let want: Vec<&str> = cases.iter().map(|(_, w)| *w).collect();
+        assert_eq!(got, want, "the v2 lexical seam drifted");
     }
 
     #[test]

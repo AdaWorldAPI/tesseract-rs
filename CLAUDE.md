@@ -4647,3 +4647,35 @@ CI line enabled both, so it was never compiled. Now:
 
 The `d` fix itself is not in this change; it changes shipped v1 /
 `spo_json` behaviour and belongs in its own measured PR.
+
+## ★ consistency reads v2's lexical layer — the multi-reading parse (2026-10-03)
+
+After lance-graph #1314 (D-LXC-2), `tesseract-paperless::consistency` no longer
+feeds v1's single tag through `map_pos`. `GraphEngine::seam_readings` gives each
+token every reading v2's own lexical layer admits:
+
+1. a relativizer surface is `Rel`;
+2. otherwise the lemma table's tag (F9);
+3. otherwise every `LexicalEvidence` reading, folded by `deepnsm_v2::coca`;
+4. otherwise unknown (empty set).
+
+`analyze` then uses `parse_readings(..).certain`. v1 contributes only the
+surface split.
+
+- `GraphSentence.alternative_triples` counts the triples found on only some
+  paths. They are not emitted.
+- `map_pos`/`seam_tags` are now `#[cfg(test)]`: they exist only for the v1 pin
+  above, which records the old behaviour.
+- `v2_lexical_seam_is_pinned_on_fixed_input` pins six sentences. Changes from
+  the v1 pin:
+  - `this`/`all`/`some` arrive as `Det`;
+  - `(man,woke,child)` replaces `(slept,woke,man)`;
+  - "found that record" closes `(people,found,record)`.
+- One regression, recorded: "They record the deeds" loses its triple. The
+  lemma table's first row tags `record` as a noun (D-LXC-3), and `deeds` is
+  not in the COCA tables.
+- `seam_readings_skips_oov_and_keeps_original_positions`: a dropped
+  out-of-vocabulary token does not shift the positions used for per-word OCR
+  confidence. Disable run: renumbering after the filter turns it red.
+- Measured on `corpus/pages/page_01.pgm`: triples 1 → 3 (adds
+  `(wind,moved,door)` and `(garden,cut,grass)`); corrections considered 3 → 9.
