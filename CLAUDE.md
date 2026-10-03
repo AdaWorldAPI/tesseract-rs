@@ -4585,7 +4585,7 @@ letting it stall; a policy pin.
 Not yet: the web app does not call it, nothing picks the content terms, and
 the thresholds are unmeasured.
 
-## ★ Search stems per language — and the choice is made at query time (2026-10-03)
+## ★ Search stems per language — routed at index time, fanned out at query time (2026-10-03)
 
 `tesseract-paperless::search` now indexes the body text into one stemmed
 field per language (`text_en`, English Snowball; `text_de`, German Snowball)

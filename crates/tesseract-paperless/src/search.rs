@@ -43,14 +43,26 @@
 //! analyzer (exact surface, and the analyzer the AUTO vocabulary reads via
 //! [`SearchIndex::tokenize_text`], so AUTO's terms do not move), plus one
 //! stemmed field per language in [`STEM_LANGUAGES`] (`text_en`, `text_de`).
-//! The archive records no per-document language -- it OCRs with one model --
-//! so the language choice is made at QUERY time instead: a query is analyzed
-//! by every field's own stemmer, `Rechnungen` reaches `rechnung` through the
-//! German field and `invoices` reaches `invoice` through the English one.
-//! A document is indexed only into the stem field of the language whose
-//! Snowball stopwords dominate it ([`stem_languages_for`]); a text with no
-//! clear language goes into every stem field. Stemming German text with the
-//! English stemmer would let `died` match the article `die`.
+//! The text is owned by the archived `DocIr`; these fields are postings over
+//! it (lenses), never a second owner of the document.
+//!
+//! Two steps, at two different times:
+//!
+//! - **Index time — morphological routing.** [`stem_languages_for`] picks
+//!   which stem field(s) a document's postings go into, from observed
+//!   Snowball stopword evidence. If one language's stopwords clearly
+//!   outnumber the other's, the document goes only into that stem field. If
+//!   the evidence is ambiguous (no function words, or no clear winner), it
+//!   goes into every stem field, so recall in either language is kept. This
+//!   is a heuristic for choosing a stemmer, not a statement about the
+//!   document: the archive records no per-document language (it OCRs with
+//!   one model). The point of routing is to stop cross-language stem
+//!   collisions: stemming German text with the English stemmer would let
+//!   `died` match the article `die`.
+//! - **Query time — fan-out over the lenses.** A query is analyzed by every
+//!   field's own analyzer. `Rechnungen` reaches `rechnung` through the German
+//!   field, and `invoices` reaches `invoice` through the English one.
+//!
 //! Only postings are added; no text is stored. Tantivy does not persist
 //! analyzers, so they are registered on every [`SearchIndex::open_or_create`].
 //!
@@ -130,7 +142,8 @@ fn stopword_hits(text: &str, language: Language) -> usize {
     count(plain) - count(filtered)
 }
 
-/// Which [`STEM_LANGUAGES`] fields a document's text is indexed into.
+/// Which [`STEM_LANGUAGES`] fields a document's text is indexed into -- an
+/// index-time morphological routing heuristic, not a language classification.
 ///
 /// Stemming a text with another language's stemmer makes unrelated words
 /// collide (English `died` stems to `die`, the German article), so a text is
@@ -861,5 +874,79 @@ mod tests {
             .expect("index");
         assert_eq!(idx.search("Rechnungen", 10).expect("search").hits.len(), 1);
         assert_eq!(idx.search("invoices", 10).expect("search").hits.len(), 1);
+    }
+
+    /// Controlled ranking falsifier: does the number of equivalent indexed
+    /// lenses change a document's score?
+    ///
+    /// Both documents carry the same source text, the same filename, the same
+    /// plain `text` field and the same `text_en` field. Doc B additionally
+    /// carries `text_de`. The token `alpha` analyzes to `alpha` in every
+    /// lens (asserted below), so the extra field shows the same single
+    /// observation again -- nothing more. The documents are written directly
+    /// through the writer to bypass [`stem_languages_for`]: routing a document
+    /// differently would require changing its text, which would change its
+    /// length, stopword counts and BM25 statistics.
+    ///
+    /// Measured: A = 0.364643, B = 0.856554. The query parser joins the
+    /// fields as optional clauses, and their BM25 scores are summed.
+    /// A = 2 x ln(1.2) (`text` + `text_en`, df 2 of 2); B adds the `text_de`
+    /// term, ln(2) x 0.70968 (df 1, average field length 0.5). So the same
+    /// observation counts once per lens it is visible through, and a sparser
+    /// lens counts for more. Equivalent lenses should combine as alternative
+    /// readings (MAX-like), not as independent relevance evidence.
+    ///
+    /// This test PINS THE KNOWN VIOLATION; it does not endorse it. A ranking
+    /// change that combines equivalent lenses as alternatives makes it fail,
+    /// and it must then be re-pinned to equal scores.
+    #[test]
+    fn equivalent_lens_multiplicity_currently_adds_score() {
+        let token = "alpha";
+        for (_, _, language) in STEM_LANGUAGES {
+            let mut analyzer = stem_analyzer(language);
+            let mut stream = analyzer.token_stream(token);
+            let mut out = Vec::new();
+            while let Some(t) = stream.next() {
+                out.push(t.text.clone());
+            }
+            assert_eq!(out, [token], "{language:?} must preserve {token}");
+        }
+
+        let (_dir, idx) = index();
+        assert_eq!(idx.tokenize_text(token).expect("tokenize"), [token]);
+        let [en, de] = idx.fields.text_stem;
+        {
+            let mut w = idx.writer.lock().expect("writer");
+            w.add_document(doc!(
+                idx.fields.hash => "docA",
+                idx.fields.filename => "doc.pdf",
+                idx.fields.text => token,
+                en => token,
+            ))
+            .expect("add A");
+            w.add_document(doc!(
+                idx.fields.hash => "docB",
+                idx.fields.filename => "doc.pdf",
+                idx.fields.text => token,
+                en => token,
+                de => token,
+            ))
+            .expect("add B");
+            w.commit().expect("commit");
+        }
+        idx.reader.reload().expect("reload");
+
+        let hits = idx.search(token, 10).expect("search").hits;
+        let score = |h: &str| {
+            hits.iter()
+                .find(|x| x.hash_hex == h)
+                .map(|x| x.score)
+                .expect("both documents match")
+        };
+        let (a, b) = (score("docA"), score("docB"));
+        // Doc A alone already sums two equivalent lenses.
+        assert!((a - 2.0 * 1.2f32.ln()).abs() < 1e-4, "A = {a}");
+        // The extra equivalent lens raises B above A.
+        assert!(b > a + 0.4, "A = {a}, B = {b}");
     }
 }
