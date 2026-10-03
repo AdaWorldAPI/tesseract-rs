@@ -47,6 +47,10 @@
 //! so the language choice is made at QUERY time instead: a query is analyzed
 //! by every field's own stemmer, `Rechnungen` reaches `rechnung` through the
 //! German field and `invoices` reaches `invoice` through the English one.
+//! A document is indexed only into the stem field of the language whose
+//! Snowball stopwords dominate it ([`stem_languages_for`]); a text with no
+//! clear language goes into every stem field. Stemming German text with the
+//! English stemmer would let `died` match the article `die`.
 //! Only postings are added; no text is stored. Tantivy does not persist
 //! analyzers, so they are registered on every [`SearchIndex::open_or_create`].
 //!
@@ -74,7 +78,7 @@ use tantivy::schema::{
 };
 use tantivy::snippet::SnippetGenerator;
 use tantivy::tokenizer::{
-    Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer,
+    Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer,
 };
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
@@ -95,6 +99,61 @@ fn stem_analyzer(language: Language) -> TextAnalyzer {
         .filter(LowerCaser)
         .filter(Stemmer::new(language))
         .build()
+}
+
+/// How many times one language's function words must outnumber every other
+/// language's before a text is attributed to it alone. A policy pin, not a
+/// measurement: below it the text is indexed for every language.
+const LANGUAGE_DOMINANCE: usize = 2;
+
+/// How many of `text`'s tokens are Snowball stopwords of `language`: tokens
+/// in, minus tokens left after the stopword filter.
+fn stopword_hits(text: &str, language: Language) -> usize {
+    let count = |mut a: TextAnalyzer| {
+        let mut stream = a.token_stream(text);
+        let mut n = 0;
+        while stream.advance() {
+            n += 1;
+        }
+        n
+    };
+    let Some(stop) = StopWordFilter::new(language) else {
+        return 0;
+    };
+    let plain = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(LowerCaser)
+        .build();
+    let filtered = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(LowerCaser)
+        .filter(stop)
+        .build();
+    count(plain) - count(filtered)
+}
+
+/// Which [`STEM_LANGUAGES`] fields a document's text is indexed into.
+///
+/// Stemming a text with another language's stemmer makes unrelated words
+/// collide (English `died` stems to `die`, the German article), so a text is
+/// indexed only for the language whose function words clearly dominate it.
+/// A text with none, or with no clear winner, is indexed for every language:
+/// it cannot be attributed, and dropping it from every stem field would lose
+/// recall rather than gain precision.
+#[must_use]
+pub fn stem_languages_for(text: &str) -> [bool; STEM_LANGUAGES.len()] {
+    let hits = STEM_LANGUAGES.map(|(_, _, language)| stopword_hits(text, language));
+    let mut out = [true; STEM_LANGUAGES.len()];
+    for (i, &h) in hits.iter().enumerate() {
+        let dominates = h > 0
+            && hits.iter().enumerate().all(|(j, &other)| {
+                j == i || h >= other.saturating_mul(LANGUAGE_DOMINANCE).max(1) && h > other
+            });
+        if dominates {
+            out = [false; STEM_LANGUAGES.len()];
+            out[i] = true;
+            break;
+        }
+    }
+    out
 }
 
 /// One ranked search result: a reference into the archive, never text.
@@ -384,8 +443,11 @@ impl SearchIndex {
                 self.fields.filename => filename,
                 self.fields.text => text,
             );
-            for field in self.fields.text_stem {
-                d.add_text(field, text);
+            let languages = stem_languages_for(text);
+            for (field, on) in self.fields.text_stem.into_iter().zip(languages) {
+                if on {
+                    d.add_text(field, text);
+                }
             }
             writer.add_document(d)?;
         }
@@ -755,5 +817,49 @@ mod tests {
             .expect("index");
         let idx = SearchIndex::open_or_create(dir.path()).expect("reopen");
         assert_eq!(idx.search("Rechnungen", 10).expect("search").hits.len(), 1);
+    }
+
+    /// Cross-language collisions stay out (review on #102): English stemming
+    /// of German text would turn the article `die` into a match for `died`.
+    /// A German document is indexed for German only, so the English query
+    /// reaches nothing in it.
+    #[test]
+    fn an_english_query_does_not_reach_german_function_words() {
+        let (_dir, idx) = index();
+        idx.index_document("de01", "a.pdf", "Die Rechnung vom Mai und die Mahnung")
+            .expect("index");
+        assert!(idx.search("died", 10).expect("search").hits.is_empty());
+        // ...while the German family still matches it.
+        assert_eq!(idx.search("Rechnungen", 10).expect("search").hits.len(), 1);
+    }
+
+    /// The reverse direction: an English document is not stemmed as German.
+    #[test]
+    fn a_german_query_does_not_reach_english_stems() {
+        let (_dir, idx) = index();
+        idx.index_document(
+            "en01",
+            "a.pdf",
+            "The invoice was paid and the receipt is attached",
+        )
+        .expect("index");
+        assert_eq!(idx.search("invoices", 10).expect("search").hits.len(), 1);
+        assert_eq!(
+            stem_languages_for("The invoice was paid and the receipt is attached"),
+            [true, false]
+        );
+    }
+
+    /// A text with no function words in either language (a bare keyword
+    /// list, a filename-like line) cannot be attributed, so it is indexed for
+    /// every language rather than for none.
+    #[test]
+    fn a_text_without_function_words_is_indexed_for_every_language() {
+        assert_eq!(stem_languages_for("Rechnung invoice 2026"), [true, true]);
+        let (_dir, idx) = index();
+        idx.index_document("xx01", "a.pdf", "Rechnung invoice 2026")
+            .expect("index");
+        assert_eq!(idx.search("Rechnungen", 10).expect("search").hits.len(), 1);
+        assert_eq!(idx.search("invoices", 10).expect("search").hits.len(), 1);
     }
 }
