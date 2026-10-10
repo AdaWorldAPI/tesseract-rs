@@ -877,7 +877,7 @@ mod tests {
     async fn hashes_lists_every_archived_document() {
         let (_dir, uri) = tmp_uri();
         let store = LanceStore::connect(&uri).await.expect("connect");
-        assert!(store.hashes().await.expect("hashes").is_empty());
+        assert_eq!(store.hashes().await.expect("hashes").len(), 0);
         let (a, b) = (ContentSha256::of(b"a"), ContentSha256::of(b"b"));
         for (h, t) in [(&a, 1), (&b, 2)] {
             store
@@ -942,12 +942,15 @@ mod tests {
 
         store.delete(&gone_hex).await.expect("delete");
 
-        assert!(store
-            .meta()
-            .assignments_for(&gone_hex)
-            .await
-            .expect("read")
-            .is_empty());
+        assert_eq!(
+            store
+                .meta()
+                .assignments_for(&gone_hex)
+                .await
+                .expect("read")
+                .len(),
+            0
+        );
         assert!(!store.meta().is_reviewed(&gone_hex).await.expect("read"));
         assert_eq!(
             store

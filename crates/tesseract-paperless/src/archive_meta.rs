@@ -1066,7 +1066,7 @@ mod tests {
         s.retire_definition(MetaKind::Tag, 0).await.expect("retire");
         let retired = s.assign("h", MetaKind::Tag, 0, Source::Manual, 2).await;
         assert!(matches!(retired, Err(MetaError::UnknownDefinition { .. })));
-        assert!(s.assignments_for("h").await.expect("for").is_empty());
+        assert_eq!(s.assignments_for("h").await.expect("for").len(), 0);
         // Wrong kind for a real id is also unknown.
         let wrong_kind = s
             .assign("h", MetaKind::Correspondent, 0, Source::Manual, 3)
@@ -1093,7 +1093,7 @@ mod tests {
             .await
             .expect("unassign");
         assert!(!s.is_reviewed("h").await.expect("is_reviewed"));
-        assert!(s.assignments_for("h").await.expect("for").is_empty());
+        assert_eq!(s.assignments_for("h").await.expect("for").len(), 0);
 
         s.mark_reviewed("h", 3).await.expect("mark");
         s.assign("h", MetaKind::Correspondent, 0, Source::Manual, 4)
@@ -1120,7 +1120,7 @@ mod tests {
         assert!(!s.is_reviewed("nope").await.expect("is"));
         s.mark_unreviewed("h").await.expect("unreview");
         assert!(!s.is_reviewed("h").await.expect("is"));
-        assert!(s.reviewed_hashes().await.expect("hashes").is_empty());
+        assert_eq!(s.reviewed_hashes().await.expect("hashes").len(), 0);
         s.mark_unreviewed("h").await.expect("absent is fine");
     }
 
@@ -1190,7 +1190,7 @@ mod tests {
             s.mark_reviewed(h, 3).await.expect("mark");
         }
         s.forget_document("gone").await.expect("forget");
-        assert!(s.assignments_for("gone").await.expect("for").is_empty());
+        assert_eq!(s.assignments_for("gone").await.expect("for").len(), 0);
         assert!(!s.is_reviewed("gone").await.expect("is"));
         assert_eq!(s.assignments_for("kept").await.expect("for").len(), 1);
         assert!(s.is_reviewed("kept").await.expect("is"));
@@ -1247,7 +1247,7 @@ mod tests {
         assert!(!s.is_reviewed("dead-review-only").await.expect("is"));
         assert!(s.is_reviewed("live").await.expect("is"));
         assert_eq!(s.assignments_for("live").await.expect("for").len(), 2);
-        assert!(s.assignments_for("dead").await.expect("for").is_empty());
+        assert_eq!(s.assignments_for("dead").await.expect("for").len(), 0);
     }
 
     /// A quote in a hash must be data, not SQL. Disable: drop `sql_quote`
@@ -1260,7 +1260,7 @@ mod tests {
             .await
             .expect("assign");
         let evil = "' OR '1'='1";
-        assert!(s.assignments_for(evil).await.expect("for").is_empty());
+        assert_eq!(s.assignments_for(evil).await.expect("for").len(), 0);
         s.forget_document(evil).await.expect("forget");
         assert_eq!(s.assignments_for("innocent").await.expect("for").len(), 1);
     }
