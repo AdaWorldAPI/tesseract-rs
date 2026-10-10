@@ -749,7 +749,7 @@ mod tests {
         }
         let idx = SearchIndex::open_or_create(dir.path()).expect("a stale index must reopen");
         assert!(idx.was_rebuilt());
-        assert!(idx.indexed_hashes().expect("hashes").is_empty());
+        assert_eq!(idx.indexed_hashes().expect("hashes").len(), 0);
         idx.index_document("new1", "b.txt", "fresh wording")
             .expect("index");
         assert_eq!(idx.search("fresh", 10).expect("search").hits.len(), 1);

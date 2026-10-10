@@ -3,7 +3,7 @@ name = "tesseract-paperless"
 description = "Document intake for the pure-Rust OCR stack: the S-2 dedup gate, the doc.v1 -> DocIr seam, and an optional one-tokenization-many-consumers lexical receipt."
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.98.1"
+rust-version = "1.99.0"
 license = "Apache-2.0"
 repository = "https://github.com/AdaWorldAPI/tesseract-rs"
 
@@ -132,10 +132,10 @@ deepnsm-v2 = { path = "../../../lance-graph/crates/deepnsm-v2", optional = true 
 # `remote` is on for ONE reason: lancedb 0.39.0 does not compile without it —
 # `src/job.rs` builds `Error::Http` unconditionally while `error.rs` gates that
 # variant on `cfg(feature = "remote")` (E0599; the same defect 0.38.0 had).
-# 0.39.0 is the only 0.39 release; drop the feature once a release gates
-# `job.rs` too.
-lancedb = { version = "0.39.*", default-features = false, features = ["remote"], optional = true }
-lance = { version = "12.*", default-features = false, optional = true }
+# 0.39.0 is the only 0.39 release; 0.40.0 (2026-10-10, lance 13) still has the
+# defect (re-measured). Drop the feature once a release gates `job.rs` too.
+lancedb = { version = "0.40.*", default-features = false, features = ["remote"], optional = true }
+lance = { version = "13.*", default-features = false, optional = true }
 arrow = { version = "58", default-features = false, optional = true }
 # `merge_insert`'s `execute` takes a `Box<dyn RecordBatchReader + Send>`; the
 # concrete `RecordBatchIterator` lives in `arrow-array` directly.

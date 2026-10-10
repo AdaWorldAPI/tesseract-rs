@@ -790,10 +790,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "checking for EXACTLY 0.0 (not NaN) from 0.0/(0.0+1.0), which is exact division, is the whole point of this test"
-    )]
     fn triple_nars_truth_zero_is_defined_not_nan() {
         let t = triple_nars_truth(&[], 0, 0);
         assert_eq!(t.frequency, 0.0);

@@ -170,7 +170,7 @@ fn a_full_byte_alphabet_is_reported_and_never_collides_with_pad() {
 #[test]
 fn an_ordinary_corpus_is_not_reported_saturated() {
     let (_, report) = TokenizerContract::train_reported(&corpus(), NormRule::Identity);
-    assert!(report.excluded_bytes.is_empty());
+    assert_eq!(report.excluded_bytes.len(), 0);
     assert!(!report.saturated(), "{report:?}");
     assert!(report.distinct_bytes > 10, "anti-vacuity: a real alphabet");
 }
