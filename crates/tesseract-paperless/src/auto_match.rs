@@ -1339,6 +1339,6 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(tag_targets(&m.suggest(&row(Some(0), None, &[]))).is_empty());
+        assert_eq!(tag_targets(&m.suggest(&row(Some(0), None, &[]))).len(), 0);
     }
 }

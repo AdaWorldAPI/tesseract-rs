@@ -771,8 +771,8 @@ mod tests {
         let novel = doc("new", "alpha zzzz", &["unknown-key"]);
         let row = ts.mapping.row_for(&assignments, &novel, &tok);
         assert_eq!(row.correspondent, None);
-        assert!(row.tags.is_empty());
-        assert!(row.field_keys.is_empty());
+        assert_eq!(row.tags.len(), 0);
+        assert_eq!(row.field_keys.len(), 0);
         assert_eq!(row.terms.len(), 1);
         assert_eq!(ts.mapping.terms()[row.terms[0] as usize], "alpha");
         // d2's own row from the full slice equals the training row.
@@ -871,7 +871,7 @@ mod tests {
                 v.sort_unstable();
                 v
             };
-            assert!(!expected.is_empty());
+            assert_ne!(expected.len(), 0);
             let kept: Vec<&str> = ts.mapping.terms().iter().map(String::as_str).collect();
             assert_eq!(kept, expected, "min_df {min_df}, ppm {ppm}");
             for (id, term) in ts.mapping.terms().iter().enumerate() {
@@ -1018,7 +1018,7 @@ mod tests {
             ..vocab
         };
         let ts = build(&[], &[], &docs, capped).unwrap();
-        assert!(ts.mapping.field_keys().is_empty());
+        assert_eq!(ts.mapping.field_keys().len(), 0);
     }
 
     /// G7a. 256 tags leave no room, so no content term fits.
