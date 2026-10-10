@@ -31,7 +31,7 @@
 #   docker run --rm ogar-demo
 
 # ── builder ─────────────────────────────────────────────────────────────────
-FROM rust:1.98.1-bookworm AS builder
+FROM rust:1.99.0-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*

@@ -59,8 +59,8 @@ jobs:
     # Workspace sweep pin (lance-graph / ndarray 1.98.1 line): 1.98.1, matching the
     # repo's rust-toolchain.toml. ndarray's rust-version = 1.95 floor is
     # satisfied a fortiori.
-    - name: Rust 1.98.1 toolchain
-      run: rustup toolchain install 1.98.1 --profile minimal --component clippy --component rustfmt && rustup default 1.98.1
+    - name: Rust 1.99.0 toolchain
+      run: rustup toolchain install 1.99.0 --profile minimal --component clippy --component rustfmt && rustup default 1.99.0
     - name: Build (core)
       working-directory: tesseract-rs
       run: cargo build -p tesseract-core --verbose
@@ -315,11 +315,11 @@ jobs:
         path: OGAR
     # Workspace sweep pin (lance-graph / ndarray 1.98.1 line): 1.98.1, matching the
     # repo's rust-toolchain.toml.
-    - name: Rust 1.98.1 toolchain
-      run: rustup toolchain install 1.98.1 --profile minimal && rustup default 1.98.1
+    - name: Rust 1.99.0 toolchain
+      run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0
     - name: Quality (resolution ladder, ocr)
       working-directory: tesseract-rs
-      run: cargo +1.98.1 test -p tesseract-ocr --test quality_resolution_grid --verbose
+      run: cargo +1.99.0 test -p tesseract-ocr --test quality_resolution_grid --verbose
     - name: Quality (typography overlay, ocr-pdf)
       working-directory: tesseract-rs
-      run: cargo +1.98.1 test -p tesseract-ocr-pdf --test typography_overlay --verbose
+      run: cargo +1.99.0 test -p tesseract-ocr-pdf --test typography_overlay --verbose
