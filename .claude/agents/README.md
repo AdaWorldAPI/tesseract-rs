@@ -51,7 +51,10 @@ If you read nothing else:
   (`cargo fmt` / `clippy -D warnings` / the scoped test suite, run ONCE), every
   `git commit` / `push`.
 - **Workers: Sonnet.** Bounded transcription against a written spec.
-- **Never Haiku** for any subagent here.
+- **Haiku** only through the six cards (`harvest-scout`, `census-counter`,
+  `quote-harvester`, `substrate-mapper`, `spec-editor`, `guarded-executor`),
+  for harvest, deep mapping, exact spec edits and pre-written command cards,
+  supervised as in CLAUDE.md § Model allocation policy (2026-10-14 amendment).
 
 Every worker brief carries, verbatim: no cargo (this crate path-deps sibling
 workspaces; per-agent compiles blow up the shared `target/` and produce spurious

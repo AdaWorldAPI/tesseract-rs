@@ -108,6 +108,34 @@ a sharp, repo-specific edge:
 > convention. First plan to declare the three tiers up front:
 > `.claude/plans/paperless-archive-integration-v1.md`.
 
+> **⊘ AMENDED 2026-10-14 — Haiku also harvests and maps.** Operator,
+> verbatim: *"Use Haiku 5.5 agents for grindwork and take haiku off the
+> guard list but watch the agents closely and start using them for very
+> focused and scoped tasks that you use for cheap harvest discovery"*;
+> *"Goal is to outsource deeper mapping due to enormous token equivalent of
+> the substrate."* Six Haiku cards in `.claude/agents/`, the same set as
+> lance-graph (#1552):
+>
+> - `harvest-scout` (candidates as `path:line`), `census-counter` (counts
+>   with their commands), `quote-harvester` (verbatim text with line
+>   numbers): read-only.
+> - `substrate-mapper`: a fact map of one module or directory (verbatim
+>   signatures and doc lines, names each body mentions, candidate callers),
+>   written to one scratchpad file. The tool for outsourcing deep mapping of
+>   the C++ and Rust trees.
+> - `spec-editor`: exact edits to one file, each only if its anchor occurs
+>   exactly once; the orchestrator writes every edit in full.
+> - `guarded-executor`: the churn tier above, as a card.
+>
+> **Watching closely:** search finds, reading decides. The orchestrator
+> Reads every item it relies on; re-runs one count per census; never takes
+> `hits: 0` as absence; Reads two mapped items per map at their stated lines;
+> reads the diff of every `spec-editor` edit; and records hits and misses per
+> run. A card that misses, miscounts or concludes twice on one kind of task
+> goes back to Sonnet for that kind. Haiku still never authors content,
+> decides, or reviews, and never judges whether a parity diff, oracle or
+> measurement means what it appears to (the orchestrator-only list below).
+
 **Declare the allocation up front, in the plan, not implicitly at each spawn.**
 Consistency is not the same as policy: a session can spawn every agent at the
 right tier and still leave no rule behind, so the next session re-derives it.
