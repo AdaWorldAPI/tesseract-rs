@@ -106,7 +106,7 @@ tesseract-ogar = { path = "../tesseract-ogar", optional = true }
 # `columnar-zstd-compression` (zstd-sys), is deliberately excluded — `token`'s
 # RAM-only resident-lane seam doesn't need any of these four either, but
 # there is only one `tantivy` entry per manifest, so both features share it.
-tantivy = { git = "https://github.com/AdaWorldAPI/tantivy", rev = "5fc9fccb613c9838cf7fde77f73dc4afa3216375", optional = true, default-features = false, features = ["mmap", "stopwords", "stemmer", "lz4-compression"] }
+tantivy = { git = "https://github.com/AdaWorldAPI/tantivy", branch = "main", optional = true, default-features = false, features = ["mmap", "stopwords", "stemmer", "lz4-compression"] }
 
 # The semantic consumer. It is a dependency of the PROBES and not of `src/`,
 # and that asymmetry is the measured finding rather than an oversight:
