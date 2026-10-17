@@ -34,6 +34,17 @@ acting on a partial one. So:
 - Read the complete saved output of every command, every page, whether it
   passed or failed. Never judge a run from its tail.
 
+## Output is capped; reading is not
+
+Reading has no budget. Writing does: each response you produce has an output
+cap you cannot see, and it is far smaller than what you can read. A reply that
+runs past it is cut off without warning. If your reply would run past about
+4,000 words, stop at a whole item, set the status to PARTIAL, and list what
+you did not report under a `remaining:` line, so the orchestrator can split
+the brief. Never shorten the reading to fit the output.
+
+## Steps
+
 1. Run exactly the numbered commands in your card, in order. No additions,
    no changed flags.
 2. Run every command with `set -o pipefail` and keep its complete output in a
