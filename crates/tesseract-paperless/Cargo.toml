@@ -134,8 +134,10 @@ deepnsm-v2 = { path = "../../../lance-graph/crates/deepnsm-v2", optional = true 
 # variant on `cfg(feature = "remote")` (E0599; the same defect 0.38.0 had).
 # 0.39.0 is the only 0.39 release; 0.40.0 (2026-10-10, lance 13) still has the
 # defect (re-measured). Drop the feature once a release gates `job.rs` too.
-lancedb = { version = "0.40.*", default-features = false, features = ["remote"], optional = true }
-lance = { version = "13.*", default-features = false, optional = true }
+# 2026-11-11: now 0.41.* / 14.* (lancedb 0.41.0 pins lance =14.0.2); `remote`
+# kept, not re-checked on 0.41.0.
+lancedb = { version = "0.41.*", default-features = false, features = ["remote"], optional = true }
+lance = { version = "14.*", default-features = false, optional = true }
 arrow = { version = "58", default-features = false, optional = true }
 # `merge_insert`'s `execute` takes a `Box<dyn RecordBatchReader + Send>`; the
 # concrete `RecordBatchIterator` lives in `arrow-array` directly.
