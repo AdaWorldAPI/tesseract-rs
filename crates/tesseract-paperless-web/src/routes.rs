@@ -1225,6 +1225,11 @@ mod tests {
         assert!(!html.contains("{{"), "no unrendered template syntax");
         assert!(!html.contains("powered by tesseract-rs"));
         assert!(!html.contains("class=\"logo\""));
+        // The hover state must not re-colour the button: on_accent() picks the
+        // text colour for the unfiltered accent, so a filter can push it
+        // below 4.5:1 (white on #757575 under brightness(1.08) is ~4.04:1).
+        assert!(html.contains("button:hover { outline:"));
+        assert!(!html.contains("button:hover { filter"));
     }
 
     /// A real 16-byte guid renders as exactly 32 lowercase hex chars, in
