@@ -30,6 +30,24 @@ use crate::fetch::fetch_image_url;
 use crate::ingest::{ingest, now_unix_ms, IngestOutcome};
 use crate::state::{AppState, AutoSlot};
 
+/// Gives every page template access to the deployment's branding
+/// ([`crate::branding`]) as `self.brand()`, so no handler has to pass it in.
+macro_rules! branded {
+    ($($t:ty),+ $(,)?) => {$(
+        impl $t {
+            fn brand(&self) -> &'static crate::branding::Branding {
+                crate::branding::get()
+            }
+        }
+    )+};
+}
+branded!(
+    IndexTemplate,
+    DocumentsTemplate,
+    DocumentDetailTemplate,
+    DefinitionsTemplate
+);
+
 /// Uploads capped at 20 MB — scans run larger than the line-image demos this
 /// stack's other web crate targets; both the per-extractor and the raw-body
 /// limit must move together, same reasoning as `tesseract-ocr-web::routes`.
@@ -1192,6 +1210,22 @@ fn format_unix_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With no `BRAND_*` variable set (the test process sets none) the upload
+    /// page is the unbranded archive: its name, tagline and accent, no logo
+    /// and no "powered by" credit. The branding values come from one source,
+    /// so the custom case is covered by `branding`'s own tests.
+    #[test]
+    fn the_upload_page_renders_the_default_branding() {
+        let html = IndexTemplate { error: None }.render().expect("render");
+        assert!(html.contains("<title>tesseract-paperless — document archive</title>"));
+        assert!(html.contains("<h1>tesseract-paperless</h1>"));
+        assert!(html.contains("deduplicated by content hash"));
+        assert!(html.contains("background: #2563eb"));
+        assert!(!html.contains("{{"), "no unrendered template syntax");
+        assert!(!html.contains("powered by tesseract-rs"));
+        assert!(!html.contains("class=\"logo\""));
+    }
 
     /// A real 16-byte guid renders as exactly 32 lowercase hex chars, in
     /// byte order — the log line's only way of showing which document a

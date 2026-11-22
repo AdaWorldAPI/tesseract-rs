@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>tesseract-paperless — document archive</title>
+<title>{{ self.brand().name }} — document archive</title>
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
@@ -16,7 +16,7 @@
   h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
   .tag { color: color-mix(in srgb, CanvasText 60%, Canvas); font-size: .95rem; margin: 0 0 1.5rem; }
   nav.top { margin-bottom: 1.5rem; }
-  nav.top a { color: #2563eb; text-decoration: none; font-weight: 600; }
+  nav.top a { color: {{ self.brand().accent }}; text-decoration: none; font-weight: 600; }
   .card {
     border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
     border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem;
@@ -33,7 +33,7 @@
   button {
     flex: 1 1 auto; padding: .7rem 1rem; font-size: 1rem;
     font-weight: 600; border: 0; border-radius: 8px; cursor: pointer;
-    background: #2563eb; color: #fff;
+    background: {{ self.brand().accent }}; color: #fff;
   }
   button:hover { filter: brightness(1.08); }
   .error {
@@ -43,13 +43,14 @@
   }
   .note { font-size: .85rem; color: color-mix(in srgb, CanvasText 55%, Canvas); }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
+  h1 img.logo { height: 1.6rem; vertical-align: middle; margin-right: .5rem; }
   footer { margin-top: 2rem; font-size: .8rem; color: color-mix(in srgb, CanvasText 50%, Canvas); }
 </style>
 </head>
 <body>
 <main>
-  <h1>tesseract-paperless</h1>
-  <p class="tag">Upload a scan or photo. It is OCR'd with the pure-Rust recognizer, deduplicated by content hash, and archived &mdash; searchable, browsable, paperless-ngx-shaped.</p>
+  <h1>{% if let Some(logo) = self.brand().logo_url() %}<img class="logo" src="{{ logo }}" alt="">{% endif %}{{ self.brand().name }}</h1>
+  <p class="tag">{{ self.brand().tagline }}</p>
 
   <nav class="top"><a href="/documents">&rarr; Browse the archive</a> &middot; <a href="/definitions">Definitions</a></nav>
 
@@ -74,7 +75,7 @@
 
   <p class="note">A document already in the archive (byte-identical content) is recognized as a duplicate and skipped &mdash; no repeat OCR spend, and you land straight on the existing record.</p>
 
-  <footer>Pure-Rust OCR (no libtesseract/leptonica at runtime) &middot; <code>lancedb</code>-backed archive.</footer>
+  <footer>Pure-Rust OCR (no libtesseract/leptonica at runtime) &middot; <code>lancedb</code>-backed archive.{% if self.brand().is_custom() %} &middot; powered by tesseract-rs{% endif %}</footer>
 </main>
 </body>
 </html>
