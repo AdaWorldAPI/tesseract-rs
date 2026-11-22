@@ -5,6 +5,7 @@
 //! Deploy target: Railway. Railway injects `PORT` and expects the process to
 //! bind `0.0.0.0:$PORT` — read at runtime only, never hardcoded.
 
+mod branding;
 mod decode;
 mod fetch;
 mod ingest;

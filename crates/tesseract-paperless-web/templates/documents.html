@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Documents — tesseract-paperless</title>
+<title>Documents — {{ self.brand().name }}</title>
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
@@ -15,7 +15,7 @@
   main { max-width: 52rem; margin: 0 auto; }
   h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
   nav.top { margin-bottom: 1.25rem; display: flex; justify-content: space-between; align-items: center; }
-  nav.top a { color: #2563eb; text-decoration: none; font-weight: 600; }
+  nav.top a { color: {{ self.brand().accent }}; text-decoration: none; font-weight: 600; }
   .count { color: color-mix(in srgb, CanvasText 55%, Canvas); font-size: .9rem; }
   form.search { display: flex; gap: .5rem; margin-bottom: 1.25rem; }
   form.search input[type=text] {
@@ -25,7 +25,7 @@
   }
   form.search button {
     padding: .55rem 1rem; font-weight: 600; border: 0; border-radius: 8px;
-    cursor: pointer; background: #2563eb; color: #fff;
+    cursor: pointer; background: {{ self.brand().accent }}; color: {{ self.brand().on_accent() }};
   }
   ul.docs { list-style: none; margin: 0; padding: 0; }
   li.doc {
@@ -33,7 +33,7 @@
     border-radius: 10px; padding: .9rem 1.1rem; margin-bottom: .7rem;
   }
   li.doc a.title { font-weight: 600; text-decoration: none; color: inherit; }
-  li.doc a.title:hover { color: #2563eb; }
+  li.doc a.title:hover { color: {{ self.brand().accent }}; }
   .preview { color: color-mix(in srgb, CanvasText 60%, Canvas); font-size: .9rem; margin: .35rem 0 0; }
   .preview b { background: color-mix(in srgb, #f59e0b 35%, transparent); color: CanvasText; font-weight: 600; border-radius: 3px; padding: 0 .15em; }
   .meta { font-size: .8rem; color: color-mix(in srgb, CanvasText 50%, Canvas); margin-top: .4rem; }

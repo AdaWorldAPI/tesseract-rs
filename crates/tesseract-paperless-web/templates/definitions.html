@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Definitions — tesseract-paperless</title>
+<title>Definitions — {{ self.brand().name }}</title>
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
@@ -15,7 +15,7 @@
   main { max-width: 52rem; margin: 0 auto; }
   h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
   nav.top { margin-bottom: 1.25rem; display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
-  nav.top a { color: #2563eb; text-decoration: none; font-weight: 600; }
+  nav.top a { color: {{ self.brand().accent }}; text-decoration: none; font-weight: 600; }
   .card {
     border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
     border-radius: 12px; padding: 1.25rem; margin-bottom: 1.25rem;
@@ -40,7 +40,7 @@
   }
   button {
     padding: .35rem .8rem; font-weight: 600; border: 0; border-radius: 6px; cursor: pointer;
-    background: #2563eb; color: #fff;
+    background: {{ self.brand().accent }}; color: {{ self.brand().on_accent() }};
   }
   button.secondary {
     background: transparent; color: inherit;

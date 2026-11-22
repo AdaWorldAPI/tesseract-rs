@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{ filename }} — tesseract-paperless</title>
+<title>{{ filename }} — {{ self.brand().name }}</title>
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
@@ -14,7 +14,7 @@
   }
   main { max-width: 52rem; margin: 0 auto; }
   nav.top { margin-bottom: 1.25rem; }
-  nav.top a { color: #2563eb; text-decoration: none; font-weight: 600; }
+  nav.top a { color: {{ self.brand().accent }}; text-decoration: none; font-weight: 600; }
   h1 { font-size: 1.5rem; margin: 0 0 .5rem; word-break: break-word; }
   .meta {
     display: flex; flex-wrap: wrap; gap: .5rem 1.2rem; font-size: .85rem;
@@ -52,7 +52,7 @@
   form.inline select { padding: .3rem; border-radius: 6px; border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas); background: Canvas; color: CanvasText; }
   button.act {
     padding: .3rem .8rem; font-weight: 600; border: 0; border-radius: 6px; cursor: pointer;
-    background: #2563eb; color: #fff;
+    background: {{ self.brand().accent }}; color: {{ self.brand().on_accent() }};
   }
   button.secondary {
     padding: .3rem .8rem; font-weight: 600; border-radius: 6px; cursor: pointer;

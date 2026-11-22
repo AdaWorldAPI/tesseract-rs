@@ -1082,7 +1082,7 @@ mod tests {
         for spec in ogar_vocab::ocr_actions::ocr_actions() {
             for p in spec.params.iter().filter(|p| p.mandatory) {
                 assert!(
-                    ogar_param_to_request_field(&spec.def.predicate, p.name).is_some(),
+                    ogar_param_to_request_field(&spec.def.predicate, &p.name).is_some(),
                     "{}: mandatory param `{}` has no OcrRequest field mapping",
                     spec.def.predicate,
                     p.name
