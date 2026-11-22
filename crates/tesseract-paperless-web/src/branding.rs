@@ -112,12 +112,47 @@ impl Branding {
         self.logo_url.as_deref()
     }
 
+    /// The text colour for a button whose background is the accent: white or
+    /// near-black, whichever contrasts more with the accent (WCAG relative
+    /// luminance). White for the default accent, so default pages are
+    /// unchanged; near-black for a light accent such as `#fff`.
+    #[must_use]
+    pub fn on_accent(&self) -> &'static str {
+        let l = relative_luminance(&self.accent).unwrap_or(0.0);
+        let with_white = 1.05 / (l + 0.05);
+        let with_black = (l + 0.05) / 0.05;
+        if with_white >= with_black {
+            "#fff"
+        } else {
+            "#111"
+        }
+    }
+
     /// Whether a custom name is set, which adds the "powered by tesseract-rs"
     /// credit.
     #[must_use]
     pub fn is_custom(&self) -> bool {
         self.name != DEFAULT_NAME
     }
+}
+
+/// WCAG relative luminance of an accepted `#rgb` / `#rrggbb` colour.
+fn relative_luminance(hex: &str) -> Option<f64> {
+    let h = hex.strip_prefix('#')?;
+    let full: String = match h.len() {
+        3 => h.chars().flat_map(|c| [c, c]).collect(),
+        6 => h.to_owned(),
+        _ => return None,
+    };
+    let channel = |i: usize| -> Option<f64> {
+        let v = f64::from(u8::from_str_radix(full.get(i..i + 2)?, 16).ok()?) / 255.0;
+        Some(if v <= 0.040_45 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        })
+    };
+    Some(0.2126 * channel(0)? + 0.7152 * channel(2)? + 0.0722 * channel(4)?)
 }
 
 fn is_hex_colour(v: &str) -> bool {
@@ -128,7 +163,13 @@ fn is_hex_colour(v: &str) -> bool {
 }
 
 fn is_logo_url(v: &str) -> bool {
-    if v.is_empty() || v.len() > MAX_URL || v.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    // A backslash is rejected anywhere: browsers read `/\host/x` as
+    // `//host/x`, a different site, and no ordinary path needs one.
+    if v.is_empty()
+        || v.len() > MAX_URL
+        || v.chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
         return false;
     }
     let same_site = v.starts_with('/') && !v.starts_with("//");
@@ -136,6 +177,18 @@ fn is_logo_url(v: &str) -> bool {
 }
 
 /// The process-wide branding, read from the environment on first use.
+///
+/// Test builds never read the environment, so a developer's `BRAND_*`
+/// variables cannot change what the template tests see; the parsing itself is
+/// tested through [`Branding::from_vars`].
+#[cfg(test)]
+pub fn get() -> &'static Branding {
+    static BRANDING: OnceLock<Branding> = OnceLock::new();
+    BRANDING.get_or_init(Branding::default)
+}
+
+/// The process-wide branding, read from the environment on first use.
+#[cfg(not(test))]
 pub fn get() -> &'static Branding {
     static BRANDING: OnceLock<Branding> = OnceLock::new();
     BRANDING.get_or_init(|| {
@@ -225,10 +278,27 @@ mod tests {
             "data:image/svg+xml,<svg/>",
             "javascript:alert(1)",
             "/a b.png",
+            "/\\other.example/logo.png",
+            "https://example.org\\@evil.example/l.png",
             "",
         ] {
             assert!(!is_logo_url(bad), "{bad}");
         }
+    }
+
+    /// White text on the default and other dark accents, near-black on light
+    /// ones; two-sided, so a constant answer cannot pass.
+    #[test]
+    fn button_text_contrasts_with_the_accent() {
+        let with = |accent: &str| Branding {
+            accent: accent.to_owned(),
+            ..Branding::default()
+        };
+        assert_eq!(Branding::default().on_accent(), "#fff");
+        assert_eq!(with("#0f766e").on_accent(), "#fff");
+        assert_eq!(with("#000").on_accent(), "#fff");
+        assert_eq!(with("#fff").on_accent(), "#111");
+        assert_eq!(with("#ffff00").on_accent(), "#111");
     }
 
     #[test]

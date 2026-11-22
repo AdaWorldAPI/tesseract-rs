@@ -52,7 +52,7 @@
   form.inline select { padding: .3rem; border-radius: 6px; border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas); background: Canvas; color: CanvasText; }
   button.act {
     padding: .3rem .8rem; font-weight: 600; border: 0; border-radius: 6px; cursor: pointer;
-    background: {{ self.brand().accent }}; color: #fff;
+    background: {{ self.brand().accent }}; color: {{ self.brand().on_accent() }};
   }
   button.secondary {
     padding: .3rem .8rem; font-weight: 600; border-radius: 6px; cursor: pointer;
