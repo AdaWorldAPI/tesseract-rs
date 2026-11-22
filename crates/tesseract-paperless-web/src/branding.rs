@@ -113,9 +113,10 @@ impl Branding {
     }
 
     /// The text colour for a button whose background is the accent: white or
-    /// near-black, whichever contrasts more with the accent (WCAG relative
-    /// luminance). White for the default accent, so default pages are
-    /// unchanged; near-black for a light accent such as `#fff`.
+    /// black, whichever contrasts more with the accent (WCAG relative
+    /// luminance). The better of the two always reaches at least 4.58:1. White
+    /// for the default accent, so default pages are unchanged; black for a
+    /// light accent such as `#fff`.
     #[must_use]
     pub fn on_accent(&self) -> &'static str {
         let l = relative_luminance(&self.accent).unwrap_or(0.0);
@@ -124,7 +125,7 @@ impl Branding {
         if with_white >= with_black {
             "#fff"
         } else {
-            "#111"
+            "#000"
         }
     }
 
@@ -297,8 +298,34 @@ mod tests {
         assert_eq!(Branding::default().on_accent(), "#fff");
         assert_eq!(with("#0f766e").on_accent(), "#fff");
         assert_eq!(with("#000").on_accent(), "#fff");
-        assert_eq!(with("#fff").on_accent(), "#111");
-        assert_eq!(with("#ffff00").on_accent(), "#111");
+        assert_eq!(with("#fff").on_accent(), "#000");
+        assert_eq!(with("#ffff00").on_accent(), "#000");
+    }
+
+    /// Contrast is measured against the colour actually returned, at the
+    /// accents nearest the switch point, where a wrong foreground would fall
+    /// below WCAG AA (4.5:1).
+    #[test]
+    fn button_text_meets_aa_contrast_near_the_switch_point() {
+        let ratio = |a: &str, b: &str| {
+            let (la, lb) = (
+                relative_luminance(a).expect("valid"),
+                relative_luminance(b).expect("valid"),
+            );
+            (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+        };
+        for accent in ["#757575", "#767676", "#777777", "#787878", "#7f7f7f"] {
+            let b = Branding {
+                accent: accent.to_owned(),
+                ..Branding::default()
+            };
+            let fg = b.on_accent();
+            assert!(
+                ratio(accent, fg) >= 4.5,
+                "{accent} with {fg}: {}",
+                ratio(accent, fg)
+            );
+        }
     }
 
     #[test]
