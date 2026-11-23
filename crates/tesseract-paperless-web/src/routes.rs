@@ -45,6 +45,16 @@ macro_rules! branded {
             fn sign_in(&self) -> bool {
                 crate::auth::enabled()
             }
+            /// The shared zone geometry (side menu | centre | quick-menu
+            /// rail), the same rules the other AdaWorldAPI apps use.
+            fn zones_css(&self) -> &'static str {
+                a2ui_layout::ZONES_CSS
+            }
+            /// The page grid mode: a wide centre between the 210px side menu
+            /// and the 70px quick-menu rail.
+            fn layout_class(&self) -> &'static str {
+                a2ui_layout::LayoutMode::MainWide.class()
+            }
         }
     )+};
 }
@@ -2109,12 +2119,15 @@ mod tests {
         assert!(html.contains("<title>tesseract-paperless — document archive</title>"));
         assert!(html.contains("<h1>tesseract-paperless</h1>"));
         assert!(html.contains("deduplicated by content hash"));
-        assert!(html.contains("background: #2563eb"));
+        // The default accent reaches the page as a token, and the upload
+        // button paints itself from the token, not from a fixed colour.
+        assert!(html.contains("--brand-accent: #2563eb;"));
+        assert!(html.contains("background: var(--brand-accent)"));
         assert!(!html.contains("{{"), "no unrendered template syntax");
         assert!(!html.contains("powered by tesseract-rs"));
         assert!(!html.contains("class=\"logo\""));
-        // The hover state must not re-colour the button: on_accent() picks the
-        // text colour for the unfiltered accent, so a filter can push it
+        // The hover state must not re-colour the button: the on_accent token
+        // is the text colour for the unfiltered accent, so a filter can push it
         // below 4.5:1 (white on #757575 under brightness(1.08) is ~4.04:1).
         assert!(html.contains("button:hover { outline:"));
         assert!(!html.contains("button:hover { filter"));
@@ -3174,6 +3187,205 @@ mod tests {
         // The page listing all kinds marks no menu entry current.
         let (_, _, body) = send(&h, get_req("/definitions")).await;
         assert_eq!(body.matches(" aria-current=\"page\">").count(), 0);
+    }
+
+    /// The pages every shell test below renders: one per template.
+    async fn shell_pages(h: &Harness) -> Vec<(String, String)> {
+        let hash = seed(h, b"shell-pages").await;
+        let mut pages = Vec::new();
+        for uri in [
+            "/".to_string(),
+            "/dashboard".to_string(),
+            "/inbox".to_string(),
+            "/documents".to_string(),
+            format!("/documents/{hash}"),
+            "/definitions".to_string(),
+            "/definitions?kind=tag".to_string(),
+        ] {
+            let (status, _, body) = send(h, get_req(&uri)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            pages.push((uri, body));
+        }
+        pages
+    }
+
+    /// The phone rule exactly as `base.html` writes it.
+    const PHONE_RULE: &str = "@media (max-width: 640px) { .a2-body, .a2-body.mode-main-wide { grid-template-columns: minmax(0, 1fr); } aside.sidemenu-region, aside.quick-rail { display: none; } nav.topnav-links { display: flex; flex-wrap: wrap; } }";
+
+    /// Every page lays itself out on the shared main-wide grid, carries the
+    /// shared zone rules once, and collapses to one column on a phone with the
+    /// rule placed after them (equal specificity: the later rule wins).
+    /// Disable: drop `zones_css()` from `base.html` (the count becomes 0), or
+    /// move the phone rule above it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_page_uses_the_main_wide_grid_and_collapses_on_a_phone() {
+        let h = harness().await;
+        for (uri, body) in shell_pages(&h).await {
+            assert!(
+                body.contains("<div class=\"a2-body mode-main-wide\">"),
+                "{uri}: not the main-wide grid"
+            );
+            assert_eq!(
+                body.matches(a2ui_layout::ZONES_CSS).count(),
+                1,
+                "{uri}: the zone rules must appear exactly once"
+            );
+            let zones_at = body.find(a2ui_layout::ZONES_CSS).expect("zone rules");
+            let phone_at = body
+                .find(PHONE_RULE)
+                .unwrap_or_else(|| panic!("{uri}: phone rule missing or reworded"));
+            assert!(
+                phone_at > zones_at,
+                "{uri}: the phone rule must come after the zone rules"
+            );
+            // The compact links are hidden by default, before the phone rule
+            // can show them.
+            let hidden_at = body
+                .find("nav.topnav-links { display: none; }")
+                .unwrap_or_else(|| panic!("{uri}: compact nav not hidden by default"));
+            assert!(hidden_at < phone_at, "{uri}: default hide must precede the phone rule");
+            assert!(body.contains("color-scheme: light;"), "{uri}");
+            assert!(!body.contains("color-scheme: light dark"), "{uri}");
+        }
+    }
+
+    /// The text of the first `<nav ...>` element that starts with `open`.
+    fn nav_text<'a>(body: &'a str, open: &str) -> &'a str {
+        let start = body.find(open).unwrap_or_else(|| panic!("no {open}"));
+        let end = body[start..].find("</nav>").expect("nav close") + start;
+        &body[start..end]
+    }
+
+    /// The side menu lists all seven destinations and marks exactly the page's
+    /// own entry; two different pages mark different entries, so a menu that
+    /// always marks the same one cannot pass. The compact top-bar copy has the
+    /// same links and marks none (one current entry per page, never two).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_side_menu_has_all_seven_links_and_marks_only_the_current_page() {
+        let h = harness().await;
+        let hrefs = [
+            "href=\"/dashboard\"",
+            "href=\"/inbox\"",
+            "href=\"/documents\"",
+            "href=\"/definitions?kind=correspondent\"",
+            "href=\"/definitions?kind=tag\"",
+            "href=\"/definitions?kind=document_type\"",
+            "href=\"/\"",
+        ];
+        let mut current_of = Vec::new();
+        for (uri, body) in shell_pages(&h).await {
+            let side = nav_text(&body, "<nav class=\"main\"");
+            for href in hrefs {
+                assert!(side.contains(href), "{uri}: side menu lacks {href}");
+            }
+            assert_eq!(
+                side.matches("aria-current=\"page\"").count(),
+                if uri == "/definitions" { 0 } else { 1 },
+                "{uri}: current entries in the side menu"
+            );
+            let compact = nav_text(&body, "<nav class=\"topnav-links\"");
+            for href in hrefs {
+                assert!(compact.contains(href), "{uri}: compact nav lacks {href}");
+            }
+            assert!(!compact.contains("aria-current"), "{uri}: compact nav must not mark a page");
+            assert!(body.contains("class=\"quick-rail region-right_panel\""), "{uri}");
+            assert!(body.contains("aria-label=\"Upload\""), "{uri}: quick-menu upload link");
+            if let Some(i) = side.find("aria-current=\"page\"") {
+                // The href of the link carrying the marker.
+                let before = &side[..i];
+                let h_at = before.rfind("href=\"").expect("href before marker");
+                current_of.push((uri.clone(), before[h_at..].trim_end().to_owned()));
+            }
+        }
+        let dashboard = current_of.iter().find(|(u, _)| u == "/dashboard").expect("dashboard");
+        let documents = current_of.iter().find(|(u, _)| u == "/documents").expect("documents");
+        assert_ne!(dashboard.1, documents.1, "different pages must mark different entries");
+    }
+
+    /// Every `#rgb` / `#rrggbb` colour in `css`, lowercased. An id selector
+    /// (`#customer`) and a numeric entity (`&#8212;`) are not colours.
+    fn hex_colours(css: &str) -> Vec<String> {
+        let b = css.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'#' && (i == 0 || b[i - 1] != b'&') {
+                let mut j = i + 1;
+                while j < b.len() && b[j].is_ascii_hexdigit() {
+                    j += 1;
+                }
+                let word_follows =
+                    j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'-');
+                if j - i - 1 >= 3 && !word_follows {
+                    out.push(css[i..j].to_ascii_lowercase());
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The only fixed colours allowed: statuses, not identity.
+    const STATUS_COLOURS: [&str; 3] = ["#d97706", "#ef4444", "#f59e0b"];
+
+    /// The scanner finds colours and skips what only looks like one.
+    #[test]
+    fn the_colour_scanner_finds_colours_and_skips_selectors_and_entities() {
+        assert_eq!(
+            hex_colours("a{color:#123456;} #customer{} &#8212; b{c:#ABC} #file{} d{e:#d97706 1px}"),
+            ["#123456", "#abc", "#d97706"]
+        );
+        assert!(hex_colours("a { color: var(--brand-fg); }").is_empty());
+    }
+
+    /// After the brand's `:root` line, the stylesheet of every page uses only
+    /// brand tokens and the three status colours: no other fixed hex, no
+    /// `rgb()`/`rgba()`, no system colours (the pages are light only).
+    /// Disable: put `border: 1px solid #e5e7eb` into any page's style block.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rendered_stylesheets_use_only_brand_tokens_and_status_colours() {
+        let h = harness().await;
+        for (uri, body) in shell_pages(&h).await {
+            let open = body.find("<style>").expect("style open");
+            let close = body[open..].find("</style>").expect("style close") + open;
+            let css = &body[open..close];
+            let vars_at = css.find("--brand-font-family").expect("brand vars");
+            let after_vars = &css[vars_at + css[vars_at..].find('\n').expect("vars line end")..];
+            assert!(after_vars.len() > 1500, "{uri}: the page rules must follow the vars");
+            let colours = hex_colours(after_vars);
+            // Can-fire: the scanner does see the status colour of `.error`.
+            assert!(colours.contains(&"#ef4444".to_owned()), "{uri}: scanner saw nothing");
+            for c in &colours {
+                assert!(STATUS_COLOURS.contains(&c.as_str()), "{uri}: fixed colour {c}");
+            }
+            for banned in ["rgb(", "rgba(", "Canvas"] {
+                assert!(!after_vars.contains(banned), "{uri}: {banned}");
+            }
+        }
+    }
+
+    /// The same check straight on the template sources, so a colour in a
+    /// branch the rendered pages above do not take (an error state, an empty
+    /// list) is caught too.
+    #[test]
+    fn template_sources_use_only_brand_tokens_and_status_colours() {
+        for (name, src) in [
+            ("base", include_str!("../templates/base.html")),
+            ("index", include_str!("../templates/index.html")),
+            ("dashboard", include_str!("../templates/dashboard.html")),
+            ("documents", include_str!("../templates/documents.html")),
+            ("document", include_str!("../templates/document.html")),
+            ("definitions", include_str!("../templates/definitions.html")),
+        ] {
+            for c in hex_colours(src) {
+                assert!(STATUS_COLOURS.contains(&c.as_str()), "{name}.html: fixed colour {c}");
+            }
+            for banned in ["rgb(", "rgba(", "Canvas", "brand().accent", "on_accent()"] {
+                assert!(!src.contains(banned), "{name}.html: {banned}");
+            }
+        }
     }
 
     /// The inbox lists exactly the documents not marked reviewed; marking one
