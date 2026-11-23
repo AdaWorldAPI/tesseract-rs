@@ -341,6 +341,8 @@ fn confidence_str(mean_confidence: u32, text: &str) -> String {
 struct DocumentsTemplate {
     /// `"documents"` or `"inbox"`: the same list template serves both.
     nav: &'static str,
+    /// Page links for the inbox; `None` on the document list.
+    pager: Option<Pager>,
     query: String,
     count: usize,
     documents: Vec<DocumentListItem>,
@@ -364,6 +366,7 @@ async fn documents(
         return match state.store.list(LIST_LIMIT).await {
             Ok(rows) => render(&DocumentsTemplate {
                 nav: "documents",
+                pager: None,
                 query,
                 count: rows.len(),
                 documents: rows.into_iter().map(DocumentListItem::from).collect(),
@@ -371,6 +374,7 @@ async fn documents(
             }),
             Err(e) => render(&DocumentsTemplate {
                 nav: "documents",
+                pager: None,
                 query,
                 count: 0,
                 documents: Vec::new(),
@@ -393,6 +397,7 @@ async fn documents(
         Ok(Err(e)) => {
             return render(&DocumentsTemplate {
                 nav: "documents",
+                pager: None,
                 query,
                 count: 0,
                 documents: Vec::new(),
@@ -402,6 +407,7 @@ async fn documents(
         Err(e) => {
             return render(&DocumentsTemplate {
                 nav: "documents",
+                pager: None,
                 query,
                 count: 0,
                 documents: Vec::new(),
@@ -430,6 +436,7 @@ async fn documents(
 
     render(&DocumentsTemplate {
         nav: "documents",
+        pager: None,
         count: documents.len(),
         query,
         documents,
@@ -920,8 +927,14 @@ async fn require_document(state: &AppState, hash: &str) -> Result<(), Response> 
     }
 }
 
-fn back_to_document(hash: &str) -> Redirect {
-    Redirect::to(&format!("/documents/{hash}"))
+/// Back to the document page; when the form came from the inbox
+/// (`from=inbox`), keep that origin so the inbox actions stay on the page.
+fn back_to_document(hash: &str, from: Option<&str>) -> Redirect {
+    if from == Some("inbox") {
+        Redirect::to(&format!("/documents/{hash}?from=inbox"))
+    } else {
+        Redirect::to(&format!("/documents/{hash}"))
+    }
 }
 
 // ---- metadata: document actions -------------------------------------------
@@ -930,6 +943,9 @@ fn back_to_document(hash: &str) -> Redirect {
 struct AssignForm {
     kind: String,
     definition_id: u32,
+    /// `inbox` when the page was opened from the inbox (see `back_to_document`).
+    #[serde(default)]
+    from: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -939,6 +955,9 @@ struct ReviewForm {
     /// review (or the empty inbox). Absent: back to this document.
     #[serde(default)]
     next: Option<String>,
+    /// `inbox` when the page was opened from the inbox (see `back_to_document`).
+    #[serde(default)]
+    from: Option<String>,
 }
 
 /// Manual assign: `Source::Manual`. Single-valued kinds replace.
@@ -955,7 +974,7 @@ async fn document_assign(
         .assign(&hash, kind, f.definition_id, Source::Manual, now_unix_ms())
         .await
         .map_err(|e| meta_fail(&e))?;
-    Ok(back_to_document(&hash))
+    Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
 async fn document_unassign(
@@ -971,7 +990,7 @@ async fn document_unassign(
         .unassign(&hash, kind, f.definition_id)
         .await
         .map_err(|e| store_fail(&e))?;
-    Ok(back_to_document(&hash))
+    Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
 /// Accept an AUTO suggestion: exactly one `AutoAccepted` assignment and
@@ -995,7 +1014,7 @@ async fn document_accept(
         )
         .await
         .map_err(|e| meta_fail(&e))?;
-    Ok(back_to_document(&hash))
+    Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
 /// The reviewed toggle: `reviewed=true` marks, `reviewed=false` clears.
@@ -1034,7 +1053,7 @@ async fn document_review(
         }
     }
     if !to_inbox {
-        return Ok(back_to_document(&hash));
+        return Ok(back_to_document(&hash, f.from.as_deref()));
     }
     let next = unreviewed_rows(&state)
         .await
@@ -1075,21 +1094,58 @@ async fn unreviewed_rows(
 
 /// The inbox: documents to review, as paperless-ngx's inbox. Shows at most
 /// `LIST_LIMIT`, and counts all of them.
-async fn inbox(State(state): State<Arc<AppState>>) -> Html<String> {
+/// Inbox page links: 1-based page, previous and next page when they exist.
+struct Pager {
+    page: usize,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+impl Pager {
+    /// The page shown for `total` documents when `requested` was asked for:
+    /// clamped to `1..=pages`, with neighbours only where they exist.
+    fn for_total(total: usize, requested: Option<usize>) -> Self {
+        let pages = total.div_ceil(LIST_LIMIT).max(1);
+        let page = requested.unwrap_or(1).clamp(1, pages);
+        Pager {
+            page,
+            prev: (page > 1).then(|| page - 1),
+            next: (page < pages).then(|| page + 1),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct InboxQuery {
+    /// 1-based page of `LIST_LIMIT` documents; absent, 0 or past the end is
+    /// clamped to a valid page.
+    page: Option<usize>,
+}
+
+/// The inbox: documents to review, as paperless-ngx's inbox, `LIST_LIMIT`
+/// per page, every page reachable.
+async fn inbox(State(state): State<Arc<AppState>>, Query(q): Query<InboxQuery>) -> Html<String> {
     match unreviewed_rows(&state).await {
-        Ok(rows) => render(&DocumentsTemplate {
-            nav: "inbox",
-            query: String::new(),
-            count: rows.len(),
-            documents: rows
-                .into_iter()
-                .take(LIST_LIMIT)
-                .map(DocumentListItem::from)
-                .collect(),
-            error: None,
-        }),
+        Ok(rows) => {
+            let pager = Pager::for_total(rows.len(), q.page);
+            let page = pager.page;
+            render(&DocumentsTemplate {
+                nav: "inbox",
+                pager: Some(pager),
+                query: String::new(),
+                count: rows.len(),
+                documents: rows
+                    .into_iter()
+                    .skip((page - 1) * LIST_LIMIT)
+                    .take(LIST_LIMIT)
+                    .map(DocumentListItem::from)
+                    .collect(),
+                error: None,
+            })
+        }
         Err(e) => render(&DocumentsTemplate {
             nav: "inbox",
+            pager: None,
             query: String::new(),
             count: 0,
             documents: Vec::new(),
@@ -2228,5 +2284,72 @@ mod tests {
             Some("/definitions"),
             "an unknown view never reaches the URL"
         );
+    }
+
+    /// Every inbox document is reachable: pages of `LIST_LIMIT`, clamped,
+    /// with neighbours only where they exist.
+    #[test]
+    fn the_inbox_pager_reaches_every_page() {
+        let p = Pager::for_total(0, None);
+        assert_eq!((p.page, p.prev, p.next), (1, None, None));
+        let p = Pager::for_total(LIST_LIMIT, Some(2));
+        assert_eq!((p.page, p.prev, p.next), (1, None, None), "one full page");
+        let p = Pager::for_total(LIST_LIMIT + 1, None);
+        assert_eq!((p.page, p.prev, p.next), (1, None, Some(2)));
+        let p = Pager::for_total(LIST_LIMIT + 1, Some(2));
+        assert_eq!((p.page, p.prev, p.next), (2, Some(1), None));
+        let p = Pager::for_total(3 * LIST_LIMIT, Some(0));
+        assert_eq!(p.page, 1, "page 0 clamps to 1");
+        let p = Pager::for_total(3 * LIST_LIMIT, Some(99));
+        assert_eq!(
+            (p.page, p.prev, p.next),
+            (3, Some(2), None),
+            "past the end clamps"
+        );
+    }
+
+    /// A form on a page opened from the inbox returns to it with the inbox
+    /// origin; the same form from the document list returns without it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn document_forms_keep_the_inbox_origin() {
+        let h = harness().await;
+        let hash = seed(&h, b"origin").await;
+        let tag = h
+            .state
+            .store
+            .meta()
+            .create_definition(MetaKind::Tag, "Energie", 1)
+            .await
+            .expect("tag")
+            .definition_id;
+        let inbox_loc = format!("/documents/{hash}?from=inbox");
+        let plain_loc = format!("/documents/{hash}");
+        for (action, body) in [
+            ("assign", format!("kind=tag&definition_id={tag}")),
+            ("unassign", format!("kind=tag&definition_id={tag}")),
+            ("accept", format!("kind=tag&definition_id={tag}")),
+            ("review", "reviewed=false".to_string()),
+        ] {
+            let uri = format!("/documents/{hash}/{action}");
+            let (_, loc, _) = send(&h, post_form(&uri, &format!("{body}&from=inbox"))).await;
+            assert_eq!(loc.as_deref(), Some(inbox_loc.as_str()), "{action}");
+            let (_, loc, _) = send(&h, post_form(&uri, &body)).await;
+            assert_eq!(loc.as_deref(), Some(plain_loc.as_str()), "{action}");
+            let (_, loc, _) = send(
+                &h,
+                post_form(&uri, &format!("{body}&from=https%3A%2F%2Fevil.example")),
+            )
+            .await;
+            assert_eq!(
+                loc.as_deref(),
+                Some(plain_loc.as_str()),
+                "{action}: unknown origin ignored"
+            );
+        }
+        // The page opened from the inbox puts the origin into every form.
+        let (_, _, page) = send(&h, get_req(&inbox_loc)).await;
+        assert!(page.contains("name=\"from\" value=\"inbox\""));
+        let (_, _, plain) = send(&h, get_req(&plain_loc)).await;
+        assert!(!plain.contains("name=\"from\" value=\"inbox\""));
     }
 }

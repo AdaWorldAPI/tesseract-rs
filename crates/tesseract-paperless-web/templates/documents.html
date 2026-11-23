@@ -23,6 +23,8 @@
   .preview b { background: color-mix(in srgb, #f59e0b 35%, transparent); color: CanvasText; font-weight: 600; border-radius: 3px; padding: 0 .15em; }
   .meta { font-size: .8rem; color: color-mix(in srgb, CanvasText 50%, Canvas); margin-top: .4rem; }
   .low-conf { color: #d97706; font-weight: 600; }
+  nav.pager { display: flex; gap: 1rem; align-items: center; justify-content: center; margin-top: 1rem; }
+  nav.pager a { font-weight: 600; text-decoration: none; }
   .empty { color: color-mix(in srgb, CanvasText 55%, Canvas); padding: 2rem 0; text-align: center; }
 {% endblock %}
 {% block content %}
@@ -71,5 +73,14 @@
     </li>
     {% endfor %}
   </ul>
+  {% endif %}
+  {% if let Some(p) = pager %}
+  {% if p.prev.is_some() || p.next.is_some() %}
+  <nav class="pager" aria-label="Inbox pages">
+    {% if let Some(n) = p.prev %}<a href="/inbox?page={{ n }}" rel="prev">&larr; Newer</a>{% endif %}
+    <span class="note">Page {{ p.page }}</span>
+    {% if let Some(n) = p.next %}<a href="/inbox?page={{ n }}" rel="next">Older &rarr;</a>{% endif %}
+  </nav>
+  {% endif %}
   {% endif %}
 {% endblock %}

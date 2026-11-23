@@ -71,17 +71,20 @@
       {% if reviewed %}
       <strong>Reviewed</strong>
       <form class="inline" action="/documents/{{ hash_hex }}/review" method="post">
+        {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
         <input type="hidden" name="reviewed" value="false">
         <button type="submit" class="secondary">Mark unreviewed</button>
       </form>
       {% else %}
       <strong>Not reviewed</strong>
       <form class="inline" action="/documents/{{ hash_hex }}/review" method="post">
+        {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
         <input type="hidden" name="reviewed" value="true">
         <button type="submit" class="secondary">Mark reviewed</button>
       </form>
       {% if from_inbox %}
       <form class="inline" action="/documents/{{ hash_hex }}/review" method="post">
+        {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
         <input type="hidden" name="reviewed" value="true">
         <input type="hidden" name="next" value="inbox">
         <button type="submit" class="act">Mark reviewed, next</button>
@@ -100,6 +103,7 @@
         <span>{{ a.name }}</span>
         <span class="src">{{ a.source }}</span>
         <form class="inline" action="/documents/{{ hash_hex }}/unassign" method="post">
+        {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
           <input type="hidden" name="kind" value="{{ g.kind }}">
           <input type="hidden" name="definition_id" value="{{ a.definition_id }}">
           <button type="submit" class="secondary">Unassign</button>
@@ -112,6 +116,7 @@
     <p class="none">No definitions yet &mdash; <a href="/definitions?kind={{ g.kind }}">create one</a>.</p>
     {% else %}
     <form class="inline" action="/documents/{{ hash_hex }}/assign" method="post">
+        {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
       <input type="hidden" name="kind" value="{{ g.kind }}">
       <select name="definition_id" aria-label="{{ g.label }}">
         {% for o in g.options %}
@@ -136,6 +141,7 @@
         <strong>{{ s.label }}: {{ s.name }}</strong>
         <span>{{ s.percent }}% expected &middot; evidence {{ s.evidence }}</span>
         <form class="inline" action="/documents/{{ hash_hex }}/accept" method="post">
+        {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
           <input type="hidden" name="kind" value="{{ s.kind }}">
           <input type="hidden" name="definition_id" value="{{ s.definition_id }}">
           <button type="submit" class="act">Accept</button>

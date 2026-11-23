@@ -20,6 +20,28 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() {
+    // Sign-in configuration is read and checked before anything else runs, so
+    // a refused start prints only its fatal line: PAPERLESS_REQUIRE_AUTH with no
+    // sign-in stops here, before the model loads or the port is bound.
+    let required = match auth::sign_in_required_from_env() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            std::process::exit(1);
+        }
+    };
+    let auth_cfg = match auth::AuthConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("fatal: sign-in configuration: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = auth::check_open_mode(required, auth_cfg.is_some()) {
+        eprintln!("fatal: {e}");
+        std::process::exit(1);
+    }
+
     let model_dir =
         PathBuf::from(std::env::var("MODEL_DIR").unwrap_or_else(|_| "corpus/model".to_string()));
     // Local filesystem path (Railway: a mounted volume) or any URI
@@ -102,17 +124,8 @@ async fn main() {
     // Sign-in (OIDC) when PAPERLESS_OIDC_ISSUER is set. A set but invalid
     // configuration stops the boot: an archive that meant to require sign-in
     // must never come up open.
-    // PAPERLESS_REQUIRE_AUTH: a deployment that must never run open says so,
-    // and a missing issuer then stops the boot instead of warning.
-    let required = match auth::sign_in_required_from_env() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("fatal: {e}");
-            std::process::exit(1);
-        }
-    };
-    let login = match auth::AuthConfig::from_env() {
-        Ok(Some(cfg)) => {
+    let login = match auth_cfg {
+        Some(cfg) => {
             println!("tesseract-paperless-web: {}", cfg.summary());
             let http = match auth::ReqwestHttp::new() {
                 Ok(h) => h,
@@ -129,20 +142,12 @@ async fn main() {
                 }
             }
         }
-        Ok(None) => {
-            if let Err(e) = auth::check_open_mode(required, false) {
-                eprintln!("fatal: {e}");
-                std::process::exit(1);
-            }
+        None => {
             eprintln!(
                 "warning: PAPERLESS_OIDC_ISSUER unset: NO sign-in, anyone who reaches \
                  this service can read and delete documents. Keep it off public networks."
             );
             None
-        }
-        Err(e) => {
-            eprintln!("fatal: sign-in configuration: {e}");
-            std::process::exit(1);
         }
     };
     let app = auth::protect(routes::router(state), login);
