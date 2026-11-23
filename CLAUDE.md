@@ -4707,3 +4707,42 @@ surface split.
   confidence. Disable run: renumbering after the filter turns it red.
 - Measured on `corpus/pages/page_01.pgm`: triples 1 → 3 (adds
   `(wind,moved,door)` and `(garden,cut,grass)`); corrections considered 3 → 9.
+
+## ★ paperless-web: customer separation, JSON API, frame headers, neutral branding (2026-11-23)
+
+The archive now separates documents by customer and can be read and embedded by
+report-rs. Recorded here because four rules are easy to break later:
+
+- **The customer is an access fact, not a filing definition.** It lives in its own
+  `customers` table (`archive_meta`), never as a `MetaKind`: renaming, retiring or
+  an AUTO suggestion must never move a document between customers. It is written
+  only by an explicit action, and only for a NEW document on upload: a duplicate
+  upload keeps its customer, or re-uploading a file would move another customer's
+  document into the uploader's scope.
+- **The archive decides scope from the caller's own grants.** `customers.rs`
+  maps `(org, role_key)` pairs from the roles claim to customers. The gate attaches
+  a `Caller` with ALL token grants (not only the admitting ones) for a session and
+  for a delegated bearer token alike; report-rs adds no authority. No policy means
+  the old behaviour (everyone sees everything); a policy without sign-in refuses to
+  start; a policy and no caller sees nothing (fail closed).
+- **Out of scope looks exactly like absent.** Every per-document route returns the
+  same 404 for another customer's document as for an unknown hash.
+- **Access is checked under the document's hash lock, never before it.** Every
+  per-document write (assign, unassign, accept, review, refile, delete) goes through
+  `routes::lock_visible`, which takes the hash lock and only then checks the caller's
+  scope against the document's current customer, holding the lock across the write.
+  An upload's duplicate path makes the same check under the same lock before it
+  attaches an original (`IngestError::Hidden`). A check before the lock is stale the
+  moment a concurrent refile lands; `a_write_waiting_for_the_lock_honours_a_concurrent_move`
+  and `a_duplicate_upload_is_checked_under_the_lock_before_the_original_is_attached`
+  fail if either check moves out from under the lock.
+
+`GET /api/v1/customers/{code}/documents` answers only with a policy and returns no
+document text. `headers.rs` sets `frame-ancestors 'self'` plus
+`PAPERLESS_FRAME_ANCESTORS` on every response (the archive was frameable by any
+site before), and a framed request without a session gets a new-tab sign-in link
+because the identity provider refuses to be framed. No customer's identity is
+compiled in (operator, 2026-11-23: the corporate identity comes only from Railway
+variables, so one blank image hosts any customer): the layout (header bar, cards)
+is the neutral default, and a deployment sets `BRAND_NAME`, `BRAND_ACCENT`,
+`BRAND_HEADER_BG` and `BRAND_LOGO_URL`.

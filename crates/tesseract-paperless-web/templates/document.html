@@ -68,6 +68,21 @@
 
   <div class="card">
     <h2>Metadata</h2>
+    <div class="customer">
+      <strong>Customer:</strong>
+      {% if let Some(c) = customer %}<span class="customer-code">{{ c }}</span>{% else %}<span class="note">not filed under a customer</span>{% endif %}
+      <form class="inline" action="/documents/{{ hash_hex }}/customer" method="post">
+        {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
+        {% if let Some(choices) = customer_choices %}
+        <select name="customer" aria-label="Customer" required>
+          {% for code in choices %}<option value="{{ code }}"{% if customer.as_deref() == Some(code.as_str()) %} selected{% endif %}>{{ code }}</option>{% endfor %}
+        </select>
+        {% else %}
+        <input name="customer" aria-label="Customer code" pattern="[A-Za-z0-9_\-]{1,32}" placeholder="e.g. K01, empty to clear" value="{% if let Some(c) = customer %}{{ c }}{% endif %}">
+        {% endif %}
+        <button type="submit" class="secondary">Set customer</button>
+      </form>
+    </div>
     <div class="review">
       {% if reviewed %}
       <strong>Reviewed</strong>

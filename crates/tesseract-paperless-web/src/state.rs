@@ -80,6 +80,10 @@ pub struct AppState {
     /// whole on every re-mine; a reader clones the slot and never holds the
     /// lock across an `.await`.
     pub auto: std::sync::RwLock<AutoSlot>,
+    /// Who may see which customers' documents (`customers.rs`). `None`: no
+    /// policy is configured and every admitted caller sees every document.
+    /// Set by `main` after [`Self::load`], from the environment.
+    pub policy: Option<crate::customers::CustomerPolicy>,
 }
 
 /// Where the AUTO model stands.
@@ -164,7 +168,11 @@ impl AppState {
                     report.already_local,
                     report.skipped,
                     report.without_original,
-                    if report.metadata { "imported" } else { "absent" }
+                    if report.metadata {
+                        "imported"
+                    } else {
+                        "absent"
+                    }
                 );
             } else if crate::replica::has_snapshot_hold(blob_dir) {
                 // A degraded restore skipped damaged records. Retry them on
@@ -271,6 +279,7 @@ impl AppState {
             reasoner,
             recognize_permits: Arc::new(Semaphore::new(permits)),
             auto: std::sync::RwLock::new(AutoSlot::Pending),
+            policy: None,
         })
     }
 
@@ -342,7 +351,9 @@ impl AppState {
             let _permit = permit;
             let Some(r) = &state.replica else { return };
             if let Err(e) = r.upload_snapshot(&state.store, &state.blobs).await {
-                eprintln!("replica: metadata snapshot upload failed: {e}; the replicator will retry");
+                eprintln!(
+                    "replica: metadata snapshot upload failed: {e}; the replicator will retry"
+                );
             }
         });
     }
@@ -377,10 +388,14 @@ impl AppState {
                 .apply_delete_intent(&state.store, &state.blobs, &hash, state.hash_lock(&key))
                 .await
             {
-                eprintln!("replica: deleting {hash} from S3 failed: {e}; the replicator will retry");
+                eprintln!(
+                    "replica: deleting {hash} from S3 failed: {e}; the replicator will retry"
+                );
             }
             if let Err(e) = r.upload_snapshot(&state.store, &state.blobs).await {
-                eprintln!("replica: metadata snapshot upload failed: {e}; the replicator will retry");
+                eprintln!(
+                    "replica: metadata snapshot upload failed: {e}; the replicator will retry"
+                );
             }
         });
     }
@@ -471,5 +486,42 @@ impl AppState {
             .auto
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = slot;
+    }
+}
+
+/// Tells a waiting test that a request is about to take a document's hash
+/// lock, so the test can change the document at exactly that point instead of
+/// guessing with a sleep. Keyed by hash, so tests running in parallel on
+/// different documents do not see each other's signals.
+#[cfg(test)]
+pub(crate) mod lock_probe {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use tokio::sync::oneshot;
+
+    static WAITERS: Mutex<Option<HashMap<String, oneshot::Sender<()>>>> = Mutex::new(None);
+
+    /// Arm the probe for `hash`; the receiver fires when a request reaches it.
+    pub(crate) fn expect(hash: &str) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        WAITERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(hash.to_string(), tx);
+        rx
+    }
+
+    /// Called just before a request takes `hash`'s lock.
+    pub(crate) fn reached(hash: &str) {
+        let tx = WAITERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|m| m.remove(hash));
+        if let Some(tx) = tx {
+            let _ = tx.send(());
+        }
     }
 }

@@ -49,6 +49,18 @@
   button:hover { outline: 2px solid CanvasText; outline-offset: 2px; }
   :focus-visible { outline: 2px solid CanvasText; outline-offset: 2px; }
   footer { max-width: 52rem; margin: 0 auto; padding: 0 1rem 2rem; font-size: .8rem; color: color-mix(in srgb, CanvasText 50%, Canvas); }
+  /* The portal layout: a header bar, cards on a slightly tinted page. Neutral by
+     default (system colours, light and dark); a deployment sets its own colours
+     with BRAND_ACCENT and BRAND_HEADER_BG. */
+  body { background: color-mix(in srgb, CanvasText 4%, Canvas); }
+  header.shell { border-bottom: 0;
+    background: {% if let Some(bg) = self.brand().header_bg() %}{{ bg }}{% else %}color-mix(in srgb, CanvasText 88%, Canvas){% endif %}; }
+  header.shell .brand, header.shell .end, form.signout button, nav.main a:hover, nav.main a[aria-current="page"] {
+    color: {% if let Some(fg) = self.brand().on_header() %}{{ fg }}{% else %}Canvas{% endif %}; }
+  nav.main a { color: {% if let Some(fg) = self.brand().on_header() %}{{ fg }}{% else %}Canvas{% endif %}; }
+  header.shell :focus-visible { outline-color: {% if let Some(fg) = self.brand().on_header() %}{{ fg }}{% else %}Canvas{% endif %}; }
+  nav.main a[aria-current="page"] { border-bottom-color: {{ self.brand().accent }}; }
+  .card { background: Canvas; border-radius: 14px; box-shadow: 0 4px 16px rgba(0,0,0,.08); }
 {% block style %}{% endblock %}
 </style>
 </head>

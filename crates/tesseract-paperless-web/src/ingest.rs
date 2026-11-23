@@ -12,7 +12,7 @@
 //! written out here rather than forced through that generic entry point. The
 //! invariant it protects — the gate decides before the producer runs, and a
 //! duplicate's bytes never reach the producer at all — holds identically:
-//! see [`ingest`]'s early return on [`Verdict::Duplicate`].
+//! see [`ingest_for_customer`]'s early return on [`Verdict::Duplicate`].
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,6 +27,7 @@ use tesseract_paperless::kv::{mint_document_root, preflight, MatchedOn, Verdict}
 use tesseract_paperless::search::SearchError;
 use tesseract_paperless::store::StoreError;
 
+use crate::customers::Scope;
 use crate::decode::decode_grey;
 use crate::state::AppState;
 
@@ -102,8 +103,11 @@ pub enum IngestError {
     Store(StoreError),
     /// The document was archived, but the search index write failed --
     /// stored yet unsearchable. Reported rather than swallowed (see
-    /// [`ingest`]'s doc comment on why this is a real, if narrow, gap).
+    /// [`ingest_for_customer`]'s doc comment on why this is a real, if narrow, gap).
     Search(SearchError),
+    /// The archive already holds these bytes, filed under a customer the
+    /// uploader cannot see. Nothing was changed.
+    Hidden,
 }
 
 impl std::fmt::Display for IngestError {
@@ -116,6 +120,7 @@ impl std::fmt::Display for IngestError {
             Self::Blob(e) => write!(f, "original-file store: {e}"),
             Self::Store(e) => write!(f, "archive write: {e}"),
             Self::Search(e) => write!(f, "search index write: {e}"),
+            Self::Hidden => write!(f, "already held under a customer the uploader cannot see"),
         }
     }
 }
@@ -135,11 +140,24 @@ impl std::fmt::Display for IngestError {
 /// index -- an inconsistency, not data loss, because the index holds no text
 /// of its own. `Err(IngestError::Search(_))` surfaces it, and
 /// `tesseract_paperless::reconcile` repairs it on the next start.
-pub async fn ingest(
+///
+/// # Filing under a customer
+///
+/// The customer is written under the document's hash lock, after a re-check
+/// that no other upload committed the same bytes meanwhile, and before the
+/// document row. So only the upload that actually creates the document sets
+/// its customer (a concurrent upload of the same file by another customer gets
+/// `Duplicate` and changes nothing), and a committed document is never left
+/// without the customer it was uploaded for, even if search indexing fails
+/// afterwards. A duplicate never changes the customer it has. The caller has
+/// validated `customer` against its scope.
+pub async fn ingest_for_customer(
     state: &Arc<AppState>,
     bytes: Vec<u8>,
     filename: Option<String>,
     mime: &str,
+    customer: Option<&str>,
+    scope: &Scope,
 ) -> Result<IngestOutcome, IngestError> {
     let (hash, verdict) = preflight(&bytes, &state.store);
     let hex = format!("{hash:?}");
@@ -149,8 +167,9 @@ pub async fn ingest(
         // the document since. Re-check under the lock: a document that is gone
         // is uploaded as new (below), never answered as "already held" with a
         // link to nothing.
-        let lock = state.hash_lock(&hash);
-        let held = lock.lock().await;
+        #[cfg(test)]
+        crate::state::lock_probe::reached(&hex);
+        let held = state.hash_lock(&hash).lock_owned().await;
         if state
             .store
             .get(&hex)
@@ -158,6 +177,13 @@ pub async fn ingest(
             .map_err(IngestError::Store)?
             .is_some()
         {
+            // Checked under the lock refiling also takes, before the original
+            // is attached: a document moved to another customer meanwhile is
+            // refused here, not after it has been changed.
+            if !may_see(state, scope, &hex).await {
+                drop(held);
+                return Err(IngestError::Hidden);
+            }
             // Deterministic from the hash alone — no store round-trip needed to
             // learn the address a Stored ingest of these exact bytes already
             // minted (`store::LanceStore::put` computes the identical value).
@@ -165,17 +191,23 @@ pub async fn ingest(
             // A document stored before originals were kept has a row and no
             // blob. These bytes hash to its key, so they are its original: keep
             // them, and change nothing else. No recognition either way.
+            // The lock moves into the blocking write and is released only when
+            // it returns, even if this request is cancelled meanwhile: a refile
+            // or a delete cannot slip in while the original is being written.
             let original_added = if matched == MatchedOn::Original {
                 let st = state.clone();
-                let outcome = tokio::task::spawn_blocking(move || st.blobs.put(&hash, &bytes))
-                    .await
-                    .map_err(|e| IngestError::Task(e.to_string()))?
-                    .map_err(IngestError::Blob)?;
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let _held = held;
+                    st.blobs.put(&hash, &bytes)
+                })
+                .await
+                .map_err(|e| IngestError::Task(e.to_string()))?
+                .map_err(IngestError::Blob)?;
                 outcome == PutOutcome::Written
             } else {
+                drop(held);
                 false
             };
-            drop(held);
             if original_added {
                 // The record in S3 says the document has no original yet.
                 state.replicate_document(&hex);
@@ -270,11 +302,48 @@ pub async fn ingest(
     // document from removing the original between these two writes.
     let lock = state.hash_lock(&hash);
     let held = lock.lock().await;
+    // Another upload of the same bytes may have committed while this one was
+    // recognizing. It created the document and set its customer; this one is a
+    // duplicate and changes nothing.
+    if state
+        .store
+        .get(&hex)
+        .await
+        .map_err(IngestError::Store)?
+        .is_some()
+    {
+        let visible = may_see(state, scope, &hex).await;
+        drop(held);
+        if !visible {
+            return Err(IngestError::Hidden);
+        }
+        return Ok(IngestOutcome::Duplicate {
+            hash_hex: hex,
+            document_guid: mint_document_root(&hash).root.0.to_bytes(),
+            matched: MatchedOn::Original,
+            original_added: false,
+        });
+    }
     let st = state.clone();
     tokio::task::spawn_blocking(move || st.blobs.put(&hash, &bytes))
         .await
         .map_err(|e| IngestError::Task(e.to_string()))?
         .map_err(IngestError::Blob)?;
+    // Before the row: a failure here stores nothing visible, and a crash
+    // between the two leaves an orphan customer row the next start removes.
+    // Written even without a customer: `None` clears an orphan a failed
+    // earlier attempt left, which this document must not inherit.
+    {
+        state
+            .store
+            .meta()
+            .set_customer(&hex, customer, ingested_at_unix_ms)
+            .await
+            .map_err(|e| match e {
+                tesseract_paperless::archive_meta::MetaError::Store(e) => IngestError::Store(e),
+                other => IngestError::Task(other.to_string()),
+            })?;
+    }
 
     let guid = state
         .store
@@ -330,6 +399,29 @@ pub async fn ingest(
         triple_count,
         spo_extraction_ran,
     })
+}
+
+/// [`ingest_for_customer`] without a customer, as tests call it.
+#[cfg(test)]
+pub async fn ingest(
+    state: &Arc<AppState>,
+    bytes: Vec<u8>,
+    filename: Option<String>,
+    mime: &str,
+) -> Result<IngestOutcome, IngestError> {
+    ingest_for_customer(state, bytes, filename, mime, None, &Scope::All).await
+}
+
+/// Whether `scope` covers the document's current customer. A failed read
+/// answers no: an upload is refused rather than let through unchecked.
+async fn may_see(state: &AppState, scope: &Scope, hex: &str) -> bool {
+    if *scope == Scope::All {
+        return true;
+    }
+    match state.store.meta().customer_of(hex).await {
+        Ok(customer) => scope.covers(customer.as_deref()),
+        Err(_) => false,
+    }
 }
 
 /// Milliseconds since the Unix epoch; 0 if the clock is before it.

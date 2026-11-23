@@ -266,7 +266,9 @@ fn normalize_endpoint(endpoint: &str) -> Result<String, String> {
         return bad("must not contain credentials");
     }
     if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
-        return bad("must be a bare origin (https://host[:port]), without a path, query or fragment");
+        return bad(
+            "must be a bare origin (https://host[:port]), without a path, query or fragment",
+        );
     }
     let Some(host) = url.host_str() else {
         return bad("has no host");
@@ -677,9 +679,8 @@ mod tests {
         assert!(!format!("{c:?}").contains("zq9"));
 
         // Only AWS_* set: off, not borrowed.
-        let aws_only = |k: &str| -> Option<String> {
-            k.starts_with("AWS_").then(|| "x".to_string())
-        };
+        let aws_only =
+            |k: &str| -> Option<String> { k.starts_with("AWS_").then(|| "x".to_string()) };
         assert!(S3Config::from_vars(aws_only).expect("ok").is_none());
 
         // A partial set is an error naming what is missing.
@@ -743,15 +744,20 @@ mod tests {
         let cleanup = Cleanup(&c, format!("{p}/"));
         let original = format!("{p}/originals/a b+c");
         let body = b"live bytes \x00\xff".to_vec();
-        c.put(&original, &body, "application/octet-stream").expect("put");
+        c.put(&original, &body, "application/octet-stream")
+            .expect("put");
         assert_eq!(c.get(&original).expect("get"), body);
         assert!(c
             .get(&format!("{p}/originals/absent"))
             .expect_err("absent")
             .is_not_found());
         for i in 0..1001 {
-            c.put(&format!("{p}/documents/{i:05}.json"), b"{}", "application/json")
-                .expect("put many");
+            c.put(
+                &format!("{p}/documents/{i:05}.json"),
+                b"{}",
+                "application/json",
+            )
+            .expect("put many");
         }
         let listed = c.list(&format!("{p}/documents/")).expect("list");
         assert_eq!(listed.len(), 1001, "a listing past one page");
@@ -805,15 +811,25 @@ mod tests {
             "<ListBucketResult><IsTruncated>false</IsTruncated>",
             "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>a</Key>",
         ] {
-            assert_eq!(list_page(bad).expect_err(bad).class, "list_invalid", "{bad}");
+            assert_eq!(
+                list_page(bad).expect_err(bad).class,
+                "list_invalid",
+                "{bad}"
+            );
         }
     }
 
     #[test]
     fn the_endpoint_must_be_a_bare_https_origin() {
         for (given, normal) in [
-            ("https://fly.storage.tigris.dev", "https://fly.storage.tigris.dev"),
-            ("https://fly.storage.tigris.dev/", "https://fly.storage.tigris.dev"),
+            (
+                "https://fly.storage.tigris.dev",
+                "https://fly.storage.tigris.dev",
+            ),
+            (
+                "https://fly.storage.tigris.dev/",
+                "https://fly.storage.tigris.dev",
+            ),
             ("https://S3.Example", "https://s3.example"),
             ("https://s3.example:9000", "https://s3.example:9000"),
             // the default port is dropped, as the HTTP client drops it

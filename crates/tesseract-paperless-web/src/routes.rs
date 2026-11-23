@@ -14,7 +14,7 @@ use axum::extract::{DefaultBodyLimit, Form, Multipart, Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{Extension, Router};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use ogar_doc_ir::{DocIr, RegionKind};
@@ -27,8 +27,10 @@ use tesseract_paperless::kv::ContentSha256;
 use tesseract_paperless::matching::MatchAlgorithm;
 use tesseract_paperless::store::DocumentRow;
 
+use crate::auth::Caller;
+use crate::customers::Scope;
 use crate::fetch::fetch_image_url;
-use crate::ingest::{ingest, now_unix_ms, IngestOutcome};
+use crate::ingest::{ingest_for_customer, now_unix_ms, IngestError, IngestOutcome};
 use crate::state::{AppState, AutoSlot};
 
 /// Gives every page template access to the deployment's branding
@@ -111,6 +113,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/documents/:hash/unassign", post(document_unassign))
         .route("/documents/:hash/accept", post(document_accept))
         .route("/documents/:hash/review", post(document_review))
+        .route("/documents/:hash/customer", post(document_customer))
+        .route(
+            "/api/v1/customers/:code/documents",
+            get(crate::api::customer_documents),
+        )
         .route("/definitions", get(definitions_page))
         .route("/definitions/create", post(definition_create))
         .route("/definitions/rename", post(definition_rename))
@@ -132,14 +139,104 @@ fn render<T: Template>(t: &T) -> Html<String> {
     }
 }
 
+// ---- customer scope --------------------------------------------------------
+
+/// The scope of this request's caller. Without a customer policy every caller
+/// sees everything (the archive's earlier behaviour). With one, a caller the
+/// gate attached no grants to sees nothing: the start rule makes that
+/// unreachable (a policy needs sign-in), and failing closed keeps it so.
+fn scope_of(state: &AppState, caller: Option<&Extension<Caller>>) -> Scope {
+    match (&state.policy, caller) {
+        (None, _) => Scope::All,
+        (Some(p), Some(Extension(c))) => p.scope_for(&c.grants),
+        (Some(_), None) => Scope::Customers(Default::default()),
+    }
+}
+
+/// Keep the rows `scope` may see. One read of the customers table, not one
+/// per row.
+async fn filter_visible(
+    state: &AppState,
+    scope: &Scope,
+    rows: Vec<DocumentRow>,
+) -> Result<Vec<DocumentRow>, tesseract_paperless::store::StoreError> {
+    if *scope == Scope::All {
+        return Ok(rows);
+    }
+    let customers = state.store.meta().customers().await?;
+    Ok(rows
+        .into_iter()
+        .filter(|r| scope.covers(customers.get(&r.content_sha256_hex).map(String::as_str)))
+        .collect())
+}
+
+/// The document must exist AND be visible to the caller. Both failures are
+/// the same 404, so a caller cannot tell another customer's document from a
+/// hash that is not in the archive.
+async fn require_visible(state: &AppState, scope: &Scope, hash: &str) -> Result<(), Response> {
+    let not_found = || fail(StatusCode::NOT_FOUND, "no document with this hash");
+    let read_failed = |e: tesseract_paperless::store::StoreError| {
+        fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("archive read failed: {e}"),
+        )
+    };
+    match state.store.get(hash).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(not_found()),
+        Err(e) => return Err(read_failed(e)),
+    }
+    if *scope == Scope::All {
+        return Ok(());
+    }
+    // A failed customer read answers 404 too: a 500 here, for a hash whose
+    // row exists, would tell another customer's document from an unknown one.
+    let Ok(customer) = state.store.meta().customer_of(hash).await else {
+        return Err(not_found());
+    };
+    if scope.covers(customer.as_deref()) {
+        Ok(())
+    } else {
+        Err(not_found())
+    }
+}
+
+/// [`require_visible`], checked while holding the document's hash lock, which
+/// is returned to be held across the write that follows. Refiling, deletes,
+/// assignments, reviews and an upload's duplicate path all take this lock, so a
+/// move to another customer cannot land between the check and the write: a
+/// write that waited for the lock sees the document's customer as it is then.
+async fn lock_visible(
+    state: &AppState,
+    scope: &Scope,
+    hash: &str,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, Response> {
+    let Some(key) = ContentSha256::from_hex(hash) else {
+        return Err(fail(StatusCode::NOT_FOUND, "no document with this hash"));
+    };
+    #[cfg(test)]
+    crate::state::lock_probe::reached(hash);
+    let held = state.hash_lock(&key).lock_owned().await;
+    require_visible(state, scope, hash).await?;
+    Ok(held)
+}
+
 #[derive(Template)]
 #[template(path = "index.html")]
 struct IndexTemplate {
     error: Option<String>,
+    /// The customers the caller may file under; `None`: any code, or none.
+    customer_choices: Option<Vec<String>>,
 }
 
-async fn index() -> Html<String> {
-    render(&IndexTemplate { error: None })
+async fn index(
+    State(state): State<Arc<AppState>>,
+    caller: Option<Extension<Caller>>,
+) -> Html<String> {
+    render(&IndexTemplate {
+        error: None,
+        customer_choices: scope_of(&state, caller.as_ref()).choices(),
+    })
 }
 
 /// The `file`/`url` upload form's parsed fields — mirrors
@@ -148,15 +245,37 @@ async fn index() -> Html<String> {
 /// dictionary beam on; deskew/rectify are display-quality knobs that don't
 /// yet have a place in the archive's stored `DocIr`).
 struct UploadedFile {
-    bytes: Vec<u8>,
-    filename: Option<String>,
-    mime: String,
+    source: UploadSource,
+    /// The customer to file the document under; `None` when left empty.
+    customer: Option<String>,
+}
+
+/// Where the upload's bytes come from. A URL is fetched only after the
+/// customer check, so a refused upload causes no outbound request.
+enum UploadSource {
+    File {
+        bytes: Vec<u8>,
+        filename: Option<String>,
+    },
+    Url(String),
+}
+
+impl UploadSource {
+    /// The bytes, the filename and the MIME guess.
+    async fn into_bytes(self) -> Result<(Vec<u8>, Option<String>, String), String> {
+        let octets = "application/octet-stream".to_string();
+        match self {
+            Self::File { bytes, filename } => Ok((bytes, filename, octets)),
+            Self::Url(u) => Ok((fetch_image_url(&u).await?, None, octets)),
+        }
+    }
 }
 
 async fn read_upload(mut multipart: Multipart) -> Result<UploadedFile, String> {
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut file_name: Option<String> = None;
     let mut url: Option<String> = None;
+    let mut customer: Option<String> = None;
 
     loop {
         match multipart.next_field().await {
@@ -178,6 +297,13 @@ async fn read_upload(mut multipart: Multipart) -> Result<UploadedFile, String> {
                             }
                         }
                     }
+                    "customer" => {
+                        if let Ok(t) = field.text().await {
+                            if !t.trim().is_empty() {
+                                customer = Some(t.trim().to_string());
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -186,36 +312,86 @@ async fn read_upload(mut multipart: Multipart) -> Result<UploadedFile, String> {
         }
     }
 
-    let (bytes, filename, mime) = if let Some(b) = file_bytes {
-        (b, file_name, "application/octet-stream".to_string())
+    let source = if let Some(bytes) = file_bytes {
+        UploadSource::File {
+            bytes,
+            filename: file_name,
+        }
     } else if let Some(u) = url {
-        let bytes = fetch_image_url(&u).await?;
-        (bytes, None, "application/octet-stream".to_string())
+        UploadSource::Url(u)
     } else {
         return Err("please choose a file or paste an image URL".to_string());
     };
-    Ok(UploadedFile {
-        bytes,
-        filename,
-        mime,
-    })
+    Ok(UploadedFile { source, customer })
 }
 
-async fn upload(State(state): State<Arc<AppState>>, multipart: Multipart) -> Response {
+/// Whether `scope` may file a document under `customer` (`None`: no customer).
+/// A scoped caller must name one of its own customers; only [`Scope::All`]
+/// may leave a document unfiled.
+fn may_file_under(scope: &Scope, customer: Option<&str>) -> Result<(), String> {
+    if let Some(c) = customer {
+        if !tesseract_paperless::archive_meta::valid_customer_code(c) {
+            return Err(format!(
+                "{c:?} is not a customer code (1 to {} letters, digits, '-' or '_')",
+                tesseract_paperless::archive_meta::MAX_CUSTOMER_CODE
+            ));
+        }
+    }
+    match (scope, customer) {
+        (Scope::All, _) => Ok(()),
+        (Scope::Customers(_), None) => Err("choose the customer this document belongs to".into()),
+        (s, Some(c)) if s.covers(Some(c)) => Ok(()),
+        (_, Some(c)) => Err(format!("you cannot file documents under customer {c}")),
+    }
+}
+
+async fn upload(
+    State(state): State<Arc<AppState>>,
+    caller: Option<Extension<Caller>>,
+    multipart: Multipart,
+) -> Response {
+    let scope = scope_of(&state, caller.as_ref());
+    let page_error = |e: String| {
+        render(&IndexTemplate {
+            error: Some(e),
+            customer_choices: scope.choices(),
+        })
+        .into_response()
+    };
     let uploaded = match read_upload(multipart).await {
         Ok(u) => u,
-        Err(e) => return render(&IndexTemplate { error: Some(e) }).into_response(),
+        Err(e) => return page_error(e),
     };
-
-    match ingest(&state, uploaded.bytes, uploaded.filename, &uploaded.mime).await {
+    // Refused before a URL is fetched or recognition is spent.
+    if let Err(e) = may_file_under(&scope, uploaded.customer.as_deref()) {
+        return page_error(e);
+    }
+    let (bytes, filename, mime) = match uploaded.source.into_bytes().await {
+        Ok(b) => b,
+        Err(e) => return page_error(e),
+    };
+    // Whether the caller may see a document these bytes already belong to is
+    // decided inside ingest, under that document's hash lock and before
+    // anything is changed, so a concurrent move to another customer cannot
+    // slip in between. A re-upload never changes a document's customer.
+    match ingest_for_customer(
+        &state,
+        bytes,
+        filename,
+        &mime,
+        uploaded.customer.as_deref(),
+        &scope,
+    )
+    .await
+    {
         Ok(outcome) => {
             log_ingest_outcome(&outcome);
             Redirect::to(&format!("/documents/{}", outcome.hash_hex())).into_response()
         }
-        Err(e) => render(&IndexTemplate {
-            error: Some(format!("ingestion failed: {e}")),
-        })
-        .into_response(),
+        Err(IngestError::Hidden) => page_error(
+            "this file is already in the archive, filed under a customer you cannot see".into(),
+        ),
+        Err(e) => page_error(format!("ingestion failed: {e}")),
     }
 }
 
@@ -366,12 +542,28 @@ const LIST_LIMIT: usize = 200;
 
 async fn documents(
     State(state): State<Arc<AppState>>,
+    caller: Option<Extension<Caller>>,
     Query(q): Query<DocumentsQuery>,
 ) -> Html<String> {
     let query = q.q.unwrap_or_default();
+    let scope = scope_of(&state, caller.as_ref());
 
     if query.trim().is_empty() {
-        return match state.store.list(LIST_LIMIT).await {
+        // A scoped caller reads the whole table and keeps its own rows, so the
+        // newest LIST_LIMIT of THEIR documents show, not their share of the
+        // newest LIST_LIMIT overall (the same exactness `unreviewed_rows` keeps).
+        let listed = async {
+            let limit = if scope == Scope::All {
+                LIST_LIMIT
+            } else {
+                state.store.count().await?.max(1)
+            };
+            let rows = state.store.list(limit).await?;
+            let mut rows = filter_visible(&state, &scope, rows).await?;
+            rows.truncate(LIST_LIMIT);
+            Ok::<_, tesseract_paperless::store::StoreError>(rows)
+        };
+        return match listed.await {
             Ok(rows) => render(&DocumentsTemplate {
                 nav: "documents",
                 pager: None,
@@ -394,10 +586,20 @@ async fn documents(
     // Ranked full-text search (BM25 + snippet generation) is CPU/disk work,
     // dispatched off the async runtime the same way OCR and the search-index
     // write already are.
+    // A scoped caller's results are filtered after the search, so it searches
+    // every entry in the index: cutting to LIST_LIMIT first would let other
+    // customers' documents push its own matches out, and a limit taken from
+    // the archive's row count would let stale index entries (no archive row)
+    // use up slots. The cut to LIST_LIMIT comes after the filter.
+    let scoped = scope != Scope::All;
     let st = state.clone();
     let q_for_search = query.clone();
     let results = match tokio::task::spawn_blocking(move || {
-        st.search.search(&q_for_search, LIST_LIMIT)
+        if scoped {
+            st.search.search_every_match(&q_for_search)
+        } else {
+            st.search.search(&q_for_search, LIST_LIMIT)
+        }
     })
     .await
     {
@@ -430,8 +632,33 @@ async fn documents(
     // cost rather than a hidden one; see `ingest.rs`'s doc comment on the
     // store/index consistency gap this join can also surface (a hit with no
     // matching row) via `Ok(None)` below.
-    let mut documents = Vec::with_capacity(results.hits.len());
+    // The index holds every customer's documents; a hit the caller may not see
+    // is dropped here, before its snippet is cut.
+    let customers = if scope == Scope::All {
+        Default::default()
+    } else {
+        match state.store.meta().customers().await {
+            Ok(c) => c,
+            Err(e) => {
+                return render(&DocumentsTemplate {
+                    nav: "documents",
+                    pager: None,
+                    query,
+                    count: 0,
+                    documents: Vec::new(),
+                    error: Some(format!("archive read failed: {e}")),
+                })
+            }
+        }
+    };
+    let mut documents = Vec::with_capacity(results.hits.len().min(LIST_LIMIT));
     for hit in &results.hits {
+        if !scope.covers(customers.get(&hit.hash_hex).map(String::as_str)) {
+            continue;
+        }
+        if documents.len() == LIST_LIMIT {
+            break;
+        }
         match state.store.get(&hit.hash_hex).await {
             Ok(Some(row)) => documents.push(DocumentListItem::from_search_hit(row, &results)),
             Ok(None) => eprintln!(
@@ -583,6 +810,10 @@ struct DocumentDetailTemplate {
     /// Whether the uploaded original is kept (false for documents stored
     /// before the original-file store).
     has_original: bool,
+    /// The customer the document is filed under.
+    customer: Option<String>,
+    /// The customers the caller may file it under; `None`: any code, or none.
+    customer_choices: Option<Vec<String>>,
     error: Option<String>,
 }
 
@@ -758,6 +989,8 @@ fn not_found_detail(hash_hex: &str, error: impl Into<String>) -> DocumentDetailT
         suggestions_note: None,
         from_inbox: false,
         has_original: false,
+        customer: None,
+        customer_choices: None,
         error: Some(error.into()),
     }
 }
@@ -770,8 +1003,24 @@ struct DetailQuery {
 
 async fn document_detail(
     State(state): State<Arc<AppState>>,
+    caller: Option<Extension<Caller>>,
     Path(hash): Path<String>,
     Query(dq): Query<DetailQuery>,
+) -> Response {
+    let scope = scope_of(&state, caller.as_ref());
+    if let Err(refused) = require_visible(&state, &scope, &hash).await {
+        return refused;
+    }
+    document_detail_page(&state, &scope, hash, dq)
+        .await
+        .into_response()
+}
+
+async fn document_detail_page(
+    state: &Arc<AppState>,
+    scope: &Scope,
+    hash: String,
+    dq: DetailQuery,
 ) -> Html<String> {
     let from_inbox = dq.from.as_deref() == Some("inbox");
     let row = match state.store.get(&hash).await {
@@ -812,20 +1061,21 @@ async fn document_detail(
     // assigns, reviews or re-mines. Metadata is read, suggestions are
     // computed from the current model slot, and nothing is stored.
     let meta = state.store.meta();
-    let (defs, assigns, reviewed) = match (
+    let (defs, assigns, reviewed, customer) = match (
         meta.definitions().await,
         meta.assignments_for(&hash).await,
         meta.is_reviewed(&hash).await,
+        meta.customer_of(&hash).await,
     ) {
-        (Ok(d), Ok(a), Ok(r)) => (d, a, r),
-        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+        (Ok(d), Ok(a), Ok(r), Ok(c)) => (d, a, r, c),
+        (Err(e), _, _, _) | (_, Err(e), _, _) | (_, _, Err(e), _) | (_, _, _, Err(e)) => {
             return render(&not_found_detail(
                 &hash,
                 format!("archive metadata read failed: {e}"),
             ))
         }
     };
-    let (suggestions, suggestions_note) = suggestions_for(&state, &row, &assigns);
+    let (suggestions, suggestions_note) = suggestions_for(state, &row, &assigns);
     let has_original =
         ContentSha256::from_hex(&row.content_sha256_hex).is_some_and(|k| state.blobs.contains(&k));
 
@@ -848,6 +1098,8 @@ async fn document_detail(
         triples,
         from_inbox,
         has_original,
+        customer,
+        customer_choices: scope.choices(),
         error: None,
     })
 }
@@ -860,11 +1112,15 @@ async fn document_detail(
 /// `nosniff`, so an upload is never rendered as a page of this origin.
 async fn document_original(
     State(state): State<Arc<AppState>>,
+    caller: Option<Extension<Caller>>,
     Path(hash): Path<String>,
 ) -> Response {
     let Some(key) = ContentSha256::from_hex(&hash) else {
         return fail(StatusCode::NOT_FOUND, "no document with this hash");
     };
+    if let Err(refused) = require_visible(&state, &scope_of(&state, caller.as_ref()), &hash).await {
+        return refused;
+    }
     let row = match state.store.get(&hash).await {
         Ok(Some(r)) => r,
         Ok(None) => return fail(StatusCode::NOT_FOUND, "no document with this hash"),
@@ -978,7 +1234,12 @@ fn percent_encode_filename(name: &str) -> String {
     out
 }
 
-async fn document_delete(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
+async fn document_delete(
+    State(state): State<Arc<AppState>>,
+    caller: Option<Extension<Caller>>,
+    Path(hash): Path<String>,
+) -> Response {
+    let scope = scope_of(&state, caller.as_ref());
     // The search-index delete only runs when the archive delete actually
     // succeeded. Doing both unconditionally (codex P1 on PR #88) meant a
     // transient LanceDB failure left the document ARCHIVED but UNSEARCHABLE
@@ -993,22 +1254,28 @@ async fn document_delete(State(state): State<Arc<AppState>>, Path(hash): Path<St
     // owns the lock: if the request is cancelled (the client goes away), the
     // task still finishes and releases the lock only after the original is
     // gone. Holding the guard in the handler would drop it on cancellation
-    // while a started unlink kept running.
-    let task = tokio::spawn(delete_document_and_original(state, hash));
-    if let Err(e) = task.await {
-        eprintln!("delete task failed: {e}");
+    // while a started unlink kept running. The caller's access is checked in
+    // that task too, under the lock, so a move to another customer while the
+    // delete waits for it is honoured.
+    let task = tokio::spawn(delete_document_and_original(state, hash, scope));
+    match task.await {
+        Ok(Err(refused)) => return refused,
+        Ok(Ok(())) => {}
+        Err(e) => eprintln!("delete task failed: {e}"),
     }
     Redirect::to("/documents").into_response()
 }
 
 /// The delete sequence behind [`document_delete`]: row, search entry, then
-/// original, under the document's hash lock.
-async fn delete_document_and_original(state: Arc<AppState>, hash: String) {
+/// original, under the document's hash lock, after checking under that lock
+/// that `scope` covers the document.
+async fn delete_document_and_original(
+    state: Arc<AppState>,
+    hash: String,
+    scope: Scope,
+) -> Result<(), Response> {
+    let _held = lock_visible(&state, &scope, &hash).await?;
     let key = ContentSha256::from_hex(&hash);
-    let _held = match &key {
-        Some(k) => Some(state.hash_lock(k).lock_owned().await),
-        None => None,
-    };
     match state.store.delete(&hash).await {
         Ok(()) => {
             // Same off-runtime dispatch as every other search-index write.
@@ -1039,6 +1306,7 @@ async fn delete_document_and_original(state: Arc<AppState>, hash: String) {
         }
         Err(e) => eprintln!("delete {hash} from archive failed: {e} (search index left untouched)"),
     }
+    Ok(())
 }
 
 // ---- metadata: errors ------------------------------------------------------
@@ -1050,6 +1318,8 @@ fn fail(status: StatusCode, msg: impl Into<String>) -> Response {
         status,
         render(&IndexTemplate {
             error: Some(msg.into()),
+            // The upload form under an error page re-checks on submit.
+            customer_choices: None,
         }),
     )
         .into_response()
@@ -1059,6 +1329,7 @@ fn meta_fail(e: &MetaError) -> Response {
     let status = match e {
         MetaError::NameTaken { .. } => StatusCode::CONFLICT,
         MetaError::UnknownDefinition { .. } => StatusCode::NOT_FOUND,
+        MetaError::InvalidCustomer => StatusCode::BAD_REQUEST,
         MetaError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     fail(status, e.to_string())
@@ -1089,19 +1360,6 @@ fn require_name(name: &str) -> Result<&str, Response> {
         Err(fail(StatusCode::BAD_REQUEST, "a name must not be empty"))
     } else {
         Ok(trimmed)
-    }
-}
-
-/// The document must exist before metadata is written for it, or a typo in
-/// a URL would leave orphan rows.
-async fn require_document(state: &AppState, hash: &str) -> Result<(), Response> {
-    match state.store.get(hash).await {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(fail(StatusCode::NOT_FOUND, "no document with this hash")),
-        Err(e) => Err(fail(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("archive read failed: {e}"),
-        )),
     }
 }
 
@@ -1141,11 +1399,12 @@ struct ReviewForm {
 /// Manual assign: `Source::Manual`. Single-valued kinds replace.
 async fn document_assign(
     State(state): State<Arc<AppState>>,
+    caller: Option<Extension<Caller>>,
     Path(hash): Path<String>,
     Form(f): Form<AssignForm>,
 ) -> Result<Redirect, Response> {
     let kind = parse_kind(&f.kind)?;
-    require_document(&state, &hash).await?;
+    let _held = lock_visible(&state, &scope_of(&state, caller.as_ref()), &hash).await?;
     state
         .store
         .meta()
@@ -1158,11 +1417,12 @@ async fn document_assign(
 
 async fn document_unassign(
     State(state): State<Arc<AppState>>,
+    caller: Option<Extension<Caller>>,
     Path(hash): Path<String>,
     Form(f): Form<AssignForm>,
 ) -> Result<Redirect, Response> {
     let kind = parse_kind(&f.kind)?;
-    require_document(&state, &hash).await?;
+    let _held = lock_visible(&state, &scope_of(&state, caller.as_ref()), &hash).await?;
     state
         .store
         .meta()
@@ -1177,11 +1437,12 @@ async fn document_unassign(
 /// NOTHING else. It never marks the document reviewed (spec R3a, G5).
 async fn document_accept(
     State(state): State<Arc<AppState>>,
+    caller: Option<Extension<Caller>>,
     Path(hash): Path<String>,
     Form(f): Form<AssignForm>,
 ) -> Result<Redirect, Response> {
     let kind = parse_kind(&f.kind)?;
-    require_document(&state, &hash).await?;
+    let _held = lock_visible(&state, &scope_of(&state, caller.as_ref()), &hash).await?;
     state
         .store
         .meta()
@@ -1201,10 +1462,12 @@ async fn document_accept(
 /// The reviewed toggle: `reviewed=true` marks, `reviewed=false` clears.
 async fn document_review(
     State(state): State<Arc<AppState>>,
+    caller: Option<Extension<Caller>>,
     Path(hash): Path<String>,
     Form(f): Form<ReviewForm>,
 ) -> Result<Redirect, Response> {
-    require_document(&state, &hash).await?;
+    let scope = scope_of(&state, caller.as_ref());
+    let held = lock_visible(&state, &scope, &hash).await?;
     // Validate `next` before anything is written: a refused request changes nothing.
     let to_inbox = match f.next.as_deref() {
         None | Some("") => false,
@@ -1233,13 +1496,14 @@ async fn document_review(
             ))
         }
     }
+    drop(held);
     // The review flag is written: copy it before either redirect, so a failed
     // inbox lookup below cannot skip the copy.
     state.replicate_metadata();
     if !to_inbox {
         return Ok(back_to_document(&hash, f.from.as_deref()));
     }
-    let next = unreviewed_rows(&state)
+    let next = unreviewed_rows(&state, &scope)
         .await
         .map_err(|e| store_fail(&e))?
         .into_iter()
@@ -1250,6 +1514,39 @@ async fn document_review(
     })
 }
 
+#[derive(serde::Deserialize)]
+struct CustomerForm {
+    /// The customer code; empty clears it (only a caller who sees every
+    /// customer may leave a document unfiled).
+    #[serde(default)]
+    customer: String,
+    #[serde(default)]
+    from: Option<String>,
+}
+
+/// File a document under a customer, or clear it. The caller must see the
+/// document now and be allowed to file under the new customer, so a scoped
+/// caller can move a document only between its own customers.
+async fn document_customer(
+    State(state): State<Arc<AppState>>,
+    caller: Option<Extension<Caller>>,
+    Path(hash): Path<String>,
+    Form(f): Form<CustomerForm>,
+) -> Result<Redirect, Response> {
+    let scope = scope_of(&state, caller.as_ref());
+    let customer = Some(f.customer.trim()).filter(|c| !c.is_empty());
+    let _held = lock_visible(&state, &scope, &hash).await?;
+    may_file_under(&scope, customer).map_err(|e| fail(StatusCode::FORBIDDEN, e))?;
+    state
+        .store
+        .meta()
+        .set_customer(&hash, customer, now_unix_ms())
+        .await
+        .map_err(|e| meta_fail(&e))?;
+    state.replicate_metadata();
+    Ok(back_to_document(&hash, f.from.as_deref()))
+}
+
 // ---- inbox and dashboard ---------------------------------------------------
 
 /// Every archived document not marked reviewed, newest first. Reads the whole
@@ -1258,6 +1555,7 @@ async fn document_review(
 /// `LIST_LIMIT` rows, which would hide older unreviewed documents.
 async fn unreviewed_rows(
     state: &AppState,
+    scope: &Scope,
 ) -> Result<Vec<DocumentRow>, tesseract_paperless::store::StoreError> {
     let total = state.store.count().await?;
     let reviewed: std::collections::HashSet<String> = state
@@ -1267,13 +1565,14 @@ async fn unreviewed_rows(
         .await?
         .into_iter()
         .collect();
-    Ok(state
+    let rows = state
         .store
         .list(total.max(1))
         .await?
         .into_iter()
         .filter(|r| !reviewed.contains(&r.content_sha256_hex))
-        .collect())
+        .collect();
+    filter_visible(state, scope, rows).await
 }
 
 /// The inbox: documents to review, as paperless-ngx's inbox. Shows at most
@@ -1308,8 +1607,12 @@ struct InboxQuery {
 
 /// The inbox: documents to review, as paperless-ngx's inbox, `LIST_LIMIT`
 /// per page, every page reachable.
-async fn inbox(State(state): State<Arc<AppState>>, Query(q): Query<InboxQuery>) -> Html<String> {
-    match unreviewed_rows(&state).await {
+async fn inbox(
+    State(state): State<Arc<AppState>>,
+    caller: Option<Extension<Caller>>,
+    Query(q): Query<InboxQuery>,
+) -> Html<String> {
+    match unreviewed_rows(&state, &scope_of(&state, caller.as_ref())).await {
         Ok(rows) => {
             let pager = Pager::for_total(rows.len(), q.page);
             let page = pager.page;
@@ -1374,32 +1677,54 @@ fn replica_summary(state: &AppState) -> Option<String> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    Some(match (status.checked_at_unix_ms, status.error, status.backlog) {
-        (None, _, _) => "S3 copy: first check pending".to_string(),
-        (Some(at), Some(e), _) => {
-            format!("S3 copy: last check failed ({}): {e}", format_unix_ms(at))
-        }
-        (Some(at), None, Some(0)) => {
-            format!(
-                "S3 copy: no documents waiting to be copied (estimate, checked {})",
+    Some(
+        match (status.checked_at_unix_ms, status.error, status.backlog) {
+            (None, _, _) => "S3 copy: first check pending".to_string(),
+            (Some(at), Some(e), _) => {
+                format!("S3 copy: last check failed ({}): {e}", format_unix_ms(at))
+            }
+            (Some(at), None, Some(0)) => {
+                format!(
+                    "S3 copy: no documents waiting to be copied (estimate, checked {})",
+                    format_unix_ms(at)
+                )
+            }
+            (Some(at), None, Some(n)) => format!(
+                "S3 copy: about {n} document{} not yet copied (estimate, checked {})",
+                if n == 1 { "" } else { "s" },
                 format_unix_ms(at)
-            )
-        }
-        (Some(at), None, Some(n)) => format!(
-            "S3 copy: about {n} document{} not yet copied (estimate, checked {})",
-            if n == 1 { "" } else { "s" },
-            format_unix_ms(at)
-        ),
-        (Some(at), None, None) => format!("S3 copy: checked {}", format_unix_ms(at)),
-    })
+            ),
+            (Some(at), None, None) => format!("S3 copy: checked {}", format_unix_ms(at)),
+        },
+    )
 }
 
 const DASHBOARD_RECENT: usize = 5;
 
-async fn dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
+async fn dashboard(
+    State(state): State<Arc<AppState>>,
+    caller: Option<Extension<Caller>>,
+) -> Html<String> {
+    let scope = scope_of(&state, caller.as_ref());
+    // The replica backlog counts every customer's documents, so only a caller
+    // who sees every customer is shown it.
+    let replica = if scope == Scope::All {
+        replica_summary(&state)
+    } else {
+        None
+    };
     let read = async {
-        let unreviewed = unreviewed_rows(&state).await?;
-        let total = state.store.count().await?;
+        let unreviewed = unreviewed_rows(&state, &scope).await?;
+        // The total a scoped caller sees counts only its own documents.
+        let total = if scope == Scope::All {
+            state.store.count().await?
+        } else {
+            let all = state.store.hashes().await?;
+            let customers = state.store.meta().customers().await?;
+            all.iter()
+                .filter(|h| scope.covers(customers.get(*h).map(String::as_str)))
+                .count()
+        };
         let defs = state.store.meta().definitions().await?;
         Ok::<_, tesseract_paperless::store::StoreError>((unreviewed, total, defs))
     };
@@ -1424,7 +1749,7 @@ async fn dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
                     ingested_at: format_unix_ms(r.ingested_at_unix_ms),
                 })
                 .collect(),
-            replica: replica_summary(&state),
+            replica: replica.clone(),
             error: None,
         }),
         Err(e) => render(&DashboardTemplate {
@@ -1432,7 +1757,7 @@ async fn dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
             unreviewed: 0,
             kinds: Vec::new(),
             recent: Vec::new(),
-            replica: replica_summary(&state),
+            replica,
             error: Some(format!("archive read failed: {e}")),
         }),
     }
@@ -1775,7 +2100,12 @@ mod tests {
     /// so the custom case is covered by `branding`'s own tests.
     #[test]
     fn the_upload_page_renders_the_default_branding() {
-        let html = IndexTemplate { error: None }.render().expect("render");
+        let html = IndexTemplate {
+            error: None,
+            customer_choices: None,
+        }
+        .render()
+        .expect("render");
         assert!(html.contains("<title>tesseract-paperless — document archive</title>"));
         assert!(html.contains("<h1>tesseract-paperless</h1>"));
         assert!(html.contains("deduplicated by content hash"));
@@ -1895,7 +2225,7 @@ mod tests {
 
     use std::path::Path as FsPath;
 
-    use crate::ingest::IngestError;
+    use crate::ingest::{ingest, IngestError};
     use axum::body::Body;
     use axum::http::{header, Request};
     use tesseract_paperless::archive_meta::MATCH_AUTO;
@@ -1911,6 +2241,10 @@ mod tests {
     }
 
     async fn harness() -> Harness {
+        harness_with(None).await
+    }
+
+    async fn harness_with(policy: Option<&str>) -> Harness {
         let archive = tempfile::tempdir().expect("archive tempdir");
         let index = tempfile::tempdir().expect("index tempdir");
         let blobs = tempfile::tempdir().expect("blob tempdir");
@@ -1924,6 +2258,9 @@ mod tests {
         )
         .await
         .expect("AppState::load");
+        let mut state = state;
+        state.policy =
+            policy.map(|p| crate::customers::CustomerPolicy::from_json(p).expect("test policy"));
         let state = Arc::new(state);
         let app = router(state.clone());
         Harness {
@@ -2210,6 +2547,37 @@ mod tests {
         let (status, _, body) = send_raw(&h, get_req(&format!("/documents/{hash}/original"))).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body == bytes);
+    }
+
+    /// A customer row a failed attempt left without its document is not
+    /// inherited by a later upload of the same bytes without a customer.
+    /// Disable: write the customer in ingest only when one is given.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unfiled_upload_does_not_inherit_an_orphan_customer() {
+        let h = harness().await;
+        let bytes = page_bytes();
+        let hash = format!("{:?}", ContentSha256::of(&bytes));
+        let meta = h.state.store.meta();
+        meta.set_customer(&hash, Some("K02"), 1)
+            .await
+            .expect("orphan");
+        assert_eq!(
+            meta.customer_of(&hash).await.expect("c").as_deref(),
+            Some("K02"),
+            "the orphan must exist, or this test measures nothing"
+        );
+        let outcome = ingest(&h.state, bytes, None, "image/x-portable-graymap")
+            .await
+            .expect("ingest");
+        assert!(
+            matches!(outcome, IngestOutcome::Stored { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            meta.customer_of(&hash).await.expect("c"),
+            None,
+            "the new document inherited a customer it was not uploaded for"
+        );
     }
 
     /// Slice B: an original survives a restart. A new `AppState` over the same
@@ -3062,5 +3430,608 @@ mod tests {
         assert!(page.contains("name=\"from\" value=\"inbox\""));
         let (_, _, plain) = send(&h, get_req(&plain_loc)).await;
         assert!(!plain.contains("name=\"from\" value=\"inbox\""));
+    }
+
+    // ---- customer separation ------------------------------------------------
+
+    const POLICY: &str = r#"{"version": 1, "grants": [
+        {"org": "o1", "role_key": "paperless.k01", "customers": ["K01"]},
+        {"org": "o1", "role_key": "paperless.admin", "customers": "*"}
+    ]}"#;
+
+    /// `req` as sent by a caller the gate admitted with one role.
+    fn as_role(mut req: Request<Body>, role: &str) -> Request<Body> {
+        req.extensions_mut().insert(Caller {
+            subject: "oidc:t".to_string(),
+            grants: vec![("o1".to_string(), role.to_string())],
+        });
+        req
+    }
+
+    /// Three documents: one under K01, one under K02, one unfiled.
+    async fn three_customers(h: &Harness) -> (String, String, String) {
+        let k01 = seed(h, b"k01 document").await;
+        let k02 = seed(h, b"k02 document").await;
+        let none = seed(h, b"unfiled document").await;
+        let meta = h.state.store.meta();
+        meta.set_customer(&k01, Some("K01"), 1).await.expect("k01");
+        meta.set_customer(&k02, Some("K02"), 1).await.expect("k02");
+        (k01, k02, none)
+    }
+
+    /// The list, inbox and dashboard show a scoped caller its own documents
+    /// only; a caller with `*` sees all three.
+    /// Disable: return `rows` unfiltered from `filter_visible`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scoped_caller_lists_only_its_customers_documents() {
+        let h = harness_with(Some(POLICY)).await;
+        let (k01, k02, none) = three_customers(&h).await;
+        for uri in ["/documents", "/inbox"] {
+            let (_, _, body) = send(&h, as_role(get_req(uri), "paperless.k01")).await;
+            assert!(body.contains(&k01), "{uri}: own document listed");
+            assert!(
+                !body.contains(&k02),
+                "{uri}: another customer's document leaked"
+            );
+            assert!(!body.contains(&none), "{uri}: an unfiled document leaked");
+            let (_, _, body) = send(&h, as_role(get_req(uri), "paperless.admin")).await;
+            for hash in [&k01, &k02, &none] {
+                assert!(
+                    body.contains(hash.as_str()),
+                    "{uri}: admin sees every document"
+                );
+            }
+        }
+        let (_, _, body) = send(&h, as_role(get_req("/dashboard"), "paperless.k01")).await;
+        assert!(!body.contains(&k02) && !body.contains(&none));
+    }
+
+    /// Every per-document route answers a document outside the caller's scope
+    /// exactly as a hash the archive does not hold: 404, and nothing changes.
+    /// Disable: make `require_visible` skip the customer check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn another_customers_document_is_not_found_on_every_route() {
+        let h = harness_with(Some(POLICY)).await;
+        let (k01, k02, _) = three_customers(&h).await;
+        h.state
+            .store
+            .meta()
+            .create_definition(MetaKind::Tag, "t", 1)
+            .await
+            .expect("tag");
+        let requests = |hash: &str| {
+            vec![
+                get_req(&format!("/documents/{hash}")),
+                get_req(&format!("/documents/{hash}/original")),
+                post_form(
+                    &format!("/documents/{hash}/assign"),
+                    "kind=tag&definition_id=0",
+                ),
+                post_form(&format!("/documents/{hash}/review"), "reviewed=true"),
+                post_form(&format!("/documents/{hash}/customer"), "customer=K01"),
+                post_form(&format!("/documents/{hash}/delete"), ""),
+            ]
+        };
+        for req in requests(&k02) {
+            let what = req.uri().to_string();
+            let (status, _, _) = send(&h, as_role(req, "paperless.k01")).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{what}");
+        }
+        let meta = h.state.store.meta();
+        assert!(
+            h.state.store.get(&k02).await.expect("get").is_some(),
+            "not deleted"
+        );
+        assert!(
+            meta.assignments_for(&k02).await.expect("a").is_empty(),
+            "not assigned"
+        );
+        assert!(!meta.is_reviewed(&k02).await.expect("r"), "not reviewed");
+        assert_eq!(
+            meta.customer_of(&k02).await.expect("c").as_deref(),
+            Some("K02"),
+            "not moved"
+        );
+        // The same routes work on the caller's own document.
+        let (status, _, _) = send(
+            &h,
+            as_role(get_req(&format!("/documents/{k01}")), "paperless.k01"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A caller no grant matches, and a request the gate attached no caller
+    /// to, see nothing once a policy is set: the check fails closed.
+    /// Disable: return `Scope::All` for `(Some(_), None)` in `scope_of`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_matching_grant_nothing_is_visible() {
+        let h = harness_with(Some(POLICY)).await;
+        let (k01, _, none) = three_customers(&h).await;
+        for req in [
+            as_role(get_req("/documents"), "paperless.other"),
+            get_req("/documents"),
+        ] {
+            let (_, _, body) = send(&h, req).await;
+            assert!(!body.contains(&k01) && !body.contains(&none));
+        }
+        let (status, _, _) = send(&h, get_req(&format!("/documents/{none}"))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Without a policy the archive keeps its earlier behaviour.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_policy_every_caller_sees_every_document() {
+        let h = harness().await;
+        let (k01, k02, none) = three_customers(&h).await;
+        let (_, _, body) = send(&h, get_req("/documents")).await;
+        for hash in [&k01, &k02, &none] {
+            assert!(body.contains(hash.as_str()));
+        }
+    }
+
+    /// A scoped caller may move its document only between its own customers
+    /// and may not unfile it; a caller with `*` may do both.
+    /// Disable: skip `may_file_under` in `document_customer`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn filing_is_limited_to_the_callers_own_customers() {
+        let h = harness_with(Some(POLICY)).await;
+        let (k01, _, _) = three_customers(&h).await;
+        let uri = format!("/documents/{k01}/customer");
+        for body in ["customer=K02", "customer="] {
+            let (status, _, _) = send(&h, as_role(post_form(&uri, body), "paperless.k01")).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        }
+        let meta = h.state.store.meta();
+        assert_eq!(
+            meta.customer_of(&k01).await.expect("c").as_deref(),
+            Some("K01")
+        );
+        let (status, _, _) = send(
+            &h,
+            as_role(post_form(&uri, "customer=K%2002"), "paperless.admin"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "an invalid code is refused for anyone"
+        );
+        let (status, _, _) = send(
+            &h,
+            as_role(post_form(&uri, "customer=K02"), "paperless.admin"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(
+            meta.customer_of(&k01).await.expect("c").as_deref(),
+            Some("K02")
+        );
+        let (status, _, _) =
+            send(&h, as_role(post_form(&uri, "customer="), "paperless.admin")).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(meta.customer_of(&k01).await.expect("c"), None);
+    }
+
+    fn upload_req(bytes: &[u8], customer: Option<&str>) -> Request<Body> {
+        let b = "XBOUNDARYX";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"f.png\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+        if let Some(c) = customer {
+            body.extend_from_slice(
+                format!(
+                    "--{b}\r\nContent-Disposition: form-data; name=\"customer\"\r\n\r\n{c}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(format!("--{b}--\r\n").as_bytes());
+        Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={b}"),
+            )
+            .body(Body::from(body))
+            .expect("request")
+    }
+
+    /// Re-uploading a file another customer already holds neither moves that
+    /// document to the uploader nor links to it; a scoped upload without a
+    /// customer is refused before any recognition is spent.
+    /// Disable: drop the `Duplicate` visibility check in `upload`, or move
+    /// `set_customer` ahead of the `Stored` match.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uploads_respect_the_callers_customers() {
+        let h = harness_with(Some(POLICY)).await;
+        let (_, k02, _) = three_customers(&h).await;
+        let (status, location, body) = send(
+            &h,
+            as_role(upload_req(b"k02 document", Some("K01")), "paperless.k01"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an error page, not a redirect: {location:?}"
+        );
+        assert!(body.contains("filed under a customer you cannot see"));
+        assert!(!body.contains(&k02), "the page must not name the document");
+        assert_eq!(
+            h.state
+                .store
+                .meta()
+                .customer_of(&k02)
+                .await
+                .expect("c")
+                .as_deref(),
+            Some("K02"),
+            "a duplicate upload must not move the document"
+        );
+
+        let before = h.state.store.count().await.expect("count");
+        let (_, _, body) = send(&h, as_role(upload_req(b"new bytes", None), "paperless.k01")).await;
+        assert!(body.contains("choose the customer"));
+        let (_, _, body) = send(
+            &h,
+            as_role(upload_req(b"new bytes", Some("K02")), "paperless.k01"),
+        )
+        .await;
+        assert!(body.contains("cannot file documents under customer K02"));
+        assert_eq!(
+            h.state.store.count().await.expect("count"),
+            before,
+            "nothing archived"
+        );
+    }
+
+    /// Sends `req` while this test holds the document's hash lock, so the
+    /// request has to wait for it; moves the document from K01 to K02 while it
+    /// waits, as a concurrent refile by an unrestricted caller would; then
+    /// releases the lock. The move happens only once the request signals that it
+    /// is about to take the lock (`lock_probe`), so a write that checked access
+    /// before taking the lock always sees the old customer and fails the test.
+    async fn send_while_moved(h: &Harness, hash: &str, req: Request<Body>) -> (StatusCode, String) {
+        let key = ContentSha256::from_hex(hash).expect("hash");
+        let held = h.state.hash_lock(&key).lock_owned().await;
+        let reached = crate::state::lock_probe::expect(hash);
+        let app = h.app.clone();
+        let task = tokio::spawn(async move { app.oneshot(req).await.expect("oneshot") });
+        // Move the document only once the request is about to take the lock,
+        // never earlier: a request that has not reached the lock yet could
+        // read the moved customer even with a check made before the lock.
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached)
+            .await
+            .expect("the request never reached the document's lock")
+            .expect("probe dropped");
+        assert!(
+            !task.is_finished(),
+            "the write did not wait for the document's lock"
+        );
+        h.state
+            .store
+            .meta()
+            .set_customer(hash, Some("K02"), 2)
+            .await
+            .expect("move");
+        drop(held);
+        let resp = task.await.expect("task");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// A K01 caller's write that waits for the document's lock while the
+    /// document moves to K02 is refused with 404 and changes nothing: access is
+    /// checked under the lock, not before it.
+    /// Disable: check access before taking the lock in `lock_visible`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_waiting_for_the_lock_honours_a_concurrent_move() {
+        let h = harness_with(Some(POLICY)).await;
+        let meta = h.state.store.meta();
+        let tag = meta
+            .create_definition(MetaKind::Tag, "Strom", 1)
+            .await
+            .expect("tag")
+            .definition_id;
+        let cases: [(&str, &str); 6] = [
+            ("assign", "kind=tag&definition_id=TAG"),
+            ("unassign", "kind=tag&definition_id=TAG"),
+            ("accept", "kind=tag&definition_id=TAG"),
+            ("review", "reviewed=true"),
+            ("customer", "customer=K01"),
+            ("delete", ""),
+        ];
+        for (i, (route, form)) in cases.iter().enumerate() {
+            let hash = seed(&h, format!("moved document {i}").as_bytes()).await;
+            meta.set_customer(&hash, Some("K01"), 1).await.expect("k01");
+            if *route == "unassign" {
+                meta.assign(&hash, MetaKind::Tag, tag, Source::Manual, 1)
+                    .await
+                    .expect("assign");
+            }
+            let body = form.replace("TAG", &tag.to_string());
+            let req = as_role(
+                post_form(&format!("/documents/{hash}/{route}"), &body),
+                "paperless.k01",
+            );
+            let (status, _) = send_while_moved(&h, &hash, req).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{route}: refused");
+
+            assert!(
+                h.state.store.get(&hash).await.expect("get").is_some(),
+                "{route}: the document must still exist"
+            );
+            assert_eq!(
+                meta.customer_of(&hash).await.expect("c").as_deref(),
+                Some("K02"),
+                "{route}: the move must stand"
+            );
+            assert!(
+                !meta.is_reviewed(&hash).await.expect("reviewed"),
+                "{route}: nothing marked reviewed"
+            );
+            let tags = meta
+                .assignments_for(&hash)
+                .await
+                .expect("for")
+                .into_iter()
+                .filter(|a| a.kind == MetaKind::Tag)
+                .count();
+            let expected = usize::from(*route == "unassign");
+            assert_eq!(tags, expected, "{route}: assignments unchanged");
+        }
+    }
+
+    /// The same interleaving without the move: the write waits for the lock,
+    /// then succeeds, so the guard does not refuse a caller who may write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_waiting_for_the_lock_succeeds_when_nothing_moves() {
+        let h = harness_with(Some(POLICY)).await;
+        let hash = seed(&h, b"stays in k01").await;
+        let meta = h.state.store.meta();
+        meta.set_customer(&hash, Some("K01"), 1).await.expect("k01");
+        let key = ContentSha256::from_hex(&hash).expect("hash");
+        let held = h.state.hash_lock(&key).lock_owned().await;
+        let reached = crate::state::lock_probe::expect(&hash);
+        let app = h.app.clone();
+        let req = as_role(
+            post_form(&format!("/documents/{hash}/review"), "reviewed=true"),
+            "paperless.k01",
+        );
+        let task = tokio::spawn(async move { app.oneshot(req).await.expect("oneshot") });
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached)
+            .await
+            .expect("the request never reached the document's lock")
+            .expect("probe dropped");
+        assert!(!task.is_finished(), "the write did not wait for the lock");
+        drop(held);
+        assert_eq!(task.await.expect("task").status(), StatusCode::SEE_OTHER);
+        assert!(meta.is_reviewed(&hash).await.expect("reviewed"));
+    }
+
+    /// An upload of bytes the archive holds, for a document stored before
+    /// originals were kept: allowed when the caller sees the document (the
+    /// original is attached), refused without touching it when the document
+    /// moves to another customer while the upload waits for its lock.
+    /// Disable: drop the `may_see` check in ingest's duplicate path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_duplicate_upload_is_checked_under_the_lock_before_the_original_is_attached() {
+        let h = harness_with(Some(POLICY)).await;
+        let meta = h.state.store.meta();
+
+        let allowed = b"legacy k01 scan";
+        let hash = seed(&h, allowed).await;
+        meta.set_customer(&hash, Some("K01"), 1).await.expect("k01");
+        let (status, location, _) = send(
+            &h,
+            as_role(upload_req(allowed, Some("K01")), "paperless.k01"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SEE_OTHER,
+            "a visible duplicate is accepted"
+        );
+        assert_eq!(
+            location.as_deref(),
+            Some(format!("/documents/{hash}").as_str())
+        );
+        assert_eq!(blob_files(&h), 1, "its original is attached");
+
+        let refused = b"legacy scan that moves";
+        let hash = seed(&h, refused).await;
+        meta.set_customer(&hash, Some("K01"), 1).await.expect("k01");
+        let (_, body) = send_while_moved(
+            &h,
+            &hash,
+            as_role(upload_req(refused, Some("K01")), "paperless.k01"),
+        )
+        .await;
+        assert!(
+            body.contains("filed under a customer you cannot see"),
+            "refused: {body}"
+        );
+        assert_eq!(
+            blob_files(&h),
+            1,
+            "no original attached to the moved document"
+        );
+        assert_eq!(
+            meta.customer_of(&hash).await.expect("c").as_deref(),
+            Some("K02")
+        );
+    }
+
+    /// The per-customer JSON lists exactly that customer's documents, to a
+    /// caller whose own grants cover it, and only with a policy configured.
+    /// Disable: drop the `scope.covers` check in `api::customer_documents`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_customer_documents_api_is_scoped_by_the_callers_grants() {
+        let h = harness_with(Some(POLICY)).await;
+        let (k01, k02, none) = three_customers(&h).await;
+        let (status, _, body) = send(
+            &h,
+            as_role(get_req("/api/v1/customers/K01/documents"), "paperless.k01"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["customer"], "K01");
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["documents"][0]["hash"], k01.as_str());
+        assert_eq!(v["documents"][0]["path"], format!("/documents/{k01}"));
+        assert!(!body.contains(&k02) && !body.contains(&none));
+        assert!(!body.contains("Stadtwerke"), "no document text in the API");
+
+        let (status, _, _) = send(
+            &h,
+            as_role(get_req("/api/v1/customers/K02/documents"), "paperless.k01"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "outside the caller's grants");
+        let (status, _, _) = send(&h, get_req("/api/v1/customers/K01/documents")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "no caller, no scope");
+        let (status, _, body) = send(
+            &h,
+            as_role(
+                get_req("/api/v1/customers/K02/documents"),
+                "paperless.admin",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(&k02));
+
+        let open = harness().await;
+        let (status, _, _) = send(
+            &open,
+            as_role(
+                get_req("/api/v1/customers/K01/documents"),
+                "paperless.admin",
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "no policy, no per-customer API"
+        );
+    }
+
+    /// A scoped caller's search is filtered before it is cut to LIST_LIMIT:
+    /// more than LIST_LIMIT higher-ranking matches of another customer must not
+    /// hide the caller's own match.
+    /// Disable: search with `LIST_LIMIT` for every scope.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scoped_search_is_not_cut_before_the_customer_filter() {
+        let h = harness_with(Some(POLICY)).await;
+        let meta = h.state.store.meta();
+        for i in 0..=LIST_LIMIT {
+            let hash = seed(&h, format!("other {i}").as_bytes()).await;
+            meta.set_customer(&hash, Some("K02"), 1).await.expect("k02");
+            h.state
+                .search
+                .index_document(&hash, "doc.png", "Stadtwerke Stadtwerke Stadtwerke")
+                .expect("index");
+        }
+        let own = seed(&h, b"own document").await;
+        meta.set_customer(&own, Some("K01"), 1).await.expect("k01");
+        h.state
+            .search
+            .index_document(
+                &own,
+                "doc.png",
+                "Stadtwerke with many more words that lower its rank considerably here",
+            )
+            .expect("index");
+        let (_, _, body) = send(
+            &h,
+            as_role(get_req("/documents?q=Stadtwerke"), "paperless.k01"),
+        )
+        .await;
+        assert!(body.contains(&own), "the caller's own match must be found");
+    }
+
+    /// A stale index entry (no archive row) that outranks the caller's match
+    /// does not push it out: the scoped search limit is the index size, not
+    /// the archive's row count.
+    /// Disable: take the scoped limit from `state.store.count()`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_index_entry_does_not_hide_a_scoped_match() {
+        let h = harness_with(Some(POLICY)).await;
+        let stale = format!("{:?}", ContentSha256::of(b"deleted, still indexed"));
+        h.state
+            .search
+            .index_document(&stale, "doc.png", "Stadtwerke Stadtwerke Stadtwerke")
+            .expect("index stale");
+        let own = seed(&h, b"own document").await;
+        h.state
+            .store
+            .meta()
+            .set_customer(&own, Some("K01"), 1)
+            .await
+            .expect("k01");
+        h.state
+            .search
+            .index_document(
+                &own,
+                "doc.png",
+                "Stadtwerke with many more words that lower its rank considerably here",
+            )
+            .expect("index");
+        assert_eq!(h.state.store.count().await.expect("count"), 1);
+        let (_, _, body) = send(
+            &h,
+            as_role(get_req("/documents?q=Stadtwerke"), "paperless.k01"),
+        )
+        .await;
+        assert!(body.contains(&own), "the caller's own match must be found");
+    }
+
+    /// The S3 backlog counts every customer's documents, so the dashboard
+    /// shows it only to a caller who sees every customer.
+    /// Disable: render `replica_summary` for every caller.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_dashboard_shows_the_s3_backlog_only_to_unrestricted_callers() {
+        let archive = tempfile::tempdir().expect("archive tempdir");
+        let index = tempfile::tempdir().expect("index tempdir");
+        let blobs = tempfile::tempdir().expect("blob tempdir");
+        let bucket = Arc::new(crate::s3::memory::MemoryStore::default());
+        let mut state = AppState::load(
+            FsPath::new(MODEL_DIR),
+            &archive.path().to_string_lossy(),
+            index.path(),
+            blobs.path(),
+            FsPath::new("/nonexistent/deepnsm/word_frequency"),
+            Some(crate::replica::Replica::new(bucket, "pl")),
+        )
+        .await
+        .expect("AppState::load");
+        state.policy = Some(crate::customers::CustomerPolicy::from_json(POLICY).expect("policy"));
+        let state = Arc::new(state);
+        let h = Harness {
+            app: router(state.clone()),
+            state,
+            _dirs: (archive, index, blobs),
+        };
+        let (_, _, admin) = send(&h, as_role(get_req("/dashboard"), "paperless.admin")).await;
+        assert!(
+            admin.contains("S3 copy"),
+            "an unrestricted caller sees the backlog"
+        );
+        let (_, _, scoped) = send(&h, as_role(get_req("/dashboard"), "paperless.k01")).await;
+        assert!(!scoped.contains("S3 copy"), "a scoped caller does not");
     }
 }

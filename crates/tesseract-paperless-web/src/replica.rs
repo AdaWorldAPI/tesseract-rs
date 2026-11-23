@@ -165,6 +165,16 @@ pub struct SnapshotFile {
     definitions: Vec<DefinitionJson>,
     assignments: Vec<AssignmentJson>,
     reviews: Vec<ReviewJson>,
+    /// Each document's customer. Absent in a snapshot written before
+    /// customers existed, which then restores with none.
+    #[serde(default)]
+    customers: Vec<CustomerJson>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CustomerJson {
+    content_sha256_hex: String,
+    customer: String,
 }
 
 impl SnapshotFile {
@@ -205,6 +215,14 @@ impl SnapshotFile {
                     reviewed_at_unix_ms: r.reviewed_at_unix_ms,
                 })
                 .collect(),
+            customers: s
+                .customers
+                .iter()
+                .map(|(h, c)| CustomerJson {
+                    content_sha256_hex: h.clone(),
+                    customer: c.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -215,9 +233,8 @@ impl SnapshotFile {
                 self.schema
             )));
         }
-        let kind = |k: &str| {
-            MetaKind::parse(k).ok_or_else(|| ReplicaError::Invalid(format!("kind {k}")))
-        };
+        let kind =
+            |k: &str| MetaKind::parse(k).ok_or_else(|| ReplicaError::Invalid(format!("kind {k}")));
         Ok(MetaSnapshot {
             definitions: self
                 .definitions
@@ -256,6 +273,11 @@ impl SnapshotFile {
                     content_sha256_hex: r.content_sha256_hex.clone(),
                     reviewed_at_unix_ms: r.reviewed_at_unix_ms,
                 })
+                .collect(),
+            customers: self
+                .customers
+                .iter()
+                .map(|c| (c.content_sha256_hex.clone(), c.customer.clone()))
                 .collect(),
         })
     }
@@ -626,7 +648,10 @@ impl Replica {
             let Some(key) = ContentSha256::from_hex(&hash) else {
                 continue;
             };
-            match self.apply_delete_intent(store, blobs, &hash, lock_for(&key)).await {
+            match self
+                .apply_delete_intent(store, blobs, &hash, lock_for(&key))
+                .await
+            {
                 Ok(true) => report.deleted += 1,
                 Ok(false) => {}
                 Err(e) => {
@@ -639,7 +664,10 @@ impl Replica {
             let Some(key) = ContentSha256::from_hex(&hash) else {
                 continue;
             };
-            match self.upload_document(store, blobs, &hash, lock_for(&key)).await {
+            match self
+                .upload_document(store, blobs, &hash, lock_for(&key))
+                .await
+            {
                 Ok(true) => report.uploaded += 1,
                 Ok(false) => {}
                 Err(e) => {
@@ -776,7 +804,9 @@ pub async fn restore(
                         .map_err(local)?;
                 }
                 Ok(_) => {
-                    eprintln!("restore: original of {hash} fails its hash check; restored without it");
+                    eprintln!(
+                        "restore: original of {hash} fails its hash check; restored without it"
+                    );
                     report.without_original += 1;
                 }
                 Err(ReplicaError::Object(e)) if e.is_not_found() => {
@@ -829,11 +859,7 @@ pub async fn restore(
             } else {
                 local_now.intersection(&held).cloned().collect()
             };
-            store
-                .meta()
-                .import(&snapshot, &live)
-                .await
-                .map_err(local)?;
+            store.meta().import(&snapshot, &live).await.map_err(local)?;
             report.metadata = true;
         }
         Err(ReplicaError::Object(e)) if e.is_not_found() => {}
@@ -966,24 +992,43 @@ mod tests {
             .expect("assign");
         meta.mark_reviewed(&b, 3).await.expect("review");
 
-        let report = r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
-        assert_eq!(report, ReplicateReport { uploaded: 2, failed: 0, deleted: 0 });
+        let report = r
+            .replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
+        assert_eq!(
+            report,
+            ReplicateReport {
+                uploaded: 2,
+                failed: 0,
+                deleted: 0
+            }
+        );
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 0);
         assert!(bucket.keys().contains(&r.original_key(&a)));
         assert!(!bucket.keys().contains(&r.original_key(&b)));
 
         let dst = local().await;
-        assert!(needs_restore(&dst.store, dst.blobs.root()).await.expect("check"));
+        assert!(needs_restore(&dst.store, dst.blobs.root())
+            .await
+            .expect("check"));
         let report = restore(&r, &dst.store, &dst.blobs).await.expect("restore");
         assert_eq!(report.restored, 2);
         assert_eq!(report.skipped, 0);
         assert_eq!(report.without_original, 0);
         assert!(report.metadata);
         assert!(!dst.blobs.root().join(RESTORE_MARKER).exists());
-        assert!(!needs_restore(&dst.store, dst.blobs.root()).await.expect("check"));
+        assert!(!needs_restore(&dst.store, dst.blobs.root())
+            .await
+            .expect("check"));
 
         for (hash, name, at) in [(&a, "a.png", 100), (&b, "b.png", 200)] {
-            let row = dst.store.get(hash).await.expect("get").expect("restored row");
+            let row = dst
+                .store
+                .get(hash)
+                .await
+                .expect("get")
+                .expect("restored row");
             assert_eq!(row.filename.as_deref(), Some(name));
             assert_eq!(row.ingested_at_unix_ms, at);
             assert_eq!(row.mean_confidence, 88);
@@ -991,7 +1036,10 @@ mod tests {
             assert_eq!(row.text().ok().as_deref(), Some(name));
         }
         let key_a = ContentSha256::from_hex(&a).expect("hex");
-        assert_eq!(dst.blobs.get(&key_a).expect("get"), Some(b"original A".to_vec()));
+        assert_eq!(
+            dst.blobs.get(&key_a).expect("get"),
+            Some(b"original A".to_vec())
+        );
         let key_b = ContentSha256::from_hex(&b).expect("hex");
         assert_eq!(dst.blobs.get(&key_b).expect("get"), None);
         assert_eq!(
@@ -1039,20 +1087,26 @@ mod tests {
         let src = local().await;
         let a = add(&src, b"doc A", "a.png", 1, true).await;
         add(&src, b"doc B", "b.png", 2, true).await;
-        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
 
         let dst = local().await;
         // As if the first attempt restored A and stopped.
         add(&dst, b"doc A", "a.png", 1, true).await;
-        std::fs::write(dst.blobs.root().join(RESTORE_MARKER), b"x").expect("marker");
-        assert!(needs_restore(&dst.store, dst.blobs.root()).await.expect("check"));
+        std::fs::write(dst.blobs.root().join(RESTORE_MARKER), MARKER_FIRST).expect("marker");
+        assert!(needs_restore(&dst.store, dst.blobs.root())
+            .await
+            .expect("check"));
 
         let report = restore(&r, &dst.store, &dst.blobs).await.expect("resume");
         assert_eq!(report.already_local, 1);
         assert_eq!(report.restored, 1);
         assert_eq!(dst.store.count().await.expect("count"), 2);
         assert!(dst.store.get(&a).await.expect("get").is_some());
-        assert!(!needs_restore(&dst.store, dst.blobs.root()).await.expect("check"));
+        assert!(!needs_restore(&dst.store, dst.blobs.root())
+            .await
+            .expect("check"));
     }
 
     /// An original whose bytes no longer match its key is not restored; the
@@ -1066,7 +1120,9 @@ mod tests {
         let a = add(&src, b"doc A", "a.png", 1, true).await;
         let b = add(&src, b"doc B", "b.png", 2, true).await;
         src.store.meta().mark_reviewed(&b, 3).await.expect("review");
-        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
         bucket
             .objects
             .lock()
@@ -1092,7 +1148,13 @@ mod tests {
         // missing documents) and the next replication pass runs.
         let before = bucket.get(&r.snapshot_key()).expect("snapshot");
         assert!(dst.blobs.root().join(SNAPSHOT_HOLD).exists());
-        let live: HashSet<String> = dst.store.hashes().await.expect("hashes").into_iter().collect();
+        let live: HashSet<String> = dst
+            .store
+            .hashes()
+            .await
+            .expect("hashes")
+            .into_iter()
+            .collect();
         dst.store.meta().reconcile(&live).await.expect("reconcile");
         assert!(r.replicate(&dst.store, &dst.blobs, &no_lock).await.is_err());
         let after = bucket.get(&r.snapshot_key()).expect("snapshot");
@@ -1102,8 +1164,14 @@ mod tests {
         assert!(held.reviews.iter().any(|v| v.content_sha256_hex == b));
         // A complete restore leaves no hold.
         let clean = local().await;
-        bucket.objects.lock().expect("lock").remove(&r.record_key(&b));
-        restore(&r, &clean.store, &clean.blobs).await.expect("restore");
+        bucket
+            .objects
+            .lock()
+            .expect("lock")
+            .remove(&r.record_key(&b));
+        restore(&r, &clean.store, &clean.blobs)
+            .await
+            .expect("restore");
         assert!(!clean.blobs.root().join(SNAPSHOT_HOLD).exists());
     }
 
@@ -1125,7 +1193,9 @@ mod tests {
             .await
             .expect("assign");
         meta.mark_reviewed(&a, 3).await.expect("review");
-        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
         bucket
             .objects
             .lock()
@@ -1139,7 +1209,10 @@ mod tests {
         assert!(snap.assignments.is_empty(), "{:?}", snap.assignments);
         assert!(snap.reviews.is_empty(), "{:?}", snap.reviews);
         // The definitions come back with their ids; the hold keeps S3 intact.
-        assert!(snap.definitions.iter().any(|d| d.definition_id == tag.definition_id));
+        assert!(snap
+            .definitions
+            .iter()
+            .any(|d| d.definition_id == tag.definition_id));
         assert!(dst.blobs.root().join(SNAPSHOT_HOLD).exists());
     }
 
@@ -1179,17 +1252,25 @@ mod tests {
         let r = replica(&bucket);
         let src = local().await;
         let a = add(&src, b"to delete", "a.png", 1, true).await;
-        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
         src.store.delete(&a).await.expect("local delete");
         Replica::record_delete_intent(&src.blobs, &a).expect("intent");
         bucket.deletes_fail.store(true, Ordering::SeqCst);
-        assert!(r.apply_delete_intent(&src.store, &src.blobs, &a, lock()).await.is_err());
+        assert!(r
+            .apply_delete_intent(&src.store, &src.blobs, &a, lock())
+            .await
+            .is_err());
         let intent = src.blobs.root().join(DELETE_INTENTS).join(&a);
         assert!(intent.exists(), "a failed delete keeps its intent");
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 1);
 
         bucket.deletes_fail.store(false, Ordering::SeqCst);
-        let report = r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        let report = r
+            .replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
         assert_eq!(report.deleted, 1);
         assert!(!bucket.keys().contains(&r.record_key(&a)));
         assert!(!bucket.keys().contains(&r.original_key(&a)));
@@ -1204,9 +1285,14 @@ mod tests {
         let r = replica(&bucket);
         let src = local().await;
         let a = add(&src, b"back again", "a.png", 1, true).await;
-        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
         Replica::record_delete_intent(&src.blobs, &a).expect("intent");
-        let report = r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        let report = r
+            .replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
         assert_eq!(report.deleted, 0);
         assert!(bucket.keys().contains(&r.record_key(&a)));
         assert!(!src.blobs.root().join(DELETE_INTENTS).join(&a).exists());
@@ -1232,7 +1318,9 @@ mod tests {
             .await
             .expect("assign");
         meta.mark_reviewed(&b, 3).await.expect("review b");
-        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
         let good_record = bucket.get(&r.record_key(&b)).expect("record");
         bucket
             .objects
@@ -1244,10 +1332,20 @@ mod tests {
         let dst = local().await;
         restore(&r, &dst.store, &dst.blobs).await.expect("restore");
         assert!(has_snapshot_hold(dst.blobs.root()));
-        let live: HashSet<String> = dst.store.hashes().await.expect("hashes").into_iter().collect();
+        let live: HashSet<String> = dst
+            .store
+            .hashes()
+            .await
+            .expect("hashes")
+            .into_iter()
+            .collect();
         dst.store.meta().reconcile(&live).await.expect("reconcile");
         // A local change made while held must survive the retry.
-        dst.store.meta().mark_reviewed(&a, 9).await.expect("review a locally");
+        dst.store
+            .meta()
+            .mark_reviewed(&a, 9)
+            .await
+            .expect("review a locally");
 
         // Repair, then the retry a start performs.
         bucket
@@ -1264,12 +1362,18 @@ mod tests {
             .assignments
             .iter()
             .any(|x| x.content_sha256_hex == b && x.definition_id == tag.definition_id));
-        assert!(snap.reviews.iter().any(|v| v.content_sha256_hex == a && v.reviewed_at_unix_ms == 9));
+        assert!(snap
+            .reviews
+            .iter()
+            .any(|v| v.content_sha256_hex == a && v.reviewed_at_unix_ms == 9));
 
         // The hold is gone, so the next pass uploads a snapshot with all of it.
-        r.replicate(&dst.store, &dst.blobs, &no_lock).await.expect("replicate");
+        r.replicate(&dst.store, &dst.blobs, &no_lock)
+            .await
+            .expect("replicate");
         let up = SnapshotFile::to_snapshot(
-            &serde_json::from_slice(&bucket.get(&r.snapshot_key()).expect("snapshot")).expect("json"),
+            &serde_json::from_slice(&bucket.get(&r.snapshot_key()).expect("snapshot"))
+                .expect("json"),
         )
         .expect("snapshot");
         assert!(up.reviews.iter().any(|v| v.content_sha256_hex == b));
@@ -1331,11 +1435,16 @@ mod tests {
         let r = replica(&bucket);
         let src = local().await;
         let a = add(&src, b"kept in s3", "a.png", 1, true).await;
-        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
 
         let other = local().await;
         add(&other, b"another", "b.png", 2, true).await;
-        let report = r.replicate(&other.store, &other.blobs, &no_lock).await.expect("replicate");
+        let report = r
+            .replicate(&other.store, &other.blobs, &no_lock)
+            .await
+            .expect("replicate");
         assert_eq!(report.uploaded, 1);
         assert_eq!(bucket.deletes.load(Ordering::SeqCst), 0);
         assert!(bucket.keys().contains(&r.record_key(&a)));
@@ -1350,10 +1459,15 @@ mod tests {
         let src = local().await;
         let a = add(&src, b"late copy", "a.png", 1, true).await;
         bucket.down.store(true, Ordering::SeqCst);
-        assert!(r.upload_document(&src.store, &src.blobs, &a, lock()).await.is_err());
+        assert!(r
+            .upload_document(&src.store, &src.blobs, &a, lock())
+            .await
+            .is_err());
         bucket.down.store(false, Ordering::SeqCst);
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 1);
-        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 0);
     }
 
@@ -1366,15 +1480,23 @@ mod tests {
         let src = local().await;
         let a = add(&src, b"pinned", "a.png", 1, true).await;
         src.store.meta().mark_reviewed(&a, 2).await.expect("review");
-        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
         let first = bucket.get(&r.snapshot_key()).expect("snapshot");
 
-        src.store.meta().mark_unreviewed(&a).await.expect("unreview");
-        r.upload_snapshot(&src.store, &src.blobs).await.expect("snapshot");
+        src.store
+            .meta()
+            .mark_unreviewed(&a)
+            .await
+            .expect("unreview");
+        r.upload_snapshot(&src.store, &src.blobs)
+            .await
+            .expect("snapshot");
         assert_ne!(bucket.get(&r.snapshot_key()).expect("snapshot"), first);
 
         let dst = local().await;
-        std::fs::write(dst.blobs.root().join(RESTORE_MARKER), b"x").expect("marker");
+        std::fs::write(dst.blobs.root().join(RESTORE_MARKER), MARKER_FIRST).expect("marker");
         std::fs::write(dst.blobs.root().join(RESTORE_SNAPSHOT), &first).expect("pin");
         restore(&r, &dst.store, &dst.blobs).await.expect("restore");
         let snap = dst.store.meta().export().await.expect("export");
@@ -1392,10 +1514,18 @@ mod tests {
         let src = local().await;
         let a = add(&src, b"stale pin", "a.png", 1, true).await;
         src.store.meta().mark_reviewed(&a, 2).await.expect("review");
-        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
         let old = bucket.get(&r.snapshot_key()).expect("snapshot");
-        src.store.meta().mark_unreviewed(&a).await.expect("unreview");
-        r.upload_snapshot(&src.store, &src.blobs).await.expect("snapshot");
+        src.store
+            .meta()
+            .mark_unreviewed(&a)
+            .await
+            .expect("unreview");
+        r.upload_snapshot(&src.store, &src.blobs)
+            .await
+            .expect("snapshot");
 
         let dst = local().await;
         std::fs::write(dst.blobs.root().join(RESTORE_SNAPSHOT), &old).expect("stale pin");
@@ -1415,9 +1545,13 @@ mod tests {
         let src = local().await;
         let bytes: &[u8] = b"original without rewritten record";
         let a = add(&src, bytes, "a.png", 1, false).await;
-        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
         let key = ContentSha256::of(bytes);
-        bucket.put(&r.original_key(&a), bytes, "application/octet-stream").expect("put");
+        bucket
+            .put(&r.original_key(&a), bytes, "application/octet-stream")
+            .expect("put");
         src.blobs.put(&key, bytes).expect("backfill");
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 0);
 
@@ -1461,18 +1595,29 @@ mod tests {
         let src = local().await;
         let bytes: &[u8] = b"legacy then backfilled";
         let a = add(&src, bytes, "a.png", 1, false).await;
-        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
         assert!(!bucket.keys().contains(&r.original_key(&a)));
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 0);
 
-        src.blobs.put(&ContentSha256::of(bytes), bytes).expect("backfill");
+        src.blobs
+            .put(&ContentSha256::of(bytes), bytes)
+            .expect("backfill");
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 1);
-        let report = r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        let report = r
+            .replicate(&src.store, &src.blobs, &no_lock)
+            .await
+            .expect("replicate");
         assert_eq!(report.uploaded, 1);
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 0);
         let log = bucket.log.lock().expect("log").clone();
-        let orig = log.iter().rposition(|l| l == &format!("put {}", r.original_key(&a)));
-        let rec = log.iter().rposition(|l| l == &format!("put {}", r.record_key(&a)));
+        let orig = log
+            .iter()
+            .rposition(|l| l == &format!("put {}", r.original_key(&a)));
+        let rec = log
+            .iter()
+            .rposition(|l| l == &format!("put {}", r.record_key(&a)));
         assert!(orig.expect("original put") < rec.expect("record put"));
 
         let dst = local().await;

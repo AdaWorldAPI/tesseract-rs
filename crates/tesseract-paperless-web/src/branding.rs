@@ -11,6 +11,13 @@
 //! | `BRAND_TAGLINE` | the line under the heading on the upload page | up to 240 characters |
 //! | `BRAND_ACCENT` | links and buttons | `#rgb` or `#rrggbb` |
 //! | `BRAND_LOGO_URL` | an image beside the heading | an `https://` URL or a same-site path starting with a single `/` |
+//! | `BRAND_HEADER_BG` | the header bar's background | `#rgb` or `#rrggbb` |
+//!
+//! No customer's identity is compiled in: the image is neutral, and a
+//! deployment brings its own name, colours and logo through these variables
+//! (for example a Railway service setting the colours of the portal it sits
+//! beside). Without `BRAND_HEADER_BG` the header bar uses a dark tone of the
+//! system colours, so light and dark mode both keep their contrast.
 //!
 //! An empty value counts as unset. A value that is not accepted is ignored
 //! with one line on stderr and the
@@ -41,6 +48,7 @@ pub struct Branding {
     pub tagline: String,
     pub accent: String,
     logo_url: Option<String>,
+    header_bg: Option<String>,
 }
 
 impl Default for Branding {
@@ -50,6 +58,7 @@ impl Default for Branding {
             tagline: DEFAULT_TAGLINE.to_owned(),
             accent: DEFAULT_ACCENT.to_owned(),
             logo_url: None,
+            header_bg: None,
         }
     }
 }
@@ -92,6 +101,14 @@ impl Branding {
                 warn("BRAND_ACCENT ignored: use #rgb or #rrggbb".to_owned());
             }
         }
+        if let Some(v) = get("BRAND_HEADER_BG") {
+            let v = v.trim();
+            if is_hex_colour(v) {
+                b.header_bg = Some(v.to_ascii_lowercase());
+            } else {
+                warn("BRAND_HEADER_BG ignored: use #rgb or #rrggbb".to_owned());
+            }
+        }
         if let Some(v) = get("BRAND_LOGO_URL") {
             let v = v.trim();
             if is_logo_url(v) {
@@ -104,6 +121,20 @@ impl Branding {
             }
         }
         b
+    }
+
+    /// The header bar's background, if one was set.
+    #[must_use]
+    pub fn header_bg(&self) -> Option<&str> {
+        self.header_bg.as_deref()
+    }
+
+    /// The text colour on the header bar: the better-contrasting of white and
+    /// black for a set `BRAND_HEADER_BG` (as [`Self::on_accent`]); `None` for
+    /// the default bar, whose text is the system `Canvas` colour.
+    #[must_use]
+    pub fn on_header(&self) -> Option<&'static str> {
+        self.header_bg.as_deref().map(on_colour)
     }
 
     /// The logo URL, if one was accepted.
@@ -119,14 +150,7 @@ impl Branding {
     /// light accent such as `#fff`.
     #[must_use]
     pub fn on_accent(&self) -> &'static str {
-        let l = relative_luminance(&self.accent).unwrap_or(0.0);
-        let with_white = 1.05 / (l + 0.05);
-        let with_black = (l + 0.05) / 0.05;
-        if with_white >= with_black {
-            "#fff"
-        } else {
-            "#000"
-        }
+        on_colour(&self.accent)
     }
 
     /// Whether a custom name is set, which adds the "powered by tesseract-rs"
@@ -134,6 +158,20 @@ impl Branding {
     #[must_use]
     pub fn is_custom(&self) -> bool {
         self.name != DEFAULT_NAME
+    }
+}
+
+/// White or black, whichever contrasts more with `colour`.
+fn on_colour(colour: &str) -> &'static str {
+    {
+        let l = relative_luminance(colour).unwrap_or(0.0);
+        let with_white = 1.05 / (l + 0.05);
+        let with_black = (l + 0.05) / 0.05;
+        if with_white >= with_black {
+            "#fff"
+        } else {
+            "#000"
+        }
     }
 }
 
@@ -336,5 +374,25 @@ mod tests {
         for bad in ["abc", "#abcd", "#ggg", "#12345", "blue"] {
             assert!(!is_hex_colour(bad), "{bad}");
         }
+    }
+
+    /// No customer's colours are compiled in: the header bar is set only by
+    /// `BRAND_HEADER_BG`, its text contrasts with it, and a bad value is ignored.
+    /// Disable: give `header_bg` a default colour.
+    #[test]
+    fn the_header_bar_colour_comes_only_from_the_variable() {
+        let (b, w) = from(&[]);
+        assert!(w.is_empty());
+        assert_eq!(b.header_bg(), None);
+        assert_eq!(b.on_header(), None);
+        let (b, w) = from(&[("BRAND_HEADER_BG", "#0D3A64")]);
+        assert!(w.is_empty());
+        assert_eq!(b.header_bg(), Some("#0d3a64"));
+        assert_eq!(b.on_header(), Some("#fff"));
+        let (b, _) = from(&[("BRAND_HEADER_BG", "#fafafa")]);
+        assert_eq!(b.on_header(), Some("#000"));
+        let (b, w) = from(&[("BRAND_HEADER_BG", "navy")]);
+        assert_eq!(b.header_bg(), None);
+        assert_eq!(w.len(), 1);
     }
 }
