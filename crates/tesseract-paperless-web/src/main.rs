@@ -132,6 +132,19 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // PAPERLESS_REQUIRE_AUTH: a deployment that must never run open says so,
+    // and a missing issuer then stops the boot instead of the warning above.
+    let required = match auth::sign_in_required_from_env() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = auth::check_open_mode(required, login.is_some()) {
+        eprintln!("fatal: {e}");
+        std::process::exit(1);
+    }
     let app = auth::protect(routes::router(state), login);
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("fatal: server error: {e}");

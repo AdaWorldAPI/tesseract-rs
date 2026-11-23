@@ -129,6 +129,39 @@ impl std::fmt::Debug for SessionKey {
     }
 }
 
+/// `PAPERLESS_REQUIRE_AUTH`: when on, the archive refuses to start without
+/// sign-in, so a missing `PAPERLESS_OIDC_ISSUER` cannot bring it up open.
+/// Unset, blank, `0` or `false`: off (today's behaviour). `1` or `true`: on.
+/// Anything else is an error, never a silent "off".
+pub fn sign_in_required(get: impl Fn(&str) -> Option<String>) -> Result<bool, String> {
+    match get("PAPERLESS_REQUIRE_AUTH").as_deref().map(str::trim) {
+        None | Some("" | "0" | "false") => Ok(false),
+        Some("1" | "true") => Ok(true),
+        Some(_) => Err("PAPERLESS_REQUIRE_AUTH must be 1, true, 0 or false".into()),
+    }
+}
+
+/// Reads [`sign_in_required`] from the process environment; a value that is
+/// not valid Unicode is an error.
+pub fn sign_in_required_from_env() -> Result<bool, String> {
+    if std::env::var_os("PAPERLESS_REQUIRE_AUTH").is_some_and(|v| v.to_str().is_none()) {
+        return Err("PAPERLESS_REQUIRE_AUTH is not valid Unicode".into());
+    }
+    sign_in_required(|k| std::env::var(k).ok())
+}
+
+/// The start decision: sign-in required but not configured is an error.
+pub fn check_open_mode(required: bool, configured: bool) -> Result<(), String> {
+    if required && !configured {
+        return Err(
+            "PAPERLESS_REQUIRE_AUTH is set but sign-in is not configured \
+             (PAPERLESS_OIDC_ISSUER unset): refusing to start an open archive"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Every variable [`AuthConfig::from_vars`] reads.
 const ENV_VARS: [&str; 10] = [
     "PAPERLESS_OIDC_ISSUER",

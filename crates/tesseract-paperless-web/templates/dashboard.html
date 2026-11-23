@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — {{ self.brand().name }}{% endblock %}
+{% block style %}
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: .75rem; margin-bottom: 1.25rem; }
+  .stat {
+    display: block; text-decoration: none; color: inherit;
+    border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
+    border-radius: 12px; padding: 1rem;
+  }
+  a.stat:hover { border-color: {{ self.brand().accent }}; }
+  .stat .n { display: block; font-size: 1.6rem; font-weight: 700; }
+  .stat .l { color: color-mix(in srgb, CanvasText 60%, Canvas); font-size: .9rem; }
+  ul.recent { list-style: none; margin: 0; padding: 0; }
+  ul.recent li { padding: .35rem 0; border-top: 1px solid color-mix(in srgb, CanvasText 12%, Canvas); }
+  ul.recent li:first-child { border-top: 0; }
+  a.go {
+    display: inline-block; padding: .55rem 1rem; font-weight: 600; border-radius: 8px; text-decoration: none;
+    background: {{ self.brand().accent }}; color: {{ self.brand().on_accent() }};
+  }
+{% endblock %}
+{% block content %}
+  <h1>Dashboard</h1>
+
+  {% if let Some(msg) = error %}
+  <div class="error" role="alert">{{ msg }}</div>
+  {% endif %}
+
+  <div class="stats">
+    <a class="stat" href="/documents"><span class="n">{{ total }}</span><span class="l">document{% if total != 1 %}s{% endif %}</span></a>
+    <a class="stat" href="/inbox"><span class="n">{{ unreviewed }}</span><span class="l">to review</span></a>
+    {% for k in kinds %}
+    <a class="stat" href="/definitions?kind={{ k.kind }}"><span class="n">{{ k.definitions }}</span><span class="l">{{ k.label|lower }}</span></a>
+    {% endfor %}
+  </div>
+
+  <div class="card">
+    <h2>Inbox</h2>
+    {% if recent.is_empty() %}
+    <p class="none">Nothing to review.</p>
+    {% else %}
+    <ul class="recent">
+      {% for d in recent %}
+      <li><a href="/documents/{{ d.hash_hex }}?from=inbox">{{ d.filename }}</a> <span class="note">{{ d.ingested_at }}</span></li>
+      {% endfor %}
+    </ul>
+    {% if unreviewed > recent.len() %}<p class="note"><a href="/inbox">All {{ unreviewed }} in the inbox</a></p>{% endif %}
+    {% endif %}
+  </div>
+
+  <p><a class="go" href="/">Upload a document</a></p>
+{% endblock %}

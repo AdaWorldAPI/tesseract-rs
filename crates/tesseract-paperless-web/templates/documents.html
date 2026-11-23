@@ -1,21 +1,6 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Documents — {{ self.brand().name }}</title>
-<style>
-  :root { color-scheme: light dark; }
-  * { box-sizing: border-box; }
-  body {
-    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-    line-height: 1.5; margin: 0; padding: 2rem 1rem;
-    background: Canvas; color: CanvasText;
-  }
-  main { max-width: 52rem; margin: 0 auto; }
-  h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
-  nav.top { margin-bottom: 1.25rem; display: flex; justify-content: space-between; align-items: center; }
-  nav.top a { color: {{ self.brand().accent }}; text-decoration: none; font-weight: 600; }
+{% extends "base.html" %}
+{% block title %}{% if nav == "inbox" %}Inbox{% else %}Documents{% endif %} — {{ self.brand().name }}{% endblock %}
+{% block style %}
   .count { color: color-mix(in srgb, CanvasText 55%, Canvas); font-size: .9rem; }
   form.search { display: flex; gap: .5rem; margin-bottom: 1.25rem; }
   form.search input[type=text] {
@@ -39,40 +24,40 @@
   .meta { font-size: .8rem; color: color-mix(in srgb, CanvasText 50%, Canvas); margin-top: .4rem; }
   .low-conf { color: #d97706; font-weight: 600; }
   .empty { color: color-mix(in srgb, CanvasText 55%, Canvas); padding: 2rem 0; text-align: center; }
-  .error {
-    border: 1px solid #ef4444; background: color-mix(in srgb, #ef4444 12%, Canvas);
-    color: color-mix(in srgb, #ef4444 85%, CanvasText);
-    padding: .75rem 1rem; border-radius: 8px; margin-bottom: 1rem;
-  }
-  form.signout { display: inline; }
-  form.signout button { font: inherit; padding: 0; border: 0; background: none; color: inherit; text-decoration: underline; cursor: pointer; }
-</style>
-</head>
-<body>
-<main>
-  <nav class="top">
-    <h1>Documents</h1>
-    <span><a href="/definitions">Definitions</a> &middot; <a href="/">&larr; Ingest another</a>{% if self.sign_in() %} &middot; <form class="signout" method="post" action="/auth/logout"><button type="submit">Sign out</button></form>{% endif %}</span>
-  </nav>
-
-  {% if let Some(msg) = error %}
-  <div class="error">{{ msg }}</div>
+{% endblock %}
+{% block content %}
+  {% if nav == "inbox" %}
+  <h1>Inbox</h1>
+  <p class="note">Documents not yet marked reviewed, newest first. Open one, file it, and mark it reviewed to take it off this list.</p>
+  {% else %}
+  <h1>Documents</h1>
   {% endif %}
 
-  <form class="search" action="/documents" method="get">
-    <input type="text" name="q" value="{{ query }}" placeholder="Search recognized text&hellip;">
+  {% if let Some(msg) = error %}
+  <div class="error" role="alert">{{ msg }}</div>
+  {% endif %}
+
+  {% if nav != "inbox" %}
+  <form class="search" action="/documents" method="get" role="search">
+    <label class="note" for="q" hidden>Search</label>
+    <input id="q" type="text" name="q" value="{{ query }}" placeholder="Search recognized text&hellip;">
     <button type="submit">Search</button>
   </form>
+  {% endif %}
 
-  <p class="count">{{ count }} document{% if count != 1 %}s{% endif %}{% if !query.is_empty() %} matching &ldquo;{{ query }}&rdquo;{% endif %}</p>
+  <p class="count">{{ count }} document{% if count != 1 %}s{% endif %}{% if !query.is_empty() %} matching &ldquo;{{ query }}&rdquo;{% endif %}{% if nav == "inbox" %} to review{% endif %}</p>
 
   {% if documents.is_empty() %}
+  {% if nav == "inbox" %}
+  <p class="empty">Nothing to review.</p>
+  {% else %}
   <p class="empty">No documents yet. <a href="/">Ingest one</a>.</p>
+  {% endif %}
   {% else %}
   <ul class="docs">
     {% for d in documents %}
     <li class="doc">
-      <a class="title" href="/documents/{{ d.hash_hex }}">{{ d.filename }}</a>
+      <a class="title" href="/documents/{{ d.hash_hex }}{% if nav == "inbox" %}?from=inbox{% endif %}">{{ d.filename }}</a>
       {% if let Some(html) = d.snippet_html %}
       <p class="preview">{{ html|safe }}</p>
       {% else %}
@@ -87,6 +72,4 @@
     {% endfor %}
   </ul>
   {% endif %}
-</main>
-</body>
-</html>
+{% endblock %}
