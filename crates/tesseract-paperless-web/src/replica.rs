@@ -509,6 +509,10 @@ pub async fn restore(
     std::fs::write(&marker, b"restore in progress\n").map_err(local)?;
 
     let mut report = RestoreReport::default();
+    // Documents whose record was damaged keep their assignments and reviews:
+    // the next snapshot upload would otherwise replace the good metadata in
+    // S3 with one that lost them.
+    let mut skipped_hashes: HashSet<String> = HashSet::new();
     let local_hashes: HashSet<String> = store.hashes().await.map_err(local)?.into_iter().collect();
     // An original present in S3 is restored even when its record still says
     // `has_original: false`: the record is rewritten only after the original
@@ -529,16 +533,19 @@ pub async fn restore(
             Err(e) => {
                 eprintln!("restore: record {hash} unreadable ({e}); skipped");
                 report.skipped += 1;
+                skipped_hashes.insert(hash.clone());
                 continue;
             }
         };
         if record.schema != RECORD_SCHEMA || record.content_sha256_hex != hash {
             eprintln!("restore: record {hash} has the wrong schema or hash; skipped");
             report.skipped += 1;
+            skipped_hashes.insert(hash.clone());
             continue;
         }
         let Some(key) = ContentSha256::from_hex(&hash) else {
             report.skipped += 1;
+            skipped_hashes.insert(hash.clone());
             continue;
         };
         let ir = match ogar_doc_ir::from_json(&record.doc_ir_json) {
@@ -546,6 +553,7 @@ pub async fn restore(
             Err(e) => {
                 eprintln!("restore: record {hash} has an unreadable DocIr ({e:?}); skipped");
                 report.skipped += 1;
+                skipped_hashes.insert(hash.clone());
                 continue;
             }
         };
@@ -593,7 +601,9 @@ pub async fn restore(
             let file: SnapshotFile = serde_json::from_slice(&body)
                 .map_err(|e| ReplicaError::Invalid(format!("metadata snapshot: {e}")))?;
             let snapshot = file.to_snapshot()?;
-            let live: HashSet<String> = store.hashes().await.map_err(local)?.into_iter().collect();
+            let mut live: HashSet<String> =
+                store.hashes().await.map_err(local)?.into_iter().collect();
+            live.extend(skipped_hashes);
             store
                 .meta()
                 .import(&snapshot, &live)
@@ -809,6 +819,7 @@ mod tests {
         let src = local().await;
         let a = add(&src, b"doc A", "a.png", 1, true).await;
         let b = add(&src, b"doc B", "b.png", 2, true).await;
+        src.store.meta().mark_reviewed(&b, 3).await.expect("review");
         r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
         bucket
             .objects
@@ -830,6 +841,9 @@ mod tests {
         let key_a = ContentSha256::from_hex(&a).expect("hex");
         assert_eq!(dst.blobs.get(&key_a).expect("get"), None);
         assert!(dst.store.get(&b).await.expect("get").is_none());
+        // B's review survives, so the next snapshot does not drop it from S3.
+        let snap = dst.store.meta().export().await.expect("export");
+        assert!(snap.reviews.iter().any(|v| v.content_sha256_hex == b));
     }
 
     /// The original goes up before its record, and a delete removes the
