@@ -204,13 +204,27 @@ impl Provider {
 
     /// A signed ID token for `sub` with `roles` (the ZITADEL claim shape).
     fn sign(&self, sub: &str, nonce: &str, roles: serde_json::Value) -> String {
+        self.sign_for(CLIENT, Some(nonce), sub, roles)
+    }
+
+    /// A signed token addressed to `aud`, with or without a nonce.
+    fn sign_for(
+        &self,
+        aud: &str,
+        nonce: Option<&str>,
+        sub: &str,
+        roles: serde_json::Value,
+    ) -> String {
         let now = now_unix();
         let header = serde_json::json!({"alg": "EdDSA", "kid": KID, "typ": "JWT"});
-        let claims = serde_json::json!({
-            "iss": ISSUER, "sub": sub, "aud": CLIENT,
-            "exp": now + 3600, "iat": now, "nonce": nonce,
+        let mut claims = serde_json::json!({
+            "iss": ISSUER, "sub": sub, "aud": aud,
+            "exp": now + 3600, "iat": now,
             DEFAULT_ROLES_CLAIM: roles
         });
+        if let Some(n) = nonce {
+            claims["nonce"] = serde_json::json!(n);
+        }
         let signing_input = format!(
             "{}.{}",
             URL_SAFE_NO_PAD.encode(header.to_string()),
@@ -570,5 +584,104 @@ async fn without_a_login_the_app_is_unchanged() {
     assert_eq!(
         send(&app, "GET", "/auth/login", None).await.status(),
         StatusCode::NOT_FOUND
+    );
+}
+
+// ---------------------------------------------------------------- bearer (delegation)
+
+#[test]
+fn api_clients_are_a_comma_list_of_plain_ids() {
+    let c = config(&[(
+        "PAPERLESS_API_CLIENTS",
+        "report-client, other-client,report-client",
+    )]);
+    assert_eq!(c.api_clients, vec!["report-client", "other-client"]);
+    assert!(c.summary().contains("2 API client(s)"));
+    for bad in ["a,,b", "a b", ","] {
+        let v = base_vars(&[]);
+        let mut v: Vec<(&str, &str)> = v;
+        v.push(("PAPERLESS_API_CLIENTS", bad));
+        assert!(
+            AuthConfig::from_vars(vars(&v))
+                .unwrap_err()
+                .contains("API_CLIENTS"),
+            "{bad:?}"
+        );
+    }
+    assert!(config(&[]).api_clients.is_empty());
+}
+
+async fn send_bearer(app: &Router, method: &str, uri: &str, token: &str) -> Response {
+    let req = HttpRequest::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap()
+}
+
+#[tokio::test]
+async fn bearer_tokens_of_api_clients_pass_the_gate_and_others_do_not() {
+    let p = Provider::new();
+    let login = Arc::new(login_with(
+        &p,
+        &[("PAPERLESS_API_CLIENTS", "report-client")],
+    ));
+    let app = protect(secret_app(), Some(login.clone()));
+
+    // A token report-rs holds for the user (addressed to its client), with an allowed role.
+    let delegated = p.sign_for("report-client", None, "u1", user_role());
+    assert_eq!(
+        send_bearer(&app, "GET", "/documents", &delegated)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send_bearer(&app, "POST", "/upload", &delegated)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        login.verify_bearer(&delegated).await.as_deref(),
+        Ok("oidc:u1")
+    );
+
+    // Addressed to a client that is not listed (here: paperless's own): refused, no redirect.
+    let own = p.sign_for(CLIENT, None, "u1", user_role());
+    assert_eq!(
+        send_bearer(&app, "GET", "/documents", &own).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // The right client, but no allowed role: refused.
+    let no_role = p.sign_for(
+        "report-client",
+        None,
+        "u2",
+        serde_json::json!({"report-admin": {"100": "a"}}),
+    );
+    assert_eq!(
+        send_bearer(&app, "GET", "/documents", &no_role)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // Not a bearer token at all.
+    assert_eq!(
+        send_bearer(&app, "GET", "/documents", "not a token")
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Without PAPERLESS_API_CLIENTS no bearer token is accepted, even a valid one.
+    let closed = protect(secret_app(), Some(Arc::new(login_with(&p, &[]))));
+    assert_eq!(
+        send_bearer(&closed, "GET", "/documents", &delegated)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
     );
 }

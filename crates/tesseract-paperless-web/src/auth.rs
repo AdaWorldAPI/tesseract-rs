@@ -17,6 +17,12 @@
 //!    the verified login and a session is created, in an `HttpOnly`, `Secure`,
 //!    `SameSite=Lax` `__Host-` cookie.
 //!
+//! A service that calls the archive on a user's behalf (report-rs, through its own
+//! Zitadel application) sends that user's token as `Authorization: Bearer`. It is
+//! accepted when it is addressed to one of `PAPERLESS_API_CLIENTS`, with the same
+//! checks minus the nonce and the same role rule, and creates no session. A request
+//! that sends an `Authorization` header is never redirected: a bad token is a 401.
+//!
 //! The provider assigns the roles; this archive only checks that one of the listed
 //! ones is present. A role revoked at the provider takes effect at the next
 //! sign-in, or when the ID token carrying it expires (a session never outlives its
@@ -106,6 +112,9 @@ pub struct AuthConfig {
     allowed_roles: Vec<String>,
     /// When non-empty, an allowed role counts only under one of these organizations.
     allowed_orgs: Vec<String>,
+    /// `PAPERLESS_API_CLIENTS`: client ids whose tokens are accepted as
+    /// `Authorization: Bearer` (a service calling on a user's behalf). Empty: none.
+    api_clients: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -134,6 +143,26 @@ fn parse_list(var: &str, s: &str) -> Result<Vec<String>, String> {
         }
     }
     Ok(out)
+}
+
+/// The client ids of `PAPERLESS_API_CLIENTS` (comma separated, as zammad-ticket's
+/// `TICKET_API_CLIENTS`): none when unset. An empty item or one with whitespace is an
+/// error, never skipped.
+fn parse_api_clients(value: Option<String>) -> Result<Vec<String>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let mut ids: Vec<String> = Vec::new();
+    for item in value.split(',') {
+        let id = item.trim();
+        if id.is_empty() || id.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err("PAPERLESS_API_CLIENTS: an item is empty or contains whitespace".into());
+        }
+        if !ids.iter().any(|known| known == id) {
+            ids.push(id.to_owned());
+        }
+    }
+    Ok(ids)
 }
 
 /// 32 bytes as base64 (URL-safe or standard, with or without padding) or 64 hex
@@ -192,6 +221,7 @@ impl AuthConfig {
             "PAPERLESS_OIDC_ORGS",
             &present("PAPERLESS_OIDC_ORGS").unwrap_or_default(),
         )?;
+        let api_clients = parse_api_clients(present("PAPERLESS_API_CLIENTS"))?;
         let session_key = match present("PAPERLESS_SESSION_KEY") {
             None => None,
             Some(k) => Some(SessionKey(parse_session_key(&k)?)),
@@ -208,6 +238,7 @@ impl AuthConfig {
                 .unwrap_or_else(|| DEFAULT_EXTRA_SCOPES.to_string()),
             allowed_roles,
             allowed_orgs,
+            api_clients,
         }))
     }
 
@@ -218,7 +249,7 @@ impl AuthConfig {
     /// One log line naming what is configured, never a secret or an identity.
     pub fn summary(&self) -> String {
         format!(
-            "sign-in via {} (client {}), roles [{}]{}{}",
+            "sign-in via {} (client {}), roles [{}]{}{}{}",
             self.issuer.as_str(),
             self.client_id,
             self.allowed_roles.join(", "),
@@ -226,6 +257,14 @@ impl AuthConfig {
                 String::new()
             } else {
                 format!(", {} organization(s)", self.allowed_orgs.len())
+            },
+            if self.api_clients.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", bearer tokens of {} API client(s)",
+                    self.api_clients.len()
+                )
             },
             if self.session_key.is_some() {
                 ""
@@ -359,6 +398,8 @@ pub struct Login {
     trusted: TrustedIssuers,
     endpoints: RwLock<Option<Endpoints>>,
     verifier: RwLock<OidcVerifier>,
+    /// The issuer's keys for bearer tokens, refreshed with the sign-in keys.
+    bearer_keys: RwLock<KeySet>,
     pending: Mutex<HashMap<String, Pending>>,
     sessions: Mutex<HashMap<String, Session>>,
     revoked: Mutex<HashMap<String, u64>>,
@@ -496,6 +537,7 @@ impl Login {
             trusted,
             endpoints: RwLock::new(None),
             verifier: RwLock::new(verifier),
+            bearer_keys: RwLock::new(KeySet::default()),
             pending: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             revoked: Mutex::new(HashMap::new()),
@@ -578,6 +620,18 @@ impl Login {
             other => other,
         }
         .map_err(|_| CallbackError::Token)?;
+        let v = self.verifier.read().map_err(|_| CallbackError::Token)?;
+        self.admit(&v, &input, &claims)
+    }
+
+    /// The role rule and `establish`, for a token `verifier` has accepted.
+    fn admit(
+        &self,
+        verifier: &OidcVerifier,
+        input: &IdToken,
+        claims: &ogar_auth::federation::VerifiedClaims,
+    ) -> Result<VerifiedLogin, CallbackError> {
+        let token = input.token.as_str();
         // From here the token is authentic, so its roles claim may be read.
         let roles = token_roles(token, &self.cfg.roles_claim);
         if roles.is_empty() {
@@ -599,8 +653,65 @@ impl Login {
                 key_refs: Vec::new(),
             },
         };
-        let v = self.verifier.read().map_err(|_| CallbackError::Token)?;
-        establish(&*v, &self.trusted, &input, &store).map_err(|_| CallbackError::Token)
+        establish(verifier, &self.trusted, input, &store).map_err(|_| CallbackError::Token)
+    }
+
+    /// `true` when bearer tokens are accepted at all.
+    pub fn accepts_bearer(&self) -> bool {
+        !self.cfg.api_clients.is_empty()
+    }
+
+    /// A token a service presents as `Authorization: Bearer` on a user's behalf: the
+    /// same checks as an ID token (signature, issuer, audience, expiry) for one of the
+    /// `PAPERLESS_API_CLIENTS`, without a nonce and without a session, then the same
+    /// role rule. Returns the subject. The JWKS is refetched once on an unknown key.
+    pub async fn verify_bearer(&self, token: &str) -> Result<String, CallbackError> {
+        if self.cfg.api_clients.is_empty() {
+            return Err(CallbackError::Token);
+        }
+        let input = IdToken {
+            token: token.to_string(),
+            now_unix: now_unix(),
+            nonce: None,
+        };
+        let login = match self.verify_as_api_client(&input) {
+            Err(CallbackError::Upstream) => {
+                let ep = self.endpoints().await?;
+                self.refresh_keys(&ep.jwks).await?;
+                self.verify_as_api_client(&input)
+            }
+            other => other,
+        }?;
+        Ok(login.authenticated_user().user.subject.clone())
+    }
+
+    /// Try the token against one verifier per accepted API client, all over the shared
+    /// keys. `Upstream` means "no key matched": refetch and try once more.
+    fn verify_as_api_client(&self, input: &IdToken) -> Result<VerifiedLogin, CallbackError> {
+        let keys = self
+            .bearer_keys
+            .read()
+            .map_err(|_| CallbackError::Token)?
+            .clone();
+        let mut unknown_key = false;
+        for client_id in &self.cfg.api_clients {
+            let mut verifier = OidcVerifier::new();
+            verifier.add_client(Client::new(
+                self.cfg.issuer.clone(),
+                client_id.clone(),
+                keys.clone(),
+            ));
+            match AssertionVerifier::verify(&verifier, &self.trusted, input) {
+                Ok(claims) => return self.admit(&verifier, input, &claims),
+                Err(OidcError::UnknownKey) => unknown_key = true,
+                Err(_) => {}
+            }
+        }
+        Err(if unknown_key {
+            CallbackError::Upstream
+        } else {
+            CallbackError::Token
+        })
     }
 
     async fn endpoints(&self) -> Result<Endpoints, CallbackError> {
@@ -644,6 +755,9 @@ impl Login {
             .await
             .map_err(|_| CallbackError::Upstream)?;
         let keys = KeySet::from_jwks_json(&doc).map_err(|_| CallbackError::Upstream)?;
+        if let Ok(mut b) = self.bearer_keys.write() {
+            *b = keys.clone();
+        }
         let mut v = self.verifier.write().map_err(|_| CallbackError::Upstream)?;
         if let Some(c) = v.client_mut(&self.cfg.issuer) {
             c.set_keys(keys);
@@ -888,7 +1002,19 @@ fn is_public(path: &str) -> bool {
     path.starts_with("/auth/") || path == "/healthz"
 }
 
-/// Middleware: a live session, or a redirect to sign-in (GET/HEAD) / 401.
+/// The token of exactly one `Authorization: Bearer <token>` header.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return None;
+    };
+    let (scheme, token) = value.to_str().ok()?.split_once(' ')?;
+    let plain = !token.is_empty() && !token.chars().any(|c| c.is_whitespace() || c.is_control());
+    (scheme.eq_ignore_ascii_case("bearer") && plain).then_some(token)
+}
+
+/// Middleware: a live session, an accepted bearer token, or a redirect to sign-in
+/// (GET/HEAD without credentials) / 401.
 async fn require_session(State(login): State<Arc<Login>>, req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     if is_public(&path) {
@@ -902,6 +1028,17 @@ async fn require_session(State(login): State<Arc<Login>>, req: Request, next: Ne
         if login.subject(sid).is_some() {
             return next.run(req).await;
         }
+    }
+    // A caller that sent credentials is a service, not a browser: never redirect it.
+    if req.headers().contains_key(header::AUTHORIZATION) {
+        if login.accepts_bearer() {
+            if let Some(token) = bearer_token(req.headers()) {
+                if login.verify_bearer(token).await.is_ok() {
+                    return next.run(req).await;
+                }
+            }
+        }
+        return (StatusCode::UNAUTHORIZED, "invalid bearer token").into_response();
     }
     if req.method() == Method::GET || req.method() == Method::HEAD {
         let target = req
