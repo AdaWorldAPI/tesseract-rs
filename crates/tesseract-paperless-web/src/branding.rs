@@ -288,8 +288,7 @@ impl Branding {
     /// Reads a brand document. Unset keys keep their defaults; `on_accent` and
     /// `side_fg` are computed from the final `accent` / `side_bg` unless given.
     fn from_toml(text: &str) -> Result<Branding, BrandError> {
-        let file: BrandFile =
-            toml::from_str(text).map_err(|e| BrandError::Parse(e.to_string()))?;
+        let file: BrandFile = toml::from_str(text).map_err(|e| BrandError::Parse(e.to_string()))?;
         let mut t = file.brand.unwrap_or_default();
         let on_accent_given = t.on_accent.as_deref().is_some_and(|v| !v.trim().is_empty());
         let side_fg_given = t.side_fg.as_deref().is_some_and(|v| !v.trim().is_empty());
@@ -609,7 +608,10 @@ mod tests {
         let toml = |t: &str| Branding::from_toml(t);
         assert!(matches!(
             toml("[brand]\naccent = \"rgb(255,255,0)\"\n"),
-            Err(BrandError::Value { key: "on_accent", .. })
+            Err(BrandError::Value {
+                key: "on_accent",
+                ..
+            })
         ));
         assert!(matches!(
             toml("[brand]\nside_bg = \"rgb(13,58,100)\"\n"),
@@ -655,7 +657,9 @@ mod tests {
                     .iter()
                     .find(|(n, _)| *n == p)
                     .map(|(_, c)| (*c).to_owned())
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))
+                    .ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "no such file")
+                    })
             },
             |w| warnings.push(w),
         );
@@ -857,7 +861,10 @@ mod tests {
     fn legacy_variables_map_onto_the_tokens_and_never_fail() {
         let (r, w) = sources(&[("BRAND_ACCENT", "#FFFF00")], &[]);
         let b = r.expect("legacy");
-        assert_eq!((b.accent.as_str(), b.on_accent.as_str()), ("#ffff00", "#000"));
+        assert_eq!(
+            (b.accent.as_str(), b.on_accent.as_str()),
+            ("#ffff00", "#000")
+        );
         assert!(w.is_empty());
 
         let (r, w) = sources(
@@ -887,13 +894,19 @@ mod tests {
     #[test]
     fn toml_computed_pairs_follow_the_colour_unless_given() {
         let b = toml_brand("[brand]\nside_bg = \"#fafafa\"\n").expect("valid");
-        assert_eq!((b.side_bg.as_str(), b.side_fg.as_str()), ("#fafafa", "#000"));
+        assert_eq!(
+            (b.side_bg.as_str(), b.side_fg.as_str()),
+            ("#fafafa", "#000")
+        );
         // An explicit value wins over the computed one.
         let b = toml_brand("[brand]\naccent = \"#ffff00\"\non_accent = \"#123\"\n").expect("valid");
         assert_eq!(b.on_accent, "#123");
         // An empty document is the default.
         assert_eq!(toml_brand("[brand]\n").expect("valid"), Branding::default());
-        assert_eq!(toml_brand("# nothing\n").expect("valid"), Branding::default());
+        assert_eq!(
+            toml_brand("# nothing\n").expect("valid"),
+            Branding::default()
+        );
     }
 
     #[test]
@@ -945,10 +958,7 @@ mod tests {
     #[test]
     fn a_document_mixed_with_a_legacy_variable_is_refused() {
         for legacy in LEGACY_VARS {
-            let (r, _) = sources(
-                &[("BRAND_TOML", "[brand]\n"), (legacy, "x")],
-                &[],
-            );
+            let (r, _) = sources(&[("BRAND_TOML", "[brand]\n"), (legacy, "x")], &[]);
             assert_eq!(r, Err(BrandError::Mixed), "BRAND_TOML + {legacy}");
             let (r, _) = sources(
                 &[("BRAND_FILE", "/b.toml"), (legacy, "x")],
@@ -1023,7 +1033,10 @@ mod tests {
         let cases = [
             (format!("name = {long_name:?}"), "name"),
             (format!("tagline = {long_tagline:?}"), "tagline"),
-            ("logo_url = \"http://example.org/l.png\"".to_owned(), "logo_url"),
+            (
+                "logo_url = \"http://example.org/l.png\"".to_owned(),
+                "logo_url",
+            ),
             ("logo_url = \"//evil.example/x.png\"".to_owned(), "logo_url"),
             ("logo_url = \"javascript:alert(1)\"".to_owned(), "logo_url"),
             ("logo_url = \"/a b.png\"".to_owned(), "logo_url"),
@@ -1066,7 +1079,11 @@ mod tests {
             "radius-sm",
             "elevation",
         ] {
-            assert_eq!(css.matches(&format!("--brand-{name}: ")).count(), 1, "{name}");
+            assert_eq!(
+                css.matches(&format!("--brand-{name}: ")).count(),
+                1,
+                "{name}"
+            );
         }
         assert!(css.contains("--brand-accent: #ffff00;"), "{css}");
         assert!(css.contains("--brand-on-accent: #000;"), "{css}");

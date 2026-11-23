@@ -3243,7 +3243,10 @@ mod tests {
             let hidden_at = body
                 .find("nav.topnav-links { display: none; }")
                 .unwrap_or_else(|| panic!("{uri}: compact nav not hidden by default"));
-            assert!(hidden_at < phone_at, "{uri}: default hide must precede the phone rule");
+            assert!(
+                hidden_at < phone_at,
+                "{uri}: default hide must precede the phone rule"
+            );
             assert!(body.contains("color-scheme: light;"), "{uri}");
             assert!(!body.contains("color-scheme: light dark"), "{uri}");
         }
@@ -3287,9 +3290,18 @@ mod tests {
             for href in hrefs {
                 assert!(compact.contains(href), "{uri}: compact nav lacks {href}");
             }
-            assert!(!compact.contains("aria-current"), "{uri}: compact nav must not mark a page");
-            assert!(body.contains("class=\"quick-rail region-right_panel\""), "{uri}");
-            assert!(body.contains("aria-label=\"Upload\""), "{uri}: quick-menu upload link");
+            assert!(
+                !compact.contains("aria-current"),
+                "{uri}: compact nav must not mark a page"
+            );
+            assert!(
+                body.contains("class=\"quick-rail region-right_panel\""),
+                "{uri}"
+            );
+            assert!(
+                body.contains("aria-label=\"Upload\""),
+                "{uri}: quick-menu upload link"
+            );
             if let Some(i) = side.find("aria-current=\"page\"") {
                 // The href of the link carrying the marker.
                 let before = &side[..i];
@@ -3297,9 +3309,18 @@ mod tests {
                 current_of.push((uri.clone(), before[h_at..].trim_end().to_owned()));
             }
         }
-        let dashboard = current_of.iter().find(|(u, _)| u == "/dashboard").expect("dashboard");
-        let documents = current_of.iter().find(|(u, _)| u == "/documents").expect("documents");
-        assert_ne!(dashboard.1, documents.1, "different pages must mark different entries");
+        let dashboard = current_of
+            .iter()
+            .find(|(u, _)| u == "/dashboard")
+            .expect("dashboard");
+        let documents = current_of
+            .iter()
+            .find(|(u, _)| u == "/documents")
+            .expect("documents");
+        assert_ne!(
+            dashboard.1, documents.1,
+            "different pages must mark different entries"
+        );
     }
 
     /// Every `#rgb` / `#rrggbb` colour in `css`, lowercased. An id selector
@@ -3316,7 +3337,9 @@ mod tests {
                 }
                 let word_follows =
                     j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'-');
-                if j - i - 1 >= 3 && !word_follows {
+                // CSS hex colours have 3, 4, 6 or 8 digits.
+                let digits = j - i - 1;
+                if matches!(digits, 3 | 4 | 6 | 8) && !word_follows {
                     out.push(css[i..j].to_ascii_lowercase());
                 }
                 i = j;
@@ -3353,12 +3376,21 @@ mod tests {
             let css = &body[open..close];
             let vars_at = css.find("--brand-font-family").expect("brand vars");
             let after_vars = &css[vars_at + css[vars_at..].find('\n').expect("vars line end")..];
-            assert!(after_vars.len() > 1500, "{uri}: the page rules must follow the vars");
+            assert!(
+                after_vars.len() > 1500,
+                "{uri}: the page rules must follow the vars"
+            );
             let colours = hex_colours(after_vars);
             // Can-fire: the scanner does see the status colour of `.error`.
-            assert!(colours.contains(&"#ef4444".to_owned()), "{uri}: scanner saw nothing");
+            assert!(
+                colours.contains(&"#ef4444".to_owned()),
+                "{uri}: scanner saw nothing"
+            );
             for c in &colours {
-                assert!(STATUS_COLOURS.contains(&c.as_str()), "{uri}: fixed colour {c}");
+                assert!(
+                    STATUS_COLOURS.contains(&c.as_str()),
+                    "{uri}: fixed colour {c}"
+                );
             }
             for banned in ["rgb(", "rgba(", "Canvas"] {
                 assert!(!after_vars.contains(banned), "{uri}: {banned}");
@@ -3380,7 +3412,10 @@ mod tests {
             ("definitions", include_str!("../templates/definitions.html")),
         ] {
             for c in hex_colours(src) {
-                assert!(STATUS_COLOURS.contains(&c.as_str()), "{name}.html: fixed colour {c}");
+                assert!(
+                    STATUS_COLOURS.contains(&c.as_str()),
+                    "{name}.html: fixed colour {c}"
+                );
             }
             for banned in ["rgb(", "rgba(", "Canvas", "brand().accent", "on_accent()"] {
                 assert!(!src.contains(banned), "{name}.html: {banned}");
