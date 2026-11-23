@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use askama::Template;
 use axum::extract::{DefaultBodyLimit, Form, Multipart, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -23,6 +23,7 @@ use tesseract_paperless::archive_meta::{
 };
 use tesseract_paperless::auto_match::Cue;
 use tesseract_paperless::auto_model::{doc_content, index_tokenizer};
+use tesseract_paperless::kv::ContentSha256;
 use tesseract_paperless::matching::MatchAlgorithm;
 use tesseract_paperless::store::DocumentRow;
 
@@ -104,6 +105,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/upload", post(upload))
         .route("/documents", get(documents))
         .route("/documents/:hash", get(document_detail))
+        .route("/documents/:hash/original", get(document_original))
         .route("/documents/:hash/delete", post(document_delete))
         .route("/documents/:hash/assign", post(document_assign))
         .route("/documents/:hash/unassign", post(document_unassign))
@@ -249,10 +251,16 @@ fn log_ingest_outcome(outcome: &IngestOutcome) {
             hash_hex,
             document_guid,
             matched,
+            original_added,
         } => {
             println!(
-                "ingest: {hash_hex} (guid {}) already held (matched: {matched:?}) -- recognition skipped",
-                hex16(document_guid)
+                "ingest: {hash_hex} (guid {}) already held (matched: {matched:?}) -- recognition skipped{}",
+                hex16(document_guid),
+                if *original_added {
+                    "; original kept for a document stored before originals were"
+                } else {
+                    ""
+                }
             );
         }
     }
@@ -572,6 +580,9 @@ struct DocumentDetailTemplate {
     suggestions_note: Option<String>,
     /// Opened from the inbox: the back link and "Mark reviewed, next" lead there.
     from_inbox: bool,
+    /// Whether the uploaded original is kept (false for documents stored
+    /// before the original-file store).
+    has_original: bool,
     error: Option<String>,
 }
 
@@ -746,6 +757,7 @@ fn not_found_detail(hash_hex: &str, error: impl Into<String>) -> DocumentDetailT
         suggestions: Vec::new(),
         suggestions_note: None,
         from_inbox: false,
+        has_original: false,
         error: Some(error.into()),
     }
 }
@@ -814,6 +826,8 @@ async fn document_detail(
         }
     };
     let (suggestions, suggestions_note) = suggestions_for(&state, &row, &assigns);
+    let has_original =
+        ContentSha256::from_hex(&row.content_sha256_hex).is_some_and(|k| state.blobs.contains(&k));
 
     render(&DocumentDetailTemplate {
         groups: kind_groups(&defs, &assigns),
@@ -833,8 +847,135 @@ async fn document_detail(
         fields,
         triples,
         from_inbox,
+        has_original,
         error: None,
     })
+}
+
+/// Serve a document's original upload, byte for byte.
+///
+/// Only for a document the archive holds: a blob without a row (left by a
+/// crash between the two writes) is not served. The bytes are re-hashed on
+/// read and refused if they no longer match. Always an attachment with
+/// `nosniff`, so an upload is never rendered as a page of this origin.
+async fn document_original(
+    State(state): State<Arc<AppState>>,
+    Path(hash): Path<String>,
+) -> Response {
+    let Some(key) = ContentSha256::from_hex(&hash) else {
+        return fail(StatusCode::NOT_FOUND, "no document with this hash");
+    };
+    let row = match state.store.get(&hash).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return fail(StatusCode::NOT_FOUND, "no document with this hash"),
+        Err(e) => {
+            return fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("archive read failed: {e}"),
+            )
+        }
+    };
+    let st = state.clone();
+    let read = match tokio::task::spawn_blocking(move || st.blobs.get(&key)).await {
+        Ok(r) => r,
+        Err(e) => {
+            return fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("original read task failed: {e}"),
+            )
+        }
+    };
+    let bytes = match read {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return fail(
+                StatusCode::NOT_FOUND,
+                "the original of this document is not available: it was stored before \
+                 originals were kept. Upload the same file again to attach it.",
+            )
+        }
+        Err(e) => {
+            eprintln!("original {hash}: {e}");
+            return fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the stored original failed its integrity check and is not served",
+            );
+        }
+    };
+    let name = download_name(row.filename.as_deref(), &hash);
+    (
+        [
+            (header::CONTENT_TYPE, download_mime(&row.mime).to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!(
+                    "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+                    ascii_fallback(&name),
+                    percent_encode_filename(&name)
+                ),
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (header::CACHE_CONTROL, "private, no-store".to_string()),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// The stored MIME type when it is a plain raster image type, else
+/// `application/octet-stream`. The stored value comes from the upload request,
+/// so it is not trusted to name anything a browser would execute.
+fn download_mime(mime: &str) -> &str {
+    let plain = mime.len() <= 64
+        && mime.strip_prefix("image/").is_some_and(|sub| {
+            !sub.is_empty()
+                && !sub.contains("svg")
+                && sub
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"+-.".contains(&b))
+        });
+    if plain {
+        mime
+    } else {
+        "application/octet-stream"
+    }
+}
+
+/// The stored filename without any directory part, or the hash when there is
+/// none.
+fn download_name(filename: Option<&str>, hash: &str) -> String {
+    filename
+        .and_then(|f| f.rsplit(['/', '\\']).next())
+        .map(str::trim)
+        .filter(|f| !f.is_empty() && *f != "." && *f != "..")
+        .map_or_else(|| hash.to_string(), str::to_string)
+}
+
+/// The filename with every character outside printable ASCII, and the two
+/// that would end the quoted string, replaced by `_`.
+fn ascii_fallback(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if (c.is_ascii_graphic() && c != '"' && c != '\\') || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// RFC 5987 encoding for `filename*`.
+fn percent_encode_filename(name: &str) -> String {
+    let mut out = String::new();
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 async fn document_delete(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
@@ -856,6 +997,16 @@ async fn document_delete(State(state): State<Arc<AppState>>, Path(hash): Path<St
                 Ok(Err(e)) => eprintln!("delete {hash} from search index failed: {e}"),
                 Err(e) => eprintln!("delete {hash} from search index task failed: {e}"),
                 Ok(Ok(())) => {}
+            }
+            // The original goes after its row: a failure here leaves an
+            // unreferenced blob, never a row without its original.
+            if let Some(key) = ContentSha256::from_hex(&hash) {
+                let st = state.clone();
+                match tokio::task::spawn_blocking(move || st.blobs.delete(&key)).await {
+                    Ok(Err(e)) => eprintln!("delete original of {hash} failed: {e}"),
+                    Err(e) => eprintln!("delete original of {hash} task failed: {e}"),
+                    Ok(Ok(())) => {}
+                }
             }
         }
         Err(e) => eprintln!("delete {hash} from archive failed: {e} (search index left untouched)"),
@@ -1675,6 +1826,7 @@ mod tests {
 
     use std::path::Path as FsPath;
 
+    use crate::ingest::IngestError;
     use axum::body::Body;
     use axum::http::{header, Request};
     use tesseract_paperless::archive_meta::MATCH_AUTO;
@@ -1686,16 +1838,18 @@ mod tests {
     struct Harness {
         state: Arc<AppState>,
         app: Router,
-        _dirs: (tempfile::TempDir, tempfile::TempDir),
+        _dirs: (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir),
     }
 
     async fn harness() -> Harness {
         let archive = tempfile::tempdir().expect("archive tempdir");
         let index = tempfile::tempdir().expect("index tempdir");
+        let blobs = tempfile::tempdir().expect("blob tempdir");
         let state = AppState::load(
             FsPath::new(MODEL_DIR),
             &archive.path().to_string_lossy(),
             index.path(),
+            blobs.path(),
             FsPath::new("/nonexistent/deepnsm/word_frequency"),
         )
         .await
@@ -1705,7 +1859,7 @@ mod tests {
         Harness {
             state,
             app,
-            _dirs: (archive, index),
+            _dirs: (archive, index, blobs),
         }
     }
 
@@ -1764,6 +1918,307 @@ mod tests {
             .uri(uri)
             .body(Body::empty())
             .expect("request")
+    }
+
+    /// Status, headers and raw body bytes.
+    async fn send_raw(
+        h: &Harness,
+        req: Request<Body>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let resp = h.app.clone().oneshot(req).await.expect("oneshot");
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, headers, bytes.to_vec())
+    }
+
+    /// A real page the recognizer reads, so the new-document path runs OCR.
+    fn page_bytes() -> Vec<u8> {
+        std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../corpus/pages/page_01.pgm"
+        ))
+        .expect("corpus page")
+    }
+
+    /// Every blob file under the store, excluding nothing: a leftover
+    /// temporary file would be counted too.
+    fn blob_files(h: &Harness) -> usize {
+        let mut n = 0;
+        for d in std::fs::read_dir(h.state.blobs.root()).expect("blob root") {
+            let d = d.expect("entry").path();
+            if d.is_dir() {
+                n += std::fs::read_dir(&d).expect("fan-out dir").count();
+            }
+        }
+        n
+    }
+
+    fn blob_path(h: &Harness, hash: &str) -> std::path::PathBuf {
+        h.state.blobs.root().join(&hash[..2]).join(hash)
+    }
+
+    /// Slice B: upload then download returns the exact bytes, as an attachment
+    /// that a browser cannot sniff into a page. A second upload of the same
+    /// bytes runs no recognition and stores no second blob.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upload_keeps_its_original_and_a_duplicate_adds_nothing() {
+        let h = harness().await;
+        let bytes = page_bytes();
+        let outcome = ingest(
+            &h.state,
+            bytes.clone(),
+            Some("scan 01.pgm".to_string()),
+            "image/x-portable-graymap",
+        )
+        .await
+        .expect("ingest");
+        let IngestOutcome::Stored { hash_hex: hash, .. } = outcome else {
+            panic!("first upload must be stored, got {outcome:?}");
+        };
+        assert_eq!(blob_files(&h), 1);
+
+        let (status, headers, body) =
+            send_raw(&h, get_req(&format!("/documents/{hash}/original"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body == bytes, "downloaded bytes differ from the upload");
+        assert_eq!(headers[header::CONTENT_TYPE], "image/x-portable-graymap");
+        assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(
+            headers[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"scan 01.pgm\"; filename*=UTF-8''scan%2001.pgm"
+        );
+        let (_, _, page) = send(&h, get_req(&format!("/documents/{hash}"))).await;
+        assert!(page.contains(&format!("href=\"/documents/{hash}/original\"")));
+
+        let row_before = h.state.store.get(&hash).await.expect("get").expect("row");
+        let again = ingest(
+            &h.state,
+            bytes,
+            Some("other name.pgm".to_string()),
+            "image/png",
+        )
+        .await
+        .expect("ingest again");
+        match again {
+            IngestOutcome::Duplicate {
+                hash_hex,
+                original_added,
+                ..
+            } => {
+                assert_eq!(hash_hex, hash);
+                assert!(!original_added, "an intact original was rewritten");
+            }
+            other => panic!("second upload must be a duplicate, got {other:?}"),
+        }
+        assert_eq!(blob_files(&h), 1, "a duplicate stored a second blob");
+        let row_after = h.state.store.get(&hash).await.expect("get").expect("row");
+        assert_eq!(
+            row_after.ingested_at_unix_ms,
+            row_before.ingested_at_unix_ms
+        );
+        assert_eq!(row_after.filename, row_before.filename);
+    }
+
+    /// Slice B: a document stored before the blob store has a row and no
+    /// original. Its detail page says so and the download is 404. Uploading
+    /// the same bytes keeps them as its original and changes neither the row
+    /// nor its metadata.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_duplicate_of_a_document_without_original_attaches_it() {
+        let h = harness().await;
+        let legacy = b"legacy upload bytes";
+        let hash = seed(&h, legacy).await;
+        let def = h
+            .state
+            .store
+            .meta()
+            .create_definition(MetaKind::Tag, "Alt", 1)
+            .await
+            .expect("create");
+        let (status, _, _) = send(
+            &h,
+            post_form(
+                &format!("/documents/{hash}/assign"),
+                &format!("kind=tag&definition_id={}", def.definition_id),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+
+        let (_, _, page) = send(&h, get_req(&format!("/documents/{hash}"))).await;
+        assert!(page.contains("The original is not available"));
+        assert!(!page.contains(&format!("/documents/{hash}/original")));
+        let (status, _, _) = send_raw(&h, get_req(&format!("/documents/{hash}/original"))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let row_before = h.state.store.get(&hash).await.expect("get").expect("row");
+        let assigns_before = h
+            .state
+            .store
+            .meta()
+            .assignments_for(&hash)
+            .await
+            .expect("for");
+        // Not an image: proves the bytes never reached the decoder or OCR.
+        let outcome = ingest(&h.state, legacy.to_vec(), None, "image/png")
+            .await
+            .expect("ingest");
+        assert!(
+            matches!(
+                outcome,
+                IngestOutcome::Duplicate {
+                    original_added: true,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        let row_after = h.state.store.get(&hash).await.expect("get").expect("row");
+        assert_eq!(
+            row_after.ingested_at_unix_ms,
+            row_before.ingested_at_unix_ms
+        );
+        assert_eq!(row_after.doc_ir_json, row_before.doc_ir_json);
+        assert_eq!(row_after.filename, row_before.filename);
+        assert_eq!(
+            h.state
+                .store
+                .meta()
+                .assignments_for(&hash)
+                .await
+                .expect("for"),
+            assigns_before
+        );
+
+        let (status, _, body) = send_raw(&h, get_req(&format!("/documents/{hash}/original"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, legacy);
+        let (_, _, page) = send(&h, get_req(&format!("/documents/{hash}"))).await;
+        assert!(page.contains("Download original"));
+    }
+
+    /// Slice B, S-5: when the original cannot be written, no row is written
+    /// either. A blob left without a row (a crash after the blob, before the
+    /// row) is not served, and the next upload of the same bytes completes
+    /// the document using that blob.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_document_row_is_never_written_without_its_original() {
+        let h = harness().await;
+        let bytes = page_bytes();
+        let key = ContentSha256::of(&bytes);
+        let hash = format!("{key:?}");
+
+        // A file where the fan-out directory belongs makes the blob write fail.
+        let block = h.state.blobs.root().join(&hash[..2]);
+        std::fs::write(&block, b"not a directory").expect("block");
+        match ingest(&h.state, bytes.clone(), None, "image/x-portable-graymap").await {
+            Err(IngestError::Blob(_)) => {}
+            other => panic!("expected a blob failure, got {other:?}"),
+        }
+        assert!(
+            h.state.store.get(&hash).await.expect("get").is_none(),
+            "a row was written although its original was not"
+        );
+        std::fs::remove_file(&block).expect("unblock");
+
+        // The crash case: the blob exists, the row does not. Not served.
+        h.state.blobs.put(&key, &bytes).expect("orphan blob");
+        let (status, _, _) = send_raw(&h, get_req(&format!("/documents/{hash}/original"))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "an orphan blob was served");
+
+        let outcome = ingest(&h.state, bytes.clone(), None, "image/x-portable-graymap")
+            .await
+            .expect("ingest");
+        assert!(
+            matches!(outcome, IngestOutcome::Stored { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(blob_files(&h), 1);
+        let (status, _, body) = send_raw(&h, get_req(&format!("/documents/{hash}/original"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body == bytes);
+    }
+
+    /// Slice B: altered stored bytes are refused, not served.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tampered_original_is_refused() {
+        let h = harness().await;
+        let original = b"original bytes";
+        let hash = seed(&h, original).await;
+        let key = ContentSha256::from_hex(&hash).expect("hex");
+        h.state.blobs.put(&key, original).expect("put");
+        std::fs::write(blob_path(&h, &hash), b"altered bytes").expect("tamper");
+
+        let (status, headers, body) =
+            send_raw(&h, get_req(&format!("/documents/{hash}/original"))).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(headers.get(header::CONTENT_DISPOSITION).is_none());
+        assert!(!body.windows(13).any(|w| w == b"altered bytes"));
+    }
+
+    /// Slice B: deleting a document removes its original; a malformed or
+    /// unknown hash is 404 without touching the filesystem by that name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_removes_the_original_and_bad_hashes_are_404() {
+        let h = harness().await;
+        let original = b"to be deleted";
+        let hash = seed(&h, original).await;
+        let key = ContentSha256::from_hex(&hash).expect("hex");
+        h.state.blobs.put(&key, original).expect("put");
+
+        let (status, _, _) = send(&h, post_form(&format!("/documents/{hash}/delete"), "")).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(
+            !h.state.blobs.contains(&key),
+            "the original outlived its document"
+        );
+
+        for bad in [
+            "nothex".to_string(),
+            "..%2F..%2Fetc%2Fpasswd".to_string(),
+            hash.to_uppercase(),
+            format!("{:?}", ContentSha256::of(b"never stored")),
+        ] {
+            let (status, _, _) = send_raw(&h, get_req(&format!("/documents/{bad}/original"))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_plain_image_types_are_served_as_such() {
+        assert_eq!(download_mime("image/png"), "image/png");
+        assert_eq!(
+            download_mime("image/x-portable-graymap"),
+            "image/x-portable-graymap"
+        );
+        for risky in [
+            "image/svg+xml",
+            "text/html",
+            "image/",
+            "image/png; charset=utf-8",
+            "image/PNG",
+            "application/pdf",
+            "",
+        ] {
+            assert_eq!(download_mime(risky), "application/octet-stream", "{risky}");
+        }
+    }
+
+    #[test]
+    fn download_names_drop_directories_and_quote_safely() {
+        let h = "ab".repeat(32);
+        assert_eq!(download_name(Some("../../etc/passwd"), &h), "passwd");
+        assert_eq!(download_name(Some("C:\\scans\\a.png"), &h), "a.png");
+        assert_eq!(download_name(Some(".."), &h), h);
+        assert_eq!(download_name(None, &h), h);
+        assert_eq!(
+            ascii_fallback("Rechnung \"März\".png"),
+            "Rechnung _M_rz_.png"
+        );
+        assert_eq!(percent_encode_filename("März 1.png"), "M%C3%A4rz%201.png");
     }
 
     /// Status, `Location` header (if any) and body text.

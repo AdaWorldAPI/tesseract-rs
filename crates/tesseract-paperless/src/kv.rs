@@ -125,6 +125,27 @@ impl ContentSha256 {
         Self(h.finalize().into())
     }
 
+    /// Parse the lower-case hex form [`Debug`](core::fmt::Debug) prints:
+    /// exactly 64 digits `0-9a-f`. Anything else, upper case included, is
+    /// `None`, so a parsed key always prints back to the same string.
+    #[must_use]
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        let b = hex.as_bytes();
+        if b.len() != CONTENT_SHA256_LEN * 2 {
+            return None;
+        }
+        let digit = |c: u8| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            _ => None,
+        };
+        let mut out = [0u8; CONTENT_SHA256_LEN];
+        for (o, [hi, lo]) in out.iter_mut().zip(b.as_chunks::<2>().0) {
+            *o = (digit(*hi)? << 4) | digit(*lo)?;
+        }
+        Some(Self(out))
+    }
+
     /// The digest bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; CONTENT_SHA256_LEN] {
@@ -295,6 +316,23 @@ mod tests {
     impl DedupIndex for Seen {
         fn look_up(&self, h: &ContentSha256) -> Option<(DocumentGuid, MatchedOn)> {
             (h == &self.0).then(|| (DocumentGuid(FacetCascade::from_bytes(&[0u8; 16])), self.1))
+        }
+    }
+
+    #[test]
+    fn from_hex_round_trips_and_refuses_anything_else() {
+        let key = ContentSha256::of(b"round trip");
+        let hex = format!("{key:?}");
+        assert_eq!(ContentSha256::from_hex(&hex), Some(key));
+        for bad in [
+            String::new(),
+            hex[..63].to_string(),
+            format!("{hex}0"),
+            hex.to_uppercase(),
+            format!("../{}", &hex[3..]),
+            format!("{}g", &hex[..63]),
+        ] {
+            assert_eq!(ContentSha256::from_hex(&bad), None, "{bad}");
         }
     }
 

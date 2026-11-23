@@ -48,6 +48,8 @@
 
 #![forbid(unsafe_code)]
 
+/// The original-file store: exact uploaded bytes, keyed by their SHA-256.
+pub mod blobs;
 pub mod intake;
 pub mod kv;
 pub mod render;

@@ -22,6 +22,7 @@ use serde_json::Value;
 use tesseract_ogar::reasoning::SentenceBelief;
 use tesseract_ogar::sentences::assemble_sentences;
 use tesseract_ogar::{BinarizeMode, OcrExecError, OcrRequest, OcrResponse};
+use tesseract_paperless::blobs::{BlobError, PutOutcome};
 use tesseract_paperless::kv::{mint_document_root, preflight, MatchedOn, Verdict};
 use tesseract_paperless::search::SearchError;
 use tesseract_paperless::store::StoreError;
@@ -65,6 +66,9 @@ pub enum IngestOutcome {
         document_guid: [u8; 16],
         /// Which stored hash matched.
         matched: MatchedOn,
+        /// The document predated the original-file store, so these bytes
+        /// were kept as its original. Its row and metadata are unchanged.
+        original_added: bool,
     },
 }
 
@@ -91,6 +95,9 @@ pub enum IngestError {
     Recognize(OcrExecError),
     /// `doc.v1` -> `DocIr` conversion failed.
     Convert(ogar_from_docv1::FromDocV1Error),
+    /// The original could not be kept. For a new document nothing was
+    /// stored: the row is only written after its original is (S-5).
+    Blob(BlobError),
     /// The archive write failed.
     Store(StoreError),
     /// The document was archived, but the search index write failed --
@@ -106,6 +113,7 @@ impl std::fmt::Display for IngestError {
             Self::Task(e) => write!(f, "recognition task: {e}"),
             Self::Recognize(e) => write!(f, "recognition: {e:?}"),
             Self::Convert(e) => write!(f, "doc.v1 conversion: {e:?}"),
+            Self::Blob(e) => write!(f, "original-file store: {e}"),
             Self::Store(e) => write!(f, "archive write: {e}"),
             Self::Search(e) => write!(f, "search index write: {e}"),
         }
@@ -141,10 +149,24 @@ pub async fn ingest(
         // learn the address a Stored ingest of these exact bytes already
         // minted (`store::LanceStore::put` computes the identical value).
         let guid = mint_document_root(&hash).root.0.to_bytes();
+        // A document stored before originals were kept has a row and no blob.
+        // These bytes hash to its key, so they are its original: keep them,
+        // and change nothing else. No recognition either way.
+        let original_added = if matched == MatchedOn::Original {
+            let st = state.clone();
+            let outcome = tokio::task::spawn_blocking(move || st.blobs.put(&hash, &bytes))
+                .await
+                .map_err(|e| IngestError::Task(e.to_string()))?
+                .map_err(IngestError::Blob)?;
+            outcome == PutOutcome::Written
+        } else {
+            false
+        };
         return Ok(IngestOutcome::Duplicate {
             hash_hex: hex,
             document_guid: guid,
             matched,
+            original_added,
         });
     }
 
@@ -206,6 +228,13 @@ pub async fn ingest(
             }
             None => (None, 0),
         };
+
+        // S-5: the original lands before the row below is written. A crash
+        // after this leaves a blob without a row, which the next upload of the
+        // same bytes reuses; it can never leave a row without its original.
+        // Kept only once recognition succeeded, so a file that is not a
+        // readable image never reaches the store.
+        st.blobs.put(&hash, &bytes).map_err(IngestError::Blob)?;
 
         Ok((doc_json, spo_json, triple_count))
     })

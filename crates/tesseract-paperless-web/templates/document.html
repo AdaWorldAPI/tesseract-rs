@@ -64,6 +64,7 @@
     <span>ingested {{ ingested_at }}</span>
     <span class="hash">{{ hash_hex }}</span>
   </div>
+  <p class="original">{% if has_original %}<a href="/documents/{{ hash_hex }}/original" download>Download original</a>{% else %}<span class="note">The original is not available: this document was stored before originals were kept. Upload the same file again to attach it.</span>{% endif %}</p>
 
   <div class="card">
     <h2>Metadata</h2>

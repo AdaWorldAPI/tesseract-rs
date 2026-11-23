@@ -9,6 +9,7 @@ use tesseract_ogar::OcrExecutor;
 use tesseract_paperless::auto_match::AutoMatchParams;
 use tesseract_paperless::auto_model::{index_tokenizer, AutoModel, MineInputs};
 use tesseract_paperless::auto_rows::VocabParams;
+use tesseract_paperless::blobs::BlobStore;
 use tesseract_paperless::search::SearchIndex;
 use tesseract_paperless::store::LanceStore;
 use tokio::sync::Semaphore;
@@ -28,6 +29,10 @@ pub struct AppState {
     /// calling `search.index_document`/`search.delete_document` alongside
     /// every `store.put`/`store.delete`.
     pub search: SearchIndex,
+    /// The uploaded originals, keyed by their SHA-256 (`blobs.rs`). Written
+    /// before the document row (S-5), so a row never points at a missing file
+    /// unless the row predates this store.
+    pub blobs: BlobStore,
     /// Sentence assembly + deepnsm SPO/`NarsTruth` extraction
     /// (`tesseract_ogar::{sentences,reasoning}`) — `None` when the deepnsm
     /// `word_frequency/` vocabulary is not present at `DEEPNSM_VOCAB_DIR`
@@ -63,8 +68,8 @@ pub enum AutoSlot {
 
 impl AppState {
     /// Load the model from `model_dir`, connect the archive at
-    /// `lancedb_uri`, and open (or create) the search index at
-    /// `search_index_dir`.
+    /// `lancedb_uri`, open (or create) the search index at
+    /// `search_index_dir` and the original-file store at `blob_dir`.
     ///
     /// # Errors
     /// A human-readable message on any failure — the caller prints it and
@@ -73,6 +78,7 @@ impl AppState {
         model_dir: &Path,
         lancedb_uri: &str,
         search_index_dir: &Path,
+        blob_dir: &Path,
         deepnsm_vocab_dir: &Path,
     ) -> Result<Self, String> {
         let path = |name: &str| model_dir.join(format!("eng.{name}"));
@@ -96,6 +102,9 @@ impl AppState {
         // makes in this same function.
         let search = SearchIndex::open_or_create(search_index_dir)
             .map_err(|e| format!("open search index at {}: {e}", search_index_dir.display()))?;
+
+        let blobs = BlobStore::open(blob_dir)
+            .map_err(|e| format!("open original-file store at {}: {e}", blob_dir.display()))?;
 
         // The index holds references into the archive, never text of its
         // own, so it is brought back in line with the archive on every start:
@@ -174,6 +183,7 @@ impl AppState {
             executor,
             store,
             search,
+            blobs,
             reasoner,
             recognize_permits: Arc::new(Semaphore::new(permits)),
             auto: std::sync::RwLock::new(AutoSlot::Pending),
