@@ -85,8 +85,27 @@ fn bad_values_refuse_the_boot() {
         err(&[("PAPERLESS_OIDC_REDIRECT_URL", "https://p.example/callback")])
             .contains("REDIRECT_URL")
     );
+    // The path is parsed, not matched as a suffix.
+    for bad in [
+        "https://p.example/wrong?next=/auth/callback",
+        "https://p.example/auth/callback#x",
+        "https://p.example/auth/callback?x=1",
+        "https://p.example/x/auth/callback",
+        "https://u:pw@p.example/auth/callback",
+    ] {
+        assert!(
+            AuthConfig::from_vars(vars(&base_vars(&[("PAPERLESS_OIDC_REDIRECT_URL", bad)])))
+                .unwrap_err()
+                .contains("REDIRECT_URL"),
+            "{bad}"
+        );
+    }
+    assert_eq!(config(&[]).origin, "https://paperless.example");
     assert!(err(&[("PAPERLESS_OIDC_ROLES", "paperless.*")]).contains("ROLES"));
     assert!(err(&[("PAPERLESS_OIDC_ORGS", "1/2")]).contains("ORGS"));
+    // Separators only would silently lift the organization restriction.
+    assert!(err(&[("PAPERLESS_OIDC_ORGS", ",")]).contains("ORGS"));
+    assert!(config(&[("PAPERLESS_OIDC_ORGS", "100")]).allowed_orgs == ["100"]);
     assert!(err(&[("PAPERLESS_SESSION_KEY", "short")]).contains("SESSION_KEY"));
 }
 
@@ -458,10 +477,20 @@ async fn sessions_survive_a_restart_only_with_a_session_key() {
     second.restore(&cookie_value).await;
     assert_eq!(second.subject(&cookie_value).as_deref(), Some("oidc:u1"));
 
-    // Without the key (random per process), the cookie opens nowhere else.
-    let keyless = login_with(&p, &[]);
-    keyless.restore(&cookie_value).await;
-    assert!(keyless.subject(&cookie_value).is_none());
+    // Without the key (random per process), a keyless process's cookie opens in
+    // no other keyless process. Issued keyless, so a fixed fallback key would fail.
+    let keyless_a = login_with(&p, &[]);
+    let (keyless_cookie, _) = sign_in(&keyless_a, &p, "u2", user_role()).await.unwrap();
+    assert_eq!(
+        keyless_a.subject(&keyless_cookie).as_deref(),
+        Some("oidc:u2")
+    );
+    let keyless_b = login_with(&p, &[]);
+    keyless_b.restore(&keyless_cookie).await;
+    assert!(keyless_b.subject(&keyless_cookie).is_none());
+    // Nor does the keyed cookie open in a keyless process.
+    keyless_b.restore(&cookie_value).await;
+    assert!(keyless_b.subject(&cookie_value).is_none());
 
     // A tampered cookie never opens.
     let mut tampered = cookie_value.clone();
@@ -684,4 +713,65 @@ async fn bearer_tokens_of_api_clients_pass_the_gate_and_others_do_not() {
             .status(),
         StatusCode::UNAUTHORIZED
     );
+}
+
+#[tokio::test]
+async fn a_session_cookie_from_another_origin_cannot_change_state() {
+    let p = Provider::new();
+    let login = Arc::new(login_with(&p, &[]));
+    let app = protect(secret_app(), Some(login.clone()));
+    let (cookie_value, _) = sign_in(&login, &p, "u1", user_role()).await.unwrap();
+    let post = |extra: &'static [(&'static str, &'static str)]| {
+        let app = app.clone();
+        let cookie_value = cookie_value.clone();
+        async move {
+            let mut b = HttpRequest::builder()
+                .method("POST")
+                .uri("/upload")
+                .header(header::COOKIE, format!("{SESSION_COOKIE}={cookie_value}"));
+            for (k, v) in extra {
+                b = b.header(*k, *v);
+            }
+            app.oneshot(b.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    // A sibling subdomain is same-site, so the cookie travels; the origin decides.
+    assert_eq!(
+        post(&[("sec-fetch-site", "same-site")]).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post(&[("origin", "https://evil.paperless.example")]).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post(&[("sec-fetch-site", "cross-site")]).await,
+        StatusCode::FORBIDDEN
+    );
+    // The archive's own pages pass.
+    assert_eq!(
+        post(&[("sec-fetch-site", "same-origin")]).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(&[("origin", "https://paperless.example")]).await,
+        StatusCode::OK
+    );
+    // GET is never refused for its origin.
+    let r = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .uri("/")
+                .header(header::COOKIE, format!("{SESSION_COOKIE}={cookie_value}"))
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
 }

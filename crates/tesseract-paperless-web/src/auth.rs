@@ -102,6 +102,9 @@ pub struct AuthConfig {
     client_id: String,
     /// Absolute https URL of `/auth/callback`, as registered at the provider.
     redirect_url: String,
+    /// `scheme://host[:port]` of `redirect_url`: the archive's own origin. A
+    /// cookie-authenticated request that changes state must come from it.
+    origin: String,
     /// Only for a confidential client. Never logged.
     client_secret: Option<String>,
     /// `PAPERLESS_SESSION_KEY`, 32 bytes. `None`: random per process. Never logged.
@@ -124,6 +127,34 @@ impl std::fmt::Debug for SessionKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SessionKey(redacted)")
     }
+}
+
+/// Every variable [`AuthConfig::from_vars`] reads.
+const ENV_VARS: [&str; 10] = [
+    "PAPERLESS_OIDC_ISSUER",
+    "PAPERLESS_OIDC_CLIENT_ID",
+    "PAPERLESS_OIDC_REDIRECT_URL",
+    "PAPERLESS_OIDC_ROLES",
+    "PAPERLESS_OIDC_ORGS",
+    "PAPERLESS_OIDC_CLIENT_SECRET",
+    "PAPERLESS_OIDC_ROLES_CLAIM",
+    "PAPERLESS_OIDC_EXTRA_SCOPES",
+    "PAPERLESS_SESSION_KEY",
+    "PAPERLESS_API_CLIENTS",
+];
+
+/// The origin of a callback URL, when it is exactly `https://<host>[:port]/auth/callback`
+/// with no credentials, query or fragment. Parsed, so `/wrong?x=/auth/callback` fails.
+fn callback_origin(url: &str) -> Option<String> {
+    let u = reqwest::Url::parse(url).ok()?;
+    let ok = u.scheme() == "https"
+        && u.host_str().is_some_and(|h| !h.is_empty())
+        && u.username().is_empty()
+        && u.password().is_none()
+        && u.path() == "/auth/callback"
+        && u.query().is_none()
+        && u.fragment().is_none();
+    ok.then(|| u.origin().ascii_serialization())
 }
 
 /// A comma or whitespace separated list of plain keys. A `/` or `*` could forge or
@@ -203,11 +234,9 @@ impl AuthConfig {
             present("PAPERLESS_OIDC_CLIENT_ID").ok_or("PAPERLESS_OIDC_CLIENT_ID is required")?;
         let redirect_url = present("PAPERLESS_OIDC_REDIRECT_URL")
             .ok_or("PAPERLESS_OIDC_REDIRECT_URL is required")?;
-        if !redirect_url.starts_with("https://") || !redirect_url.ends_with("/auth/callback") {
-            return Err(
-                "PAPERLESS_OIDC_REDIRECT_URL must be an https URL ending in /auth/callback".into(),
-            );
-        }
+        let origin = callback_origin(&redirect_url).ok_or(
+            "PAPERLESS_OIDC_REDIRECT_URL must be https://<host>/auth/callback (no query or fragment)",
+        )?;
         let allowed_roles = parse_list(
             "PAPERLESS_OIDC_ROLES",
             &present("PAPERLESS_OIDC_ROLES").unwrap_or_default(),
@@ -221,6 +250,10 @@ impl AuthConfig {
             "PAPERLESS_OIDC_ORGS",
             &present("PAPERLESS_OIDC_ORGS").unwrap_or_default(),
         )?;
+        // A set value that lists no organization would silently lift the restriction.
+        if allowed_orgs.is_empty() && present("PAPERLESS_OIDC_ORGS").is_some() {
+            return Err("PAPERLESS_OIDC_ORGS must list at least one organization id".into());
+        }
         let api_clients = parse_api_clients(present("PAPERLESS_API_CLIENTS"))?;
         let session_key = match present("PAPERLESS_SESSION_KEY") {
             None => None,
@@ -230,6 +263,7 @@ impl AuthConfig {
             issuer,
             client_id,
             redirect_url,
+            origin,
             client_secret: present("PAPERLESS_OIDC_CLIENT_SECRET"),
             session_key,
             roles_claim: present("PAPERLESS_OIDC_ROLES_CLAIM")
@@ -242,7 +276,14 @@ impl AuthConfig {
         }))
     }
 
+    /// Reads the process environment. A variable that is set but not valid Unicode
+    /// is an error: dropping it would turn sign-in off or lift a restriction.
     pub fn from_env() -> Result<Option<Self>, String> {
+        for name in ENV_VARS {
+            if std::env::var_os(name).is_some_and(|v| v.to_str().is_none()) {
+                return Err(format!("{name} is not valid Unicode"));
+            }
+        }
         Self::from_vars(|k| std::env::var(k).ok())
     }
 
@@ -935,6 +976,11 @@ impl Login {
     }
 
     /// The subject (`oidc:<sub>`) of a live session cookie.
+    /// See [`same_origin_request`]; the origin is the configured callback's.
+    pub fn same_origin(&self, method: &Method, headers: &HeaderMap) -> bool {
+        same_origin_request(&self.cfg.origin, method, headers)
+    }
+
     pub fn subject(&self, cookie: &str) -> Option<String> {
         let sealed = self.open(cookie)?;
         let s = self.sessions.lock().ok()?;
@@ -1013,6 +1059,26 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     (scheme.eq_ignore_ascii_case("bearer") && plain).then_some(token)
 }
 
+/// Whether a cookie-authenticated request may run. GET and HEAD do not change state
+/// and always may. Anything else must come from the archive's own origin: a browser
+/// says so with `Sec-Fetch-Site: same-origin` (or `none` for a typed URL) or with an
+/// `Origin` equal to the configured origin. `SameSite=Lax` alone would let a sibling
+/// subdomain (same site, other origin) post with the session cookie. A request with
+/// neither header is not from a current browser and is let through: every browser
+/// this serves sends at least one of them on a POST.
+fn same_origin_request(origin: &str, method: &Method, headers: &HeaderMap) -> bool {
+    if method == Method::GET || method == Method::HEAD {
+        return true;
+    }
+    if let Some(site) = headers.get("sec-fetch-site") {
+        return matches!(site.to_str(), Ok("same-origin" | "none"));
+    }
+    match headers.get(header::ORIGIN) {
+        Some(o) => o.to_str().is_ok_and(|o| o == origin),
+        None => true,
+    }
+}
+
 /// Middleware: a live session, an accepted bearer token, or a redirect to sign-in
 /// (GET/HEAD without credentials) / 401.
 async fn require_session(State(login): State<Arc<Login>>, req: Request, next: Next) -> Response {
@@ -1026,6 +1092,9 @@ async fn require_session(State(login): State<Arc<Login>>, req: Request, next: Ne
             login.restore(sid).await;
         }
         if login.subject(sid).is_some() {
+            if !login.same_origin(req.method(), req.headers()) {
+                return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+            }
             return next.run(req).await;
         }
     }
