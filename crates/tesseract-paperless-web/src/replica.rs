@@ -1094,7 +1094,7 @@ mod tests {
         let dst = local().await;
         // As if the first attempt restored A and stopped.
         add(&dst, b"doc A", "a.png", 1, true).await;
-        std::fs::write(dst.blobs.root().join(RESTORE_MARKER), b"x").expect("marker");
+        std::fs::write(dst.blobs.root().join(RESTORE_MARKER), MARKER_FIRST).expect("marker");
         assert!(needs_restore(&dst.store, dst.blobs.root())
             .await
             .expect("check"));
@@ -1496,7 +1496,7 @@ mod tests {
         assert_ne!(bucket.get(&r.snapshot_key()).expect("snapshot"), first);
 
         let dst = local().await;
-        std::fs::write(dst.blobs.root().join(RESTORE_MARKER), b"x").expect("marker");
+        std::fs::write(dst.blobs.root().join(RESTORE_MARKER), MARKER_FIRST).expect("marker");
         std::fs::write(dst.blobs.root().join(RESTORE_SNAPSHOT), &first).expect("pin");
         restore(&r, &dst.store, &dst.blobs).await.expect("restore");
         let snap = dst.store.meta().export().await.expect("export");
