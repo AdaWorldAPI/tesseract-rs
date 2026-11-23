@@ -103,9 +103,7 @@ impl S3Config {
             ));
         }
         let endpoint = v("PAPERLESS_S3_ENDPOINT").unwrap_or_default();
-        if !endpoint.starts_with("https://") || endpoint.len() <= "https://".len() {
-            return Err("PAPERLESS_S3_ENDPOINT must be an https:// URL".to_string());
-        }
+        check_endpoint(&endpoint)?;
         Ok(Some(S3Config::new(
             &endpoint,
             &v("PAPERLESS_S3_BUCKET").unwrap_or_default(),
@@ -117,6 +115,9 @@ impl S3Config {
     }
 
     /// [`Self::from_vars`] over the process environment.
+    ///
+    /// The endpoint must be a bare `https://host[:port]` origin, optionally
+    /// with one trailing `/`.
     ///
     /// # Errors
     /// As [`Self::from_vars`].
@@ -245,6 +246,34 @@ fn uri_encode(s: &str, keep_slash: bool) -> String {
         }
     }
     o
+}
+
+/// Check `PAPERLESS_S3_ENDPOINT`: an `https://` origin with a host and an
+/// optional port, nothing else. A path would be sent but not signed (the
+/// signer signs `/<bucket>/<key>`), so the server would refuse every request;
+/// credentials in the URL would be printed at start; a query or fragment has
+/// no meaning here.
+fn check_endpoint(endpoint: &str) -> Result<(), String> {
+    let bad = |why: &str| Err(format!("PAPERLESS_S3_ENDPOINT {why}"));
+    let Some(rest) = endpoint.strip_prefix("https://") else {
+        return bad("must be an https:// URL");
+    };
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
+    if authority.is_empty() {
+        return bad("has no host");
+    }
+    if authority.contains('@') {
+        return bad("must not contain credentials");
+    }
+    if authority.contains(['/', '?', '#']) {
+        return bad("must be a bare origin (https://host[:port]), without a path, query or fragment");
+    }
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if !host.ends_with(']') && (host.is_empty() || port.parse::<u16>().is_err()) {
+            return bad("has an invalid port");
+        }
+    }
+    Ok(())
 }
 
 /// A signed request: URL plus headers, deterministic for a given time.
@@ -450,16 +479,41 @@ impl ObjectStore for S3Client {
             }
             let r = self.send(reqwest::Method::GET, "", &query, &[], None)?;
             let text = r.text().map_err(|e| class_of_transport(&e))?;
-            keys.extend(xml_values(&text, "Key"));
-            let truncated = xml_values(&text, "IsTruncated")
-                .first()
-                .is_some_and(|v| v == "true");
-            token = xml_values(&text, "NextContinuationToken").into_iter().next();
-            if !truncated || token.is_none() {
-                return Ok(keys);
+            match list_page(&text)? {
+                (page, Some(next)) => {
+                    keys.extend(page);
+                    token = Some(next);
+                }
+                (page, None) => {
+                    keys.extend(page);
+                    return Ok(keys);
+                }
             }
         }
         Err(ObjectError::new("list_too_long"))
+    }
+}
+
+/// One ListObjectsV2 page: its keys, and the continuation token when the page
+/// says more follow. A page that is not a listing, says nothing about
+/// truncation, or is truncated without a token is an error: treating it as
+/// complete would let a restore finish with part of the archive.
+fn list_page(text: &str) -> Result<(Vec<String>, Option<String>), ObjectError> {
+    if !text.contains("<ListBucketResult") {
+        return Err(ObjectError::new("list_invalid"));
+    }
+    let truncated = match xml_values(text, "IsTruncated").first().map(String::as_str) {
+        Some("true") => true,
+        Some("false") => false,
+        _ => return Err(ObjectError::new("list_invalid")),
+    };
+    let keys = xml_values(text, "Key");
+    if !truncated {
+        return Ok((keys, None));
+    }
+    match xml_values(text, "NextContinuationToken").into_iter().next() {
+        Some(t) if !t.is_empty() => Ok((keys, Some(t))),
+        _ => Err(ObjectError::new("list_invalid")),
     }
 }
 
@@ -571,17 +625,21 @@ mod tests {
         assert_eq!(amz_dates(1_700_000_000).1, "20231114T221320Z");
     }
 
-    /// The SigV4 test-suite vector "get-vanilla" from AWS's own documentation
-    /// does not use the S3 service, so this pins the signature this code
-    /// produces for a fixed request. A change to any part of the canonical
-    /// request changes it.
+    /// The expected Authorization value was computed independently with
+    /// botocore's `S3SigV4Auth` (AWS's reference signer) for the same request:
+    /// GET https://t3.example/bkt/a%20b/c.json, empty body, region `auto`,
+    /// key AKID/SECRET, time 1700000000.
     #[test]
-    fn signature_is_deterministic_and_secret_free() {
+    fn signature_matches_the_reference_signer_and_is_secret_free() {
         let c = S3Config::new("https://t3.example", "bkt", "auto", "p", "AKID", "SECRET");
         let a = sign(&c, "GET", "a b/c.json", &[], b"", 1_700_000_000);
-        let b = sign(&c, "GET", "a b/c.json", &[], b"", 1_700_000_000);
-        assert_eq!(a, b);
         assert_eq!(a.url, "https://t3.example/bkt/a%20b/c.json");
+        assert_eq!(
+            a.headers[2].1,
+            "AWS4-HMAC-SHA256 Credential=AKID/20231114/auto/s3/aws4_request, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+             Signature=27c0e360dcb0185444ee23c0938e0037c053eaa9336fdfcd7fd53860c82d05fc"
+        );
         assert!(a.headers.iter().all(|(_, v)| !v.contains("SECRET")));
         let other = sign(&c, "GET", "a b/c.json", &[], b"x", 1_700_000_000);
         assert_ne!(a.headers[2], other.headers[2], "the payload is signed");
@@ -639,26 +697,52 @@ mod tests {
             eprintln!("skipped: PAPERLESS_S3_LIVE_* not set");
             return;
         };
-        let cfg = S3Config::new(&ep, &bucket, "us-east-1", "t", &key, &secret);
+        // A prefix of its own per run, removed afterwards even when an
+        // assertion fails, so the test never touches or counts other objects.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = format!("live-test-{}-{nanos}", std::process::id());
+        let cfg = S3Config::new(&ep, &bucket, "us-east-1", &p, &key, &secret);
         let c = S3Client::new(cfg).expect("client");
+        struct Cleanup<'a>(&'a S3Client, String);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                if let Ok(keys) = self.0.list(&self.1) {
+                    for k in keys {
+                        let _ = self.0.delete(&k);
+                    }
+                }
+            }
+        }
+        let _cleanup = Cleanup(&c, format!("{p}/"));
+        let original = format!("{p}/originals/a b+c");
         let body = b"live bytes \x00\xff".to_vec();
-        c.put("t/originals/a b+c", &body, "application/octet-stream")
-            .expect("put");
-        assert_eq!(c.get("t/originals/a b+c").expect("get"), body);
-        assert!(c.get("t/originals/absent").expect_err("absent").is_not_found());
+        c.put(&original, &body, "application/octet-stream").expect("put");
+        assert_eq!(c.get(&original).expect("get"), body);
+        assert!(c
+            .get(&format!("{p}/originals/absent"))
+            .expect_err("absent")
+            .is_not_found());
         for i in 0..1001 {
-            c.put(&format!("t/documents/{i:05}.json"), b"{}", "application/json")
+            c.put(&format!("{p}/documents/{i:05}.json"), b"{}", "application/json")
                 .expect("put many");
         }
-        let listed = c.list("t/documents/").expect("list");
+        let listed = c.list(&format!("{p}/documents/")).expect("list");
         assert_eq!(listed.len(), 1001, "a listing past one page");
-        c.delete("t/originals/a b+c").expect("delete");
-        c.delete("t/originals/a b+c").expect("delete again");
-        assert!(c.get("t/originals/a b+c").expect_err("gone").is_not_found());
+        c.delete(&original).expect("delete");
+        c.delete(&original).expect("delete again");
+        assert!(c.get(&original).expect_err("gone").is_not_found());
 
-        let bad = S3Client::new(S3Config::new(&ep, &bucket, "us-east-1", "t", &key, "wrong"))
+        let bad = S3Client::new(S3Config::new(&ep, &bucket, "us-east-1", &p, &key, "wrong"))
             .expect("client");
-        assert_eq!(bad.get("t/documents/00000.json").expect_err("refused").class, "forbidden");
+        assert_eq!(
+            bad.get(&format!("{p}/documents/00000.json"))
+                .expect_err("refused")
+                .class,
+            "forbidden"
+        );
     }
 
     #[test]
@@ -673,5 +757,48 @@ mod tests {
         );
         assert_eq!(xml_values(page, "IsTruncated"), vec!["true"]);
         assert_eq!(xml_values(page, "NextContinuationToken"), vec!["tok/1="]);
+        let (keys, next) = list_page(page).expect("page");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(next.as_deref(), Some("tok/1="));
+    }
+
+    /// A valid complete listing, empty included, is accepted; anything that
+    /// could be a cut-off listing is refused.
+    #[test]
+    fn incomplete_or_invalid_listings_are_refused() {
+        let empty = "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
+        assert_eq!(list_page(empty).expect("empty"), (Vec::new(), None));
+        for bad in [
+            "",
+            "<html>proxy error</html>",
+            "<ListBucketResult><Contents><Key>a</Key></Contents></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>maybe</IsTruncated></ListBucketResult>",
+        ] {
+            assert_eq!(list_page(bad).expect_err(bad).class, "list_invalid", "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_endpoint_must_be_a_bare_https_origin() {
+        for ok in [
+            "https://fly.storage.tigris.dev",
+            "https://fly.storage.tigris.dev/",
+            "https://s3.example:9000",
+            "https://[::1]:9000",
+        ] {
+            assert!(check_endpoint(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://s3.example",
+            "https://",
+            "https://s3.example/gateway",
+            "https://user:pw@s3.example",
+            "https://s3.example?x=1",
+            "https://s3.example:port",
+        ] {
+            let e = check_endpoint(bad).expect_err(bad);
+            assert!(e.starts_with("PAPERLESS_S3_ENDPOINT"), "{e}");
+        }
     }
 }

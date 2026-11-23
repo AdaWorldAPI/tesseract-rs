@@ -1040,7 +1040,7 @@ async fn delete_document_and_original(state: Arc<AppState>, hash: String) {
                         "replica: deleting {hash} from S3 failed: {e}; the S3 copy still holds it"
                     );
                 }
-                state.replicate_metadata().await;
+                state.replicate_metadata();
             }
         }
         Err(e) => eprintln!("delete {hash} from archive failed: {e} (search index left untouched)"),
@@ -1158,7 +1158,7 @@ async fn document_assign(
         .assign(&hash, kind, f.definition_id, Source::Manual, now_unix_ms())
         .await
         .map_err(|e| meta_fail(&e))?;
-    state.replicate_metadata().await;
+    state.replicate_metadata();
     Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
@@ -1175,7 +1175,7 @@ async fn document_unassign(
         .unassign(&hash, kind, f.definition_id)
         .await
         .map_err(|e| store_fail(&e))?;
-    state.replicate_metadata().await;
+    state.replicate_metadata();
     Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
@@ -1200,7 +1200,7 @@ async fn document_accept(
         )
         .await
         .map_err(|e| meta_fail(&e))?;
-    state.replicate_metadata().await;
+    state.replicate_metadata();
     Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
@@ -1239,8 +1239,10 @@ async fn document_review(
             ))
         }
     }
+    // The review flag is written: copy it before either redirect, so a failed
+    // inbox lookup below cannot skip the copy.
+    state.replicate_metadata();
     if !to_inbox {
-        state.replicate_metadata().await;
         return Ok(back_to_document(&hash, f.from.as_deref()));
     }
     let next = unreviewed_rows(&state)
@@ -1248,7 +1250,6 @@ async fn document_review(
         .map_err(|e| store_fail(&e))?
         .into_iter()
         .find(|r| r.content_sha256_hex != hash);
-    state.replicate_metadata().await;
     Ok(match next {
         Some(r) => Redirect::to(&format!("/documents/{}?from=inbox", r.content_sha256_hex)),
         None => Redirect::to("/inbox"),
@@ -1388,7 +1389,7 @@ fn replica_summary(state: &AppState) -> Option<String> {
             format!("S3 copy: every document copied (checked {})", format_unix_ms(at))
         }
         (Some(at), None, Some(n)) => format!(
-            "S3 copy: {n} document{} not yet copied (checked {})",
+            "S3 copy: about {n} document{} not yet copied (estimate, checked {})",
             if n == 1 { "" } else { "s" },
             format_unix_ms(at)
         ),
@@ -1663,7 +1664,7 @@ async fn definition_create(
         .create_definition(kind, name, now_unix_ms())
         .await
         .map_err(|e| meta_fail(&e))?;
-    state.replicate_metadata().await;
+    state.replicate_metadata();
     Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 
@@ -1679,7 +1680,7 @@ async fn definition_rename(
         .rename_definition(kind, f.definition_id, name)
         .await
         .map_err(|e| meta_fail(&e))?;
-    state.replicate_metadata().await;
+    state.replicate_metadata();
     Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 
@@ -1712,7 +1713,7 @@ async fn definition_rule(
         )
         .await
         .map_err(|e| meta_fail(&e))?;
-    state.replicate_metadata().await;
+    state.replicate_metadata();
     Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 
@@ -1727,7 +1728,7 @@ async fn definition_retire(
         .retire_definition(kind, f.definition_id)
         .await
         .map_err(|e| meta_fail(&e))?;
-    state.replicate_metadata().await;
+    state.replicate_metadata();
     Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 

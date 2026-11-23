@@ -178,7 +178,7 @@ pub async fn ingest(
             drop(held);
             if original_added {
                 // The record in S3 says the document has no original yet.
-                state.replicate_document(&hex).await;
+                state.replicate_document(&hex);
             }
             return Ok(IngestOutcome::Duplicate {
                 hash_hex: hex,
@@ -290,6 +290,10 @@ pub async fn ingest(
         .await
         .map_err(IngestError::Store)?;
     drop(held);
+    // The S3 copy of the original and record, as soon as the local commit
+    // stands: not after search indexing, so a failed index write cannot leave
+    // a committed document uncopied (`docs/RECOVERY.md` §4).
+    state.replicate_document(&hex);
 
     // Same text `LanceStore::put` itself just computed and stored -- recomputed
     // here rather than threaded through `put`'s return value, since it is a
@@ -313,10 +317,9 @@ pub async fn ingest(
     // never turned into a failed upload.
     s8_assign(state, &hex, &text_for_s8).await;
 
-    // The S3 copy: original then record, then the metadata the rules may have
-    // assigned. A failure there never fails the upload (`docs/RECOVERY.md` §4).
-    state.replicate_document(&hex).await;
-    state.replicate_metadata().await;
+    // The metadata the rules may have assigned. A failure there never fails
+    // the upload (`docs/RECOVERY.md` §4).
+    state.replicate_metadata();
 
     Ok(IngestOutcome::Stored {
         hash_hex: hex,

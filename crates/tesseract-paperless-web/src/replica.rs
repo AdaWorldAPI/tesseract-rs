@@ -38,6 +38,11 @@ pub const SNAPSHOT_SCHEMA: &str = "paperless-rs/metadata-snapshot/v1";
 /// File name of the restore marker in the original-file directory.
 pub const RESTORE_MARKER: &str = ".restore-in-progress";
 
+/// The metadata snapshot a restore imports, kept beside the marker until the
+/// restore finishes. A restore that resumes after a crash imports this same
+/// snapshot, never a newer one from S3, so it cannot mix two snapshots.
+pub const RESTORE_SNAPSHOT: &str = ".restore-snapshot.json";
+
 /// Why a replica operation failed.
 #[derive(Debug)]
 pub enum ReplicaError {
@@ -245,7 +250,7 @@ pub struct Replica {
     prefix: String,
     /// Serializes snapshot uploads; each reads the state while holding it, so
     /// an older snapshot never lands after a newer one.
-    snapshot: tokio::sync::Mutex<()>,
+    snapshot: Arc<tokio::sync::Mutex<()>>,
 }
 
 async fn blocking<T: Send + 'static>(
@@ -270,7 +275,7 @@ impl Replica {
         Self {
             store,
             prefix: prefix.trim_matches('/').to_string(),
-            snapshot: tokio::sync::Mutex::new(()),
+            snapshot: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -377,7 +382,7 @@ impl Replica {
     ) -> Result<bool, ReplicaError> {
         let key = ContentSha256::from_hex(hash)
             .ok_or_else(|| ReplicaError::Invalid(format!("hash {hash}")))?;
-        let _held = lock.lock_owned().await;
+        let held = lock.lock_owned().await;
         let Some(row) = store.get(hash).await.map_err(local)? else {
             return Ok(false);
         };
@@ -406,7 +411,14 @@ impl Replica {
         let body = serde_json::to_vec(&record).map_err(local)?;
         let s = self.store.clone();
         let k = self.record_key(hash);
-        blocking(move || s.put(&k, &body, "application/json")).await?;
+        // The guard moves into the blocking write, so it is released only when
+        // the PUT has returned, even if this future is dropped meanwhile. A
+        // delete can then never overtake a record PUT that already started.
+        blocking(move || {
+            let _held = held;
+            s.put(&k, &body, "application/json")
+        })
+        .await?;
         Ok(true)
     }
 
@@ -429,13 +441,19 @@ impl Replica {
     /// # Errors
     /// [`ReplicaError`] when the metadata cannot be read or written.
     pub async fn upload_snapshot(&self, store: &LanceStore) -> Result<(), ReplicaError> {
-        let _serial = self.snapshot.lock().await;
+        let serial = self.snapshot.clone().lock_owned().await;
         let snap = store.meta().export().await.map_err(local)?;
         let body =
             serde_json::to_vec(&SnapshotFile::from_snapshot(&snap, now_ms())).map_err(local)?;
         let s = self.store.clone();
         let k = self.snapshot_key();
-        blocking(move || s.put(&k, &body, "application/json")).await
+        // Released only when the PUT has returned, even if this future is
+        // dropped: an older snapshot can never land after a newer one.
+        blocking(move || {
+            let _serial = serial;
+            s.put(&k, &body, "application/json")
+        })
+        .await
     }
 
     /// Copy every local document whose S3 copy is missing or lacks its
@@ -594,9 +612,21 @@ pub async fn restore(
         report.restored += 1;
     }
 
-    let s = replica.store.clone();
-    let k = replica.snapshot_key();
-    match blocking(move || s.get(&k)).await {
+    let pinned = blobs.root().join(RESTORE_SNAPSHOT);
+    let fetched = match std::fs::read(&pinned) {
+        Ok(body) => Ok(body),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let s = replica.store.clone();
+            let k = replica.snapshot_key();
+            let got = blocking(move || s.get(&k)).await;
+            if let Ok(body) = &got {
+                std::fs::write(&pinned, body).map_err(local)?;
+            }
+            got
+        }
+        Err(e) => return Err(local(e)),
+    };
+    match fetched {
         Ok(body) => {
             let file: SnapshotFile = serde_json::from_slice(&body)
                 .map_err(|e| ReplicaError::Invalid(format!("metadata snapshot: {e}")))?;
@@ -615,6 +645,11 @@ pub async fn restore(
         Err(e) => return Err(e),
     }
 
+    match std::fs::remove_file(&pinned) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(local(e)),
+    }
     std::fs::remove_file(&marker).map_err(local)?;
     Ok(report)
 }
@@ -742,7 +777,7 @@ mod tests {
             assert_eq!(row.ingested_at_unix_ms, at);
             assert_eq!(row.mean_confidence, 88);
             assert_eq!(row.spo_json.as_deref(), Some("[]"));
-            assert_eq!(row.text(), name);
+            assert_eq!(row.text().ok().as_deref(), Some(name));
         }
         let key_a = ContentSha256::from_hex(&a).expect("hex");
         assert_eq!(dst.blobs.get(&key_a).expect("get"), Some(b"original A".to_vec()));
@@ -901,6 +936,32 @@ mod tests {
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 1);
         r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 0);
+    }
+
+    /// A restore that resumes imports the snapshot it pinned on its first
+    /// attempt, not a newer one from S3, and removes the pin when done.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_restore_imports_the_pinned_snapshot() {
+        let bucket = Arc::new(MemoryStore::default());
+        let r = replica(&bucket);
+        let src = local().await;
+        let a = add(&src, b"pinned", "a.png", 1, true).await;
+        src.store.meta().mark_reviewed(&a, 2).await.expect("review");
+        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        let first = bucket.get(&r.snapshot_key()).expect("snapshot");
+
+        src.store.meta().mark_unreviewed(&a).await.expect("unreview");
+        r.upload_snapshot(&src.store).await.expect("snapshot");
+        assert_ne!(bucket.get(&r.snapshot_key()).expect("snapshot"), first);
+
+        let dst = local().await;
+        std::fs::write(dst.blobs.root().join(RESTORE_MARKER), b"x").expect("marker");
+        std::fs::write(dst.blobs.root().join(RESTORE_SNAPSHOT), &first).expect("pin");
+        restore(&r, &dst.store, &dst.blobs).await.expect("restore");
+        let snap = dst.store.meta().export().await.expect("export");
+        assert!(snap.reviews.iter().any(|v| v.content_sha256_hex == a));
+        assert!(!dst.blobs.root().join(RESTORE_SNAPSHOT).exists());
+        assert!(!dst.blobs.root().join(RESTORE_MARKER).exists());
     }
 
     /// A rewrite of the record that fails after the original reached S3

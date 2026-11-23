@@ -28,6 +28,9 @@ pub struct ReplicaStatus {
     pub error: Option<String>,
 }
 
+/// How many S3 copies run at once in the background.
+pub const REPLICA_PERMITS: usize = 4;
+
 /// How many locks [`AppState::hash_lock`] spreads hashes over.
 pub const HASH_LOCK_STRIPES: usize = 64;
 
@@ -54,6 +57,8 @@ pub struct AppState {
     pub replica: Option<Arc<Replica>>,
     /// What the last replication pass found, for the dashboard.
     pub replica_status: std::sync::Mutex<ReplicaStatus>,
+    /// Bounds how many S3 copies run at once in the background.
+    replica_permits: Arc<Semaphore>,
     /// Serializes the original and row writes of an upload with the row and
     /// original deletes of a delete, for the same hash (see [`Self::hash_lock`]).
     hash_locks: Box<[Arc<tokio::sync::Mutex<()>>]>,
@@ -244,6 +249,7 @@ impl AppState {
             blobs,
             replica,
             replica_status: std::sync::Mutex::new(ReplicaStatus::default()),
+            replica_permits: Arc::new(Semaphore::new(REPLICA_PERMITS)),
             hash_locks: (0..HASH_LOCK_STRIPES)
                 .map(|_| Arc::new(tokio::sync::Mutex::new(())))
                 .collect(),
@@ -269,28 +275,54 @@ impl AppState {
         self.hash_locks[usize::from(key.as_bytes()[0]) % self.hash_locks.len()].clone()
     }
 
-    /// Copy one document to S3 after its local commit. A failure is logged;
-    /// the replicator copies it later (`docs/RECOVERY.md` §4).
-    pub async fn replicate_document(&self, hash: &str) {
-        if let Some(r) = &self.replica {
-            let Some(key) = ContentSha256::from_hex(hash) else { return };
+    /// Copy one document to S3 after its local commit, in the background: the
+    /// request that committed it does not wait for S3. The copy takes the
+    /// document's lock, so it stays ordered with a delete of the same
+    /// document. A failure is logged; the replicator copies it later
+    /// (`docs/RECOVERY.md` §4 and §5). Nothing is lost if the process stops
+    /// before the copy runs: the replicator finds every document whose S3
+    /// copy is missing or lacks its original.
+    pub fn replicate_document(self: &Arc<Self>, hash: &str) {
+        if self.replica.is_none() {
+            return;
+        }
+        let Some(key) = ContentSha256::from_hex(hash) else {
+            return;
+        };
+        let state = Arc::clone(self);
+        let hash = hash.to_string();
+        tokio::spawn(async move {
+            let Ok(_permit) = Arc::clone(&state.replica_permits).acquire_owned().await else {
+                return;
+            };
+            let Some(r) = &state.replica else { return };
             if let Err(e) = r
-                .upload_document(&self.store, &self.blobs, hash, self.hash_lock(&key))
+                .upload_document(&state.store, &state.blobs, &hash, state.hash_lock(&key))
                 .await
             {
                 eprintln!("replica: copying {hash} to S3 failed: {e}; the replicator will retry");
             }
-        }
+        });
     }
 
-    /// Upload the metadata snapshot after a metadata change. A failure is
-    /// logged; the replicator uploads it again.
-    pub async fn replicate_metadata(&self) {
-        if let Some(r) = &self.replica {
-            if let Err(e) = r.upload_snapshot(&self.store).await {
+    /// Upload the metadata snapshot after a metadata change, in the
+    /// background. Each upload reads the metadata when it runs, under the
+    /// snapshot lock, so whichever runs last uploads the newest state. A
+    /// failure is logged; the replicator uploads it again.
+    pub fn replicate_metadata(self: &Arc<Self>) {
+        if self.replica.is_none() {
+            return;
+        }
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let Ok(_permit) = Arc::clone(&state.replica_permits).acquire_owned().await else {
+                return;
+            };
+            let Some(r) = &state.replica else { return };
+            if let Err(e) = r.upload_snapshot(&state.store).await {
                 eprintln!("replica: metadata snapshot upload failed: {e}; the replicator will retry");
             }
-        }
+        });
     }
 
     /// One replication pass: copy what is missing in S3, upload the snapshot,
