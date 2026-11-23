@@ -265,11 +265,40 @@ fn check_endpoint(endpoint: &str) -> Result<(), String> {
     if authority.contains('@') {
         return bad("must not contain credentials");
     }
-    if authority.contains(['/', '?', '#']) {
+    // Only characters a host and port can contain. Anything else, such as a
+    // path, query, fragment or a backslash (which URL parsers turn into a
+    // path separator), would make the request path differ from the signed one.
+    if !authority
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+    {
         return bad("must be a bare origin (https://host[:port]), without a path, query or fragment");
     }
-    if let Some((host, port)) = authority.rsplit_once(':') {
-        if !host.ends_with(']') && (host.is_empty() || port.parse::<u16>().is_err()) {
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let Some((addr, after)) = v6.split_once(']') else {
+            return bad("has an unclosed IPv6 address");
+        };
+        if addr.is_empty() || !addr.chars().all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.') {
+            return bad("has an invalid IPv6 address");
+        }
+        match after {
+            "" => (addr, None),
+            p if p.starts_with(':') => (addr, Some(&p[1..])),
+            _ => return bad("has text after the IPv6 address"),
+        }
+    } else if authority.contains(['[', ']']) {
+        return bad("has a bracket outside an IPv6 address");
+    } else {
+        match authority.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return bad("has no host");
+    }
+    if let Some(p) = port {
+        if p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) || p.parse::<u16>().is_err() {
             return bad("has an invalid port");
         }
     }
@@ -499,7 +528,12 @@ impl ObjectStore for S3Client {
 /// truncation, or is truncated without a token is an error: treating it as
 /// complete would let a restore finish with part of the archive.
 fn list_page(text: &str) -> Result<(Vec<String>, Option<String>), ObjectError> {
-    if !text.contains("<ListBucketResult") {
+    // The whole document must be there: a body cut off in transit can still
+    // carry `<IsTruncated>false</IsTruncated>` and would otherwise read as a
+    // complete listing. A closing root tag at the end is what a cut-off body
+    // lacks.
+    let body = text.trim();
+    if !body.contains("<ListBucketResult") || !body.ends_with("</ListBucketResult>") {
         return Err(ObjectError::new("list_invalid"));
     }
     let truncated = match xml_values(text, "IsTruncated").first().map(String::as_str) {
@@ -536,6 +570,8 @@ pub mod memory {
         pub deletes: AtomicUsize,
         /// Every put and delete, in order, as `put <key>` / `delete <key>`.
         pub log: Mutex<Vec<String>>,
+        /// Milliseconds each put sleeps first, to model a slow S3.
+        pub put_delay_ms: std::sync::atomic::AtomicU64,
     }
 
     impl MemoryStore {
@@ -562,6 +598,10 @@ pub mod memory {
                 .ok_or_else(|| ObjectError::new("not_found"))
         }
         fn put(&self, key: &str, body: &[u8], _ct: &str) -> Result<(), ObjectError> {
+            let delay = self.put_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
             self.up()?;
             self.log.lock().expect("lock").push(format!("put {key}"));
             self.objects
@@ -789,6 +829,9 @@ mod tests {
             "<ListBucketResult><Contents><Key>a</Key></Contents></ListBucketResult>",
             "<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>",
             "<ListBucketResult><IsTruncated>maybe</IsTruncated></ListBucketResult>",
+            // cut off in transit after the truncation flag
+            "<ListBucketResult><IsTruncated>false</IsTruncated>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>a</Key>",
         ] {
             assert_eq!(list_page(bad).expect_err(bad).class, "list_invalid", "{bad}");
         }
@@ -808,9 +851,14 @@ mod tests {
             "http://s3.example",
             "https://",
             "https://s3.example/gateway",
+            "https://s3.example\\gateway",
             "https://user:pw@s3.example",
             "https://s3.example?x=1",
             "https://s3.example:port",
+            "https://s3.example:1:2",
+            "https://[::1]:port",
+            "https://[::1",
+            "https://[::1]x",
         ] {
             let e = check_endpoint(bad).expect_err(bad);
             assert!(e.starts_with("PAPERLESS_S3_ENDPOINT"), "{e}");

@@ -43,6 +43,14 @@ pub const RESTORE_MARKER: &str = ".restore-in-progress";
 /// snapshot, never a newer one from S3, so it cannot mix two snapshots.
 pub const RESTORE_SNAPSHOT: &str = ".restore-snapshot.json";
 
+/// Written by a restore that had to skip damaged records. While it exists the
+/// metadata snapshot in S3 is not replaced: the local metadata lacks the
+/// skipped documents' assignments and reviews (start-up reconciliation
+/// removes rows whose document is missing), and replacing the snapshot would
+/// lose them from S3 as well. It lists the skipped hashes; remove it once
+/// those records are repaired or deliberately given up.
+pub const SNAPSHOT_HOLD: &str = ".snapshot-hold";
+
 /// Why a replica operation failed.
 #[derive(Debug)]
 pub enum ReplicaError {
@@ -367,9 +375,19 @@ impl Replica {
     }
 
     /// Copy one local document: its original first (when there is one), then
-    /// its record. Runs under `lock`, the lock a delete of the same document
-    /// holds, and reads the row under it: a document deleted meanwhile is not
-    /// copied, and `Ok(false)` says so.
+    /// its record. `lock` is the lock a delete of the same document holds. It
+    /// is taken only for the two local checks, never across S3 I/O, so a slow
+    /// S3 never holds up an upload or delete:
+    ///
+    /// 1. under the lock, read the row; a document already deleted is not
+    ///    copied (`Ok(false)`);
+    /// 2. without the lock, upload the original and the record;
+    /// 3. under the lock, check the row again. If a delete removed it while
+    ///    the copy ran, the copy removes what it just wrote (record first) and
+    ///    returns `Ok(false)`, so a deleted document never stays in S3.
+    ///
+    /// If that compensating delete fails, the record stays in S3 and a restore
+    /// would bring the document back; it is logged with the hash.
     ///
     /// # Errors
     /// [`ReplicaError`] when the document cannot be read locally or written to S3.
@@ -382,9 +400,12 @@ impl Replica {
     ) -> Result<bool, ReplicaError> {
         let key = ContentSha256::from_hex(hash)
             .ok_or_else(|| ReplicaError::Invalid(format!("hash {hash}")))?;
-        let held = lock.lock_owned().await;
-        let Some(row) = store.get(hash).await.map_err(local)? else {
-            return Ok(false);
+        let row = {
+            let _held = lock.clone().lock_owned().await;
+            match store.get(hash).await.map_err(local)? {
+                Some(row) => row,
+                None => return Ok(false),
+            }
         };
         let b = blobs.clone();
         let original = tokio::task::spawn_blocking(move || b.get(&key))
@@ -411,15 +432,23 @@ impl Replica {
         let body = serde_json::to_vec(&record).map_err(local)?;
         let s = self.store.clone();
         let k = self.record_key(hash);
-        // The guard moves into the blocking write, so it is released only when
-        // the PUT has returned, even if this future is dropped meanwhile. A
-        // delete can then never overtake a record PUT that already started.
-        blocking(move || {
-            let _held = held;
-            s.put(&k, &body, "application/json")
-        })
-        .await?;
-        Ok(true)
+        blocking(move || s.put(&k, &body, "application/json")).await?;
+
+        let still_here = {
+            let _held = lock.lock_owned().await;
+            store.get(hash).await.map_err(local)?.is_some()
+        };
+        if still_here {
+            return Ok(true);
+        }
+        if let Err(e) = self.delete_document(hash).await {
+            eprintln!(
+                "replica: {hash} was deleted while being copied and removing the copy failed: \
+                 {e}; the S3 copy still holds it"
+            );
+            return Err(e);
+        }
+        Ok(false)
     }
 
     /// Remove one document from S3: the record first, then the original, so a
@@ -436,11 +465,23 @@ impl Replica {
         blocking(move || s.delete(&k)).await
     }
 
-    /// Upload the current metadata as the snapshot.
+    /// Upload the current metadata as the snapshot, unless a degraded restore
+    /// left a [`SNAPSHOT_HOLD`] in `blobs`.
     ///
     /// # Errors
-    /// [`ReplicaError`] when the metadata cannot be read or written.
-    pub async fn upload_snapshot(&self, store: &LanceStore) -> Result<(), ReplicaError> {
+    /// [`ReplicaError`] when the metadata cannot be read or written, or
+    /// [`ReplicaError::Invalid`] while the hold is in place.
+    pub async fn upload_snapshot(
+        &self,
+        store: &LanceStore,
+        blobs: &Arc<BlobStore>,
+    ) -> Result<(), ReplicaError> {
+        if blobs.root().join(SNAPSHOT_HOLD).exists() {
+            return Err(ReplicaError::Invalid(format!(
+                "metadata snapshot not replaced: a restore skipped damaged records \
+                 (listed in {SNAPSHOT_HOLD}); remove that file once they are dealt with"
+            )));
+        }
         let serial = self.snapshot.clone().lock_owned().await;
         let snap = store.meta().export().await.map_err(local)?;
         let body =
@@ -482,7 +523,7 @@ impl Replica {
                 }
             }
         }
-        self.upload_snapshot(store).await?;
+        self.upload_snapshot(store, blobs).await?;
         Ok(report)
     }
 
@@ -639,7 +680,7 @@ pub async fn restore(
             let snapshot = file.to_snapshot()?;
             let mut live: HashSet<String> =
                 store.hashes().await.map_err(local)?.into_iter().collect();
-            live.extend(skipped_hashes);
+            live.extend(skipped_hashes.iter().cloned());
             store
                 .meta()
                 .import(&snapshot, &live)
@@ -651,6 +692,12 @@ pub async fn restore(
         Err(e) => return Err(e),
     }
 
+    if !skipped_hashes.is_empty() {
+        let mut list: Vec<&String> = skipped_hashes.iter().collect();
+        list.sort();
+        let body: String = list.iter().map(|h| format!("{h}\n")).collect();
+        std::fs::write(blobs.root().join(SNAPSHOT_HOLD), body).map_err(local)?;
+    }
     // Marker first, then the pin: while the marker exists the pin stays
     // authoritative, so an interruption between the two can never make a
     // resumed restore read a newer snapshot.
@@ -889,9 +936,48 @@ mod tests {
         let key_a = ContentSha256::from_hex(&a).expect("hex");
         assert_eq!(dst.blobs.get(&key_a).expect("get"), None);
         assert!(dst.store.get(&b).await.expect("get").is_none());
-        // B's review survives, so the next snapshot does not drop it from S3.
-        let snap = dst.store.meta().export().await.expect("export");
-        assert!(snap.reviews.iter().any(|v| v.content_sha256_hex == b));
+        // The snapshot in S3 is held, so it keeps B's review even after the
+        // local metadata loses it (start-up reconciliation drops rows of
+        // missing documents) and the next replication pass runs.
+        let before = bucket.get(&r.snapshot_key()).expect("snapshot");
+        assert!(dst.blobs.root().join(SNAPSHOT_HOLD).exists());
+        let live: HashSet<String> = dst.store.hashes().await.expect("hashes").into_iter().collect();
+        dst.store.meta().reconcile(&live).await.expect("reconcile");
+        assert!(r.replicate(&dst.store, &dst.blobs, &no_lock).await.is_err());
+        let after = bucket.get(&r.snapshot_key()).expect("snapshot");
+        assert_eq!(after, before);
+        let held = SnapshotFile::to_snapshot(&serde_json::from_slice(&after).expect("json"))
+            .expect("snapshot");
+        assert!(held.reviews.iter().any(|v| v.content_sha256_hex == b));
+        // A complete restore leaves no hold.
+        let clean = local().await;
+        bucket.objects.lock().expect("lock").remove(&r.record_key(&b));
+        restore(&r, &clean.store, &clean.blobs).await.expect("restore");
+        assert!(!clean.blobs.root().join(SNAPSHOT_HOLD).exists());
+    }
+
+    /// A slow S3 does not hold the document's lock: an upload or delete of the
+    /// same document proceeds while the copy's PUT is running. A delete that
+    /// lands meanwhile wins: the copy removes what it wrote.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_copy_does_not_hold_the_lock_and_a_delete_meanwhile_wins() {
+        let bucket = Arc::new(MemoryStore::default());
+        let r = replica(&bucket);
+        let src = local().await;
+        let a = add(&src, b"slow copy", "a.png", 1, true).await;
+        bucket.put_delay_ms.store(300, Ordering::SeqCst);
+        let l = lock();
+        let copy = r.upload_document(&src.store, &src.blobs, &a, l.clone());
+        let delete = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let held = l.clone().try_lock_owned().expect("free during the S3 PUT");
+            src.store.delete(&a).await.expect("delete");
+            drop(held);
+        };
+        let (copied, ()) = tokio::join!(copy, delete);
+        assert!(!copied.expect("copy"));
+        assert!(!bucket.keys().contains(&r.record_key(&a)));
+        assert!(!bucket.keys().contains(&r.original_key(&a)));
     }
 
     /// The original goes up before its record, and a delete removes the
@@ -964,7 +1050,7 @@ mod tests {
         let first = bucket.get(&r.snapshot_key()).expect("snapshot");
 
         src.store.meta().mark_unreviewed(&a).await.expect("unreview");
-        r.upload_snapshot(&src.store).await.expect("snapshot");
+        r.upload_snapshot(&src.store, &src.blobs).await.expect("snapshot");
         assert_ne!(bucket.get(&r.snapshot_key()).expect("snapshot"), first);
 
         let dst = local().await;
@@ -989,7 +1075,7 @@ mod tests {
         r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
         let old = bucket.get(&r.snapshot_key()).expect("snapshot");
         src.store.meta().mark_unreviewed(&a).await.expect("unreview");
-        r.upload_snapshot(&src.store).await.expect("snapshot");
+        r.upload_snapshot(&src.store, &src.blobs).await.expect("snapshot");
 
         let dst = local().await;
         std::fs::write(dst.blobs.root().join(RESTORE_SNAPSHOT), &old).expect("stale pin");

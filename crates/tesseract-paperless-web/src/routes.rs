@@ -1031,17 +1031,11 @@ async fn delete_document_and_original(state: Arc<AppState>, hash: String) {
                     Ok(Ok(())) => {}
                 }
             }
-            // Then the S3 copy, record before original (`docs/RECOVERY.md` §4).
+            // Then the S3 copy, record before original (`docs/RECOVERY.md` §4),
+            // in the background: the delete answers without waiting for S3.
             // A failure leaves the S3 objects; a later restore would bring the
             // document back, so it is logged with the hash.
-            if let Some(r) = &state.replica {
-                if let Err(e) = r.delete_document(&hash).await {
-                    eprintln!(
-                        "replica: deleting {hash} from S3 failed: {e}; the S3 copy still holds it"
-                    );
-                }
-                state.replicate_metadata();
-            }
+            state.replicate_delete(&hash);
         }
         Err(e) => eprintln!("delete {hash} from archive failed: {e} (search index left untouched)"),
     }
@@ -1386,7 +1380,10 @@ fn replica_summary(state: &AppState) -> Option<String> {
             format!("S3 copy: last check failed ({}): {e}", format_unix_ms(at))
         }
         (Some(at), None, Some(0)) => {
-            format!("S3 copy: every document copied (checked {})", format_unix_ms(at))
+            format!(
+                "S3 copy: no documents waiting to be copied (estimate, checked {})",
+                format_unix_ms(at)
+            )
         }
         (Some(at), None, Some(n)) => format!(
             "S3 copy: about {n} document{} not yet copied (estimate, checked {})",

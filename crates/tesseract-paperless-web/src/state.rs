@@ -291,10 +291,14 @@ impl AppState {
         };
         let state = Arc::clone(self);
         let hash = hash.to_string();
+        // A copy that finds no free slot is dropped, not queued: the
+        // replicator finds every document whose S3 copy is missing or lacks
+        // its original, so nothing is lost and tasks cannot pile up.
+        let Ok(permit) = Arc::clone(&self.replica_permits).try_acquire_owned() else {
+            return;
+        };
         tokio::spawn(async move {
-            let Ok(_permit) = Arc::clone(&state.replica_permits).acquire_owned().await else {
-                return;
-            };
+            let _permit = permit;
             let Some(r) = &state.replica else { return };
             if let Err(e) = r
                 .upload_document(&state.store, &state.blobs, &hash, state.hash_lock(&key))
@@ -314,12 +318,40 @@ impl AppState {
             return;
         }
         let state = Arc::clone(self);
+        // Dropped when no slot is free, like a document copy: the replicator
+        // uploads the snapshot on every pass.
+        let Ok(permit) = Arc::clone(&self.replica_permits).try_acquire_owned() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            let Some(r) = &state.replica else { return };
+            if let Err(e) = r.upload_snapshot(&state.store, &state.blobs).await {
+                eprintln!("replica: metadata snapshot upload failed: {e}; the replicator will retry");
+            }
+        });
+    }
+
+    /// Remove a deleted document from S3 in the background (record, then
+    /// original), then upload the snapshot. Unlike a copy this waits for a
+    /// slot instead of being dropped: the replicator never deletes, so a
+    /// dropped delete would leave the document in S3. The local delete has
+    /// already finished; the request does not wait for this.
+    pub fn replicate_delete(self: &Arc<Self>, hash: &str) {
+        if self.replica.is_none() {
+            return;
+        }
+        let state = Arc::clone(self);
+        let hash = hash.to_string();
         tokio::spawn(async move {
             let Ok(_permit) = Arc::clone(&state.replica_permits).acquire_owned().await else {
                 return;
             };
             let Some(r) = &state.replica else { return };
-            if let Err(e) = r.upload_snapshot(&state.store).await {
+            if let Err(e) = r.delete_document(&hash).await {
+                eprintln!("replica: deleting {hash} from S3 failed: {e}; the S3 copy still holds it");
+            }
+            if let Err(e) = r.upload_snapshot(&state.store, &state.blobs).await {
                 eprintln!("replica: metadata snapshot upload failed: {e}; the replicator will retry");
             }
         });
