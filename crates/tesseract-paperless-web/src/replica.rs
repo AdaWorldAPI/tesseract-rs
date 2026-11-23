@@ -298,17 +298,62 @@ impl Replica {
     /// # Errors
     /// [`ReplicaError::Object`] when the listing fails.
     pub async fn recorded_hashes(&self) -> Result<HashSet<String>, ReplicaError> {
+        self.listed_hashes(self.records_prefix(), ".json").await
+    }
+
+    /// Hashes that have an original in S3.
+    ///
+    /// # Errors
+    /// [`ReplicaError::Object`] when the listing fails.
+    pub async fn original_hashes(&self) -> Result<HashSet<String>, ReplicaError> {
+        self.listed_hashes(self.key("originals/"), "").await
+    }
+
+    async fn listed_hashes(
+        &self,
+        prefix: String,
+        suffix: &'static str,
+    ) -> Result<HashSet<String>, ReplicaError> {
         let store = self.store.clone();
-        let prefix = self.records_prefix();
-        let keys = blocking(move || store.list(&prefix)).await?;
-        let prefix = self.records_prefix();
+        let p = prefix.clone();
+        let keys = blocking(move || store.list(&p)).await?;
         Ok(keys
             .iter()
             .filter_map(|k| k.strip_prefix(prefix.as_str()))
-            .filter_map(|k| k.strip_suffix(".json"))
+            .filter_map(|k| k.strip_suffix(suffix))
             .filter(|h| ContentSha256::from_hex(h).is_some())
             .map(str::to_string)
             .collect())
+    }
+
+    /// Local documents whose S3 copy is missing or incomplete: no record, or
+    /// a local original that S3 does not hold. The second case is a document
+    /// stored before originals were kept, whose original was attached later by
+    /// a re-upload; its record then still says `has_original: false`, and
+    /// copying it again uploads the original and rewrites the record.
+    async fn pending(
+        &self,
+        store: &LanceStore,
+        blobs: &Arc<BlobStore>,
+    ) -> Result<Vec<String>, ReplicaError> {
+        let recorded = self.recorded_hashes().await?;
+        let originals = self.original_hashes().await?;
+        let local_hashes = store.hashes().await.map_err(local)?;
+        let b = blobs.clone();
+        tokio::task::spawn_blocking(move || {
+            local_hashes
+                .into_iter()
+                .filter(|h| {
+                    if !recorded.contains(h) {
+                        return true;
+                    }
+                    !originals.contains(h)
+                        && ContentSha256::from_hex(h).is_some_and(|k| b.contains(&k))
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| ReplicaError::Local(format!("task: {e}")))
     }
 
     /// Copy one local document: its original first (when there is one), then
@@ -385,8 +430,8 @@ impl Replica {
         blocking(move || s.put(&k, &body, "application/json")).await
     }
 
-    /// Copy every local document that has no record in S3, then upload the
-    /// snapshot. Never deletes anything in S3.
+    /// Copy every local document whose S3 copy is missing or lacks its
+    /// original, then upload the snapshot. Never deletes anything in S3.
     ///
     /// # Errors
     /// [`ReplicaError`] when the listing, the local read or the snapshot fails.
@@ -396,12 +441,8 @@ impl Replica {
         store: &LanceStore,
         blobs: &Arc<BlobStore>,
     ) -> Result<ReplicateReport, ReplicaError> {
-        let recorded = self.recorded_hashes().await?;
         let mut report = ReplicateReport::default();
-        for hash in store.hashes().await.map_err(local)? {
-            if recorded.contains(&hash) {
-                continue;
-            }
+        for hash in self.pending(store, blobs).await? {
             match self.upload_document(store, blobs, &hash).await {
                 Ok(()) => report.uploaded += 1,
                 Err(e) => {
@@ -414,19 +455,16 @@ impl Replica {
         Ok(report)
     }
 
-    /// Local documents with no record in S3.
+    /// Local documents whose S3 copy is missing or lacks its original.
     ///
     /// # Errors
     /// [`ReplicaError`] when the listing or the local read fails.
-    pub async fn backlog(&self, store: &LanceStore) -> Result<usize, ReplicaError> {
-        let recorded = self.recorded_hashes().await?;
-        Ok(store
-            .hashes()
-            .await
-            .map_err(local)?
-            .into_iter()
-            .filter(|h| !recorded.contains(h))
-            .count())
+    pub async fn backlog(
+        &self,
+        store: &LanceStore,
+        blobs: &Arc<BlobStore>,
+    ) -> Result<usize, ReplicaError> {
+        Ok(self.pending(store, blobs).await?.len())
     }
 }
 
@@ -820,8 +858,39 @@ mod tests {
         bucket.down.store(true, Ordering::SeqCst);
         assert!(r.upload_document(&src.store, &src.blobs, &a).await.is_err());
         bucket.down.store(false, Ordering::SeqCst);
-        assert_eq!(r.backlog(&src.store).await.expect("backlog"), 1);
+        assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 1);
         r.replicate(&src.store, &src.blobs).await.expect("replicate");
-        assert_eq!(r.backlog(&src.store).await.expect("backlog"), 0);
+        assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 0);
+    }
+
+    /// A legacy document already copied without an original gets its original
+    /// later (re-upload backfill). If the immediate copy of the backfill
+    /// fails, the replicator still uploads the original and rewrites the
+    /// record, and a restore then brings the original back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_backfilled_original_is_copied_and_the_record_rewritten() {
+        let bucket = Arc::new(MemoryStore::default());
+        let r = replica(&bucket);
+        let src = local().await;
+        let bytes: &[u8] = b"legacy then backfilled";
+        let a = add(&src, bytes, "a.png", 1, false).await;
+        r.replicate(&src.store, &src.blobs).await.expect("replicate");
+        assert!(!bucket.keys().contains(&r.original_key(&a)));
+        assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 0);
+
+        src.blobs.put(&ContentSha256::of(bytes), bytes).expect("backfill");
+        assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 1);
+        let report = r.replicate(&src.store, &src.blobs).await.expect("replicate");
+        assert_eq!(report.uploaded, 1);
+        assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 0);
+        let log = bucket.log.lock().expect("log").clone();
+        let orig = log.iter().rposition(|l| l == &format!("put {}", r.original_key(&a)));
+        let rec = log.iter().rposition(|l| l == &format!("put {}", r.record_key(&a)));
+        assert!(orig.expect("original put") < rec.expect("record put"));
+
+        let dst = local().await;
+        restore(&r, &dst.store, &dst.blobs).await.expect("restore");
+        let key = ContentSha256::of(bytes);
+        assert_eq!(dst.blobs.get(&key).expect("get").as_deref(), Some(bytes));
     }
 }

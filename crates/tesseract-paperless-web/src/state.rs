@@ -294,7 +294,7 @@ impl AppState {
     pub async fn replicate_now(&self) {
         let Some(r) = &self.replica else { return };
         let outcome = r.replicate(&self.store, &self.blobs).await;
-        let backlog = r.backlog(&self.store).await;
+        let backlog = r.backlog(&self.store, &self.blobs).await;
         let now = crate::ingest::now_unix_ms();
         let mut status = self
             .replica_status
