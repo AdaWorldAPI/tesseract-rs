@@ -49,8 +49,40 @@ branded!(
     IndexTemplate,
     DocumentsTemplate,
     DocumentDetailTemplate,
-    DefinitionsTemplate
+    DefinitionsTemplate,
+    DashboardTemplate
 );
+
+// Which main-menu entry a page belongs to (`base.html` marks it current).
+impl IndexTemplate {
+    fn nav(&self) -> &'static str {
+        "upload"
+    }
+}
+impl DocumentsTemplate {
+    fn nav(&self) -> &'static str {
+        self.nav
+    }
+}
+impl DocumentDetailTemplate {
+    fn nav(&self) -> &'static str {
+        if self.from_inbox {
+            "inbox"
+        } else {
+            "documents"
+        }
+    }
+}
+impl DefinitionsTemplate {
+    fn nav(&self) -> &'static str {
+        self.nav
+    }
+}
+impl DashboardTemplate {
+    fn nav(&self) -> &'static str {
+        "dashboard"
+    }
+}
 
 /// Uploads capped at 20 MB — scans run larger than the line-image demos this
 /// stack's other web crate targets; both the per-extractor and the raw-body
@@ -66,6 +98,8 @@ async fn healthz() -> &'static str {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/dashboard", get(dashboard))
+        .route("/inbox", get(inbox))
         .route("/healthz", get(healthz))
         .route("/upload", post(upload))
         .route("/documents", get(documents))
@@ -305,6 +339,10 @@ fn confidence_str(mean_confidence: u32, text: &str) -> String {
 #[derive(Template)]
 #[template(path = "documents.html")]
 struct DocumentsTemplate {
+    /// `"documents"` or `"inbox"`: the same list template serves both.
+    nav: &'static str,
+    /// Page links for the inbox; `None` on the document list.
+    pager: Option<Pager>,
     query: String,
     count: usize,
     documents: Vec<DocumentListItem>,
@@ -327,12 +365,16 @@ async fn documents(
     if query.trim().is_empty() {
         return match state.store.list(LIST_LIMIT).await {
             Ok(rows) => render(&DocumentsTemplate {
+                nav: "documents",
+                pager: None,
                 query,
                 count: rows.len(),
                 documents: rows.into_iter().map(DocumentListItem::from).collect(),
                 error: None,
             }),
             Err(e) => render(&DocumentsTemplate {
+                nav: "documents",
+                pager: None,
                 query,
                 count: 0,
                 documents: Vec::new(),
@@ -354,6 +396,8 @@ async fn documents(
         Ok(Ok(results)) => results,
         Ok(Err(e)) => {
             return render(&DocumentsTemplate {
+                nav: "documents",
+                pager: None,
                 query,
                 count: 0,
                 documents: Vec::new(),
@@ -362,6 +406,8 @@ async fn documents(
         }
         Err(e) => {
             return render(&DocumentsTemplate {
+                nav: "documents",
+                pager: None,
                 query,
                 count: 0,
                 documents: Vec::new(),
@@ -389,6 +435,8 @@ async fn documents(
     }
 
     render(&DocumentsTemplate {
+        nav: "documents",
+        pager: None,
         count: documents.len(),
         query,
         documents,
@@ -522,6 +570,8 @@ struct DocumentDetailTemplate {
     suggestions: Vec<SuggestionView>,
     /// Why there are no suggestions, when there are none.
     suggestions_note: Option<String>,
+    /// Opened from the inbox: the back link and "Mark reviewed, next" lead there.
+    from_inbox: bool,
     error: Option<String>,
 }
 
@@ -695,14 +745,23 @@ fn not_found_detail(hash_hex: &str, error: impl Into<String>) -> DocumentDetailT
         reviewed: false,
         suggestions: Vec::new(),
         suggestions_note: None,
+        from_inbox: false,
         error: Some(error.into()),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct DetailQuery {
+    /// `inbox` when opened from the inbox; anything else is ignored.
+    from: Option<String>,
 }
 
 async fn document_detail(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
+    Query(dq): Query<DetailQuery>,
 ) -> Html<String> {
+    let from_inbox = dq.from.as_deref() == Some("inbox");
     let row = match state.store.get(&hash).await {
         Ok(Some(r)) => r,
         Ok(None) => return render(&not_found_detail(&hash, "no document with this hash")),
@@ -773,6 +832,7 @@ async fn document_detail(
         regions,
         fields,
         triples,
+        from_inbox,
         error: None,
     })
 }
@@ -867,8 +927,14 @@ async fn require_document(state: &AppState, hash: &str) -> Result<(), Response> 
     }
 }
 
-fn back_to_document(hash: &str) -> Redirect {
-    Redirect::to(&format!("/documents/{hash}"))
+/// Back to the document page; when the form came from the inbox
+/// (`from=inbox`), keep that origin so the inbox actions stay on the page.
+fn back_to_document(hash: &str, from: Option<&str>) -> Redirect {
+    if from == Some("inbox") {
+        Redirect::to(&format!("/documents/{hash}?from=inbox"))
+    } else {
+        Redirect::to(&format!("/documents/{hash}"))
+    }
 }
 
 // ---- metadata: document actions -------------------------------------------
@@ -877,11 +943,21 @@ fn back_to_document(hash: &str) -> Redirect {
 struct AssignForm {
     kind: String,
     definition_id: u32,
+    /// `inbox` when the page was opened from the inbox (see `back_to_document`).
+    #[serde(default)]
+    from: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct ReviewForm {
     reviewed: String,
+    /// `inbox`: after marking reviewed, open the next document still to
+    /// review (or the empty inbox). Absent: back to this document.
+    #[serde(default)]
+    next: Option<String>,
+    /// `inbox` when the page was opened from the inbox (see `back_to_document`).
+    #[serde(default)]
+    from: Option<String>,
 }
 
 /// Manual assign: `Source::Manual`. Single-valued kinds replace.
@@ -898,7 +974,7 @@ async fn document_assign(
         .assign(&hash, kind, f.definition_id, Source::Manual, now_unix_ms())
         .await
         .map_err(|e| meta_fail(&e))?;
-    Ok(back_to_document(&hash))
+    Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
 async fn document_unassign(
@@ -914,7 +990,7 @@ async fn document_unassign(
         .unassign(&hash, kind, f.definition_id)
         .await
         .map_err(|e| store_fail(&e))?;
-    Ok(back_to_document(&hash))
+    Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
 /// Accept an AUTO suggestion: exactly one `AutoAccepted` assignment and
@@ -938,7 +1014,7 @@ async fn document_accept(
         )
         .await
         .map_err(|e| meta_fail(&e))?;
-    Ok(back_to_document(&hash))
+    Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
 /// The reviewed toggle: `reviewed=true` marks, `reviewed=false` clears.
@@ -948,6 +1024,17 @@ async fn document_review(
     Form(f): Form<ReviewForm>,
 ) -> Result<Redirect, Response> {
     require_document(&state, &hash).await?;
+    // Validate `next` before anything is written: a refused request changes nothing.
+    let to_inbox = match f.next.as_deref() {
+        None | Some("") => false,
+        Some("inbox") => true,
+        Some(other) => {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                format!("next must be inbox, not {other:?}"),
+            ))
+        }
+    };
     let meta = state.store.meta();
     match f.reviewed.as_str() {
         "true" => meta
@@ -965,7 +1052,174 @@ async fn document_review(
             ))
         }
     }
-    Ok(back_to_document(&hash))
+    if !to_inbox {
+        return Ok(back_to_document(&hash, f.from.as_deref()));
+    }
+    let next = unreviewed_rows(&state)
+        .await
+        .map_err(|e| store_fail(&e))?
+        .into_iter()
+        .find(|r| r.content_sha256_hex != hash);
+    Ok(match next {
+        Some(r) => Redirect::to(&format!("/documents/{}?from=inbox", r.content_sha256_hex)),
+        None => Redirect::to("/inbox"),
+    })
+}
+
+// ---- inbox and dashboard ---------------------------------------------------
+
+/// Every archived document not marked reviewed, newest first. Reads the whole
+/// table (`count` rows) and the reviewed set; the archive is small enough for
+/// that today, and the result is exact, unlike a filter over the newest
+/// `LIST_LIMIT` rows, which would hide older unreviewed documents.
+async fn unreviewed_rows(
+    state: &AppState,
+) -> Result<Vec<DocumentRow>, tesseract_paperless::store::StoreError> {
+    let total = state.store.count().await?;
+    let reviewed: std::collections::HashSet<String> = state
+        .store
+        .meta()
+        .reviewed_hashes()
+        .await?
+        .into_iter()
+        .collect();
+    Ok(state
+        .store
+        .list(total.max(1))
+        .await?
+        .into_iter()
+        .filter(|r| !reviewed.contains(&r.content_sha256_hex))
+        .collect())
+}
+
+/// The inbox: documents to review, as paperless-ngx's inbox. Shows at most
+/// `LIST_LIMIT`, and counts all of them.
+/// Inbox page links: 1-based page, previous and next page when they exist.
+struct Pager {
+    page: usize,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+impl Pager {
+    /// The page shown for `total` documents when `requested` was asked for:
+    /// clamped to `1..=pages`, with neighbours only where they exist.
+    fn for_total(total: usize, requested: Option<usize>) -> Self {
+        let pages = total.div_ceil(LIST_LIMIT).max(1);
+        let page = requested.unwrap_or(1).clamp(1, pages);
+        Pager {
+            page,
+            prev: (page > 1).then(|| page - 1),
+            next: (page < pages).then(|| page + 1),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct InboxQuery {
+    /// 1-based page of `LIST_LIMIT` documents; absent, 0 or past the end is
+    /// clamped to a valid page.
+    page: Option<usize>,
+}
+
+/// The inbox: documents to review, as paperless-ngx's inbox, `LIST_LIMIT`
+/// per page, every page reachable.
+async fn inbox(State(state): State<Arc<AppState>>, Query(q): Query<InboxQuery>) -> Html<String> {
+    match unreviewed_rows(&state).await {
+        Ok(rows) => {
+            let pager = Pager::for_total(rows.len(), q.page);
+            let page = pager.page;
+            render(&DocumentsTemplate {
+                nav: "inbox",
+                pager: Some(pager),
+                query: String::new(),
+                count: rows.len(),
+                documents: rows
+                    .into_iter()
+                    .skip((page - 1) * LIST_LIMIT)
+                    .take(LIST_LIMIT)
+                    .map(DocumentListItem::from)
+                    .collect(),
+                error: None,
+            })
+        }
+        Err(e) => render(&DocumentsTemplate {
+            nav: "inbox",
+            pager: None,
+            query: String::new(),
+            count: 0,
+            documents: Vec::new(),
+            error: Some(format!("archive read failed: {e}")),
+        }),
+    }
+}
+
+/// One kind's tile on the dashboard.
+struct KindStat {
+    kind: &'static str,
+    label: &'static str,
+    /// Definitions of this kind that are not retired.
+    definitions: usize,
+}
+
+/// One inbox entry on the dashboard.
+struct RecentItem {
+    hash_hex: String,
+    filename: String,
+    ingested_at: String,
+}
+
+#[derive(Template)]
+#[template(path = "dashboard.html")]
+struct DashboardTemplate {
+    total: usize,
+    unreviewed: usize,
+    kinds: Vec<KindStat>,
+    /// The newest documents to review, at most `DASHBOARD_RECENT`.
+    recent: Vec<RecentItem>,
+    error: Option<String>,
+}
+
+const DASHBOARD_RECENT: usize = 5;
+
+async fn dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
+    let read = async {
+        let unreviewed = unreviewed_rows(&state).await?;
+        let total = state.store.count().await?;
+        let defs = state.store.meta().definitions().await?;
+        Ok::<_, tesseract_paperless::store::StoreError>((unreviewed, total, defs))
+    };
+    match read.await {
+        Ok((unreviewed, total, defs)) => render(&DashboardTemplate {
+            total,
+            unreviewed: unreviewed.len(),
+            kinds: DEF_SECTIONS
+                .iter()
+                .map(|&(kind, label)| KindStat {
+                    kind: kind.as_str(),
+                    label,
+                    definitions: defs.iter().filter(|d| d.kind == kind && !d.retired).count(),
+                })
+                .collect(),
+            recent: unreviewed
+                .into_iter()
+                .take(DASHBOARD_RECENT)
+                .map(|r| RecentItem {
+                    hash_hex: r.content_sha256_hex,
+                    filename: r.filename.unwrap_or_else(|| "(untitled)".to_string()),
+                    ingested_at: format_unix_ms(r.ingested_at_unix_ms),
+                })
+                .collect(),
+            error: None,
+        }),
+        Err(e) => render(&DashboardTemplate {
+            total: 0,
+            unreviewed: 0,
+            kinds: Vec::new(),
+            recent: Vec::new(),
+            error: Some(format!("archive read failed: {e}")),
+        }),
+    }
 }
 
 // ---- metadata: definitions page -------------------------------------------
@@ -1000,6 +1254,8 @@ struct DefView {
     case_insensitive: bool,
     retired: bool,
     alg_options: Vec<AlgOption>,
+    /// Documents this definition is assigned to.
+    documents: usize,
 }
 
 struct DefSection {
@@ -1013,16 +1269,28 @@ struct DefSection {
 struct DefinitionsTemplate {
     sections: Vec<DefSection>,
     auto_status: String,
+    /// `"definitions"` for all kinds, else the kind's name (menu entry).
+    nav: &'static str,
+    /// The kind shown, as the forms send it back (`""` for all kinds).
+    view: &'static str,
+    heading: &'static str,
 }
 
-fn def_sections(defs: &[DefinitionRow]) -> Vec<DefSection> {
-    const SECTIONS: [(MetaKind, &str); 3] = [
-        (MetaKind::Correspondent, "Correspondents"),
-        (MetaKind::DocumentType, "Document types"),
-        (MetaKind::Tag, "Tags"),
-    ];
-    SECTIONS
+/// The three kinds, in menu order, with their headings.
+const DEF_SECTIONS: [(MetaKind, &str); 3] = [
+    (MetaKind::Correspondent, "Correspondents"),
+    (MetaKind::DocumentType, "Document types"),
+    (MetaKind::Tag, "Tags"),
+];
+
+fn def_sections(
+    defs: &[DefinitionRow],
+    assigns: &[AssignmentRow],
+    only: Option<MetaKind>,
+) -> Vec<DefSection> {
+    DEF_SECTIONS
         .iter()
+        .filter(|(kind, _)| only.is_none_or(|o| o == *kind))
         .map(|&(kind, label)| DefSection {
             kind: kind.as_str(),
             label,
@@ -1043,6 +1311,10 @@ fn def_sections(defs: &[DefinitionRow]) -> Vec<DefSection> {
                             selected: v == d.match_algorithm,
                         })
                         .collect(),
+                    documents: assigns
+                        .iter()
+                        .filter(|a| a.kind == kind && a.definition_id == d.definition_id)
+                        .count(),
                 })
                 .collect(),
         })
@@ -1057,17 +1329,60 @@ fn auto_status(state: &AppState) -> String {
     }
 }
 
-async fn definitions_page(State(state): State<Arc<AppState>>) -> Response {
-    match state.store.meta().definitions().await {
-        Ok(defs) => render(&DefinitionsTemplate {
-            sections: def_sections(&defs),
-            auto_status: auto_status(&state),
-        })
-        .into_response(),
-        Err(e) => fail(
+#[derive(serde::Deserialize)]
+struct DefinitionsQuery {
+    /// One kind (`correspondent`, `document_type`, `tag`); absent or empty:
+    /// all three. Anything else is a 400.
+    kind: Option<String>,
+}
+
+async fn definitions_page(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DefinitionsQuery>,
+) -> Response {
+    let only = match q.kind.as_deref() {
+        None | Some("") => None,
+        Some(k) => match parse_kind(k) {
+            Ok(kind) => Some(kind),
+            Err(r) => return r,
+        },
+    };
+    let meta = state.store.meta();
+    match (meta.definitions().await, meta.all_assignments().await) {
+        (Ok(defs), Ok(assigns)) => {
+            let (nav, view, heading) = match only {
+                None => ("definitions", "", "Definitions"),
+                Some(kind) => {
+                    let label = DEF_SECTIONS
+                        .iter()
+                        .find(|(k, _)| *k == kind)
+                        .map_or("Definitions", |(_, l)| *l);
+                    (kind.as_str(), kind.as_str(), label)
+                }
+            };
+            render(&DefinitionsTemplate {
+                sections: def_sections(&defs, &assigns, only),
+                auto_status: auto_status(&state),
+                nav,
+                view,
+                heading,
+            })
+            .into_response()
+        }
+        (Err(e), _) | (_, Err(e)) => fail(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("archive read failed: {e}"),
         ),
+    }
+}
+
+/// Where a definition form returns to: the kind's own page when it came
+/// from one (`view` names a known kind), else the page with all kinds. Only
+/// a parsed kind reaches the URL, so `view` cannot inject a location.
+fn definitions_location(view: Option<&str>) -> String {
+    match view.and_then(MetaKind::parse) {
+        Some(kind) => format!("/definitions?kind={}", kind.as_str()),
+        None => "/definitions".to_string(),
     }
 }
 
@@ -1075,6 +1390,9 @@ async fn definitions_page(State(state): State<Arc<AppState>>) -> Response {
 struct CreateForm {
     kind: String,
     name: String,
+    /// The page the form came from (see `definitions_location`).
+    #[serde(default)]
+    view: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1082,6 +1400,9 @@ struct RenameForm {
     kind: String,
     definition_id: u32,
     name: String,
+    /// The page the form came from (see `definitions_location`).
+    #[serde(default)]
+    view: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1096,12 +1417,18 @@ struct RuleForm {
     /// An unchecked checkbox is simply absent from the body.
     #[serde(default)]
     case_insensitive: Option<String>,
+    /// The page the form came from (see `definitions_location`).
+    #[serde(default)]
+    view: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct RetireForm {
     kind: String,
     definition_id: u32,
+    /// The page the form came from (see `definitions_location`).
+    #[serde(default)]
+    view: Option<String>,
 }
 
 /// Create a definition. `MetaStore::create_definition` defaults it to AUTO
@@ -1118,7 +1445,7 @@ async fn definition_create(
         .create_definition(kind, name, now_unix_ms())
         .await
         .map_err(|e| meta_fail(&e))?;
-    Ok(Redirect::to("/definitions"))
+    Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 
 async fn definition_rename(
@@ -1133,7 +1460,7 @@ async fn definition_rename(
         .rename_definition(kind, f.definition_id, name)
         .await
         .map_err(|e| meta_fail(&e))?;
-    Ok(Redirect::to("/definitions"))
+    Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 
 async fn definition_rule(
@@ -1165,7 +1492,7 @@ async fn definition_rule(
         )
         .await
         .map_err(|e| meta_fail(&e))?;
-    Ok(Redirect::to("/definitions"))
+    Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 
 async fn definition_retire(
@@ -1179,7 +1506,7 @@ async fn definition_retire(
         .retire_definition(kind, f.definition_id)
         .await
         .map_err(|e| meta_fail(&e))?;
-    Ok(Redirect::to("/definitions"))
+    Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 
 /// Re-mine the AUTO model in the background and go back to the definitions
@@ -1727,5 +2054,302 @@ mod tests {
             after.contains("class=\"badge\">Auto<"),
             "a new definition shows its algorithm badge"
         );
+    }
+
+    /// The shell: every page carries the same menu, and exactly the page's own
+    /// entry is marked current.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_page_has_the_menu_with_its_own_entry_current() {
+        let h = harness().await;
+        let hash = seed(&h, b"shell").await;
+        for (uri, current) in [
+            ("/".to_string(), "/\""),
+            ("/dashboard".to_string(), "/dashboard\""),
+            ("/inbox".to_string(), "/inbox\""),
+            ("/documents".to_string(), "/documents\""),
+            (format!("/documents/{hash}"), "/documents\""),
+            (format!("/documents/{hash}?from=inbox"), "/inbox\""),
+            (
+                "/definitions?kind=tag".to_string(),
+                "/definitions?kind=tag\"",
+            ),
+            (
+                "/definitions?kind=correspondent".to_string(),
+                "/definitions?kind=correspondent\"",
+            ),
+        ] {
+            let (status, _, body) = send(&h, get_req(&uri)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(body.contains("<nav class=\"main\""), "{uri}: no menu");
+            assert_eq!(
+                body.matches(" aria-current=\"page\">").count(),
+                1,
+                "{uri}: exactly one current entry"
+            );
+            assert!(
+                body.contains(&format!("href=\"{current} aria-current=\"page\"")),
+                "{uri}: wrong current entry"
+            );
+            assert!(!body.contains("{{"), "{uri}: unrendered template syntax");
+        }
+        // The page listing all kinds marks no menu entry current.
+        let (_, _, body) = send(&h, get_req("/definitions")).await;
+        assert_eq!(body.matches(" aria-current=\"page\">").count(), 0);
+    }
+
+    /// The inbox lists exactly the documents not marked reviewed; marking one
+    /// reviewed takes it off. Disable: drop the `reviewed` filter in
+    /// `unreviewed_rows`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_inbox_lists_exactly_the_unreviewed_documents() {
+        let h = harness().await;
+        let a = seed(&h, b"inbox-a").await;
+        let b = seed(&h, b"inbox-b").await;
+        let (_, _, body) = send(&h, get_req("/inbox")).await;
+        assert!(body.contains(&a) && body.contains(&b), "both to review");
+        assert!(body.contains("2 documents"), "{body}");
+
+        h.state
+            .store
+            .meta()
+            .mark_reviewed(&a, 1)
+            .await
+            .expect("mark");
+        let (_, _, body) = send(&h, get_req("/inbox")).await;
+        assert!(!body.contains(&a), "a reviewed document leaves the inbox");
+        assert!(body.contains(&b));
+        assert!(body.contains("1 document "), "{body}");
+        // The document list still shows both.
+        let (_, _, body) = send(&h, get_req("/documents")).await;
+        assert!(body.contains(&a) && body.contains(&b));
+    }
+
+    /// "Mark reviewed, next" marks the document and opens the next one still to
+    /// review, then the empty inbox. Without `next` the old behaviour holds;
+    /// an unknown `next` is a 400 and marks nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_and_next_walks_the_inbox() {
+        let h = harness().await;
+        let a = seed(&h, b"next-a").await;
+        let b = seed(&h, b"next-b").await;
+
+        let (status, loc, _) = send(
+            &h,
+            post_form(
+                &format!("/documents/{a}/review"),
+                "reviewed=true&next=inbox",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(
+            loc.as_deref(),
+            Some(format!("/documents/{b}?from=inbox").as_str())
+        );
+        assert!(h.state.store.meta().is_reviewed(&a).await.expect("is"));
+
+        let (_, loc, _) = send(
+            &h,
+            post_form(
+                &format!("/documents/{b}/review"),
+                "reviewed=true&next=inbox",
+            ),
+        )
+        .await;
+        assert_eq!(loc.as_deref(), Some("/inbox"));
+
+        let (_, loc, _) = send(
+            &h,
+            post_form(&format!("/documents/{a}/review"), "reviewed=false"),
+        )
+        .await;
+        assert_eq!(loc.as_deref(), Some(format!("/documents/{a}").as_str()));
+
+        let (status, _, _) = send(
+            &h,
+            post_form(
+                &format!("/documents/{a}/review"),
+                "reviewed=true&next=elsewhere",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            !h.state.store.meta().is_reviewed(&a).await.expect("is"),
+            "a refused request marks nothing"
+        );
+
+        // The button exists only when the page was opened from the inbox.
+        let (_, _, from_inbox) = send(&h, get_req(&format!("/documents/{a}?from=inbox"))).await;
+        let (_, _, plain) = send(&h, get_req(&format!("/documents/{a}"))).await;
+        assert!(from_inbox.contains("Mark reviewed, next"));
+        assert!(!plain.contains("Mark reviewed, next"));
+    }
+
+    /// The dashboard counts documents, documents to review and live definitions
+    /// per kind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_dashboard_counts_what_the_archive_holds() {
+        let h = harness().await;
+        let a = seed(&h, b"dash-a").await;
+        seed(&h, b"dash-b").await;
+        h.state
+            .store
+            .meta()
+            .mark_reviewed(&a, 1)
+            .await
+            .expect("mark");
+        let meta = h.state.store.meta();
+        meta.create_definition(MetaKind::Tag, "Energie", 1)
+            .await
+            .expect("tag");
+        let retired = meta
+            .create_definition(MetaKind::Tag, "Alt", 1)
+            .await
+            .expect("tag")
+            .definition_id;
+        meta.retire_definition(MetaKind::Tag, retired)
+            .await
+            .expect("retire");
+
+        let (status, _, body) = send(&h, get_req("/dashboard")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("<span class=\"n\">2</span><span class=\"l\">documents</span>"),
+            "{body}"
+        );
+        assert!(
+            body.contains("<span class=\"n\">1</span><span class=\"l\">to review</span>"),
+            "{body}"
+        );
+        assert!(
+            body.contains("<span class=\"n\">1</span><span class=\"l\">tags</span>"),
+            "a retired tag is not counted: {body}"
+        );
+        assert!(
+            !body.contains(&format!("/documents/{a}?from=inbox")),
+            "a reviewed document is not in the inbox card"
+        );
+    }
+
+    /// One kind per page: `?kind=` shows only that section, with document
+    /// counts; an unknown kind is a 400; a form returns to the page it came
+    /// from, and only a known kind reaches the redirect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn definitions_split_by_kind_and_forms_return_to_their_page() {
+        let h = harness().await;
+        let hash = seed(&h, b"kinds").await;
+        let meta = h.state.store.meta();
+        let tag = meta
+            .create_definition(MetaKind::Tag, "Energie", 1)
+            .await
+            .expect("tag")
+            .definition_id;
+        meta.create_definition(MetaKind::Correspondent, "Stadtwerke", 1)
+            .await
+            .expect("corr");
+        meta.assign(&hash, MetaKind::Tag, tag, Source::Manual, 1)
+            .await
+            .expect("assign");
+
+        let (_, _, tags) = send(&h, get_req("/definitions?kind=tag")).await;
+        assert!(
+            tags.contains("Energie") && !tags.contains("Stadtwerke"),
+            "{tags}"
+        );
+        assert!(tags.contains("1 document<"), "{tags}");
+        let (_, _, all) = send(&h, get_req("/definitions")).await;
+        assert!(all.contains("Energie") && all.contains("Stadtwerke"));
+        let (status, _, _) = send(&h, get_req("/definitions?kind=storage_path")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (_, loc, _) = send(
+            &h,
+            post_form("/definitions/create", "kind=tag&name=Wasser&view=tag"),
+        )
+        .await;
+        assert_eq!(loc.as_deref(), Some("/definitions?kind=tag"));
+        let (_, loc, _) = send(&h, post_form("/definitions/create", "kind=tag&name=Gas")).await;
+        assert_eq!(loc.as_deref(), Some("/definitions"));
+        let (_, loc, _) = send(
+            &h,
+            post_form(
+                "/definitions/create",
+                "kind=tag&name=Luft&view=https%3A%2F%2Fevil.example",
+            ),
+        )
+        .await;
+        assert_eq!(
+            loc.as_deref(),
+            Some("/definitions"),
+            "an unknown view never reaches the URL"
+        );
+    }
+
+    /// Every inbox document is reachable: pages of `LIST_LIMIT`, clamped,
+    /// with neighbours only where they exist.
+    #[test]
+    fn the_inbox_pager_reaches_every_page() {
+        let p = Pager::for_total(0, None);
+        assert_eq!((p.page, p.prev, p.next), (1, None, None));
+        let p = Pager::for_total(LIST_LIMIT, Some(2));
+        assert_eq!((p.page, p.prev, p.next), (1, None, None), "one full page");
+        let p = Pager::for_total(LIST_LIMIT + 1, None);
+        assert_eq!((p.page, p.prev, p.next), (1, None, Some(2)));
+        let p = Pager::for_total(LIST_LIMIT + 1, Some(2));
+        assert_eq!((p.page, p.prev, p.next), (2, Some(1), None));
+        let p = Pager::for_total(3 * LIST_LIMIT, Some(0));
+        assert_eq!(p.page, 1, "page 0 clamps to 1");
+        let p = Pager::for_total(3 * LIST_LIMIT, Some(99));
+        assert_eq!(
+            (p.page, p.prev, p.next),
+            (3, Some(2), None),
+            "past the end clamps"
+        );
+    }
+
+    /// A form on a page opened from the inbox returns to it with the inbox
+    /// origin; the same form from the document list returns without it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn document_forms_keep_the_inbox_origin() {
+        let h = harness().await;
+        let hash = seed(&h, b"origin").await;
+        let tag = h
+            .state
+            .store
+            .meta()
+            .create_definition(MetaKind::Tag, "Energie", 1)
+            .await
+            .expect("tag")
+            .definition_id;
+        let inbox_loc = format!("/documents/{hash}?from=inbox");
+        let plain_loc = format!("/documents/{hash}");
+        for (action, body) in [
+            ("assign", format!("kind=tag&definition_id={tag}")),
+            ("unassign", format!("kind=tag&definition_id={tag}")),
+            ("accept", format!("kind=tag&definition_id={tag}")),
+            ("review", "reviewed=false".to_string()),
+        ] {
+            let uri = format!("/documents/{hash}/{action}");
+            let (_, loc, _) = send(&h, post_form(&uri, &format!("{body}&from=inbox"))).await;
+            assert_eq!(loc.as_deref(), Some(inbox_loc.as_str()), "{action}");
+            let (_, loc, _) = send(&h, post_form(&uri, &body)).await;
+            assert_eq!(loc.as_deref(), Some(plain_loc.as_str()), "{action}");
+            let (_, loc, _) = send(
+                &h,
+                post_form(&uri, &format!("{body}&from=https%3A%2F%2Fevil.example")),
+            )
+            .await;
+            assert_eq!(
+                loc.as_deref(),
+                Some(plain_loc.as_str()),
+                "{action}: unknown origin ignored"
+            );
+        }
+        // The page opened from the inbox puts the origin into every form.
+        let (_, _, page) = send(&h, get_req(&inbox_loc)).await;
+        assert!(page.contains("name=\"from\" value=\"inbox\""));
+        let (_, _, plain) = send(&h, get_req(&plain_loc)).await;
+        assert!(!plain.contains("name=\"from\" value=\"inbox\""));
     }
 }

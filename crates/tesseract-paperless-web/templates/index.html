@@ -1,26 +1,10 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{ self.brand().name }} — document archive</title>
-<style>
-  :root { color-scheme: light dark; }
-  * { box-sizing: border-box; }
-  body {
-    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-    line-height: 1.5; margin: 0; padding: 2rem 1rem;
-    background: Canvas; color: CanvasText;
-  }
-  main { max-width: 42rem; margin: 0 auto; }
+{% extends "base.html" %}
+{% block title %}{{ self.brand().name }} — document archive{% endblock %}
+{% block style %}
+  main { max-width: 42rem; }
   h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+
   .tag { color: color-mix(in srgb, CanvasText 60%, Canvas); font-size: .95rem; margin: 0 0 1.5rem; }
-  nav.top { margin-bottom: 1.5rem; }
-  nav.top a { color: {{ self.brand().accent }}; text-decoration: none; font-weight: 600; }
-  .card {
-    border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
-    border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem;
-  }
   label { display: block; font-weight: 600; margin-bottom: .35rem; }
   input[type=file], input[type=url] {
     width: 100%; padding: .55rem; border-radius: 8px;
@@ -30,36 +14,18 @@
   .or { text-align: center; color: color-mix(in srgb, CanvasText 50%, Canvas);
         margin: .9rem 0; font-size: .85rem; letter-spacing: .05em; }
   .btns { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: 1rem; }
-  button {
+  button.go {
     flex: 1 1 auto; padding: .7rem 1rem; font-size: 1rem;
     font-weight: 600; border: 0; border-radius: 8px; cursor: pointer;
     background: {{ self.brand().accent }}; color: {{ self.brand().on_accent() }};
   }
-  /* Hover changes no colour: the text/background pair was chosen for 4.5:1
-     contrast (Branding::on_accent), and a brightness filter would undo it. */
-  button:hover { outline: 2px solid CanvasText; outline-offset: 2px; }
-  .error {
-    border: 1px solid #ef4444; background: color-mix(in srgb, #ef4444 12%, Canvas);
-    color: color-mix(in srgb, #ef4444 85%, CanvasText);
-    padding: .75rem 1rem; border-radius: 8px; margin-bottom: 1rem;
-  }
-  .note { font-size: .85rem; color: color-mix(in srgb, CanvasText 55%, Canvas); }
-  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
-  h1 img.logo { height: 1.6rem; vertical-align: middle; margin-right: .5rem; }
-  form.signout { display: inline; margin-left: .5rem; }
-  form.signout button { font: inherit; padding: 0; border: 0; background: none; color: inherit; text-decoration: underline; cursor: pointer; }
-  footer { margin-top: 2rem; font-size: .8rem; color: color-mix(in srgb, CanvasText 50%, Canvas); }
-</style>
-</head>
-<body>
-<main>
-  <h1>{% if let Some(logo) = self.brand().logo_url() %}<img class="logo" src="{{ logo }}" alt="">{% endif %}{{ self.brand().name }}</h1>
+{% endblock %}
+{% block content %}
+  <h1>{{ self.brand().name }}</h1>
   <p class="tag">{{ self.brand().tagline }}</p>
 
-  <nav class="top"><a href="/documents">&rarr; Browse the archive</a> &middot; <a href="/definitions">Definitions</a></nav>
-
   {% if let Some(msg) = error %}
-  <div class="error">{{ msg }}</div>
+  <div class="error" role="alert">{{ msg }}</div>
   {% endif %}
 
   <form class="card" action="/upload" method="post" enctype="multipart/form-data">
@@ -73,13 +39,9 @@
     <p class="note">Private, loopback, and link-local addresses are refused (SSRF guard); 10&nbsp;MB / 10&nbsp;s cap.</p>
 
     <div class="btns">
-      <button type="submit">Ingest document</button>
+      <button class="go" type="submit">Ingest document</button>
     </div>
   </form>
 
   <p class="note">A document already in the archive (byte-identical content) is recognized as a duplicate and skipped &mdash; no repeat OCR spend, and you land straight on the existing record.</p>
-
-  <footer>Pure-Rust OCR (no libtesseract/leptonica at runtime) &middot; <code>lancedb</code>-backed archive.{% if self.brand().is_custom() %} &middot; powered by tesseract-rs{% endif %}{% if self.sign_in() %} <form class="signout" method="post" action="/auth/logout"><button type="submit">Sign out</button></form>{% endif %}</footer>
-</main>
-</body>
-</html>
+{% endblock %}

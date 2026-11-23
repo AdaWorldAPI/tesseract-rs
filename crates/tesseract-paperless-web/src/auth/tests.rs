@@ -792,3 +792,27 @@ async fn a_session_cookie_from_another_origin_cannot_change_state() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
 }
+
+#[test]
+fn require_auth_refuses_an_open_start_and_changes_nothing_when_off() {
+    let flag = |v: &'static str| sign_in_required(vars(&[("PAPERLESS_REQUIRE_AUTH", v)]));
+    // Off: unset, blank, 0, false. On: 1, true. Anything else is an error.
+    assert!(!sign_in_required(vars(&[])).unwrap());
+    for off in ["", " ", "0", "false"] {
+        assert!(!flag(off).unwrap(), "{off:?}");
+    }
+    for on in ["1", "true", " 1 "] {
+        assert!(flag(on).unwrap(), "{on:?}");
+    }
+    for bad in ["yes", "TRUE", "2", "on"] {
+        assert!(
+            flag(bad).unwrap_err().contains("PAPERLESS_REQUIRE_AUTH"),
+            "{bad:?}"
+        );
+    }
+    // Required without sign-in refuses; every other combination starts.
+    assert!(check_open_mode(true, false).is_err());
+    assert!(check_open_mode(true, true).is_ok());
+    assert!(check_open_mode(false, false).is_ok());
+    assert!(check_open_mode(false, true).is_ok());
+}

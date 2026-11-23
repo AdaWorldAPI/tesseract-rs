@@ -1,20 +1,9 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{ filename }} — {{ self.brand().name }}</title>
-<style>
-  :root { color-scheme: light dark; }
-  * { box-sizing: border-box; }
-  body {
-    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-    line-height: 1.5; margin: 0; padding: 2rem 1rem;
-    background: Canvas; color: CanvasText;
-  }
-  main { max-width: 52rem; margin: 0 auto; }
-  nav.top { margin-bottom: 1.25rem; }
-  nav.top a { color: {{ self.brand().accent }}; text-decoration: none; font-weight: 600; }
+{% extends "base.html" %}
+{% block title %}{{ filename }} — {{ self.brand().name }}{% endblock %}
+{% block style %}
+  .back { margin: 0 0 1rem; }
+  .back a { text-decoration: none; font-weight: 600; }
+  .review { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .6rem; margin-bottom: 1rem; }
   h1 { font-size: 1.5rem; margin: 0 0 .5rem; word-break: break-word; }
   .meta {
     display: flex; flex-wrap: wrap; gap: .5rem 1.2rem; font-size: .85rem;
@@ -22,11 +11,6 @@
   }
   .low-conf { color: #d97706; font-weight: 600; }
   .hash { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8em; }
-  .card {
-    border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
-    border-radius: 12px; padding: 1.25rem; margin-bottom: 1.25rem;
-  }
-  .card h2 { font-size: 1rem; margin: 0 0 .75rem; }
   pre.text {
     white-space: pre-wrap; word-break: break-word; font-family: inherit;
     font-size: .95rem; margin: 0;
@@ -64,21 +48,12 @@
     background: #ef4444; color: #fff;
   }
   button.danger:hover { filter: brightness(1.08); }
-  .error {
-    border: 1px solid #ef4444; background: color-mix(in srgb, #ef4444 12%, Canvas);
-    color: color-mix(in srgb, #ef4444 85%, CanvasText);
-    padding: .75rem 1rem; border-radius: 8px; margin-bottom: 1rem;
-  }
-  form.signout { display: inline; }
-  form.signout button { font: inherit; padding: 0; border: 0; background: none; color: inherit; text-decoration: underline; cursor: pointer; }
-</style>
-</head>
-<body>
-<main>
-  <nav class="top"><a href="/documents">&larr; All documents</a>{% if self.sign_in() %} &middot; <form class="signout" method="post" action="/auth/logout"><button type="submit">Sign out</button></form>{% endif %}</nav>
+{% endblock %}
+{% block content %}
+  <p class="back">{% if from_inbox %}<a href="/inbox">&larr; Inbox</a>{% else %}<a href="/documents">&larr; All documents</a>{% endif %}</p>
 
   {% if let Some(msg) = error %}
-  <div class="error">{{ msg }}</div>
+  <div class="error" role="alert">{{ msg }}</div>
   {% else %}
   <h1>{{ filename }}</h1>
   <div class="meta">
@@ -92,19 +67,29 @@
 
   <div class="card">
     <h2>Metadata</h2>
-    <div>
+    <div class="review">
       {% if reviewed %}
       <strong>Reviewed</strong>
       <form class="inline" action="/documents/{{ hash_hex }}/review" method="post">
+        {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
         <input type="hidden" name="reviewed" value="false">
         <button type="submit" class="secondary">Mark unreviewed</button>
       </form>
       {% else %}
       <strong>Not reviewed</strong>
       <form class="inline" action="/documents/{{ hash_hex }}/review" method="post">
+        {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
         <input type="hidden" name="reviewed" value="true">
         <button type="submit" class="secondary">Mark reviewed</button>
       </form>
+      {% if from_inbox %}
+      <form class="inline" action="/documents/{{ hash_hex }}/review" method="post">
+        {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
+        <input type="hidden" name="reviewed" value="true">
+        <input type="hidden" name="next" value="inbox">
+        <button type="submit" class="act">Mark reviewed, next</button>
+      </form>
+      {% endif %}
       {% endif %}
     </div>
     {% for g in groups %}
@@ -118,6 +103,7 @@
         <span>{{ a.name }}</span>
         <span class="src">{{ a.source }}</span>
         <form class="inline" action="/documents/{{ hash_hex }}/unassign" method="post">
+        {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
           <input type="hidden" name="kind" value="{{ g.kind }}">
           <input type="hidden" name="definition_id" value="{{ a.definition_id }}">
           <button type="submit" class="secondary">Unassign</button>
@@ -127,11 +113,12 @@
     </ul>
     {% endif %}
     {% if g.options.is_empty() %}
-    <p class="none">No definitions yet &mdash; <a href="/definitions">create one</a>.</p>
+    <p class="none">No definitions yet &mdash; <a href="/definitions?kind={{ g.kind }}">create one</a>.</p>
     {% else %}
     <form class="inline" action="/documents/{{ hash_hex }}/assign" method="post">
+        {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
       <input type="hidden" name="kind" value="{{ g.kind }}">
-      <select name="definition_id">
+      <select name="definition_id" aria-label="{{ g.label }}">
         {% for o in g.options %}
         <option value="{{ o.definition_id }}">{{ o.name }}</option>
         {% endfor %}
@@ -154,6 +141,7 @@
         <strong>{{ s.label }}: {{ s.name }}</strong>
         <span>{{ s.percent }}% expected &middot; evidence {{ s.evidence }}</span>
         <form class="inline" action="/documents/{{ hash_hex }}/accept" method="post">
+        {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
           <input type="hidden" name="kind" value="{{ s.kind }}">
           <input type="hidden" name="definition_id" value="{{ s.definition_id }}">
           <button type="submit" class="act">Accept</button>
@@ -211,6 +199,4 @@
     <button type="submit" class="danger">Delete document</button>
   </form>
   {% endif %}
-</main>
-</body>
-</html>
+{% endblock %}
