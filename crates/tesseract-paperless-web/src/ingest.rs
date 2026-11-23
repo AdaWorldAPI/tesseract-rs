@@ -141,6 +141,26 @@ pub async fn ingest(
     filename: Option<String>,
     mime: &str,
 ) -> Result<IngestOutcome, IngestError> {
+    ingest_for_customer(state, bytes, filename, mime, None).await
+}
+
+/// [`ingest`], filing a NEW document under `customer`.
+///
+/// The customer is written under the document's hash lock, after a re-check
+/// that no other upload committed the same bytes meanwhile, and before the
+/// document row. So only the upload that actually creates the document sets
+/// its customer (a concurrent upload of the same file by another customer gets
+/// `Duplicate` and changes nothing), and a committed document is never left
+/// without the customer it was uploaded for, even if search indexing fails
+/// afterwards. A duplicate never changes the customer it has. The caller has
+/// validated `customer` against its scope.
+pub async fn ingest_for_customer(
+    state: &Arc<AppState>,
+    bytes: Vec<u8>,
+    filename: Option<String>,
+    mime: &str,
+    customer: Option<&str>,
+) -> Result<IngestOutcome, IngestError> {
     let (hash, verdict) = preflight(&bytes, &state.store);
     let hex = format!("{hash:?}");
 
@@ -270,11 +290,42 @@ pub async fn ingest(
     // document from removing the original between these two writes.
     let lock = state.hash_lock(&hash);
     let held = lock.lock().await;
+    // Another upload of the same bytes may have committed while this one was
+    // recognizing. It created the document and set its customer; this one is a
+    // duplicate and changes nothing.
+    if state
+        .store
+        .get(&hex)
+        .await
+        .map_err(IngestError::Store)?
+        .is_some()
+    {
+        drop(held);
+        return Ok(IngestOutcome::Duplicate {
+            hash_hex: hex,
+            document_guid: mint_document_root(&hash).root.0.to_bytes(),
+            matched: MatchedOn::Original,
+            original_added: false,
+        });
+    }
     let st = state.clone();
     tokio::task::spawn_blocking(move || st.blobs.put(&hash, &bytes))
         .await
         .map_err(|e| IngestError::Task(e.to_string()))?
         .map_err(IngestError::Blob)?;
+    // Before the row: a failure here stores nothing visible, and a crash
+    // between the two leaves an orphan customer row the next start removes.
+    if let Some(c) = customer {
+        state
+            .store
+            .meta()
+            .set_customer(&hex, Some(c), ingested_at_unix_ms)
+            .await
+            .map_err(|e| match e {
+                tesseract_paperless::archive_meta::MetaError::Store(e) => IngestError::Store(e),
+                other => IngestError::Task(other.to_string()),
+            })?;
+    }
 
     let guid = state
         .store

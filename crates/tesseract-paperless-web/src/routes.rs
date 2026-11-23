@@ -30,7 +30,7 @@ use tesseract_paperless::store::DocumentRow;
 use crate::auth::Caller;
 use crate::customers::Scope;
 use crate::fetch::fetch_image_url;
-use crate::ingest::{ingest, now_unix_ms, IngestOutcome};
+use crate::ingest::{ingest_for_customer, now_unix_ms, IngestOutcome};
 use crate::state::{AppState, AutoSlot};
 
 /// Gives every page template access to the deployment's branding
@@ -332,40 +332,28 @@ async fn upload(
         return page_error(e);
     }
 
-    match ingest(&state, uploaded.bytes, uploaded.filename, &uploaded.mime).await {
+    match ingest_for_customer(
+        &state,
+        uploaded.bytes,
+        uploaded.filename,
+        &uploaded.mime,
+        uploaded.customer.as_deref(),
+    )
+    .await
+    {
         Ok(outcome) => {
             log_ingest_outcome(&outcome);
             let hash = outcome.hash_hex().to_string();
-            match &outcome {
-                // Only a NEW document takes the customer. A duplicate keeps the
-                // customer it has: re-uploading a file must never move another
-                // customer's document into the uploader's scope.
-                IngestOutcome::Stored { .. } => {
-                    if let Some(c) = uploaded.customer.as_deref() {
-                        if let Err(e) = state
-                            .store
-                            .meta()
-                            .set_customer(&hash, Some(c), now_unix_ms())
-                            .await
-                        {
-                            return page_error(format!(
-                                "the document was archived, but filing it under customer \
-                                 {c} failed: {e}. Only a caller who sees every customer \
-                                 can open it until it is filed."
-                            ));
-                        }
-                        state.replicate_metadata();
-                    }
-                }
-                IngestOutcome::Duplicate { .. } => {
-                    if require_visible(&state, &scope, &hash).await.is_err() {
-                        return page_error(
-                            "this file is already in the archive, filed under a customer \
-                             you cannot see"
-                                .into(),
-                        );
-                    }
-                }
+            // A duplicate keeps the customer it has: re-uploading a file never
+            // moves another customer's document into the uploader's scope.
+            if matches!(outcome, IngestOutcome::Duplicate { .. })
+                && require_visible(&state, &scope, &hash).await.is_err()
+            {
+                return page_error(
+                    "this file is already in the archive, filed under a customer \
+                     you cannot see"
+                        .into(),
+                );
             }
             Redirect::to(&format!("/documents/{hash}")).into_response()
         }
@@ -564,35 +552,54 @@ async fn documents(
     // Ranked full-text search (BM25 + snippet generation) is CPU/disk work,
     // dispatched off the async runtime the same way OCR and the search-index
     // write already are.
-    let st = state.clone();
-    let q_for_search = query.clone();
-    let results = match tokio::task::spawn_blocking(move || {
-        st.search.search(&q_for_search, LIST_LIMIT)
-    })
-    .await
-    {
-        Ok(Ok(results)) => results,
-        Ok(Err(e)) => {
-            return render(&DocumentsTemplate {
-                nav: "documents",
-                pager: None,
-                query,
-                count: 0,
-                documents: Vec::new(),
-                error: Some(format!("search failed: {e}")),
-            })
-        }
-        Err(e) => {
-            return render(&DocumentsTemplate {
-                nav: "documents",
-                pager: None,
-                query,
-                count: 0,
-                documents: Vec::new(),
-                error: Some(format!("search task failed: {e}")),
-            })
+    // A scoped caller's results are filtered after the search, so it searches
+    // the whole archive: cutting to LIST_LIMIT first would let other customers'
+    // documents push its own matches out. The cut to LIST_LIMIT comes after.
+    let search_limit = if scope == Scope::All {
+        LIST_LIMIT
+    } else {
+        match state.store.count().await {
+            Ok(n) => n.max(1),
+            Err(e) => {
+                return render(&DocumentsTemplate {
+                    nav: "documents",
+                    pager: None,
+                    query,
+                    count: 0,
+                    documents: Vec::new(),
+                    error: Some(format!("archive read failed: {e}")),
+                })
+            }
         }
     };
+    let st = state.clone();
+    let q_for_search = query.clone();
+    let results =
+        match tokio::task::spawn_blocking(move || st.search.search(&q_for_search, search_limit))
+            .await
+        {
+            Ok(Ok(results)) => results,
+            Ok(Err(e)) => {
+                return render(&DocumentsTemplate {
+                    nav: "documents",
+                    pager: None,
+                    query,
+                    count: 0,
+                    documents: Vec::new(),
+                    error: Some(format!("search failed: {e}")),
+                })
+            }
+            Err(e) => {
+                return render(&DocumentsTemplate {
+                    nav: "documents",
+                    pager: None,
+                    query,
+                    count: 0,
+                    documents: Vec::new(),
+                    error: Some(format!("search task failed: {e}")),
+                })
+            }
+        };
 
     // Each hit is joined back to its archive row for display metadata the
     // search index does not carry (page_count/confidence/low_confidence).
@@ -619,10 +626,13 @@ async fn documents(
             }
         }
     };
-    let mut documents = Vec::with_capacity(results.hits.len());
+    let mut documents = Vec::with_capacity(results.hits.len().min(LIST_LIMIT));
     for hit in &results.hits {
         if !scope.covers(customers.get(&hit.hash_hex).map(String::as_str)) {
             continue;
+        }
+        if documents.len() == LIST_LIMIT {
+            break;
         }
         match state.store.get(&hit.hash_hex).await {
             Ok(Some(row)) => documents.push(DocumentListItem::from_search_hit(row, &results)),
@@ -2177,7 +2187,7 @@ mod tests {
 
     use std::path::Path as FsPath;
 
-    use crate::ingest::IngestError;
+    use crate::ingest::{ingest, IngestError};
     use axum::body::Body;
     use axum::http::{header, Request};
     use tesseract_paperless::archive_meta::MATCH_AUTO;
@@ -3669,5 +3679,39 @@ mod tests {
             StatusCode::FORBIDDEN,
             "no policy, no per-customer API"
         );
+    }
+
+    /// A scoped caller's search is filtered before it is cut to LIST_LIMIT:
+    /// more than LIST_LIMIT higher-ranking matches of another customer must not
+    /// hide the caller's own match.
+    /// Disable: search with `LIST_LIMIT` for every scope.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scoped_search_is_not_cut_before_the_customer_filter() {
+        let h = harness_with(Some(POLICY)).await;
+        let meta = h.state.store.meta();
+        for i in 0..=LIST_LIMIT {
+            let hash = seed(&h, format!("other {i}").as_bytes()).await;
+            meta.set_customer(&hash, Some("K02"), 1).await.expect("k02");
+            h.state
+                .search
+                .index_document(&hash, "doc.png", "Stadtwerke Stadtwerke Stadtwerke")
+                .expect("index");
+        }
+        let own = seed(&h, b"own document").await;
+        meta.set_customer(&own, Some("K01"), 1).await.expect("k01");
+        h.state
+            .search
+            .index_document(
+                &own,
+                "doc.png",
+                "Stadtwerke with many more words that lower its rank considerably here",
+            )
+            .expect("index");
+        let (_, _, body) = send(
+            &h,
+            as_role(get_req("/documents?q=Stadtwerke"), "paperless.k01"),
+        )
+        .await;
+        assert!(body.contains(&own), "the caller's own match must be found");
     }
 }
