@@ -51,6 +51,12 @@ pub const RESTORE_SNAPSHOT: &str = ".restore-snapshot.json";
 /// those records are repaired or deliberately given up.
 pub const SNAPSHOT_HOLD: &str = ".snapshot-hold";
 
+/// Directory in `BLOB_DIR` holding one empty file per pending S3 delete.
+pub const DELETE_INTENTS: &str = ".s3-deletes";
+
+/// How many times a copy starts over when the document changed under it.
+const COPY_ROUNDS: usize = 3;
+
 /// Why a replica operation failed.
 #[derive(Debug)]
 pub enum ReplicaError {
@@ -232,8 +238,10 @@ impl SnapshotFile {
 pub struct ReplicateReport {
     /// Documents whose record was missing and has now been written.
     pub uploaded: usize,
-    /// Documents that could not be copied this time.
+    /// Documents (copies or pending deletes) that failed this time.
     pub failed: usize,
+    /// Pending S3 deletes carried out.
+    pub deleted: usize,
 }
 
 /// What [`restore`] did.
@@ -400,55 +408,131 @@ impl Replica {
     ) -> Result<bool, ReplicaError> {
         let key = ContentSha256::from_hex(hash)
             .ok_or_else(|| ReplicaError::Invalid(format!("hash {hash}")))?;
-        let row = {
-            let _held = lock.clone().lock_owned().await;
-            match store.get(hash).await.map_err(local)? {
-                Some(row) => row,
-                None => return Ok(false),
+        // A few rounds: if the document was deleted and uploaded again while a
+        // round's PUTs ran, its row changed and the record just written is the
+        // old one, so the next round copies the new row over it.
+        for _ in 0..COPY_ROUNDS {
+            let row = {
+                let _held = lock.clone().lock_owned().await;
+                match store.get(hash).await.map_err(local)? {
+                    Some(row) => row,
+                    None => return Ok(false),
+                }
+            };
+            let b = blobs.clone();
+            let original = tokio::task::spawn_blocking(move || b.get(&key))
+                .await
+                .map_err(|e| ReplicaError::Local(format!("task: {e}")))?
+                .map_err(local)?;
+            let has_original = original.is_some();
+            if let Some(bytes) = original {
+                let s = self.store.clone();
+                let k = self.original_key(hash);
+                blocking(move || s.put(&k, &bytes, "application/octet-stream")).await?;
             }
-        };
-        let b = blobs.clone();
-        let original = tokio::task::spawn_blocking(move || b.get(&key))
-            .await
-            .map_err(|e| ReplicaError::Local(format!("task: {e}")))?
-            .map_err(local)?;
-        let has_original = original.is_some();
-        if let Some(bytes) = original {
+            let copied_at = row.ingested_at_unix_ms;
+            let copied_name = row.filename.clone();
+            let record = DocumentRecord {
+                schema: RECORD_SCHEMA.to_string(),
+                content_sha256_hex: hash.to_string(),
+                filename: row.filename,
+                ingested_at_unix_ms: row.ingested_at_unix_ms,
+                mean_confidence: row.mean_confidence,
+                low_confidence: row.low_confidence,
+                doc_ir_json: row.doc_ir_json,
+                spo_json: row.spo_json,
+                has_original,
+            };
+            let body = serde_json::to_vec(&record).map_err(local)?;
             let s = self.store.clone();
-            let k = self.original_key(hash);
-            blocking(move || s.put(&k, &bytes, "application/octet-stream")).await?;
-        }
-        let record = DocumentRecord {
-            schema: RECORD_SCHEMA.to_string(),
-            content_sha256_hex: hash.to_string(),
-            filename: row.filename,
-            ingested_at_unix_ms: row.ingested_at_unix_ms,
-            mean_confidence: row.mean_confidence,
-            low_confidence: row.low_confidence,
-            doc_ir_json: row.doc_ir_json,
-            spo_json: row.spo_json,
-            has_original,
-        };
-        let body = serde_json::to_vec(&record).map_err(local)?;
-        let s = self.store.clone();
-        let k = self.record_key(hash);
-        blocking(move || s.put(&k, &body, "application/json")).await?;
+            let k = self.record_key(hash);
+            blocking(move || s.put(&k, &body, "application/json")).await?;
 
-        let still_here = {
+            let now = {
+                let _held = lock.clone().lock_owned().await;
+                store.get(hash).await.map_err(local)?
+            };
+            match now {
+                Some(r) if r.ingested_at_unix_ms == copied_at && r.filename == copied_name => {
+                    return Ok(true);
+                }
+                // Deleted and uploaded again meanwhile: copy the new row.
+                Some(_) => continue,
+                None => {
+                    if let Err(e) = self.delete_document(hash).await {
+                        eprintln!(
+                            "replica: {hash} was deleted while being copied and removing the \
+                             copy failed: {e}; the S3 copy still holds it"
+                        );
+                        return Err(e);
+                    }
+                    return Ok(false);
+                }
+            }
+        }
+        Err(ReplicaError::Invalid(format!(
+            "{hash} changed during {COPY_ROUNDS} copy rounds; the replicator will retry"
+        )))
+    }
+
+    /// Record that `hash` was deleted locally and must be removed from S3.
+    /// The intent is a file under [`DELETE_INTENTS`] in `blobs`, so it survives
+    /// a failed S3 delete and a restart; the replicator retries it on every
+    /// pass until it succeeds. Unlike a missing copy, a missing delete could
+    /// not otherwise be found again: the replicator never deletes on its own.
+    ///
+    /// # Errors
+    /// [`ReplicaError::Local`] when the intent cannot be written.
+    pub fn record_delete_intent(blobs: &BlobStore, hash: &str) -> Result<(), ReplicaError> {
+        if ContentSha256::from_hex(hash).is_none() {
+            return Err(ReplicaError::Invalid(format!("hash {hash}")));
+        }
+        let dir = blobs.root().join(DELETE_INTENTS);
+        std::fs::create_dir_all(&dir).map_err(local)?;
+        std::fs::write(dir.join(hash), b"").map_err(local)
+    }
+
+    /// The hashes with a pending S3 delete.
+    fn delete_intents(blobs: &BlobStore) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(blobs.root().join(DELETE_INTENTS)) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = entries
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|h| ContentSha256::from_hex(h).is_some())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Carry out one pending S3 delete. If the document is local again (it
+    /// was uploaded again after the delete), the intent is dropped and nothing
+    /// is deleted: the copy of the new upload owns those keys. Otherwise the
+    /// S3 objects are removed (record first) and the intent with them.
+    /// `Ok(true)` when S3 objects were removed.
+    ///
+    /// # Errors
+    /// [`ReplicaError`] when the S3 delete fails; the intent then stays.
+    pub async fn apply_delete_intent(
+        &self,
+        store: &LanceStore,
+        blobs: &Arc<BlobStore>,
+        hash: &str,
+        lock: DocLock,
+    ) -> Result<bool, ReplicaError> {
+        let intent = blobs.root().join(DELETE_INTENTS).join(hash);
+        let back = {
             let _held = lock.lock_owned().await;
             store.get(hash).await.map_err(local)?.is_some()
         };
-        if still_here {
-            return Ok(true);
+        if back {
+            remove_if_present(&intent)?;
+            return Ok(false);
         }
-        if let Err(e) = self.delete_document(hash).await {
-            eprintln!(
-                "replica: {hash} was deleted while being copied and removing the copy failed: \
-                 {e}; the S3 copy still holds it"
-            );
-            return Err(e);
-        }
-        Ok(false)
+        self.delete_document(hash).await?;
+        remove_if_present(&intent)?;
+        Ok(true)
     }
 
     /// Remove one document from S3: the record first, then the original, so a
@@ -510,6 +594,19 @@ impl Replica {
         lock_for: &(dyn Fn(&ContentSha256) -> DocLock + Sync),
     ) -> Result<ReplicateReport, ReplicaError> {
         let mut report = ReplicateReport::default();
+        for hash in Self::delete_intents(blobs) {
+            let Some(key) = ContentSha256::from_hex(&hash) else {
+                continue;
+            };
+            match self.apply_delete_intent(store, blobs, &hash, lock_for(&key)).await {
+                Ok(true) => report.deleted += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("replica: deleting {hash} from S3 failed: {e}; will retry");
+                    report.failed += 1;
+                }
+            }
+        }
         for hash in self.pending(store, blobs).await? {
             let Some(key) = ContentSha256::from_hex(&hash) else {
                 continue;
@@ -536,7 +633,7 @@ impl Replica {
         store: &LanceStore,
         blobs: &Arc<BlobStore>,
     ) -> Result<usize, ReplicaError> {
-        Ok(self.pending(store, blobs).await?.len())
+        Ok(self.pending(store, blobs).await?.len() + Self::delete_intents(blobs).len())
     }
 }
 
@@ -819,7 +916,7 @@ mod tests {
         meta.mark_reviewed(&b, 3).await.expect("review");
 
         let report = r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
-        assert_eq!(report, ReplicateReport { uploaded: 2, failed: 0 });
+        assert_eq!(report, ReplicateReport { uploaded: 2, failed: 0, deleted: 0 });
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 0);
         assert!(bucket.keys().contains(&r.original_key(&a)));
         assert!(!bucket.keys().contains(&r.original_key(&b)));
@@ -993,6 +1090,75 @@ mod tests {
         // The definitions come back with their ids; the hold keeps S3 intact.
         assert!(snap.definitions.iter().any(|d| d.definition_id == tag.definition_id));
         assert!(dst.blobs.root().join(SNAPSHOT_HOLD).exists());
+    }
+
+    /// A copy whose document was deleted and uploaded again (same bytes, new
+    /// name and time) while its PUTs ran does not leave the old record: it
+    /// copies the new row over it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delayed_copy_does_not_leave_a_stale_record_after_re_upload() {
+        let bucket = Arc::new(MemoryStore::default());
+        let r = replica(&bucket);
+        let src = local().await;
+        let bytes: &[u8] = b"same bytes";
+        let a = add(&src, bytes, "old.png", 1, true).await;
+        bucket.put_delay_ms.store(200, Ordering::SeqCst);
+        let l = lock();
+        let copy = r.upload_document(&src.store, &src.blobs, &a, l.clone());
+        let reupload = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let held = l.clone().lock_owned().await;
+            src.store.delete(&a).await.expect("delete");
+            add(&src, bytes, "new.png", 2, true).await;
+            drop(held);
+        };
+        let (copied, ()) = tokio::join!(copy, reupload);
+        assert!(copied.expect("copy"));
+        let rec: DocumentRecord =
+            serde_json::from_slice(&bucket.get(&r.record_key(&a)).expect("record")).expect("json");
+        assert_eq!(rec.filename.as_deref(), Some("new.png"));
+        assert_eq!(rec.ingested_at_unix_ms, 2);
+    }
+
+    /// A pending S3 delete survives a failure (and so a restart: it is a file)
+    /// and is carried out by the next replication pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_s3_delete_is_retried_by_the_replicator() {
+        let bucket = Arc::new(MemoryStore::default());
+        let r = replica(&bucket);
+        let src = local().await;
+        let a = add(&src, b"to delete", "a.png", 1, true).await;
+        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        src.store.delete(&a).await.expect("local delete");
+        Replica::record_delete_intent(&src.blobs, &a).expect("intent");
+        bucket.deletes_fail.store(true, Ordering::SeqCst);
+        assert!(r.apply_delete_intent(&src.store, &src.blobs, &a, lock()).await.is_err());
+        let intent = src.blobs.root().join(DELETE_INTENTS).join(&a);
+        assert!(intent.exists(), "a failed delete keeps its intent");
+        assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 1);
+
+        bucket.deletes_fail.store(false, Ordering::SeqCst);
+        let report = r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        assert_eq!(report.deleted, 1);
+        assert!(!bucket.keys().contains(&r.record_key(&a)));
+        assert!(!bucket.keys().contains(&r.original_key(&a)));
+        assert!(!intent.exists());
+    }
+
+    /// A pending delete for a document that was uploaded again is dropped
+    /// without touching S3.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_delete_of_a_re_uploaded_document_is_dropped() {
+        let bucket = Arc::new(MemoryStore::default());
+        let r = replica(&bucket);
+        let src = local().await;
+        let a = add(&src, b"back again", "a.png", 1, true).await;
+        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        Replica::record_delete_intent(&src.blobs, &a).expect("intent");
+        let report = r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        assert_eq!(report.deleted, 0);
+        assert!(bucket.keys().contains(&r.record_key(&a)));
+        assert!(!src.blobs.root().join(DELETE_INTENTS).join(&a).exists());
     }
 
     /// A slow S3 does not hold the document's lock: an upload or delete of the

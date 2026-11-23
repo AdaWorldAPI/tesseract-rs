@@ -332,24 +332,37 @@ impl AppState {
         });
     }
 
-    /// Remove a deleted document from S3 in the background (record, then
-    /// original), then upload the snapshot. Unlike a copy this waits for a
-    /// slot instead of being dropped: the replicator never deletes, so a
-    /// dropped delete would leave the document in S3. The local delete has
-    /// already finished; the request does not wait for this.
+    /// Remove a deleted document from S3. First a delete intent is written to
+    /// disk, so the delete survives a failure or a restart; then, if a slot is
+    /// free, it is carried out in the background (record, then original) and
+    /// the snapshot uploaded. Without a free slot, or after a failure, the
+    /// replicator carries it out on its next pass. The local delete has
+    /// already finished; the request does not wait for S3.
     pub fn replicate_delete(self: &Arc<Self>, hash: &str) {
         if self.replica.is_none() {
             return;
         }
+        if let Err(e) = Replica::record_delete_intent(&self.blobs, hash) {
+            eprintln!(
+                "replica: recording the S3 delete of {hash} failed: {e}; the S3 copy may keep it"
+            );
+        }
+        let Some(key) = ContentSha256::from_hex(hash) else {
+            return;
+        };
+        let Ok(permit) = Arc::clone(&self.replica_permits).try_acquire_owned() else {
+            return;
+        };
         let state = Arc::clone(self);
         let hash = hash.to_string();
         tokio::spawn(async move {
-            let Ok(_permit) = Arc::clone(&state.replica_permits).acquire_owned().await else {
-                return;
-            };
+            let _permit = permit;
             let Some(r) = &state.replica else { return };
-            if let Err(e) = r.delete_document(&hash).await {
-                eprintln!("replica: deleting {hash} from S3 failed: {e}; the S3 copy still holds it");
+            if let Err(e) = r
+                .apply_delete_intent(&state.store, &state.blobs, &hash, state.hash_lock(&key))
+                .await
+            {
+                eprintln!("replica: deleting {hash} from S3 failed: {e}; the replicator will retry");
             }
             if let Err(e) = r.upload_snapshot(&state.store, &state.blobs).await {
                 eprintln!("replica: metadata snapshot upload failed: {e}; the replicator will retry");
@@ -373,10 +386,10 @@ impl AppState {
         status.checked_at_unix_ms = Some(now);
         match (outcome, backlog) {
             (Ok(report), Ok(n)) => {
-                if report.uploaded + report.failed > 0 {
+                if report.uploaded + report.deleted + report.failed > 0 {
                     eprintln!(
-                        "replica: {} copied to S3, {} failed, {n} still missing",
-                        report.uploaded, report.failed
+                        "replica: {} copied to S3, {} deleted from S3, {} failed, {n} still pending",
+                        report.uploaded, report.deleted, report.failed
                     );
                 }
                 status.backlog = Some(n);
