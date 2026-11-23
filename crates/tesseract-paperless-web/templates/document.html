@@ -69,11 +69,13 @@
     color: color-mix(in srgb, #ef4444 85%, CanvasText);
     padding: .75rem 1rem; border-radius: 8px; margin-bottom: 1rem;
   }
+  form.signout { display: inline; }
+  form.signout button { font: inherit; padding: 0; border: 0; background: none; color: inherit; text-decoration: underline; cursor: pointer; }
 </style>
 </head>
 <body>
 <main>
-  <nav class="top"><a href="/documents">&larr; All documents</a></nav>
+  <nav class="top"><a href="/documents">&larr; All documents</a>{% if self.sign_in() %} &middot; <form class="signout" method="post" action="/auth/logout"><button type="submit">Sign out</button></form>{% endif %}</nav>
 
   {% if let Some(msg) = error %}
   <div class="error">{{ msg }}</div>

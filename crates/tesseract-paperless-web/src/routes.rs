@@ -38,6 +38,10 @@ macro_rules! branded {
             fn brand(&self) -> &'static crate::branding::Branding {
                 crate::branding::get()
             }
+            /// Whether sign-in is on, so the page offers "Sign out".
+            fn sign_in(&self) -> bool {
+                crate::auth::enabled()
+            }
         }
     )+};
 }
@@ -53,9 +57,16 @@ branded!(
 /// limit must move together, same reasoning as `tesseract-ocr-web::routes`.
 const MAX_UPLOAD: usize = 20 * 1024 * 1024;
 
+/// Liveness for the platform healthcheck. Answers without a session (the sign-in
+/// gate exempts it) and reveals nothing about the archive.
+async fn healthz() -> &'static str {
+    "ok"
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/healthz", get(healthz))
         .route("/upload", post(upload))
         .route("/documents", get(documents))
         .route("/documents/:hash", get(document_detail))
