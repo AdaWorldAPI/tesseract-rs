@@ -2541,6 +2541,37 @@ mod tests {
         assert!(body == bytes);
     }
 
+    /// A customer row a failed attempt left without its document is not
+    /// inherited by a later upload of the same bytes without a customer.
+    /// Disable: write the customer in ingest only when one is given.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unfiled_upload_does_not_inherit_an_orphan_customer() {
+        let h = harness().await;
+        let bytes = page_bytes();
+        let hash = format!("{:?}", ContentSha256::of(&bytes));
+        let meta = h.state.store.meta();
+        meta.set_customer(&hash, Some("K02"), 1)
+            .await
+            .expect("orphan");
+        assert_eq!(
+            meta.customer_of(&hash).await.expect("c").as_deref(),
+            Some("K02"),
+            "the orphan must exist, or this test measures nothing"
+        );
+        let outcome = ingest(&h.state, bytes, None, "image/x-portable-graymap")
+            .await
+            .expect("ingest");
+        assert!(
+            matches!(outcome, IngestOutcome::Stored { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            meta.customer_of(&hash).await.expect("c"),
+            None,
+            "the new document inherited a customer it was not uploaded for"
+        );
+    }
+
     /// Slice B: an original survives a restart. A new `AppState` over the same
     /// directories (what a redeploy with the volume does) serves the same
     /// bytes, and their SHA-256 is the document's key.

@@ -307,11 +307,13 @@ pub async fn ingest_for_customer(
         .map_err(IngestError::Blob)?;
     // Before the row: a failure here stores nothing visible, and a crash
     // between the two leaves an orphan customer row the next start removes.
-    if let Some(c) = customer {
+    // Written even without a customer: `None` clears an orphan a failed
+    // earlier attempt left, which this document must not inherit.
+    {
         state
             .store
             .meta()
-            .set_customer(&hex, Some(c), ingested_at_unix_ms)
+            .set_customer(&hex, customer, ingested_at_unix_ms)
             .await
             .map_err(|e| match e {
                 tesseract_paperless::archive_meta::MetaError::Store(e) => IngestError::Store(e),
