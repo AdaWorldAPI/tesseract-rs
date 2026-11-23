@@ -509,19 +509,44 @@ impl SearchIndex {
     /// [`SearchError::Query`] if `query_str` does not parse;
     /// [`SearchError::Tantivy`] on a search failure.
     pub fn search(&self, query_str: &str, limit: usize) -> Result<SearchResults, SearchError> {
+        self.search_on(&self.reader.searcher(), query_str, limit)
+    }
+
+    /// [`Self::search`] with no limit: every matching document, ranked. The
+    /// limit is the number of documents in the same searcher the query runs
+    /// on, so an index reload between sizing and searching cannot add a hit
+    /// that pushes another one out. For callers that filter hits afterwards
+    /// (a customer-scoped search) and must not lose a hit they keep to one
+    /// they drop.
+    ///
+    /// # Errors
+    /// As [`Self::search`].
+    pub fn search_every_match(&self, query_str: &str) -> Result<SearchResults, SearchError> {
         let searcher = self.reader.searcher();
+        let limit = usize::try_from(searcher.num_docs())
+            .unwrap_or(usize::MAX)
+            .max(1);
+        self.search_on(&searcher, query_str, limit)
+    }
+
+    fn search_on(
+        &self,
+        searcher: &tantivy::Searcher,
+        query_str: &str,
+        limit: usize,
+    ) -> Result<SearchResults, SearchError> {
         let mut fields = vec![self.fields.filename, self.fields.text];
         fields.extend(self.fields.text_stem);
         let query_parser = QueryParser::for_index(&self.index, fields);
         let query = query_parser.parse_query(query_str)?;
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
         let mut snippets = vec![SnippetGenerator::create(
-            &searcher,
+            searcher,
             &*query,
             self.fields.text,
         )?];
         for field in self.fields.text_stem {
-            snippets.push(SnippetGenerator::create(&searcher, &*query, field)?);
+            snippets.push(SnippetGenerator::create(searcher, &*query, field)?);
         }
 
         let mut hits = Vec::with_capacity(top_docs.len());
@@ -546,6 +571,27 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let idx = SearchIndex::open_or_create(dir.path()).expect("open_or_create");
         (dir, idx)
+    }
+
+    /// `search_every_match` returns every matching document, not a page.
+    /// Disable: give it a fixed limit of 1.
+    #[test]
+    fn search_every_match_returns_every_hit() {
+        let (_dir, idx) = index();
+        for i in 0..5 {
+            idx.index_document(&format!("{i:064x}"), "doc.png", "Stadtwerke Rechnung")
+                .expect("index");
+        }
+        idx.index_document(&format!("{:064x}", 9), "doc.png", "unrelated")
+            .expect("index");
+        assert_eq!(
+            idx.search_every_match("Stadtwerke")
+                .expect("search")
+                .hits
+                .len(),
+            5
+        );
+        assert_eq!(idx.search("Stadtwerke", 2).expect("search").hits.len(), 2);
     }
 
     /// `tokenize_text` is the index's own analyzer, not a whitespace split:

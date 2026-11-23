@@ -595,12 +595,11 @@ async fn documents(
     let st = state.clone();
     let q_for_search = query.clone();
     let results = match tokio::task::spawn_blocking(move || {
-        let limit = if scoped {
-            st.search.indexed_hashes()?.len().max(1)
+        if scoped {
+            st.search.search_every_match(&q_for_search)
         } else {
-            LIST_LIMIT
-        };
-        st.search.search(&q_for_search, limit)
+            st.search.search(&q_for_search, LIST_LIMIT)
+        }
     })
     .await
     {
