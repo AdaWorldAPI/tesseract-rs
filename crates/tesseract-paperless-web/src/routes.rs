@@ -986,6 +986,15 @@ async fn document_delete(State(state): State<Arc<AppState>>, Path(hash): Path<St
     // looks identical to a real success either way. Gating on success keeps
     // a failed delete's outcome identical to the pre-delete state (both
     // stores untouched) rather than a half-deleted one.
+    //
+    // The hash lock is held across the row and original deletes so a
+    // concurrent upload of the same file cannot write its original in between
+    // and then lose it to this delete.
+    let key = ContentSha256::from_hex(&hash);
+    let _held = match &key {
+        Some(k) => Some(state.hash_lock(k).lock().await),
+        None => None,
+    };
     match state.store.delete(&hash).await {
         Ok(()) => {
             // Same off-runtime dispatch as every other search-index write.
@@ -1000,7 +1009,7 @@ async fn document_delete(State(state): State<Arc<AppState>>, Path(hash): Path<St
             }
             // The original goes after its row: a failure here leaves an
             // unreferenced blob, never a row without its original.
-            if let Some(key) = ContentSha256::from_hex(&hash) {
+            if let Some(key) = key {
                 let st = state.clone();
                 match tokio::task::spawn_blocking(move || st.blobs.delete(&key)).await {
                     Ok(Err(e)) => eprintln!("delete original of {hash} failed: {e}"),
@@ -2191,6 +2200,53 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(format!("{:?}", ContentSha256::of(&body)), hash);
         assert!(body == bytes);
+    }
+
+    /// Slice B: a delete and an upload of the same document take the same
+    /// lock, so the delete cannot remove an original between the upload's
+    /// original and row writes. Holding the lock here stalls both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_and_upload_of_one_document_wait_for_each_other() {
+        let h = harness().await;
+        let legacy = b"locked document";
+        let hash = seed(&h, legacy).await;
+        let key = ContentSha256::from_hex(&hash).expect("hex");
+        let held = h.state.hash_lock(&key).lock().await;
+
+        let st = h.state.clone();
+        let upload =
+            tokio::spawn(async move { ingest(&st, legacy.to_vec(), None, "image/png").await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !h.state.blobs.contains(&key),
+            "the upload wrote its original without the lock"
+        );
+        assert!(!upload.is_finished());
+
+        let app = h.app.clone();
+        let del = tokio::spawn(async move {
+            app.oneshot(post_form(&format!("/documents/{hash}/delete"), ""))
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!del.is_finished(), "the delete ran without the lock");
+        let hash = format!("{key:?}");
+        assert!(h.state.store.get(&hash).await.expect("get").is_some());
+
+        drop(held);
+        let outcome = upload.await.expect("join").expect("ingest");
+        assert!(matches!(
+            outcome,
+            IngestOutcome::Duplicate {
+                original_added: true,
+                ..
+            }
+        ));
+        del.await.expect("join").expect("delete");
+        // The lock is first-come: the upload attached the original, then the
+        // delete removed row and original together.
+        assert!(h.state.store.get(&hash).await.expect("get").is_none());
+        assert!(!h.state.blobs.contains(&key));
     }
 
     /// Slice B: altered stored bytes are refused, not served.

@@ -153,6 +153,7 @@ pub async fn ingest(
         // These bytes hash to its key, so they are its original: keep them,
         // and change nothing else. No recognition either way.
         let original_added = if matched == MatchedOn::Original {
+            let _held = state.hash_lock(&hash).lock().await;
             let st = state.clone();
             let outcome = tokio::task::spawn_blocking(move || st.blobs.put(&hash, &bytes))
                 .await
@@ -179,7 +180,7 @@ pub async fn ingest(
         .await
         .map_err(|_| IngestError::Task("server is shutting down".to_string()))?;
     let st = state.clone();
-    let (doc_json, spo_json, triple_count) = tokio::task::spawn_blocking(move || {
+    let (bytes, doc_json, spo_json, triple_count) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let (grey, w, h) = decode_grey(&bytes).map_err(IngestError::Decode)?;
         let doc_json = match st.executor.execute(OcrRequest::RecognizeDocument {
@@ -229,14 +230,7 @@ pub async fn ingest(
             None => (None, 0),
         };
 
-        // S-5: the original lands before the row below is written. A crash
-        // after this leaves a blob without a row, which the next upload of the
-        // same bytes reuses; it can never leave a row without its original.
-        // Kept only once recognition succeeded, so a file that is not a
-        // readable image never reaches the store.
-        st.blobs.put(&hash, &bytes).map_err(IngestError::Blob)?;
-
-        Ok((doc_json, spo_json, triple_count))
+        Ok((bytes, doc_json, spo_json, triple_count))
     })
     .await
     .map_err(|e| IngestError::Task(e.to_string()))??;
@@ -248,6 +242,19 @@ pub async fn ingest(
     let spo_extraction_ran = state.reasoner.is_some();
 
     let ingested_at_unix_ms = now_unix_ms();
+
+    // S-5: the original lands before the row is written. A crash between the
+    // two leaves a blob without a row, which the next upload of the same bytes
+    // reuses; it can never leave a row without its original. Kept only once
+    // recognition succeeded, so a file that is not a readable image never
+    // reaches the store. The hash lock keeps a concurrent delete of the same
+    // document from removing the original between these two writes.
+    let held = state.hash_lock(&hash).lock().await;
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || st.blobs.put(&hash, &bytes))
+        .await
+        .map_err(|e| IngestError::Task(e.to_string()))?
+        .map_err(IngestError::Blob)?;
 
     let guid = state
         .store
@@ -262,6 +269,7 @@ pub async fn ingest(
         )
         .await
         .map_err(IngestError::Store)?;
+    drop(held);
 
     // Same text `LanceStore::put` itself just computed and stored -- recomputed
     // here rather than threaded through `put`'s return value, since it is a

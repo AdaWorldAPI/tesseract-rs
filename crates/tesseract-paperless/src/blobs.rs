@@ -108,7 +108,7 @@ impl BlobStore {
     /// [`BlobError::Io`] when the directory cannot be created.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, BlobError> {
         let root = root.into();
-        fs::create_dir_all(&root)?;
+        create_dir_durable(&root)?;
         Ok(Self { root })
     }
 
@@ -157,7 +157,7 @@ impl BlobStore {
         let dir = target
             .parent()
             .ok_or_else(|| io::Error::other("blob path has no parent"))?;
-        fs::create_dir_all(dir)?;
+        create_dir_durable(dir)?;
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let temp = dir.join(format!(
             ".{}.{}.{seq}.tmp",
@@ -222,6 +222,26 @@ impl BlobStore {
             Err(e) => Err(BlobError::Io(e)),
         }
     }
+}
+
+/// Create `dir` and any missing ancestors, syncing each new directory's
+/// parent so the new entry survives a power loss. A directory that already
+/// exists is left alone.
+fn create_dir_durable(dir: &Path) -> io::Result<()> {
+    if dir.as_os_str().is_empty() || dir.is_dir() {
+        return Ok(());
+    }
+    let parent = dir.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(p) = parent {
+        create_dir_durable(p)?;
+    }
+    match fs::create_dir(dir) {
+        Ok(()) => {}
+        // Created concurrently: someone else made it, and synced its parent.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    File::open(parent.unwrap_or_else(|| Path::new(".")))?.sync_all()
 }
 
 #[cfg(test)]
@@ -324,6 +344,16 @@ mod tests {
         assert!(matches!(s.put(&key, &bytes), Err(BlobError::Io(_))));
         assert!(!s.contains(&key));
         assert!(matches!(s.get(&key), Err(BlobError::Io(_)) | Ok(None)));
+    }
+
+    #[test]
+    fn missing_ancestors_are_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = BlobStore::open(dir.path().join("a").join("b").join("blobs")).expect("open");
+        let bytes = b"deep".to_vec();
+        let key = ContentSha256::of(&bytes);
+        s.put(&key, &bytes).expect("put");
+        assert_eq!(s.get(&key).expect("get"), Some(bytes));
     }
 
     #[test]

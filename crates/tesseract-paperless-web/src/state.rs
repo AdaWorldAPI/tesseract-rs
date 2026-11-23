@@ -10,9 +10,13 @@ use tesseract_paperless::auto_match::AutoMatchParams;
 use tesseract_paperless::auto_model::{index_tokenizer, AutoModel, MineInputs};
 use tesseract_paperless::auto_rows::VocabParams;
 use tesseract_paperless::blobs::BlobStore;
+use tesseract_paperless::kv::ContentSha256;
 use tesseract_paperless::search::SearchIndex;
 use tesseract_paperless::store::LanceStore;
 use tokio::sync::Semaphore;
+
+/// How many locks [`AppState::hash_lock`] spreads hashes over.
+pub const HASH_LOCK_STRIPES: usize = 64;
 
 /// The archive's tissue, loaded once at startup and shared.
 pub struct AppState {
@@ -33,6 +37,9 @@ pub struct AppState {
     /// before the document row (S-5), so a row never points at a missing file
     /// unless the row predates this store.
     pub blobs: BlobStore,
+    /// Serializes the original and row writes of an upload with the row and
+    /// original deletes of a delete, for the same hash (see [`Self::hash_lock`]).
+    hash_locks: Box<[tokio::sync::Mutex<()>]>,
     /// Sentence assembly + deepnsm SPO/`NarsTruth` extraction
     /// (`tesseract_ogar::{sentences,reasoning}`) — `None` when the deepnsm
     /// `word_frequency/` vocabulary is not present at `DEEPNSM_VOCAB_DIR`
@@ -184,10 +191,25 @@ impl AppState {
             store,
             search,
             blobs,
+            hash_locks: (0..HASH_LOCK_STRIPES)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
             reasoner,
             recognize_permits: Arc::new(Semaphore::new(permits)),
             auto: std::sync::RwLock::new(AutoSlot::Pending),
         })
+    }
+
+    /// The lock an upload holds while it writes a document's original and row,
+    /// and a delete holds while it removes them. Without it, a delete can
+    /// remove the original a concurrent upload of the same file just wrote,
+    /// and the upload then commits a row whose original is gone.
+    ///
+    /// Striped by the first hash byte: two different documents share a lock
+    /// only 1 time in [`HASH_LOCK_STRIPES`], and then only wait for each
+    /// other's short write, never for recognition.
+    pub fn hash_lock(&self, key: &ContentSha256) -> &tokio::sync::Mutex<()> {
+        &self.hash_locks[usize::from(key.as_bytes()[0]) % self.hash_locks.len()]
     }
 
     /// The current AUTO slot.
