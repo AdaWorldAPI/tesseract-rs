@@ -241,6 +241,30 @@ pub struct AssignmentRow {
     pub assigned_at_unix_ms: i64,
 }
 
+/// One review flag, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRow {
+    /// Hex `content_sha256` of the document.
+    pub content_sha256_hex: String,
+    /// When it was marked reviewed, milliseconds since the Unix epoch.
+    pub reviewed_at_unix_ms: i64,
+}
+
+/// Every metadata row at one moment: what the S3 copy keeps and a restore
+/// writes back ([`MetaStore::export`], [`MetaStore::import`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetaSnapshot {
+    /// Every definition, retired ones included, with its id.
+    pub definitions: Vec<DefinitionRow>,
+    /// Every assignment.
+    pub assignments: Vec<AssignmentRow>,
+    /// Every review flag.
+    pub reviews: Vec<ReviewRow>,
+    /// Every document's customer, as `(hash, customer code)`, sorted by hash.
+    /// A snapshot taken before customers existed has none.
+    pub customers: Vec<(String, String)>,
+}
+
 /// What [`MetaStore::reconcile`] removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetaReconcileReport {
@@ -488,6 +512,19 @@ fn customers_from_batches(batches: &[RecordBatch]) -> Result<Vec<(String, String
         out.extend(
             (0..batch.num_rows()).map(|i| (hash.value(i).to_string(), code.value(i).to_string())),
         );
+    }
+    Ok(out)
+}
+
+fn reviews_from_batches(batches: &[RecordBatch]) -> Result<Vec<ReviewRow>, StoreError> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let hash = typed::<StringArray>(batch, col::HASH)?;
+        let at = typed::<Int64Array>(batch, col::REVIEWED_AT)?;
+        out.extend((0..batch.num_rows()).map(|i| ReviewRow {
+            content_sha256_hex: hash.value(i).to_string(),
+            reviewed_at_unix_ms: at.value(i),
+        }));
     }
     Ok(out)
 }
@@ -913,9 +950,7 @@ impl MetaStore {
     ///
     /// # Errors
     /// As [`Self::definitions`].
-    pub async fn customers(
-        &self,
-    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+    pub async fn customers(&self) -> Result<std::collections::HashMap<String, String>, StoreError> {
         let batches = collect(&self.customers, None).await?;
         Ok(customers_from_batches(&batches)?.into_iter().collect())
     }
@@ -987,6 +1022,105 @@ impl MetaStore {
     }
 }
 
+impl MetaStore {
+    /// Every metadata row, read under the write lock so the three tables
+    /// describe one moment.
+    ///
+    /// # Errors
+    /// As [`Self::definitions`].
+    pub async fn export(&self) -> Result<MetaSnapshot, StoreError> {
+        let _write = self.writes.lock().await;
+        let definitions = self.definitions().await?;
+        let assignments = self.all_assignments().await?;
+        let reviews = reviews_from_batches(&collect(&self.reviews, None).await?)?;
+        let mut customers = customers_from_batches(&collect(&self.customers, None).await?)?;
+        customers.sort();
+        Ok(MetaSnapshot {
+            definitions,
+            assignments,
+            reviews,
+            customers,
+        })
+    }
+
+    /// Write a snapshot back, keeping every definition id. Assignments and
+    /// reviews whose document is not in `live_hashes` are dropped, as
+    /// [`Self::reconcile`] would drop them. Upserts, so importing the same
+    /// snapshot twice changes nothing.
+    ///
+    /// # Errors
+    /// [`StoreError::Db`] on a write failure.
+    pub async fn import(
+        &self,
+        snapshot: &MetaSnapshot,
+        live_hashes: &HashSet<String>,
+    ) -> Result<(), StoreError> {
+        let _write = self.writes.lock().await;
+        for d in &snapshot.definitions {
+            self.upsert_definition(d).await?;
+        }
+        for a in snapshot
+            .assignments
+            .iter()
+            .filter(|a| live_hashes.contains(&a.content_sha256_hex))
+        {
+            let batch = RecordBatch::try_new(
+                assignments_schema(),
+                vec![
+                    Arc::new(StringArray::from(vec![a.content_sha256_hex.as_str()])),
+                    Arc::new(StringArray::from(vec![a.kind.as_str()])),
+                    Arc::new(UInt32Array::from(vec![a.definition_id])),
+                    Arc::new(StringArray::from(vec![a.source.as_str()])),
+                    Arc::new(Int64Array::from(vec![a.assigned_at_unix_ms])),
+                ],
+            )
+            .map_err(|_| StoreError::Malformed("assignments batch assembly"))?;
+            upsert(
+                &self.assignments,
+                &[col::HASH, col::KIND, col::DEFINITION_ID],
+                batch,
+                assignments_schema(),
+            )
+            .await?;
+        }
+        for r in snapshot
+            .reviews
+            .iter()
+            .filter(|r| live_hashes.contains(&r.content_sha256_hex))
+        {
+            let batch = RecordBatch::try_new(
+                reviews_schema(),
+                vec![
+                    Arc::new(StringArray::from(vec![r.content_sha256_hex.as_str()])),
+                    Arc::new(Int64Array::from(vec![r.reviewed_at_unix_ms])),
+                ],
+            )
+            .map_err(|_| StoreError::Malformed("reviews batch assembly"))?;
+            upsert(&self.reviews, &[col::HASH], batch, reviews_schema()).await?;
+        }
+        // A customer decides who sees a document, so a code that does not
+        // validate is never written back; it is skipped, as a row whose
+        // document is gone is.
+        for (hash, code) in snapshot
+            .customers
+            .iter()
+            .filter(|(h, c)| live_hashes.contains(h) && valid_customer_code(c))
+        {
+            let batch = RecordBatch::try_new(
+                customers_schema(),
+                vec![
+                    Arc::new(StringArray::from(vec![hash.as_str()])),
+                    Arc::new(StringArray::from(vec![code.as_str()])),
+                    Arc::new(Int64Array::from(vec![0_i64])),
+                ],
+            )
+            .map_err(|_| StoreError::Malformed("customers batch assembly"))?;
+            upsert(&self.customers, &[col::HASH], batch, customers_schema()).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Delete every row whose hash is in `dead`, in bounded `IN (...)` chunks.
 async fn delete_hashes(table: &Table, dead: &HashSet<&str>) -> Result<(), StoreError> {
     let dead: Vec<&str> = dead.iter().copied().collect();
@@ -1021,6 +1155,87 @@ mod tests {
 
     fn set(hashes: &[&str]) -> HashSet<String> {
         hashes.iter().map(|h| (*h).to_string()).collect()
+    }
+
+    /// Slice C: a snapshot written into an empty store reproduces every
+    /// definition (ids, rules, retired flag), every assignment and every review
+    /// of a live document, and drops rows of documents that are not live.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn export_then_import_reproduces_the_metadata() {
+        let (_a, src) = fresh().await;
+        let tag = src
+            .create_definition(MetaKind::Tag, "Strom", 10)
+            .await
+            .expect("tag");
+        let corr = src
+            .create_definition(MetaKind::Correspondent, "Stadtwerke", 11)
+            .await
+            .expect("corr");
+        let old = src
+            .create_definition(MetaKind::Tag, "Alt", 12)
+            .await
+            .expect("old");
+        src.set_rule(MetaKind::Tag, tag.definition_id, 3, "strom", false)
+            .await
+            .expect("rule");
+        src.retire_definition(MetaKind::Tag, old.definition_id)
+            .await
+            .expect("retire");
+        src.assign("h1", MetaKind::Tag, tag.definition_id, Source::Manual, 20)
+            .await
+            .expect("assign");
+        src.assign(
+            "h1",
+            MetaKind::Correspondent,
+            corr.definition_id,
+            Source::Rule,
+            21,
+        )
+        .await
+        .expect("assign");
+        src.assign("gone", MetaKind::Tag, tag.definition_id, Source::Manual, 22)
+            .await
+            .expect("assign");
+        src.mark_reviewed("h1", 30).await.expect("review");
+        src.mark_reviewed("gone", 31).await.expect("review");
+
+        let snap = src.export().await.expect("export");
+        assert_eq!(snap.definitions.len(), 3);
+        assert_eq!(snap.assignments.len(), 3);
+        assert_eq!(snap.reviews.len(), 2);
+
+        let (_b, dst) = fresh().await;
+        dst.import(&snap, &set(&["h1"])).await.expect("import");
+        // Twice: idempotent.
+        dst.import(&snap, &set(&["h1"]))
+            .await
+            .expect("import again");
+
+        assert_eq!(dst.definitions().await.expect("defs"), snap.definitions);
+        let mut assigns = dst.all_assignments().await.expect("assigns");
+        assigns.sort_by_key(|a| a.assigned_at_unix_ms);
+        let mut want: Vec<_> = snap
+            .assignments
+            .iter()
+            .filter(|a| a.content_sha256_hex == "h1")
+            .cloned()
+            .collect();
+        want.sort_by_key(|a| a.assigned_at_unix_ms);
+        assert_eq!(assigns, want);
+        let exported = dst.export().await.expect("export");
+        assert_eq!(
+            exported.reviews,
+            vec![ReviewRow {
+                content_sha256_hex: "h1".to_string(),
+                reviewed_at_unix_ms: 30
+            }]
+        );
+        // The next id continues after the restored ones.
+        let next = dst
+            .create_definition(MetaKind::Tag, "Neu", 40)
+            .await
+            .expect("next");
+        assert!(next.definition_id > old.definition_id);
     }
 
     /// G14 support. Disable: default `match_algorithm` to ANY (1) or
@@ -1514,7 +1729,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn customer_codes_are_validated_before_anything_is_written() {
         let (_d, s) = fresh().await;
-        for bad in ["", "K 01", "K01'", "../K01", &"K".repeat(MAX_CUSTOMER_CODE + 1)] {
+        for bad in [
+            "",
+            "K 01",
+            "K01'",
+            "../K01",
+            &"K".repeat(MAX_CUSTOMER_CODE + 1),
+        ] {
             assert!(
                 matches!(
                     s.set_customer("h", Some(bad), 1).await,
@@ -1537,12 +1758,18 @@ mod tests {
         s.set_customer("h", Some("K01"), 1).await.expect("set");
         s.set_customer("h", Some("K02"), 2).await.expect("replace");
         s.set_customer("other", Some("K01"), 3).await.expect("set");
-        assert_eq!(s.customer_of("h").await.expect("of").as_deref(), Some("K02"));
+        assert_eq!(
+            s.customer_of("h").await.expect("of").as_deref(),
+            Some("K02")
+        );
         let all = s.customers().await.expect("all");
         assert_eq!(all.len(), 2, "replacing a customer must not add a row");
         s.set_customer("h", None, 4).await.expect("clear");
         assert_eq!(s.customer_of("h").await.expect("of"), None);
-        assert_eq!(s.customer_of("other").await.expect("of").as_deref(), Some("K01"));
+        assert_eq!(
+            s.customer_of("other").await.expect("of").as_deref(),
+            Some("K01")
+        );
     }
 
     /// A deleted document must not leave its customer behind: a re-upload of
@@ -1559,6 +1786,39 @@ mod tests {
         let report = s.reconcile(&set(&["live"])).await.expect("reconcile");
         assert_eq!(report.customers_removed, 1);
         assert_eq!(s.customer_of("orphan").await.expect("of"), None);
-        assert_eq!(s.customer_of("live").await.expect("of").as_deref(), Some("K01"));
+        assert_eq!(
+            s.customer_of("live").await.expect("of").as_deref(),
+            Some("K01")
+        );
+    }
+
+    /// A restore brings each document's customer back, because it decides who
+    /// may see the document; a code that does not validate is not written back.
+    /// Disable: drop the customers loop from `import`, or the code check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn customers_survive_export_and_import() {
+        let (_a, src) = fresh().await;
+        src.set_customer("h1", Some("K01"), 1).await.expect("h1");
+        src.set_customer("h2", Some("K02"), 1).await.expect("h2");
+        let mut snap = src.export().await.expect("export");
+        assert_eq!(
+            snap.customers,
+            vec![("h1".into(), "K01".into()), ("h2".into(), "K02".into())]
+        );
+        snap.customers.push(("h3".into(), "bad code".into()));
+        let (_b, dst) = fresh().await;
+        dst.import(&snap, &set(&["h1", "h3"]))
+            .await
+            .expect("import");
+        assert_eq!(
+            dst.customer_of("h1").await.expect("h1").as_deref(),
+            Some("K01")
+        );
+        assert_eq!(dst.customer_of("h2").await.expect("h2"), None, "not live");
+        assert_eq!(
+            dst.customer_of("h3").await.expect("h3"),
+            None,
+            "invalid code"
+        );
     }
 }

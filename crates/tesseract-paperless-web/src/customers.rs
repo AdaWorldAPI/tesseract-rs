@@ -117,16 +117,21 @@ impl CustomerPolicy {
             let org = g.org.trim();
             let role_key = g.role_key.trim();
             if org.is_empty() || role_key.is_empty() {
-                return Err(format!("customer policy grant {i}: org and role_key are required"));
+                return Err(format!(
+                    "customer policy grant {i}: org and role_key are required"
+                ));
             }
             let customers = match &g.customers {
                 serde_json::Value::String(s) if s == "*" => Customers::All,
                 serde_json::Value::Array(items) => {
                     let mut set = BTreeSet::new();
                     for item in items {
-                        let code = item.as_str().filter(|c| valid_customer_code(c)).ok_or_else(
-                            || format!("customer policy grant {i}: {item} is not a customer code"),
-                        )?;
+                        let code = item
+                            .as_str()
+                            .filter(|c| valid_customer_code(c))
+                            .ok_or_else(|| {
+                                format!("customer policy grant {i}: {item} is not a customer code")
+                            })?;
                         set.insert(code.to_string());
                     }
                     if set.is_empty() {
@@ -181,7 +186,10 @@ impl CustomerPolicy {
     /// # Errors
     /// As [`Self::from_vars`], and for a value that is not valid Unicode.
     pub fn from_env() -> Result<Option<Self>, String> {
-        for name in ["PAPERLESS_CUSTOMER_POLICY", "PAPERLESS_CUSTOMER_POLICY_FILE"] {
+        for name in [
+            "PAPERLESS_CUSTOMER_POLICY",
+            "PAPERLESS_CUSTOMER_POLICY_FILE",
+        ] {
             if std::env::var_os(name).is_some_and(|v| v.to_str().is_none()) {
                 return Err(format!("{name} is not valid Unicode"));
             }
@@ -248,7 +256,10 @@ mod tests {
     #[test]
     fn scope_is_the_union_of_matching_grants_and_empty_otherwise() {
         let p = CustomerPolicy::from_json(POLICY).expect("parse");
-        assert_eq!(p.scope_for(&[g("o1", "paperless.user")]), codes(&["K01", "K02"]));
+        assert_eq!(
+            p.scope_for(&[g("o1", "paperless.user")]),
+            codes(&["K01", "K02"])
+        );
         assert_eq!(
             p.scope_for(&[g("o1", "paperless.user"), g("o1", "paperless.extra")]),
             codes(&["K01", "K02", "K03"])
@@ -265,7 +276,10 @@ mod tests {
         let s = codes(&["K01"]);
         assert!(s.covers(Some("K01")));
         assert!(!s.covers(Some("K02")));
-        assert!(!s.covers(None), "an unfiled document must not leak to a scoped caller");
+        assert!(
+            !s.covers(None),
+            "an unfiled document must not leak to a scoped caller"
+        );
         assert!(Scope::All.covers(None));
         assert!(!codes(&[]).covers(Some("K01")));
     }
@@ -283,7 +297,10 @@ mod tests {
             r#"{"version": 1, "grants": [{"org":"o","role_key":"r","customers":[1]}]}"#,
             r#"{"version": 1, "grants": [{"org":"o","role_key":"r","customers":"*","x":1}]}"#,
         ] {
-            assert!(CustomerPolicy::from_json(bad).is_err(), "{bad} must be refused");
+            assert!(
+                CustomerPolicy::from_json(bad).is_err(),
+                "{bad} must be refused"
+            );
         }
     }
 

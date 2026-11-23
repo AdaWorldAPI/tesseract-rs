@@ -21,7 +21,7 @@ tower-http = { version = "0.5", features = ["limit"] }
 # no C image libraries at runtime).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "tiff", "gif", "bmp", "pnm"] }
 # URL fetch for the "web link" upload arm — rustls only.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "blocking"] }
 futures-util = { version = "0.3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

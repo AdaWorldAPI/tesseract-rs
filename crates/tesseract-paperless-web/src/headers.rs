@@ -124,9 +124,15 @@ mod tests {
     fn framing_is_self_only_unless_origins_are_listed() {
         let none = with(None).expect("default");
         assert_eq!(none.csp, "frame-ancestors 'self'");
-        assert_eq!(none.frame_options.as_ref().map(|v| v.as_bytes()), Some(&b"SAMEORIGIN"[..]));
+        assert_eq!(
+            none.frame_options.as_ref().map(|v| v.as_bytes()),
+            Some(&b"SAMEORIGIN"[..])
+        );
 
-        let listed = with(Some("https://report.example.de, https://report.example.de/, https://x.example.de:8443")).expect("listed");
+        let listed = with(Some(
+            "https://report.example.de, https://report.example.de/, https://x.example.de:8443",
+        ))
+        .expect("listed");
         assert_eq!(
             listed.csp,
             "frame-ancestors 'self' https://report.example.de https://x.example.de:8443"

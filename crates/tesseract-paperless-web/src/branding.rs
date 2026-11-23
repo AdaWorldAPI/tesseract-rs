@@ -41,7 +41,6 @@ const MAX_NAME: usize = 60;
 const MAX_TAGLINE: usize = 240;
 const MAX_URL: usize = 2048;
 
-
 /// The branding the pages render.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Branding {

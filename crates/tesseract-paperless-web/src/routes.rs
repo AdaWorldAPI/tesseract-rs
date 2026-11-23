@@ -354,6 +354,7 @@ async fn upload(
                                  can open it until it is filed."
                             ));
                         }
+                        state.replicate_metadata();
                     }
                 }
                 IngestOutcome::Duplicate { .. } => {
@@ -975,7 +976,9 @@ async fn document_detail(
     if let Err(refused) = require_visible(&state, &scope, &hash).await {
         return refused;
     }
-    document_detail_page(&state, &scope, hash, dq).await.into_response()
+    document_detail_page(&state, &scope, hash, dq)
+        .await
+        .into_response()
 }
 
 async fn document_detail_page(
@@ -1080,8 +1083,7 @@ async fn document_original(
     let Some(key) = ContentSha256::from_hex(&hash) else {
         return fail(StatusCode::NOT_FOUND, "no document with this hash");
     };
-    if let Err(refused) = require_visible(&state, &scope_of(&state, caller.as_ref()), &hash).await
-    {
+    if let Err(refused) = require_visible(&state, &scope_of(&state, caller.as_ref()), &hash).await {
         return refused;
     }
     let row = match state.store.get(&hash).await {
@@ -1202,8 +1204,7 @@ async fn document_delete(
     caller: Option<Extension<Caller>>,
     Path(hash): Path<String>,
 ) -> Response {
-    if let Err(refused) = require_visible(&state, &scope_of(&state, caller.as_ref()), &hash).await
-    {
+    if let Err(refused) = require_visible(&state, &scope_of(&state, caller.as_ref()), &hash).await {
         return refused;
     }
     // The search-index delete only runs when the archive delete actually
@@ -1258,6 +1259,11 @@ async fn delete_document_and_original(state: Arc<AppState>, hash: String) {
                     Ok(Ok(())) => {}
                 }
             }
+            // Then the S3 copy, record before original (`docs/RECOVERY.md` §4),
+            // in the background: the delete answers without waiting for S3.
+            // A failure leaves the S3 objects; a later restore would bring the
+            // document back, so it is logged with the hash.
+            state.replicate_delete(&hash);
         }
         Err(e) => eprintln!("delete {hash} from archive failed: {e} (search index left untouched)"),
     }
@@ -1365,6 +1371,7 @@ async fn document_assign(
         .assign(&hash, kind, f.definition_id, Source::Manual, now_unix_ms())
         .await
         .map_err(|e| meta_fail(&e))?;
+    state.replicate_metadata();
     Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
@@ -1382,6 +1389,7 @@ async fn document_unassign(
         .unassign(&hash, kind, f.definition_id)
         .await
         .map_err(|e| store_fail(&e))?;
+    state.replicate_metadata();
     Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
@@ -1407,6 +1415,7 @@ async fn document_accept(
         )
         .await
         .map_err(|e| meta_fail(&e))?;
+    state.replicate_metadata();
     Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
@@ -1447,6 +1456,9 @@ async fn document_review(
             ))
         }
     }
+    // The review flag is written: copy it before either redirect, so a failed
+    // inbox lookup below cannot skip the copy.
+    state.replicate_metadata();
     if !to_inbox {
         return Ok(back_to_document(&hash, f.from.as_deref()));
     }
@@ -1490,6 +1502,7 @@ async fn document_customer(
         .set_customer(&hash, customer, now_unix_ms())
         .await
         .map_err(|e| meta_fail(&e))?;
+    state.replicate_metadata();
     Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
@@ -1610,7 +1623,39 @@ struct DashboardTemplate {
     kinds: Vec<KindStat>,
     /// The newest documents to review, at most `DASHBOARD_RECENT`.
     recent: Vec<RecentItem>,
+    /// The S3 copy's state, `None` when no copy is configured.
+    replica: Option<String>,
     error: Option<String>,
+}
+
+/// One line about the S3 copy for the dashboard, or `None` without a copy.
+fn replica_summary(state: &AppState) -> Option<String> {
+    state.replica.as_ref()?;
+    let status = state
+        .replica_status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    Some(
+        match (status.checked_at_unix_ms, status.error, status.backlog) {
+            (None, _, _) => "S3 copy: first check pending".to_string(),
+            (Some(at), Some(e), _) => {
+                format!("S3 copy: last check failed ({}): {e}", format_unix_ms(at))
+            }
+            (Some(at), None, Some(0)) => {
+                format!(
+                    "S3 copy: no documents waiting to be copied (estimate, checked {})",
+                    format_unix_ms(at)
+                )
+            }
+            (Some(at), None, Some(n)) => format!(
+                "S3 copy: about {n} document{} not yet copied (estimate, checked {})",
+                if n == 1 { "" } else { "s" },
+                format_unix_ms(at)
+            ),
+            (Some(at), None, None) => format!("S3 copy: checked {}", format_unix_ms(at)),
+        },
+    )
 }
 
 const DASHBOARD_RECENT: usize = 5;
@@ -1656,6 +1701,7 @@ async fn dashboard(
                     ingested_at: format_unix_ms(r.ingested_at_unix_ms),
                 })
                 .collect(),
+            replica: replica_summary(&state),
             error: None,
         }),
         Err(e) => render(&DashboardTemplate {
@@ -1663,6 +1709,7 @@ async fn dashboard(
             unreviewed: 0,
             kinds: Vec::new(),
             recent: Vec::new(),
+            replica: replica_summary(&state),
             error: Some(format!("archive read failed: {e}")),
         }),
     }
@@ -1891,6 +1938,7 @@ async fn definition_create(
         .create_definition(kind, name, now_unix_ms())
         .await
         .map_err(|e| meta_fail(&e))?;
+    state.replicate_metadata();
     Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 
@@ -1906,6 +1954,7 @@ async fn definition_rename(
         .rename_definition(kind, f.definition_id, name)
         .await
         .map_err(|e| meta_fail(&e))?;
+    state.replicate_metadata();
     Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 
@@ -1938,6 +1987,7 @@ async fn definition_rule(
         )
         .await
         .map_err(|e| meta_fail(&e))?;
+    state.replicate_metadata();
     Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 
@@ -1952,6 +2002,7 @@ async fn definition_retire(
         .retire_definition(kind, f.definition_id)
         .await
         .map_err(|e| meta_fail(&e))?;
+    state.replicate_metadata();
     Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 
@@ -2155,12 +2206,13 @@ mod tests {
             index.path(),
             blobs.path(),
             FsPath::new("/nonexistent/deepnsm/word_frequency"),
+            None,
         )
         .await
         .expect("AppState::load");
         let mut state = state;
-        state.policy = policy
-            .map(|p| crate::customers::CustomerPolicy::from_json(p).expect("test policy"));
+        state.policy =
+            policy.map(|p| crate::customers::CustomerPolicy::from_json(p).expect("test policy"));
         let state = Arc::new(state);
         let app = router(state.clone());
         Harness {
@@ -2465,6 +2517,7 @@ mod tests {
                     index.path(),
                     blobs.path(),
                     FsPath::new("/nonexistent/deepnsm/word_frequency"),
+                    None,
                 )
                 .await
                 .expect("AppState::load"),
@@ -3337,11 +3390,17 @@ mod tests {
         for uri in ["/documents", "/inbox"] {
             let (_, _, body) = send(&h, as_role(get_req(uri), "paperless.k01")).await;
             assert!(body.contains(&k01), "{uri}: own document listed");
-            assert!(!body.contains(&k02), "{uri}: another customer's document leaked");
+            assert!(
+                !body.contains(&k02),
+                "{uri}: another customer's document leaked"
+            );
             assert!(!body.contains(&none), "{uri}: an unfiled document leaked");
             let (_, _, body) = send(&h, as_role(get_req(uri), "paperless.admin")).await;
             for hash in [&k01, &k02, &none] {
-                assert!(body.contains(hash.as_str()), "{uri}: admin sees every document");
+                assert!(
+                    body.contains(hash.as_str()),
+                    "{uri}: admin sees every document"
+                );
             }
         }
         let (_, _, body) = send(&h, as_role(get_req("/dashboard"), "paperless.k01")).await;
@@ -3365,7 +3424,10 @@ mod tests {
             vec![
                 get_req(&format!("/documents/{hash}")),
                 get_req(&format!("/documents/{hash}/original")),
-                post_form(&format!("/documents/{hash}/assign"), "kind=tag&definition_id=0"),
+                post_form(
+                    &format!("/documents/{hash}/assign"),
+                    "kind=tag&definition_id=0",
+                ),
                 post_form(&format!("/documents/{hash}/review"), "reviewed=true"),
                 post_form(&format!("/documents/{hash}/customer"), "customer=K01"),
                 post_form(&format!("/documents/{hash}/delete"), ""),
@@ -3377,13 +3439,26 @@ mod tests {
             assert_eq!(status, StatusCode::NOT_FOUND, "{what}");
         }
         let meta = h.state.store.meta();
-        assert!(h.state.store.get(&k02).await.expect("get").is_some(), "not deleted");
-        assert!(meta.assignments_for(&k02).await.expect("a").is_empty(), "not assigned");
+        assert!(
+            h.state.store.get(&k02).await.expect("get").is_some(),
+            "not deleted"
+        );
+        assert!(
+            meta.assignments_for(&k02).await.expect("a").is_empty(),
+            "not assigned"
+        );
         assert!(!meta.is_reviewed(&k02).await.expect("r"), "not reviewed");
-        assert_eq!(meta.customer_of(&k02).await.expect("c").as_deref(), Some("K02"), "not moved");
+        assert_eq!(
+            meta.customer_of(&k02).await.expect("c").as_deref(),
+            Some("K02"),
+            "not moved"
+        );
         // The same routes work on the caller's own document.
-        let (status, _, _) =
-            send(&h, as_role(get_req(&format!("/documents/{k01}")), "paperless.k01")).await;
+        let (status, _, _) = send(
+            &h,
+            as_role(get_req(&format!("/documents/{k01}")), "paperless.k01"),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
     }
 
@@ -3429,14 +3504,30 @@ mod tests {
             assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         }
         let meta = h.state.store.meta();
-        assert_eq!(meta.customer_of(&k01).await.expect("c").as_deref(), Some("K01"));
-        let (status, _, _) =
-            send(&h, as_role(post_form(&uri, "customer=K%2002"), "paperless.admin")).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "an invalid code is refused for anyone");
-        let (status, _, _) =
-            send(&h, as_role(post_form(&uri, "customer=K02"), "paperless.admin")).await;
+        assert_eq!(
+            meta.customer_of(&k01).await.expect("c").as_deref(),
+            Some("K01")
+        );
+        let (status, _, _) = send(
+            &h,
+            as_role(post_form(&uri, "customer=K%2002"), "paperless.admin"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "an invalid code is refused for anyone"
+        );
+        let (status, _, _) = send(
+            &h,
+            as_role(post_form(&uri, "customer=K02"), "paperless.admin"),
+        )
+        .await;
         assert_eq!(status, StatusCode::SEE_OTHER);
-        assert_eq!(meta.customer_of(&k01).await.expect("c").as_deref(), Some("K02"));
+        assert_eq!(
+            meta.customer_of(&k01).await.expect("c").as_deref(),
+            Some("K02")
+        );
         let (status, _, _) =
             send(&h, as_role(post_form(&uri, "customer="), "paperless.admin")).await;
         assert_eq!(status, StatusCode::SEE_OTHER);
@@ -3457,8 +3548,10 @@ mod tests {
         body.extend_from_slice(b"\r\n");
         if let Some(c) = customer {
             body.extend_from_slice(
-                format!("--{b}\r\nContent-Disposition: form-data; name=\"customer\"\r\n\r\n{c}\r\n")
-                    .as_bytes(),
+                format!(
+                    "--{b}\r\nContent-Disposition: form-data; name=\"customer\"\r\n\r\n{c}\r\n"
+                )
+                .as_bytes(),
             );
         }
         body.extend_from_slice(format!("--{b}--\r\n").as_bytes());
@@ -3487,23 +3580,39 @@ mod tests {
             as_role(upload_req(b"k02 document", Some("K01")), "paperless.k01"),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "an error page, not a redirect: {location:?}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an error page, not a redirect: {location:?}"
+        );
         assert!(body.contains("filed under a customer you cannot see"));
         assert!(!body.contains(&k02), "the page must not name the document");
         assert_eq!(
-            h.state.store.meta().customer_of(&k02).await.expect("c").as_deref(),
+            h.state
+                .store
+                .meta()
+                .customer_of(&k02)
+                .await
+                .expect("c")
+                .as_deref(),
             Some("K02"),
             "a duplicate upload must not move the document"
         );
 
         let before = h.state.store.count().await.expect("count");
-        let (_, _, body) =
-            send(&h, as_role(upload_req(b"new bytes", None), "paperless.k01")).await;
+        let (_, _, body) = send(&h, as_role(upload_req(b"new bytes", None), "paperless.k01")).await;
         assert!(body.contains("choose the customer"));
-        let (_, _, body) =
-            send(&h, as_role(upload_req(b"new bytes", Some("K02")), "paperless.k01")).await;
+        let (_, _, body) = send(
+            &h,
+            as_role(upload_req(b"new bytes", Some("K02")), "paperless.k01"),
+        )
+        .await;
         assert!(body.contains("cannot file documents under customer K02"));
-        assert_eq!(h.state.store.count().await.expect("count"), before, "nothing archived");
+        assert_eq!(
+            h.state.store.count().await.expect("count"),
+            before,
+            "nothing archived"
+        );
     }
 
     /// The per-customer JSON lists exactly that customer's documents, to a
@@ -3537,7 +3646,10 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN, "no caller, no scope");
         let (status, _, body) = send(
             &h,
-            as_role(get_req("/api/v1/customers/K02/documents"), "paperless.admin"),
+            as_role(
+                get_req("/api/v1/customers/K02/documents"),
+                "paperless.admin",
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -3546,9 +3658,16 @@ mod tests {
         let open = harness().await;
         let (status, _, _) = send(
             &open,
-            as_role(get_req("/api/v1/customers/K01/documents"), "paperless.admin"),
+            as_role(
+                get_req("/api/v1/customers/K01/documents"),
+                "paperless.admin",
+            ),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "no policy, no per-customer API");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "no policy, no per-customer API"
+        );
     }
 }

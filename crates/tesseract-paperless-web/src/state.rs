@@ -10,10 +10,26 @@ use tesseract_paperless::auto_match::AutoMatchParams;
 use tesseract_paperless::auto_model::{index_tokenizer, AutoModel, MineInputs};
 use tesseract_paperless::auto_rows::VocabParams;
 use tesseract_paperless::blobs::BlobStore;
+
+use crate::replica::Replica;
 use tesseract_paperless::kv::ContentSha256;
 use tesseract_paperless::search::SearchIndex;
 use tesseract_paperless::store::LanceStore;
 use tokio::sync::Semaphore;
+
+/// What the last replication pass found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplicaStatus {
+    /// When the last pass ended, milliseconds since the Unix epoch.
+    pub checked_at_unix_ms: Option<i64>,
+    /// Documents still without a copy in S3 after that pass.
+    pub backlog: Option<usize>,
+    /// Why the last pass failed, if it did.
+    pub error: Option<String>,
+}
+
+/// How many S3 copies run at once in the background.
+pub const REPLICA_PERMITS: usize = 4;
 
 /// How many locks [`AppState::hash_lock`] spreads hashes over.
 pub const HASH_LOCK_STRIPES: usize = 64;
@@ -36,7 +52,13 @@ pub struct AppState {
     /// The uploaded originals, keyed by their SHA-256 (`blobs.rs`). Written
     /// before the document row (S-5), so a row never points at a missing file
     /// unless the row predates this store.
-    pub blobs: BlobStore,
+    pub blobs: Arc<BlobStore>,
+    /// The S3 copy (`replica.rs`), when `PAPERLESS_S3_*` is configured.
+    pub replica: Option<Arc<Replica>>,
+    /// What the last replication pass found, for the dashboard.
+    pub replica_status: std::sync::Mutex<ReplicaStatus>,
+    /// Bounds how many S3 copies run at once in the background.
+    replica_permits: Arc<Semaphore>,
     /// Serializes the original and row writes of an upload with the row and
     /// original deletes of a delete, for the same hash (see [`Self::hash_lock`]).
     hash_locks: Box<[Arc<tokio::sync::Mutex<()>>]>,
@@ -91,6 +113,7 @@ impl AppState {
         search_index_dir: &Path,
         blob_dir: &Path,
         deepnsm_vocab_dir: &Path,
+        replica: Option<Replica>,
     ) -> Result<Self, String> {
         let path = |name: &str| model_dir.join(format!("eng.{name}"));
         let opt = |name: &str| path(name).exists().then(|| path(name));
@@ -114,8 +137,60 @@ impl AppState {
         let search = SearchIndex::open_or_create(search_index_dir)
             .map_err(|e| format!("open search index at {}: {e}", search_index_dir.display()))?;
 
-        let blobs = BlobStore::open(blob_dir)
-            .map_err(|e| format!("open original-file store at {}: {e}", blob_dir.display()))?;
+        let blobs = Arc::new(
+            BlobStore::open(blob_dir)
+                .map_err(|e| format!("open original-file store at {}: {e}", blob_dir.display()))?,
+        );
+
+        // An empty volume (or an interrupted restore) is filled from the S3
+        // copy before anything else reads the archive, so the reconcile below
+        // indexes the restored documents (paperless-rs `docs/RECOVERY.md` §6).
+        // A failure stops the start: an empty archive must not begin taking
+        // uploads while its history is unreachable.
+        let replica = replica.map(Arc::new);
+        if let Some(r) = &replica {
+            let restore = crate::replica::needs_restore(&store, blob_dir)
+                .await
+                .map_err(|e| format!("check whether to restore: {e}"))?;
+            if restore {
+                let report = crate::replica::restore(r, &store, &blobs)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "restore from the S3 copy failed: {e} (the archive is empty or a \
+                             restore was interrupted; it will retry on the next start)"
+                        )
+                    })?;
+                eprintln!(
+                    "tesseract-paperless-web: restored from S3: {} documents ({} already local, \
+                     {} skipped, {} without original), metadata {}",
+                    report.restored,
+                    report.already_local,
+                    report.skipped,
+                    report.without_original,
+                    if report.metadata {
+                        "imported"
+                    } else {
+                        "absent"
+                    }
+                );
+            } else if crate::replica::has_snapshot_hold(blob_dir) {
+                // A degraded restore skipped damaged records. Retry them on
+                // every start; a failure here is logged, never fatal, since
+                // the archive itself is present and usable.
+                match crate::replica::retry_held(r, &store, &blobs).await {
+                    Ok(report) => eprintln!(
+                        "tesseract-paperless-web: retried held S3 records: {} restored, {} \
+                         still damaged",
+                        report.restored, report.skipped
+                    ),
+                    Err(e) => eprintln!(
+                        "tesseract-paperless-web: retrying held S3 records failed: {e}; will \
+                         retry on the next start"
+                    ),
+                }
+            }
+        }
 
         // The index holds references into the archive, never text of its
         // own, so it is brought back in line with the archive on every start:
@@ -195,6 +270,9 @@ impl AppState {
             store,
             search,
             blobs,
+            replica,
+            replica_status: std::sync::Mutex::new(ReplicaStatus::default()),
+            replica_permits: Arc::new(Semaphore::new(REPLICA_PERMITS)),
             hash_locks: (0..HASH_LOCK_STRIPES)
                 .map(|_| Arc::new(tokio::sync::Mutex::new(())))
                 .collect(),
@@ -219,6 +297,139 @@ impl AppState {
     #[must_use]
     pub fn hash_lock(&self, key: &ContentSha256) -> Arc<tokio::sync::Mutex<()>> {
         self.hash_locks[usize::from(key.as_bytes()[0]) % self.hash_locks.len()].clone()
+    }
+
+    /// Copy one document to S3 after its local commit, in the background: the
+    /// request that committed it does not wait for S3. The copy takes the
+    /// document's lock, so it stays ordered with a delete of the same
+    /// document. A failure is logged; the replicator copies it later
+    /// (`docs/RECOVERY.md` §4 and §5). Nothing is lost if the process stops
+    /// before the copy runs: the replicator finds every document whose S3
+    /// copy is missing or lacks its original.
+    pub fn replicate_document(self: &Arc<Self>, hash: &str) {
+        if self.replica.is_none() {
+            return;
+        }
+        let Some(key) = ContentSha256::from_hex(hash) else {
+            return;
+        };
+        let state = Arc::clone(self);
+        let hash = hash.to_string();
+        // A copy that finds no free slot is dropped, not queued: the
+        // replicator finds every document whose S3 copy is missing or lacks
+        // its original, so nothing is lost and tasks cannot pile up.
+        let Ok(permit) = Arc::clone(&self.replica_permits).try_acquire_owned() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            let Some(r) = &state.replica else { return };
+            if let Err(e) = r
+                .upload_document(&state.store, &state.blobs, &hash, state.hash_lock(&key))
+                .await
+            {
+                eprintln!("replica: copying {hash} to S3 failed: {e}; the replicator will retry");
+            }
+        });
+    }
+
+    /// Upload the metadata snapshot after a metadata change, in the
+    /// background. Each upload reads the metadata when it runs, under the
+    /// snapshot lock, so whichever runs last uploads the newest state. A
+    /// failure is logged; the replicator uploads it again.
+    pub fn replicate_metadata(self: &Arc<Self>) {
+        if self.replica.is_none() {
+            return;
+        }
+        let state = Arc::clone(self);
+        // Dropped when no slot is free, like a document copy: the replicator
+        // uploads the snapshot on every pass.
+        let Ok(permit) = Arc::clone(&self.replica_permits).try_acquire_owned() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            let Some(r) = &state.replica else { return };
+            if let Err(e) = r.upload_snapshot(&state.store, &state.blobs).await {
+                eprintln!(
+                    "replica: metadata snapshot upload failed: {e}; the replicator will retry"
+                );
+            }
+        });
+    }
+
+    /// Remove a deleted document from S3. First a delete intent is written to
+    /// disk, so the delete survives a failure or a restart; then, if a slot is
+    /// free, it is carried out in the background (record, then original) and
+    /// the snapshot uploaded. Without a free slot, or after a failure, the
+    /// replicator carries it out on its next pass. The local delete has
+    /// already finished; the request does not wait for S3.
+    pub fn replicate_delete(self: &Arc<Self>, hash: &str) {
+        if self.replica.is_none() {
+            return;
+        }
+        if let Err(e) = Replica::record_delete_intent(&self.blobs, hash) {
+            eprintln!(
+                "replica: recording the S3 delete of {hash} failed: {e}; the S3 copy may keep it"
+            );
+        }
+        let Some(key) = ContentSha256::from_hex(hash) else {
+            return;
+        };
+        let Ok(permit) = Arc::clone(&self.replica_permits).try_acquire_owned() else {
+            return;
+        };
+        let state = Arc::clone(self);
+        let hash = hash.to_string();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let Some(r) = &state.replica else { return };
+            if let Err(e) = r
+                .apply_delete_intent(&state.store, &state.blobs, &hash, state.hash_lock(&key))
+                .await
+            {
+                eprintln!(
+                    "replica: deleting {hash} from S3 failed: {e}; the replicator will retry"
+                );
+            }
+            if let Err(e) = r.upload_snapshot(&state.store, &state.blobs).await {
+                eprintln!(
+                    "replica: metadata snapshot upload failed: {e}; the replicator will retry"
+                );
+            }
+        });
+    }
+
+    /// One replication pass: copy what is missing in S3, upload the snapshot,
+    /// and record the backlog for the dashboard.
+    pub async fn replicate_now(&self) {
+        let Some(r) = &self.replica else { return };
+        let outcome = r
+            .replicate(&self.store, &self.blobs, &|k| self.hash_lock(k))
+            .await;
+        let backlog = r.backlog(&self.store, &self.blobs).await;
+        let now = crate::ingest::now_unix_ms();
+        let mut status = self
+            .replica_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.checked_at_unix_ms = Some(now);
+        match (outcome, backlog) {
+            (Ok(report), Ok(n)) => {
+                if report.uploaded + report.deleted + report.failed > 0 {
+                    eprintln!(
+                        "replica: {} copied to S3, {} deleted from S3, {} failed, {n} still pending",
+                        report.uploaded, report.deleted, report.failed
+                    );
+                }
+                status.backlog = Some(n);
+                status.error = None;
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("replica: replication pass failed: {e}");
+                status.error = Some(e.to_string());
+            }
+        }
     }
 
     /// The current AUTO slot.

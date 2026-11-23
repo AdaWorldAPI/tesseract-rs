@@ -98,7 +98,10 @@ pub(crate) async fn customer_documents(
         None => Scope::Customers(Default::default()),
     };
     if !scope.covers(Some(&code)) {
-        return error(StatusCode::FORBIDDEN, "this customer is outside your access");
+        return error(
+            StatusCode::FORBIDDEN,
+            "this customer is outside your access",
+        );
     }
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
