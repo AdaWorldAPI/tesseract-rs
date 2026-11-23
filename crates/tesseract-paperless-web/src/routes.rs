@@ -2302,6 +2302,53 @@ mod tests {
         assert!(lock.try_lock().is_ok());
     }
 
+    /// Slice B: the duplicate check runs before the lock, so a document can be
+    /// deleted after the check said "already held". The upload re-checks under
+    /// the lock and stores the document as new instead of pointing at nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_duplicate_whose_document_was_deleted_meanwhile_is_stored_anew() {
+        let h = harness().await;
+        let bytes = page_bytes();
+        let key = ContentSha256::of(&bytes);
+        let hash = format!("{key:?}");
+        h.state
+            .store
+            .put(&key, Some("old.pgm"), 90, false, &sample_ir(), 1, None)
+            .await
+            .expect("seed");
+
+        // The upload passes the gate as a duplicate, then waits on the lock
+        // while the document is deleted underneath it.
+        let lock = h.state.hash_lock(&key);
+        let held = lock.lock().await;
+        let st = h.state.clone();
+        let b = bytes.clone();
+        let upload = tokio::spawn(async move {
+            ingest(
+                &st,
+                b,
+                Some("new.pgm".to_string()),
+                "image/x-portable-graymap",
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!upload.is_finished());
+        h.state.store.delete(&hash).await.expect("delete");
+        drop(held);
+
+        let outcome = upload.await.expect("join").expect("ingest");
+        assert!(
+            matches!(outcome, IngestOutcome::Stored { .. }),
+            "a deleted document was answered as a duplicate: {outcome:?}"
+        );
+        let row = h.state.store.get(&hash).await.expect("get").expect("row");
+        assert_eq!(row.filename.as_deref(), Some("new.pgm"));
+        let (status, _, body) = send_raw(&h, get_req(&format!("/documents/{hash}/original"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body == bytes);
+    }
+
     /// Slice B: altered stored bytes are refused, not served.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_tampered_original_is_refused() {

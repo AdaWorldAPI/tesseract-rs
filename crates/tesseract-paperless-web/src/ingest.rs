@@ -145,31 +145,45 @@ pub async fn ingest(
     let hex = format!("{hash:?}");
 
     if let Verdict::Duplicate { matched } = verdict {
-        // Deterministic from the hash alone — no store round-trip needed to
-        // learn the address a Stored ingest of these exact bytes already
-        // minted (`store::LanceStore::put` computes the identical value).
-        let guid = mint_document_root(&hash).root.0.to_bytes();
-        // A document stored before originals were kept has a row and no blob.
-        // These bytes hash to its key, so they are its original: keep them,
-        // and change nothing else. No recognition either way.
-        let original_added = if matched == MatchedOn::Original {
-            let lock = state.hash_lock(&hash);
-            let _held = lock.lock().await;
-            let st = state.clone();
-            let outcome = tokio::task::spawn_blocking(move || st.blobs.put(&hash, &bytes))
-                .await
-                .map_err(|e| IngestError::Task(e.to_string()))?
-                .map_err(IngestError::Blob)?;
-            outcome == PutOutcome::Written
-        } else {
-            false
-        };
-        return Ok(IngestOutcome::Duplicate {
-            hash_hex: hex,
-            document_guid: guid,
-            matched,
-            original_added,
-        });
+        // The gate looked before taking the lock, so a delete may have removed
+        // the document since. Re-check under the lock: a document that is gone
+        // is uploaded as new (below), never answered as "already held" with a
+        // link to nothing.
+        let lock = state.hash_lock(&hash);
+        let held = lock.lock().await;
+        if state
+            .store
+            .get(&hex)
+            .await
+            .map_err(IngestError::Store)?
+            .is_some()
+        {
+            // Deterministic from the hash alone — no store round-trip needed to
+            // learn the address a Stored ingest of these exact bytes already
+            // minted (`store::LanceStore::put` computes the identical value).
+            let guid = mint_document_root(&hash).root.0.to_bytes();
+            // A document stored before originals were kept has a row and no
+            // blob. These bytes hash to its key, so they are its original: keep
+            // them, and change nothing else. No recognition either way.
+            let original_added = if matched == MatchedOn::Original {
+                let st = state.clone();
+                let outcome = tokio::task::spawn_blocking(move || st.blobs.put(&hash, &bytes))
+                    .await
+                    .map_err(|e| IngestError::Task(e.to_string()))?
+                    .map_err(IngestError::Blob)?;
+                outcome == PutOutcome::Written
+            } else {
+                false
+            };
+            drop(held);
+            return Ok(IngestOutcome::Duplicate {
+                hash_hex: hex,
+                document_guid: guid,
+                matched,
+                original_added,
+            });
+        }
+        drop(held);
     }
 
     // S-2 cleared: pay for recognition now, off the async runtime, bounded by
