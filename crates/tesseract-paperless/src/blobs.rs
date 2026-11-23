@@ -109,6 +109,14 @@ impl BlobStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, BlobError> {
         let root = root.into();
         create_dir_durable(&root)?;
+        // Sync every existing ancestor's entry too: a start whose directory
+        // sync failed exits, and the next start finds the directories present
+        // but never synced.
+        let mut dir = Some(root.as_path());
+        while let Some(d) = dir.filter(|d| !d.as_os_str().is_empty()) {
+            sync_dir(d)?;
+            dir = d.parent();
+        }
         Ok(Self { root })
     }
 
@@ -188,7 +196,11 @@ impl BlobStore {
             drop(f);
             fs::rename(&temp, &target)?;
             // The rename is only durable once the directory entry is.
-            sync_dir(dir)
+            sync_dir(dir)?;
+            // The fan-out directory's own entry lives in the root. Synced on
+            // every write, not only when this put created the directory: an
+            // earlier put may have created it and then failed to sync.
+            sync_dir(&self.root)
         })();
         if let Err(e) = written {
             // Best effort: a leftover temporary file is garbage, not a blob,
@@ -260,6 +272,7 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(test)]
     {
         tests::DIR_SYNCS.with(|n| n.set(n.get() + 1));
+        tests::SYNCED.with(|v| v.borrow_mut().push(dir.to_path_buf()));
         if tests::FAIL_DIR_SYNC.with(|f| f.replace(false)) {
             return Err(io::Error::other("injected directory sync failure"));
         }
@@ -275,8 +288,49 @@ mod tests {
     thread_local! {
         /// Directory syncs performed on this thread.
         pub(super) static DIR_SYNCS: Cell<usize> = const { Cell::new(0) };
+        /// Directories synced on this thread, in order.
+        pub(super) static SYNCED: std::cell::RefCell<Vec<PathBuf>> =
+            const { std::cell::RefCell::new(Vec::new()) };
         /// Fail the next directory sync on this thread.
         pub(super) static FAIL_DIR_SYNC: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// A put that created the fan-out directory and then failed to sync its
+    /// parent leaves the directory present. The retry finds it and must still
+    /// sync the root before reporting the blob written.
+    #[test]
+    fn a_retry_after_a_failed_directory_creation_syncs_the_root() {
+        let (_d, s) = store();
+        let bytes = b"directory created, entry not synced".to_vec();
+        let key = ContentSha256::of(&bytes);
+        let hex = format!("{key:?}");
+        FAIL_DIR_SYNC.with(|f| f.set(true));
+        assert!(matches!(s.put(&key, &bytes), Err(BlobError::Io(_))));
+        assert!(
+            s.root().join(&hex[..2]).is_dir(),
+            "the directory was created"
+        );
+        assert!(!s.contains(&key));
+
+        SYNCED.with(|v| v.borrow_mut().clear());
+        assert_eq!(s.put(&key, &bytes).expect("retry"), PutOutcome::Written);
+        let synced = SYNCED.with(|v| v.borrow().clone());
+        assert!(
+            synced.iter().any(|p| p == s.root()),
+            "the retry did not sync the root: {synced:?}"
+        );
+    }
+
+    #[test]
+    fn opening_an_existing_store_syncs_its_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("blobs");
+        fs::create_dir(&root).expect("pre-existing root");
+        SYNCED.with(|v| v.borrow_mut().clear());
+        BlobStore::open(&root).expect("open");
+        let synced = SYNCED.with(|v| v.borrow().clone());
+        assert!(synced.iter().any(|p| p == &root), "{synced:?}");
+        assert!(synced.iter().any(|p| p == dir.path()), "{synced:?}");
     }
 
     #[test]
