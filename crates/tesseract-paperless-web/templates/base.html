@@ -5,69 +5,89 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}{% endblock %}</title>
 <style>
-  :root { color-scheme: light dark; }
+{{ self.zones_css()|safe }}
+  :root { color-scheme: light; }
+  nav.topnav-links { display: none; }
+  @media (max-width: 640px) { .a2-body, .a2-body.mode-main-wide { grid-template-columns: minmax(0, 1fr); } aside.sidemenu-region, aside.quick-rail { display: none; } nav.topnav-links { display: flex; flex-wrap: wrap; } }
+{{ self.brand().css_vars()|safe }}
   * { box-sizing: border-box; }
   body {
-    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    font-family: var(--brand-font-family);
     line-height: 1.5; margin: 0;
-    background: Canvas; color: CanvasText;
+    background: var(--brand-bg); color: var(--brand-fg);
   }
-  a { color: {{ self.brand().accent }}; }
-  header.shell {
-    border-bottom: 1px solid color-mix(in srgb, CanvasText 15%, Canvas);
-    padding: .75rem 1rem;
-  }
-  header.shell .bar {
-    max-width: 64rem; margin: 0 auto;
-    display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1.5rem;
-  }
+  a { color: var(--brand-accent); }
+  h1 { font-size: 1.5rem; margin: 0 0 1rem; color: var(--brand-h1); word-break: break-word; }
+  header.shell { background: var(--brand-side-bg); color: var(--brand-side-fg); padding: .75rem 1rem; }
+  header.shell .bar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1.5rem; }
   header.shell .brand { font-weight: 700; font-size: 1.1rem; color: inherit; text-decoration: none; }
   header.shell .brand img { height: 1.4rem; vertical-align: middle; margin-right: .4rem; }
-  nav.main ul { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: .25rem .9rem; }
-  nav.main a { text-decoration: none; font-weight: 600; color: color-mix(in srgb, CanvasText 70%, Canvas); padding: .15rem 0; }
-  nav.main a:hover { color: {{ self.brand().accent }}; }
-  nav.main a[aria-current="page"] { color: {{ self.brand().accent }}; border-bottom: 2px solid {{ self.brand().accent }}; }
   header.shell .end { margin-left: auto; }
+  nav.topnav-links { gap: .25rem .9rem; flex-basis: 100%; }
+  nav.topnav-links a { color: var(--brand-side-fg); text-decoration: none; font-weight: 600; padding: .15rem 0; }
   form.signout { display: inline; margin: 0; }
   form.signout button { font: inherit; padding: 0; border: 0; background: none; color: inherit; text-decoration: underline; cursor: pointer; }
-  main { max-width: 52rem; margin: 0 auto; padding: 1.5rem 1rem 2rem; }
-  h1 { font-size: 1.5rem; margin: 0 0 1rem; word-break: break-word; }
+  aside.sidemenu-region { align-self: stretch; background: var(--brand-side-bg); color: var(--brand-side-fg); padding: .75rem 0; }
+  nav.main ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+  nav.main a {
+    display: block; padding: .5rem 1rem; text-decoration: none; font-weight: 500;
+    color: var(--brand-side-fg); border-left: 3px solid transparent;
+  }
+  /* Hover and the current entry keep the side background: side_fg is chosen
+     for contrast against side_bg, and an overlay there could undo it. */
+  nav.main a:hover { text-decoration: underline; border-left-color: var(--brand-side-hover); }
+  nav.main a[aria-current="page"], nav.topnav-links a[aria-current="page"] { font-weight: 700; border-left-color: var(--brand-accent); text-decoration: underline; text-decoration-color: var(--brand-accent); text-decoration-thickness: 2px; }
+  aside.quick-rail {
+    align-self: stretch; padding: .75rem 0; text-align: center;
+    background: var(--brand-subtle-bg); border-left: 1px solid var(--brand-border);
+  }
+  aside.quick-rail a {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 2.5rem; height: 2.5rem; font-size: 1.4rem; font-weight: 700; text-decoration: none;
+    border-radius: var(--brand-radius-sm); background: var(--brand-accent); color: var(--brand-on-accent);
+  }
+  main { min-width: 0; padding: 1.25rem; }
   .card {
-    border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
-    border-radius: 12px; padding: 1.25rem; margin-bottom: 1.25rem;
+    background: var(--brand-card-bg); border: 1px solid var(--brand-border);
+    border-radius: var(--brand-radius); box-shadow: var(--brand-elevation);
+    padding: 1.25rem; margin-bottom: 1.25rem;
   }
   .card h2 { font-size: 1rem; margin: 0 0 .75rem; }
   .error {
-    border: 1px solid #ef4444; background: color-mix(in srgb, #ef4444 12%, Canvas);
-    color: color-mix(in srgb, #ef4444 85%, CanvasText);
-    padding: .75rem 1rem; border-radius: 8px; margin-bottom: 1rem;
+    border: 1px solid #ef4444; background: color-mix(in srgb, #ef4444 12%, var(--brand-card-bg));
+    color: color-mix(in srgb, #ef4444 85%, var(--brand-fg));
+    padding: .75rem 1rem; border-radius: var(--brand-radius-sm); margin-bottom: 1rem;
   }
-  .note, .none, .muted { color: color-mix(in srgb, CanvasText 55%, Canvas); font-size: .85rem; margin: .25rem 0; }
+  .note, .none, .muted { color: var(--brand-muted); font-size: .85rem; margin: .25rem 0; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
   /* Hover changes no colour: the text/background pair was chosen for 4.5:1
-     contrast (Branding::on_accent), and a brightness filter would undo it. */
-  button:hover { outline: 2px solid CanvasText; outline-offset: 2px; }
-  :focus-visible { outline: 2px solid CanvasText; outline-offset: 2px; }
-  footer { max-width: 52rem; margin: 0 auto; padding: 0 1rem 2rem; font-size: .8rem; color: color-mix(in srgb, CanvasText 50%, Canvas); }
-  /* The portal layout: a header bar, cards on a slightly tinted page. Neutral by
-     default (system colours, light and dark); a deployment sets its own colours
-     with BRAND_ACCENT and BRAND_HEADER_BG. */
-  body { background: color-mix(in srgb, CanvasText 4%, Canvas); }
-  header.shell { border-bottom: 0;
-    background: {% if let Some(bg) = self.brand().header_bg() %}{{ bg }}{% else %}color-mix(in srgb, CanvasText 88%, Canvas){% endif %}; }
-  header.shell .brand, header.shell .end, form.signout button, nav.main a:hover, nav.main a[aria-current="page"] {
-    color: {% if let Some(fg) = self.brand().on_header() %}{{ fg }}{% else %}Canvas{% endif %}; }
-  nav.main a { color: {% if let Some(fg) = self.brand().on_header() %}{{ fg }}{% else %}Canvas{% endif %}; }
-  header.shell :focus-visible { outline-color: {% if let Some(fg) = self.brand().on_header() %}{{ fg }}{% else %}Canvas{% endif %}; }
-  nav.main a[aria-current="page"] { border-bottom-color: {{ self.brand().accent }}; }
-  .card { background: Canvas; border-radius: 14px; box-shadow: 0 4px 16px rgba(0,0,0,.08); }
+     contrast (the on_accent token), and a brightness filter would undo it. */
+  button:hover { outline: 2px solid var(--brand-fg); outline-offset: 2px; }
+  :focus-visible { outline: 2px solid var(--brand-fg); outline-offset: 2px; }
+  header.shell :focus-visible, aside.sidemenu-region :focus-visible { outline-color: var(--brand-side-fg); }
+  footer { padding: .75rem 1rem; font-size: .8rem; background: var(--brand-side-bg); color: var(--brand-side-fg); }
 {% block style %}{% endblock %}
 </style>
 </head>
 <body>
-<header class="shell">
+<div class="a2-shell">
+<header class="shell region-top_bar">
   <div class="bar">
     <a class="brand" href="/dashboard">{% if let Some(logo) = self.brand().logo_url() %}<img src="{{ logo }}" alt="">{% endif %}{{ self.brand().name }}</a>
+    {% if self.sign_in() %}<span class="end"><form class="signout" method="post" action="/auth/logout"><button type="submit">Sign out</button></form></span>{% endif %}
+    <nav class="topnav-links" aria-label="Main (compact)">
+      <a href="/dashboard"{% if self.nav() == "dashboard" %} aria-current="page"{% endif %}>Dashboard</a>
+      <a href="/inbox"{% if self.nav() == "inbox" %} aria-current="page"{% endif %}>Inbox</a>
+      <a href="/documents"{% if self.nav() == "documents" %} aria-current="page"{% endif %}>Documents</a>
+      <a href="/definitions?kind=correspondent"{% if self.nav() == "correspondent" %} aria-current="page"{% endif %}>Correspondents</a>
+      <a href="/definitions?kind=tag"{% if self.nav() == "tag" %} aria-current="page"{% endif %}>Tags</a>
+      <a href="/definitions?kind=document_type"{% if self.nav() == "document_type" %} aria-current="page"{% endif %}>Document types</a>
+      <a href="/"{% if self.nav() == "upload" %} aria-current="page"{% endif %}>Upload</a>
+    </nav>
+  </div>
+</header>
+<div class="a2-body {{ self.layout_class() }}">
+  <aside class="sidemenu-region region-left_nav">
     <nav class="main" aria-label="Main">
       <ul>
         <li><a href="/dashboard"{% if self.nav() == "dashboard" %} aria-current="page"{% endif %}>Dashboard</a></li>
@@ -79,12 +99,15 @@
         <li><a href="/"{% if self.nav() == "upload" %} aria-current="page"{% endif %}>Upload</a></li>
       </ul>
     </nav>
-    {% if self.sign_in() %}<span class="end"><form class="signout" method="post" action="/auth/logout"><button type="submit">Sign out</button></form></span>{% endif %}
-  </div>
-</header>
-<main>
+  </aside>
+  <main class="region-center">
 {% block content %}{% endblock %}
-</main>
+  </main>
+  <aside class="quick-rail region-right_panel" aria-label="Quick actions">
+    <a href="/" aria-label="Upload" title="Upload">+</a>
+  </aside>
+</div>
 <footer>Pure-Rust OCR (no libtesseract/leptonica at runtime) &middot; <code>lancedb</code>-backed archive.{% if self.brand().is_custom() %} &middot; powered by tesseract-rs{% endif %}</footer>
+</div>
 </body>
 </html>

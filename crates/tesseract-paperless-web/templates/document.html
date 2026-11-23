@@ -7,7 +7,7 @@
   h1 { font-size: 1.5rem; margin: 0 0 .5rem; word-break: break-word; }
   .meta {
     display: flex; flex-wrap: wrap; gap: .5rem 1.2rem; font-size: .85rem;
-    color: color-mix(in srgb, CanvasText 55%, Canvas); margin-bottom: 1.25rem;
+    color: var(--brand-muted); margin-bottom: 1.25rem;
   }
   .low-conf { color: #d97706; font-weight: 600; }
   .hash { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8em; }
@@ -16,35 +16,35 @@
     font-size: .95rem; margin: 0;
   }
   table.fields, table.regions, table.triples { width: 100%; border-collapse: collapse; font-size: .9rem; }
-  table.fields td, table.regions td, table.triples td, table.triples th { padding: .35rem .5rem; border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, Canvas); vertical-align: top; }
+  table.fields td, table.regions td, table.triples td, table.triples th { padding: .35rem .5rem; border-bottom: 1px solid var(--brand-border); vertical-align: top; }
   table.fields td:first-child { font-weight: 600; white-space: nowrap; }
-  table.triples th { text-align: left; font-size: .75rem; text-transform: uppercase; letter-spacing: .03em; color: color-mix(in srgb, CanvasText 55%, Canvas); }
-  table.triples td.sentence { color: color-mix(in srgb, CanvasText 55%, Canvas); font-size: .85em; }
+  table.triples th { text-align: left; font-size: .75rem; text-transform: uppercase; letter-spacing: .03em; background: var(--brand-subtle-bg); color: var(--brand-muted); }
+  table.triples td.sentence { color: var(--brand-muted); font-size: .85em; }
   .region-kind {
     display: inline-block; font-size: .75rem; font-weight: 600; text-transform: uppercase;
-    letter-spacing: .03em; color: color-mix(in srgb, CanvasText 55%, Canvas);
+    letter-spacing: .03em; color: var(--brand-muted);
     min-width: 4.5rem;
   }
   .card h3 { font-size: .9rem; margin: 1rem 0 .4rem; }
   .card h3:first-of-type { margin-top: 0; }
-  .none, .note { color: color-mix(in srgb, CanvasText 55%, Canvas); font-size: .85rem; margin: .25rem 0; }
+  .none, .note { color: var(--brand-muted); font-size: .85rem; margin: .25rem 0; }
   ul.assigned, ul.suggestions { list-style: none; margin: 0 0 .5rem; padding: 0; }
   ul.assigned li, ul.suggestions li { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .8rem; padding: .3rem 0; }
-  .src { font-size: .75rem; color: color-mix(in srgb, CanvasText 55%, Canvas); border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas); border-radius: 999px; padding: 0 .5rem; }
-  .cues { flex-basis: 100%; font-size: .8rem; color: color-mix(in srgb, CanvasText 55%, Canvas); }
+  .src { font-size: .75rem; color: var(--brand-muted); border: 1px solid var(--brand-border); border-radius: 999px; padding: 0 .5rem; }
+  .cues { flex-basis: 100%; font-size: .8rem; color: var(--brand-muted); }
   form.inline { display: inline-flex; gap: .4rem; align-items: center; margin: 0; }
-  form.inline select { padding: .3rem; border-radius: 6px; border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas); background: Canvas; color: CanvasText; }
+  form.inline select { padding: .3rem; border-radius: var(--brand-radius-sm); border: 1px solid var(--brand-border); background: var(--brand-card-bg); color: var(--brand-fg); }
   button.act {
-    padding: .3rem .8rem; font-weight: 600; border: 0; border-radius: 6px; cursor: pointer;
-    background: {{ self.brand().accent }}; color: {{ self.brand().on_accent() }};
+    padding: .3rem .8rem; font-weight: 600; border: 0; border-radius: var(--brand-radius-sm); cursor: pointer;
+    background: var(--brand-accent); color: var(--brand-on-accent);
   }
   button.secondary {
-    padding: .3rem .8rem; font-weight: 600; border-radius: 6px; cursor: pointer;
-    background: transparent; color: inherit; border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
+    padding: .3rem .8rem; font-weight: 600; border-radius: var(--brand-radius-sm); cursor: pointer;
+    background: transparent; color: inherit; border: 1px solid var(--brand-border);
   }
   form.delete { margin-top: .5rem; }
   button.danger {
-    padding: .55rem 1rem; font-weight: 600; border: 0; border-radius: 8px; cursor: pointer;
+    padding: .55rem 1rem; font-weight: 600; border: 0; border-radius: var(--brand-radius-sm); cursor: pointer;
     background: #ef4444; color: #fff;
   }
   button.danger:hover { filter: brightness(1.08); }

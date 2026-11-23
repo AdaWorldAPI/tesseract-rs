@@ -1,28 +1,28 @@
 {% extends "base.html" %}
 {% block title %}{{ heading }} — {{ self.brand().name }}{% endblock %}
 {% block style %}
-  .def { border-top: 1px solid color-mix(in srgb, CanvasText 12%, Canvas); padding: .75rem 0; }
+  .def { border-top: 1px solid var(--brand-border); padding: .75rem 0; }
   .def.retired { opacity: .6; }
   .badge {
-    font-size: .75rem; border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas);
+    font-size: .75rem; border: 1px solid var(--brand-border);
     border-radius: 999px; padding: 0 .5rem; margin-left: .4rem;
-    color: color-mix(in srgb, CanvasText 60%, Canvas);
+    color: var(--brand-muted);
   }
   .badge.warn { color: #d97706; border-color: #d97706; }
   .forms { display: flex; flex-wrap: wrap; gap: .5rem 1rem; margin-top: .5rem; }
   form.inline { display: inline-flex; flex-wrap: wrap; gap: .4rem; align-items: center; margin: 0; }
   input[type=text], select {
-    padding: .35rem .5rem; border-radius: 6px;
-    border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
-    background: Canvas; color: CanvasText; font-size: .9rem;
+    padding: .35rem .5rem; border-radius: var(--brand-radius-sm);
+    border: 1px solid var(--brand-border);
+    background: var(--brand-card-bg); color: var(--brand-fg); font-size: .9rem;
   }
   button {
-    padding: .35rem .8rem; font-weight: 600; border: 0; border-radius: 6px; cursor: pointer;
-    background: {{ self.brand().accent }}; color: {{ self.brand().on_accent() }};
+    padding: .35rem .8rem; font-weight: 600; border: 0; border-radius: var(--brand-radius-sm); cursor: pointer;
+    background: var(--brand-accent); color: var(--brand-on-accent);
   }
   button.secondary {
     background: transparent; color: inherit;
-    border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
+    border: 1px solid var(--brand-border);
   }
   button.danger { background: #ef4444; color: #fff; }
 {% endblock %}

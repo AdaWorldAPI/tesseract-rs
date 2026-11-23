@@ -4,18 +4,18 @@
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: .75rem; margin-bottom: 1.25rem; }
   .stat {
     display: block; text-decoration: none; color: inherit;
-    border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
-    border-radius: 12px; padding: 1rem;
+    background: var(--brand-card-bg); border: 1px solid var(--brand-border);
+    border-radius: var(--brand-radius); padding: 1rem;
   }
-  a.stat:hover { border-color: {{ self.brand().accent }}; }
+  a.stat:hover { border-color: var(--brand-accent); }
   .stat .n { display: block; font-size: 1.6rem; font-weight: 700; }
-  .stat .l { color: color-mix(in srgb, CanvasText 60%, Canvas); font-size: .9rem; }
+  .stat .l { color: var(--brand-muted); font-size: .9rem; }
   ul.recent { list-style: none; margin: 0; padding: 0; }
-  ul.recent li { padding: .35rem 0; border-top: 1px solid color-mix(in srgb, CanvasText 12%, Canvas); }
+  ul.recent li { padding: .35rem 0; border-top: 1px solid var(--brand-border); }
   ul.recent li:first-child { border-top: 0; }
   a.go {
-    display: inline-block; padding: .55rem 1rem; font-weight: 600; border-radius: 8px; text-decoration: none;
-    background: {{ self.brand().accent }}; color: {{ self.brand().on_accent() }};
+    display: inline-block; padding: .55rem 1rem; font-weight: 600; border-radius: var(--brand-radius-sm); text-decoration: none;
+    background: var(--brand-accent); color: var(--brand-on-accent);
   }
 {% endblock %}
 {% block content %}
