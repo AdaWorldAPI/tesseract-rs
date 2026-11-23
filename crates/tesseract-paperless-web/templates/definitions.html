@@ -47,13 +47,15 @@
     border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
   }
   button.danger { background: #ef4444; color: #fff; }
+  form.signout { display: inline; }
+  form.signout button { font: inherit; padding: 0; border: 0; background: none; color: inherit; text-decoration: underline; cursor: pointer; }
 </style>
 </head>
 <body>
 <main>
   <nav class="top">
     <h1>Definitions</h1>
-    <span><a href="/documents">Documents</a> &middot; <a href="/">Ingest</a></span>
+    <span><a href="/documents">Documents</a> &middot; <a href="/">Ingest</a>{% if self.sign_in() %} &middot; <form class="signout" method="post" action="/auth/logout"><button type="submit">Sign out</button></form>{% endif %}</span>
   </nav>
 
   <div class="card">

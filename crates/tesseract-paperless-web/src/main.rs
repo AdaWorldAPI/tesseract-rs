@@ -5,6 +5,7 @@
 //! Deploy target: Railway. Railway injects `PORT` and expects the process to
 //! bind `0.0.0.0:$PORT` — read at runtime only, never hardcoded.
 
+mod auth;
 mod branding;
 mod decode;
 mod fetch;
@@ -98,7 +99,40 @@ async fn main() {
     };
     println!("tesseract-paperless-web: listening on http://{addr}");
 
-    let app = routes::router(state);
+    // Sign-in (OIDC) when PAPERLESS_OIDC_ISSUER is set. A set but invalid
+    // configuration stops the boot: an archive that meant to require sign-in
+    // must never come up open.
+    let login = match auth::AuthConfig::from_env() {
+        Ok(Some(cfg)) => {
+            println!("tesseract-paperless-web: {}", cfg.summary());
+            let http = match auth::ReqwestHttp::new() {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("fatal: {e}");
+                    std::process::exit(1);
+                }
+            };
+            match auth::Login::new(cfg, Box::new(http)) {
+                Ok(l) => Some(Arc::new(l)),
+                Err(e) => {
+                    eprintln!("fatal: sign-in: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Ok(None) => {
+            eprintln!(
+                "warning: PAPERLESS_OIDC_ISSUER unset: NO sign-in, anyone who reaches \
+                 this service can read and delete documents. Keep it off public networks."
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("fatal: sign-in configuration: {e}");
+            std::process::exit(1);
+        }
+    };
+    let app = auth::protect(routes::router(state), login);
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("fatal: server error: {e}");
         std::process::exit(1);

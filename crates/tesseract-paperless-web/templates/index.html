@@ -46,6 +46,8 @@
   .note { font-size: .85rem; color: color-mix(in srgb, CanvasText 55%, Canvas); }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
   h1 img.logo { height: 1.6rem; vertical-align: middle; margin-right: .5rem; }
+  form.signout { display: inline; margin-left: .5rem; }
+  form.signout button { font: inherit; padding: 0; border: 0; background: none; color: inherit; text-decoration: underline; cursor: pointer; }
   footer { margin-top: 2rem; font-size: .8rem; color: color-mix(in srgb, CanvasText 50%, Canvas); }
 </style>
 </head>
@@ -77,7 +79,7 @@
 
   <p class="note">A document already in the archive (byte-identical content) is recognized as a duplicate and skipped &mdash; no repeat OCR spend, and you land straight on the existing record.</p>
 
-  <footer>Pure-Rust OCR (no libtesseract/leptonica at runtime) &middot; <code>lancedb</code>-backed archive.{% if self.brand().is_custom() %} &middot; powered by tesseract-rs{% endif %}</footer>
+  <footer>Pure-Rust OCR (no libtesseract/leptonica at runtime) &middot; <code>lancedb</code>-backed archive.{% if self.brand().is_custom() %} &middot; powered by tesseract-rs{% endif %}{% if self.sign_in() %} <form class="signout" method="post" action="/auth/logout"><button type="submit">Sign out</button></form>{% endif %}</footer>
 </main>
 </body>
 </html>

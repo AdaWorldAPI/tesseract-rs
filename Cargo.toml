@@ -30,3 +30,17 @@ members = [
     "crates/tesseract-paperless-web",
 ]
 resolver = "2"
+
+# RustCrypto crates pulled by ogar-auth / ogar-oidc / ogar-encryption (the
+# paperless sign-in) resolve to their AdaWorldAPI forks. Mirrors OGAR's root
+# [patch] and report-rs's: cargo never applies a dependency's patches
+# downstream. Only tesseract-paperless-web reaches these crates.
+[patch.crates-io]
+ecdsa = { git = "https://github.com/AdaWorldAPI/signatures", branch = "master" }
+chacha20poly1305 = { git = "https://github.com/AdaWorldAPI/AEADs", rev = "c5c199953aba561261bed1c55f62b9c19d0f49cf" }
+chacha20 = { git = "https://github.com/AdaWorldAPI/ndarray", branch = "master" }
+poly1305 = { git = "https://github.com/AdaWorldAPI/universal-hashes", rev = "35de31af7396fe57fa28265e91532c816183c47f" }
+curve25519-dalek = { git = "https://github.com/AdaWorldAPI/curve25519-dalek", rev = "5312a0311ec40df95be953eacfa8a11b9a34bc54" }
+ed448-goldilocks = { git = "https://github.com/AdaWorldAPI/elliptic-curves", branch = "master" }
+md-5 = { git = "https://github.com/AdaWorldAPI/hashes", rev = "026b0e81e90ba476a5d343a8e4efbc63b814737b" }
+des = { git = "https://github.com/AdaWorldAPI/block-ciphers", rev = "7de364ede310f1ea7080c99ddf1138aeb47f9a69" }

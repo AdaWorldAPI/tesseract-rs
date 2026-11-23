@@ -33,6 +33,17 @@ tesseract-paperless = { path = "../tesseract-paperless", features = ["ocr", "sto
 ogar-doc-ir = { path = "../../../OGAR/crates/ogar-doc-ir" }
 ogar-from-docv1 = { path = "../../../OGAR/crates/ogar-from-docv1" }
 
+# Sign-in (OIDC authorization code + PKCE) against an existing identity
+# provider such as ZITADEL. ogar-oidc verifies the ID token (ES256 / EdDSA),
+# ogar-auth's `establish` turns it into a verified login, ogar-encryption seals
+# the session cookie. Active only when PAPERLESS_OIDC_ISSUER is set.
+ogar-auth = { path = "../../../OGAR/crates/ogar-auth" }
+ogar-oidc = { path = "../../../OGAR/crates/ogar-oidc" }
+ogar-encryption = { path = "../../../OGAR/crates/ogar-encryption" }
+getrandom = "0.2"
+sha2 = "0.10"
+base64 = "0.22"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
