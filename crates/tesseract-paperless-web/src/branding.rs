@@ -31,7 +31,7 @@
 //! | `subtle_bg` | table headings and the quick-menu rail |
 //! | `side_bg` | the top bar, side menu and footer background |
 //! | `side_fg` | text on `side_bg`; computed from `side_bg` when unset |
-//! | `side_hover` | hovered and current side-menu entry background |
+//! | `side_hover` | the marker beside a hovered side-menu entry (backgrounds never change, so side text keeps its contrast) |
 //! | `radius` | card corner radius |
 //! | `radius_sm` | input and button corner radius |
 //! | `elevation` | card shadow (`none` for flat cards) |
@@ -536,6 +536,29 @@ fn is_css_value(v: &str) -> bool {
     !v.trim().is_empty()
         && v.chars()
             .all(|c| c.is_ascii_alphanumeric() || " #(),.%-_+/\"'".contains(c))
+        && is_closed(v)
+}
+
+/// Every parenthesis is closed and every quote ends. An unclosed `calc(` or
+/// `"Font` would make the CSS parser swallow the declarations after it, so
+/// later tokens such as `--brand-accent` would silently be undefined.
+fn is_closed(v: &str) -> bool {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    for c in v.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') => match depth.checked_sub(1) {
+                Some(d) => depth = d,
+                None => return false,
+            },
+            (None, _) => {}
+        }
+    }
+    depth == 0 && quote.is_none()
 }
 
 /// The trimmed value when [`is_css_value`] accepts `raw`, else the error for `key`.
@@ -561,7 +584,13 @@ fn is_logo_url(v: &str) -> bool {
         return false;
     }
     let same_site = v.starts_with('/') && !v.starts_with("//");
-    same_site || v.starts_with("https://")
+    // An absolute address needs a host, and no userinfo that could make the
+    // visible host a different one (`https://good@evil/`).
+    let https_host = v.strip_prefix("https://").is_some_and(|rest| {
+        let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+        !host.is_empty() && !host.contains('@')
+    });
+    same_site || https_host
 }
 
 /// The branding chosen at start by [`install`].
@@ -599,6 +628,55 @@ pub fn get() -> &'static Branding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unclosed functions and quotes would swallow the later declarations;
+    /// balanced ones, including quoted font names, pass.
+    #[test]
+    fn unclosed_functions_and_quotes_are_refused() {
+        for bad in [
+            "calc(",
+            "rgba(0,0,0,.1",
+            "\"Inter, sans-serif",
+            "'x",
+            "a)b(",
+            "rgba(0,0,0))",
+        ] {
+            assert!(!is_css_value(bad), "{bad:?} must be refused");
+            assert!(
+                matches!(
+                    Branding::from_toml(&format!("[brand]\nfont_family = {bad:?}\n")),
+                    Err(BrandError::Value {
+                        key: "font_family",
+                        ..
+                    })
+                ),
+                "{bad:?} must stop the start"
+            );
+        }
+        for ok in [
+            "rgba(0,0,0,.08)",
+            "\"Segoe UI\", sans-serif",
+            "'a(b'",
+            "calc(1px + 2px)",
+        ] {
+            assert!(is_css_value(ok), "{ok:?} must pass");
+        }
+    }
+
+    /// An absolute logo address needs a real host.
+    #[test]
+    fn a_logo_address_needs_a_host() {
+        for bad in [
+            "https://",
+            "https:///logo.svg",
+            "https://user@evil.example/l.svg",
+            "https://?x",
+        ] {
+            assert!(!is_logo_url(bad), "{bad:?}");
+        }
+        assert!(is_logo_url("https://cdn.example.org/l.svg"));
+        assert!(is_logo_url("/static/logo.svg"));
+    }
 
     /// A non-hex accent or side background needs its text colour named: the
     /// contrast cannot be computed, and a guessed white could be unreadable.

@@ -33,8 +33,10 @@
     display: block; padding: .5rem 1rem; text-decoration: none; font-weight: 500;
     color: var(--brand-side-fg); border-left: 3px solid transparent;
   }
-  nav.main a:hover { background: var(--brand-side-hover); }
-  nav.main a[aria-current="page"] { font-weight: 700; border-left-color: var(--brand-accent); background: var(--brand-side-hover); }
+  /* Hover and the current entry keep the side background: side_fg is chosen
+     for contrast against side_bg, and an overlay there could undo it. */
+  nav.main a:hover { text-decoration: underline; border-left-color: var(--brand-side-hover); }
+  nav.main a[aria-current="page"], nav.topnav-links a[aria-current="page"] { font-weight: 700; border-left-color: var(--brand-accent); text-decoration: underline; text-decoration-color: var(--brand-accent); text-decoration-thickness: 2px; }
   aside.quick-rail {
     align-self: stretch; padding: .75rem 0; text-align: center;
     background: var(--brand-subtle-bg); border-left: 1px solid var(--brand-border);
@@ -74,13 +76,13 @@
     <a class="brand" href="/dashboard">{% if let Some(logo) = self.brand().logo_url() %}<img src="{{ logo }}" alt="">{% endif %}{{ self.brand().name }}</a>
     {% if self.sign_in() %}<span class="end"><form class="signout" method="post" action="/auth/logout"><button type="submit">Sign out</button></form></span>{% endif %}
     <nav class="topnav-links" aria-label="Main (compact)">
-      <a href="/dashboard">Dashboard</a>
-      <a href="/inbox">Inbox</a>
-      <a href="/documents">Documents</a>
-      <a href="/definitions?kind=correspondent">Correspondents</a>
-      <a href="/definitions?kind=tag">Tags</a>
-      <a href="/definitions?kind=document_type">Document types</a>
-      <a href="/">Upload</a>
+      <a href="/dashboard"{% if self.nav() == "dashboard" %} aria-current="page"{% endif %}>Dashboard</a>
+      <a href="/inbox"{% if self.nav() == "inbox" %} aria-current="page"{% endif %}>Inbox</a>
+      <a href="/documents"{% if self.nav() == "documents" %} aria-current="page"{% endif %}>Documents</a>
+      <a href="/definitions?kind=correspondent"{% if self.nav() == "correspondent" %} aria-current="page"{% endif %}>Correspondents</a>
+      <a href="/definitions?kind=tag"{% if self.nav() == "tag" %} aria-current="page"{% endif %}>Tags</a>
+      <a href="/definitions?kind=document_type"{% if self.nav() == "document_type" %} aria-current="page"{% endif %}>Document types</a>
+      <a href="/"{% if self.nav() == "upload" %} aria-current="page"{% endif %}>Upload</a>
     </nav>
   </div>
 </header>

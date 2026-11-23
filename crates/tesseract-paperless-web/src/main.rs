@@ -25,21 +25,6 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() {
-    // The brand is read first and strictly: a deployment that supplied a brand
-    // document (BRAND_TOML / BRAND_FILE) and got a value wrong must stop here,
-    // not come up looking like the neutral archive. It is installed before the
-    // router exists, so no page can render with another brand.
-    match branding::Branding::from_sources(
-        |k| std::env::var(k).ok(),
-        |p| std::fs::read_to_string(std::path::Path::new(p)),
-        |w| eprintln!("tesseract-paperless-web: {w}"),
-    ) {
-        Ok(b) => branding::install(b),
-        Err(e) => {
-            eprintln!("fatal: branding: {e}");
-            std::process::exit(1);
-        }
-    }
     // Sign-in configuration is read and checked before anything else runs, so
     // a refused start prints only its fatal line: PAPERLESS_REQUIRE_AUTH with no
     // sign-in stops here, before the model loads or the port is bound.
@@ -60,6 +45,27 @@ async fn main() {
     if let Err(e) = auth::check_open_mode(required, auth_cfg.is_some()) {
         eprintln!("fatal: {e}");
         std::process::exit(1);
+    }
+    // The brand is read strictly, after the sign-in preflight (whose fatal line
+    // comes first) and before the model loads or the router exists, so no page
+    // renders with another brand. A brand document that is set but not valid
+    // Unicode is refused, not read as unset.
+    for key in ["BRAND_TOML", "BRAND_FILE"] {
+        if let Err(std::env::VarError::NotUnicode(_)) = std::env::var(key) {
+            eprintln!("fatal: branding: {key} is not valid Unicode");
+            std::process::exit(1);
+        }
+    }
+    match branding::Branding::from_sources(
+        |k| std::env::var(k).ok(),
+        |p| std::fs::read_to_string(std::path::Path::new(p)),
+        |w| eprintln!("tesseract-paperless-web: {w}"),
+    ) {
+        Ok(b) => branding::install(b),
+        Err(e) => {
+            eprintln!("fatal: branding: {e}");
+            std::process::exit(1);
+        }
     }
     let policy = match customers::CustomerPolicy::from_env() {
         Ok(p) => p,

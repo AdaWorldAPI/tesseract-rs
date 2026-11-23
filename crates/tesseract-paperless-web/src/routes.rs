@@ -3262,7 +3262,7 @@ mod tests {
     /// The side menu lists all seven destinations and marks exactly the page's
     /// own entry; two different pages mark different entries, so a menu that
     /// always marks the same one cannot pass. The compact top-bar copy has the
-    /// same links and marks none (one current entry per page, never two).
+    /// same links and marks the same entry.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_side_menu_has_all_seven_links_and_marks_only_the_current_page() {
         let h = harness().await;
@@ -3290,10 +3290,22 @@ mod tests {
             for href in hrefs {
                 assert!(compact.contains(href), "{uri}: compact nav lacks {href}");
             }
-            assert!(
-                !compact.contains("aria-current"),
-                "{uri}: compact nav must not mark a page"
+            // The compact copy marks the same entry, so phone users keep it.
+            assert_eq!(
+                compact.matches("aria-current=\"page\"").count(),
+                side.matches("aria-current=\"page\"").count(),
+                "{uri}: current entries in the compact nav"
             );
+            if let (Some(a), Some(b)) = (
+                side.find("aria-current=\"page\""),
+                compact.find("aria-current=\"page\""),
+            ) {
+                let href_before = |t: &str, i: usize| {
+                    let h = t[..i].rfind("href=\"").expect("href before marker");
+                    t[h..i].trim_end().to_owned()
+                };
+                assert_eq!(href_before(&side, a), href_before(&compact, b), "{uri}");
+            }
             assert!(
                 body.contains("class=\"quick-rail region-right_panel\""),
                 "{uri}"
@@ -3350,8 +3362,9 @@ mod tests {
         out
     }
 
-    /// The only fixed colours allowed: statuses, not identity.
-    const STATUS_COLOURS: [&str; 3] = ["#d97706", "#ef4444", "#f59e0b"];
+    /// The only fixed colours allowed: statuses, not identity, and the white
+    /// label on the fixed danger red (a brand colour there could match the red).
+    const STATUS_COLOURS: [&str; 4] = ["#d97706", "#ef4444", "#f59e0b", "#fff"];
 
     /// The scanner finds colours and skips what only looks like one.
     #[test]
