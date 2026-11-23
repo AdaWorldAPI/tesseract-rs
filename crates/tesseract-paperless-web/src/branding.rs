@@ -584,12 +584,16 @@ fn is_logo_url(v: &str) -> bool {
         return false;
     }
     let same_site = v.starts_with('/') && !v.starts_with("//");
-    // An absolute address needs a host, and no userinfo that could make the
-    // visible host a different one (`https://good@evil/`).
-    let https_host = v.strip_prefix("https://").is_some_and(|rest| {
-        let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-        !host.is_empty() && !host.contains('@')
-    });
+    // An absolute address is parsed the way a browser would: it must be https,
+    // carry a real host (`https://:443/x` has none), and have no userinfo that
+    // could make the visible host a different one (`https://good@evil/`).
+    let https_host = v.starts_with("https://")
+        && url::Url::parse(v).is_ok_and(|u| {
+            u.scheme() == "https"
+                && u.host_str().is_some_and(|h| !h.is_empty())
+                && u.username().is_empty()
+                && u.password().is_none()
+        });
     same_site || https_host
 }
 
