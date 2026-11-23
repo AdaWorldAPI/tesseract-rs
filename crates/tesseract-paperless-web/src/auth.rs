@@ -1181,6 +1181,11 @@ async fn auth_callback(
 }
 
 async fn auth_logout(State(login): State<Arc<Login>>, headers: HeaderMap) -> Response {
+    // `/auth/*` skips the gate, so the origin rule is applied here: a sibling
+    // subdomain must not be able to sign the user out.
+    if !login.same_origin(&Method::POST, &headers) {
+        return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+    }
     if let Some(sid) = cookie(cookie_header(&headers), SESSION_COOKIE) {
         login.logout(sid);
     }

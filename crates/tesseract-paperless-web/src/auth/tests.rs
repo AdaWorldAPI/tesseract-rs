@@ -760,6 +760,23 @@ async fn a_session_cookie_from_another_origin_cannot_change_state() {
         post(&[("origin", "https://paperless.example")]).await,
         StatusCode::OK
     );
+    // Sign-out sits outside the gate, so it checks the origin itself: a sibling
+    // origin cannot sign the user out.
+    let r = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/auth/logout")
+                .header(header::COOKIE, format!("{SESSION_COOKIE}={cookie_value}"))
+                .header("origin", "https://evil.paperless.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    assert_eq!(login.subject(&cookie_value).as_deref(), Some("oidc:u1"));
     // GET is never refused for its origin.
     let r = app
         .clone()
