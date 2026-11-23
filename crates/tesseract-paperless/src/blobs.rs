@@ -112,10 +112,11 @@ impl BlobStore {
         // Sync every existing ancestor's entry too: a start whose directory
         // sync failed exits, and the next start finds the directories present
         // but never synced.
-        let mut dir = Some(root.as_path());
-        while let Some(d) = dir.filter(|d| !d.as_os_str().is_empty()) {
+        // The absolute path, so a relative root such as `blobs` also syncs the
+        // current directory that holds its entry.
+        let absolute = fs::canonicalize(&root)?;
+        for d in absolute.ancestors() {
             sync_dir(d)?;
-            dir = d.parent();
         }
         Ok(Self { root })
     }
@@ -321,6 +322,21 @@ mod tests {
         );
     }
 
+    /// A relative root's own entry lives in the current directory, which the
+    /// relative path never names.
+    #[test]
+    fn opening_a_relative_store_syncs_the_current_directory() {
+        let name = format!("blobs-relative-test-{}", std::process::id());
+        fs::create_dir(&name).expect("pre-existing relative root");
+        SYNCED.with(|v| v.borrow_mut().clear());
+        let opened = BlobStore::open(&name);
+        let synced = SYNCED.with(|v| v.borrow().clone());
+        let cwd = fs::canonicalize(".").expect("cwd");
+        fs::remove_dir(&name).expect("cleanup");
+        opened.expect("open");
+        assert!(synced.iter().any(|p| p == &cwd), "{synced:?}");
+    }
+
     #[test]
     fn opening_an_existing_store_syncs_its_directories() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -329,8 +345,12 @@ mod tests {
         SYNCED.with(|v| v.borrow_mut().clear());
         BlobStore::open(&root).expect("open");
         let synced = SYNCED.with(|v| v.borrow().clone());
+        let root = fs::canonicalize(&root).expect("canonical root");
         assert!(synced.iter().any(|p| p == &root), "{synced:?}");
-        assert!(synced.iter().any(|p| p == dir.path()), "{synced:?}");
+        assert!(
+            synced.iter().any(|p| Some(p.as_path()) == root.parent()),
+            "{synced:?}"
+        );
     }
 
     #[test]
