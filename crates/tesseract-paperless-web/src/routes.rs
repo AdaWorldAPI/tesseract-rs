@@ -1031,6 +1031,11 @@ async fn delete_document_and_original(state: Arc<AppState>, hash: String) {
                     Ok(Ok(())) => {}
                 }
             }
+            // Then the S3 copy, record before original (`docs/RECOVERY.md` §4),
+            // in the background: the delete answers without waiting for S3.
+            // A failure leaves the S3 objects; a later restore would bring the
+            // document back, so it is logged with the hash.
+            state.replicate_delete(&hash);
         }
         Err(e) => eprintln!("delete {hash} from archive failed: {e} (search index left untouched)"),
     }
@@ -1147,6 +1152,7 @@ async fn document_assign(
         .assign(&hash, kind, f.definition_id, Source::Manual, now_unix_ms())
         .await
         .map_err(|e| meta_fail(&e))?;
+    state.replicate_metadata();
     Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
@@ -1163,6 +1169,7 @@ async fn document_unassign(
         .unassign(&hash, kind, f.definition_id)
         .await
         .map_err(|e| store_fail(&e))?;
+    state.replicate_metadata();
     Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
@@ -1187,6 +1194,7 @@ async fn document_accept(
         )
         .await
         .map_err(|e| meta_fail(&e))?;
+    state.replicate_metadata();
     Ok(back_to_document(&hash, f.from.as_deref()))
 }
 
@@ -1225,6 +1233,9 @@ async fn document_review(
             ))
         }
     }
+    // The review flag is written: copy it before either redirect, so a failed
+    // inbox lookup below cannot skip the copy.
+    state.replicate_metadata();
     if !to_inbox {
         return Ok(back_to_document(&hash, f.from.as_deref()));
     }
@@ -1350,7 +1361,37 @@ struct DashboardTemplate {
     kinds: Vec<KindStat>,
     /// The newest documents to review, at most `DASHBOARD_RECENT`.
     recent: Vec<RecentItem>,
+    /// The S3 copy's state, `None` when no copy is configured.
+    replica: Option<String>,
     error: Option<String>,
+}
+
+/// One line about the S3 copy for the dashboard, or `None` without a copy.
+fn replica_summary(state: &AppState) -> Option<String> {
+    state.replica.as_ref()?;
+    let status = state
+        .replica_status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    Some(match (status.checked_at_unix_ms, status.error, status.backlog) {
+        (None, _, _) => "S3 copy: first check pending".to_string(),
+        (Some(at), Some(e), _) => {
+            format!("S3 copy: last check failed ({}): {e}", format_unix_ms(at))
+        }
+        (Some(at), None, Some(0)) => {
+            format!(
+                "S3 copy: no documents waiting to be copied (estimate, checked {})",
+                format_unix_ms(at)
+            )
+        }
+        (Some(at), None, Some(n)) => format!(
+            "S3 copy: about {n} document{} not yet copied (estimate, checked {})",
+            if n == 1 { "" } else { "s" },
+            format_unix_ms(at)
+        ),
+        (Some(at), None, None) => format!("S3 copy: checked {}", format_unix_ms(at)),
+    })
 }
 
 const DASHBOARD_RECENT: usize = 5;
@@ -1383,6 +1424,7 @@ async fn dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
                     ingested_at: format_unix_ms(r.ingested_at_unix_ms),
                 })
                 .collect(),
+            replica: replica_summary(&state),
             error: None,
         }),
         Err(e) => render(&DashboardTemplate {
@@ -1390,6 +1432,7 @@ async fn dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
             unreviewed: 0,
             kinds: Vec::new(),
             recent: Vec::new(),
+            replica: replica_summary(&state),
             error: Some(format!("archive read failed: {e}")),
         }),
     }
@@ -1618,6 +1661,7 @@ async fn definition_create(
         .create_definition(kind, name, now_unix_ms())
         .await
         .map_err(|e| meta_fail(&e))?;
+    state.replicate_metadata();
     Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 
@@ -1633,6 +1677,7 @@ async fn definition_rename(
         .rename_definition(kind, f.definition_id, name)
         .await
         .map_err(|e| meta_fail(&e))?;
+    state.replicate_metadata();
     Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 
@@ -1665,6 +1710,7 @@ async fn definition_rule(
         )
         .await
         .map_err(|e| meta_fail(&e))?;
+    state.replicate_metadata();
     Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 
@@ -1679,6 +1725,7 @@ async fn definition_retire(
         .retire_definition(kind, f.definition_id)
         .await
         .map_err(|e| meta_fail(&e))?;
+    state.replicate_metadata();
     Ok(Redirect::to(&definitions_location(f.view.as_deref())))
 }
 
@@ -1873,6 +1920,7 @@ mod tests {
             index.path(),
             blobs.path(),
             FsPath::new("/nonexistent/deepnsm/word_frequency"),
+            None,
         )
         .await
         .expect("AppState::load");
@@ -2180,6 +2228,7 @@ mod tests {
                     index.path(),
                     blobs.path(),
                     FsPath::new("/nonexistent/deepnsm/word_frequency"),
+                    None,
                 )
                 .await
                 .expect("AppState::load"),
