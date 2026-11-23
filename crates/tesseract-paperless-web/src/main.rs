@@ -55,6 +55,11 @@ async fn main() {
     let search_index_dir = PathBuf::from(
         std::env::var("SEARCH_INDEX_DIR").unwrap_or_else(|_| "./search_index".to_string()),
     );
+    // The uploaded originals, one file per SHA-256. Railway keeps it on the
+    // same volume as the archive (`/app/data/blobs`); falls back like the two
+    // directories above.
+    let blob_dir =
+        PathBuf::from(std::env::var("BLOB_DIR").unwrap_or_else(|_| "./blobs".to_string()));
     // deepnsm's `word_frequency/` CSVs — the SPO/`NarsTruth` reasoning
     // layer's vocabulary. Same env-var-then-sibling-path convention as
     // `tesseract-ogar/examples/ocr_demo.rs`'s own step 6: the sibling path
@@ -80,6 +85,10 @@ async fn main() {
         search_index_dir.display()
     );
     println!(
+        "tesseract-paperless-web: originals at {}",
+        blob_dir.display()
+    );
+    println!(
         "tesseract-paperless-web: deepnsm vocabulary at {}",
         deepnsm_vocab_dir.display()
     );
@@ -88,6 +97,7 @@ async fn main() {
         &model_dir,
         &archive_uri,
         &search_index_dir,
+        &blob_dir,
         &deepnsm_vocab_dir,
     )
     .await
@@ -99,7 +109,7 @@ async fn main() {
                 "hint: set MODEL_DIR to a directory containing eng.lstm, \
                  eng.lstm-unicharset, eng.lstm-recoder (+ optional *-dawg files), \
                  ARCHIVE_URI to a writable lancedb location, \
-                 and SEARCH_INDEX_DIR to a writable directory"
+                 SEARCH_INDEX_DIR and BLOB_DIR to writable directories"
             );
             std::process::exit(1);
         }

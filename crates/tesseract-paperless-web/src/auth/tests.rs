@@ -531,6 +531,10 @@ fn secret_app() -> Router {
     Router::new()
         .route("/", get(|| async { "secret" }))
         .route("/documents", get(|| async { "secret" }))
+        .route(
+            "/documents/:hash/original",
+            get(|| async { "original bytes" }),
+        )
         .route("/upload", post(|| async { "uploaded" }))
         .route("/healthz", get(|| async { "ok" }))
 }
@@ -552,6 +556,19 @@ async fn the_gate_admits_only_a_live_session() {
         send(&app, "POST", "/upload", None).await.status(),
         StatusCode::UNAUTHORIZED
     );
+    // An original is a page like any other: no session, no bytes.
+    let r = send(
+        &app,
+        "GET",
+        &format!("/documents/{}/original", "a".repeat(64)),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(!body.windows(14).any(|w| w == b"original bytes"));
     // A garbage cookie is no session.
     assert_eq!(
         send(&app, "GET", "/", Some("v1.junk")).await.status(),

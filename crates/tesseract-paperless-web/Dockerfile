@@ -154,11 +154,11 @@ COPY --from=builder /src/tesseract-rs/corpus/model /app/model
 # degraded fallback, by default.
 COPY --from=builder /src/lance-graph/crates/deepnsm/word_frequency /app/word_frequency
 
-# Both the lancedb archive AND the Tantivy search index need a writable,
-# ideally PERSISTENT directory — on Railway, mount a volume at /app/data
-# (Railway's volume UI lets you pick the mount path; point it here) or both
-# are lost on every redeploy. Both live under the SAME mount so one volume
-# covers both stores. Created and owned by the non-root runtime user up
+# The lancedb archive, the Tantivy search index AND the uploaded originals
+# (BLOB_DIR) need a writable, PERSISTENT directory — on Railway, mount a volume
+# at /app/data (Railway's volume UI lets you pick the mount path; point it
+# here) or all three are lost on every redeploy. All live under the SAME mount
+# so one volume covers every store. Created and owned by the non-root runtime user up
 # front so `lancedb::connect` / `SearchIndex::open_or_create` can create
 # their files on first boot without a permissions surprise.
 RUN mkdir -p /app/data \
@@ -169,6 +169,7 @@ USER appuser
 ENV MODEL_DIR=/app/model
 ENV ARCHIVE_URI=/app/data/archive.lance
 ENV SEARCH_INDEX_DIR=/app/data/search_index
+ENV BLOB_DIR=/app/data/blobs
 ENV DEEPNSM_VOCAB_DIR=/app/word_frequency
 # NOTE: the listen port is intentionally NOT set here. The binary binds
 # 0.0.0.0:$PORT at runtime; Railway injects PORT itself. For a local run pass
