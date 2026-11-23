@@ -111,7 +111,13 @@ async fn main() {
                 cfg.endpoint, cfg.bucket, cfg.prefix
             );
             let prefix = cfg.prefix.clone();
-            match s3::S3Client::new(cfg) {
+            // reqwest's blocking client must not be built on an async worker
+            // thread: building it there panics.
+            match tokio::task::spawn_blocking(move || s3::S3Client::new(cfg))
+                .await
+                .map_err(|e| s3::ObjectError::new(&format!("task: {e}")))
+                .and_then(|r| r)
+            {
                 Ok(client) => Some(replica::Replica::new(Arc::new(client), &prefix)),
                 Err(e) => {
                     eprintln!("fatal: S3 client: {e}");

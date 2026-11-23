@@ -26,6 +26,11 @@ use tesseract_paperless::store::LanceStore;
 
 use crate::s3::{ObjectError, ObjectStore};
 
+/// The per-document lock a delete holds (`AppState::hash_lock`). A copy takes
+/// the same lock, so it can never write a document's S3 objects after a
+/// delete has removed them.
+pub type DocLock = Arc<tokio::sync::Mutex<()>>;
+
 /// Schema tag of a [`DocumentRecord`].
 pub const RECORD_SCHEMA: &str = "paperless-rs/document-record/v1";
 /// Schema tag of a [`SnapshotFile`].
@@ -357,7 +362,9 @@ impl Replica {
     }
 
     /// Copy one local document: its original first (when there is one), then
-    /// its record.
+    /// its record. Runs under `lock`, the lock a delete of the same document
+    /// holds, and reads the row under it: a document deleted meanwhile is not
+    /// copied, and `Ok(false)` says so.
     ///
     /// # Errors
     /// [`ReplicaError`] when the document cannot be read locally or written to S3.
@@ -366,14 +373,14 @@ impl Replica {
         store: &LanceStore,
         blobs: &Arc<BlobStore>,
         hash: &str,
-    ) -> Result<(), ReplicaError> {
+        lock: DocLock,
+    ) -> Result<bool, ReplicaError> {
         let key = ContentSha256::from_hex(hash)
             .ok_or_else(|| ReplicaError::Invalid(format!("hash {hash}")))?;
-        let row = store
-            .get(hash)
-            .await
-            .map_err(local)?
-            .ok_or_else(|| ReplicaError::Local(format!("no document {hash}")))?;
+        let _held = lock.lock_owned().await;
+        let Some(row) = store.get(hash).await.map_err(local)? else {
+            return Ok(false);
+        };
         let b = blobs.clone();
         let original = tokio::task::spawn_blocking(move || b.get(&key))
             .await
@@ -399,7 +406,8 @@ impl Replica {
         let body = serde_json::to_vec(&record).map_err(local)?;
         let s = self.store.clone();
         let k = self.record_key(hash);
-        blocking(move || s.put(&k, &body, "application/json")).await
+        blocking(move || s.put(&k, &body, "application/json")).await?;
+        Ok(true)
     }
 
     /// Remove one document from S3: the record first, then the original, so a
@@ -440,11 +448,16 @@ impl Replica {
         &self,
         store: &LanceStore,
         blobs: &Arc<BlobStore>,
+        lock_for: &(dyn Fn(&ContentSha256) -> DocLock + Sync),
     ) -> Result<ReplicateReport, ReplicaError> {
         let mut report = ReplicateReport::default();
         for hash in self.pending(store, blobs).await? {
-            match self.upload_document(store, blobs, &hash).await {
-                Ok(()) => report.uploaded += 1,
+            let Some(key) = ContentSha256::from_hex(&hash) else {
+                continue;
+            };
+            match self.upload_document(store, blobs, &hash, lock_for(&key)).await {
+                Ok(true) => report.uploaded += 1,
+                Ok(false) => {}
                 Err(e) => {
                     eprintln!("replica: copying {hash} failed: {e}");
                     report.failed += 1;
@@ -497,6 +510,10 @@ pub async fn restore(
 
     let mut report = RestoreReport::default();
     let local_hashes: HashSet<String> = store.hashes().await.map_err(local)?.into_iter().collect();
+    // An original present in S3 is restored even when its record still says
+    // `has_original: false`: the record is rewritten only after the original
+    // is uploaded, and a failed rewrite must not cost the original.
+    let originals = replica.original_hashes().await?;
     let mut recorded: Vec<String> = replica.recorded_hashes().await?.into_iter().collect();
     recorded.sort();
     for hash in recorded {
@@ -532,7 +549,7 @@ pub async fn restore(
                 continue;
             }
         };
-        if record.has_original {
+        if record.has_original || originals.contains(&hash) {
             let s = replica.store.clone();
             let k = replica.original_key(&hash);
             match blocking(move || s.get(&k)).await {
@@ -663,6 +680,15 @@ mod tests {
         Replica::new(bucket.clone(), "pl")
     }
 
+    /// A fresh lock per call: these tests run no delete concurrently.
+    fn no_lock(_: &ContentSha256) -> DocLock {
+        Arc::new(tokio::sync::Mutex::new(()))
+    }
+
+    fn lock() -> DocLock {
+        Arc::new(tokio::sync::Mutex::new(()))
+    }
+
     /// Slice C acceptance: an empty volume gets back every document with its
     /// original (byte-identical), filename and upload time, every definition
     /// with its id, every assignment and review flag. A document stored
@@ -684,9 +710,9 @@ mod tests {
             .expect("assign");
         meta.mark_reviewed(&b, 3).await.expect("review");
 
-        let report = r.replicate(&src.store, &src.blobs).await.expect("replicate");
+        let report = r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
         assert_eq!(report, ReplicateReport { uploaded: 2, failed: 0 });
-        assert_eq!(r.backlog(&src.store).await.expect("backlog"), 0);
+        assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 0);
         assert!(bucket.keys().contains(&r.original_key(&a)));
         assert!(!bucket.keys().contains(&r.original_key(&b)));
 
@@ -757,7 +783,7 @@ mod tests {
         let src = local().await;
         let a = add(&src, b"doc A", "a.png", 1, true).await;
         add(&src, b"doc B", "b.png", 2, true).await;
-        r.replicate(&src.store, &src.blobs).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
 
         let dst = local().await;
         // As if the first attempt restored A and stopped.
@@ -783,7 +809,7 @@ mod tests {
         let src = local().await;
         let a = add(&src, b"doc A", "a.png", 1, true).await;
         let b = add(&src, b"doc B", "b.png", 2, true).await;
-        r.replicate(&src.store, &src.blobs).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
         bucket
             .objects
             .lock()
@@ -814,7 +840,7 @@ mod tests {
         let r = replica(&bucket);
         let src = local().await;
         let a = add(&src, b"ordered", "a.png", 1, true).await;
-        r.upload_document(&src.store, &src.blobs, &a)
+        r.upload_document(&src.store, &src.blobs, &a, lock())
             .await
             .expect("upload");
         r.delete_document(&a).await.expect("delete");
@@ -837,11 +863,11 @@ mod tests {
         let r = replica(&bucket);
         let src = local().await;
         let a = add(&src, b"kept in s3", "a.png", 1, true).await;
-        r.replicate(&src.store, &src.blobs).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
 
         let other = local().await;
         add(&other, b"another", "b.png", 2, true).await;
-        let report = r.replicate(&other.store, &other.blobs).await.expect("replicate");
+        let report = r.replicate(&other.store, &other.blobs, &no_lock).await.expect("replicate");
         assert_eq!(report.uploaded, 1);
         assert_eq!(bucket.deletes.load(Ordering::SeqCst), 0);
         assert!(bucket.keys().contains(&r.record_key(&a)));
@@ -856,11 +882,56 @@ mod tests {
         let src = local().await;
         let a = add(&src, b"late copy", "a.png", 1, true).await;
         bucket.down.store(true, Ordering::SeqCst);
-        assert!(r.upload_document(&src.store, &src.blobs, &a).await.is_err());
+        assert!(r.upload_document(&src.store, &src.blobs, &a, lock()).await.is_err());
         bucket.down.store(false, Ordering::SeqCst);
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 1);
-        r.replicate(&src.store, &src.blobs).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 0);
+    }
+
+    /// A rewrite of the record that fails after the original reached S3
+    /// leaves `has_original: false` beside an original in S3. Restore still
+    /// brings the original back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_uses_an_original_whose_record_was_not_rewritten() {
+        let bucket = Arc::new(MemoryStore::default());
+        let r = replica(&bucket);
+        let src = local().await;
+        let bytes: &[u8] = b"original without rewritten record";
+        let a = add(&src, bytes, "a.png", 1, false).await;
+        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        let key = ContentSha256::of(bytes);
+        bucket.put(&r.original_key(&a), bytes, "application/octet-stream").expect("put");
+        src.blobs.put(&key, bytes).expect("backfill");
+        assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 0);
+
+        let dst = local().await;
+        let report = restore(&r, &dst.store, &dst.blobs).await.expect("restore");
+        assert_eq!(report.without_original, 0);
+        assert_eq!(dst.blobs.get(&key).expect("get").as_deref(), Some(bytes));
+    }
+
+    /// A copy waits for a delete holding the document's lock, and then finds
+    /// the document gone and writes nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_copy_after_a_delete_writes_nothing() {
+        let bucket = Arc::new(MemoryStore::default());
+        let r = replica(&bucket);
+        let src = local().await;
+        let a = add(&src, b"deleted while copying", "a.png", 1, true).await;
+        let l = lock();
+        let held = l.clone().lock_owned().await;
+        let copy = r.upload_document(&src.store, &src.blobs, &a, l.clone());
+        let delete = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            src.store.delete(&a).await.expect("delete");
+            drop(held);
+        };
+        let (copied, ()) = tokio::join!(copy, delete);
+        // Had the copy not waited for the lock, it would have read the row
+        // before the delete and written it to S3.
+        assert!(!copied.expect("copy"));
+        assert!(bucket.keys().is_empty());
     }
 
     /// A legacy document already copied without an original gets its original
@@ -874,13 +945,13 @@ mod tests {
         let src = local().await;
         let bytes: &[u8] = b"legacy then backfilled";
         let a = add(&src, bytes, "a.png", 1, false).await;
-        r.replicate(&src.store, &src.blobs).await.expect("replicate");
+        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
         assert!(!bucket.keys().contains(&r.original_key(&a)));
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 0);
 
         src.blobs.put(&ContentSha256::of(bytes), bytes).expect("backfill");
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 1);
-        let report = r.replicate(&src.store, &src.blobs).await.expect("replicate");
+        let report = r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
         assert_eq!(report.uploaded, 1);
         assert_eq!(r.backlog(&src.store, &src.blobs).await.expect("backlog"), 0);
         let log = bucket.log.lock().expect("log").clone();

@@ -273,7 +273,11 @@ impl AppState {
     /// the replicator copies it later (`docs/RECOVERY.md` §4).
     pub async fn replicate_document(&self, hash: &str) {
         if let Some(r) = &self.replica {
-            if let Err(e) = r.upload_document(&self.store, &self.blobs, hash).await {
+            let Some(key) = ContentSha256::from_hex(hash) else { return };
+            if let Err(e) = r
+                .upload_document(&self.store, &self.blobs, hash, self.hash_lock(&key))
+                .await
+            {
                 eprintln!("replica: copying {hash} to S3 failed: {e}; the replicator will retry");
             }
         }
@@ -293,7 +297,9 @@ impl AppState {
     /// and record the backlog for the dashboard.
     pub async fn replicate_now(&self) {
         let Some(r) = &self.replica else { return };
-        let outcome = r.replicate(&self.store, &self.blobs).await;
+        let outcome = r
+            .replicate(&self.store, &self.blobs, &|k| self.hash_lock(k))
+            .await;
         let backlog = r.backlog(&self.store, &self.blobs).await;
         let now = crate::ingest::now_unix_ms();
         let mut status = self
