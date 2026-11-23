@@ -102,6 +102,15 @@ async fn main() {
     // Sign-in (OIDC) when PAPERLESS_OIDC_ISSUER is set. A set but invalid
     // configuration stops the boot: an archive that meant to require sign-in
     // must never come up open.
+    // PAPERLESS_REQUIRE_AUTH: a deployment that must never run open says so,
+    // and a missing issuer then stops the boot instead of warning.
+    let required = match auth::sign_in_required_from_env() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            std::process::exit(1);
+        }
+    };
     let login = match auth::AuthConfig::from_env() {
         Ok(Some(cfg)) => {
             println!("tesseract-paperless-web: {}", cfg.summary());
@@ -121,6 +130,10 @@ async fn main() {
             }
         }
         Ok(None) => {
+            if let Err(e) = auth::check_open_mode(required, false) {
+                eprintln!("fatal: {e}");
+                std::process::exit(1);
+            }
             eprintln!(
                 "warning: PAPERLESS_OIDC_ISSUER unset: NO sign-in, anyone who reaches \
                  this service can read and delete documents. Keep it off public networks."
@@ -132,19 +145,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    // PAPERLESS_REQUIRE_AUTH: a deployment that must never run open says so,
-    // and a missing issuer then stops the boot instead of the warning above.
-    let required = match auth::sign_in_required_from_env() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("fatal: {e}");
-            std::process::exit(1);
-        }
-    };
-    if let Err(e) = auth::check_open_mode(required, login.is_some()) {
-        eprintln!("fatal: {e}");
-        std::process::exit(1);
-    }
     let app = auth::protect(routes::router(state), login);
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("fatal: server error: {e}");
