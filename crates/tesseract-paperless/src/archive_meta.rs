@@ -213,6 +213,27 @@ pub struct AssignmentRow {
     pub assigned_at_unix_ms: i64,
 }
 
+/// One review flag, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRow {
+    /// Hex `content_sha256` of the document.
+    pub content_sha256_hex: String,
+    /// When it was marked reviewed, milliseconds since the Unix epoch.
+    pub reviewed_at_unix_ms: i64,
+}
+
+/// Every metadata row at one moment: what the S3 copy keeps and a restore
+/// writes back ([`MetaStore::export`], [`MetaStore::import`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetaSnapshot {
+    /// Every definition, retired ones included, with its id.
+    pub definitions: Vec<DefinitionRow>,
+    /// Every assignment.
+    pub assignments: Vec<AssignmentRow>,
+    /// Every review flag.
+    pub reviews: Vec<ReviewRow>,
+}
+
 /// What [`MetaStore::reconcile`] removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetaReconcileReport {
@@ -432,6 +453,19 @@ fn assignments_from_batches(batches: &[RecordBatch]) -> Result<Vec<AssignmentRow
                 assigned_at_unix_ms: at.value(i),
             });
         }
+    }
+    Ok(out)
+}
+
+fn reviews_from_batches(batches: &[RecordBatch]) -> Result<Vec<ReviewRow>, StoreError> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let hash = typed::<StringArray>(batch, col::HASH)?;
+        let at = typed::<Int64Array>(batch, col::REVIEWED_AT)?;
+        out.extend((0..batch.num_rows()).map(|i| ReviewRow {
+            content_sha256_hex: hash.value(i).to_string(),
+            reviewed_at_unix_ms: at.value(i),
+        }));
     }
     Ok(out)
 }
@@ -857,6 +891,83 @@ impl MetaStore {
     }
 }
 
+impl MetaStore {
+    /// Every metadata row, read under the write lock so the three tables
+    /// describe one moment.
+    ///
+    /// # Errors
+    /// As [`Self::definitions`].
+    pub async fn export(&self) -> Result<MetaSnapshot, StoreError> {
+        let _write = self.writes.lock().await;
+        let definitions = self.definitions().await?;
+        let assignments = self.all_assignments().await?;
+        let reviews = reviews_from_batches(&collect(&self.reviews, None).await?)?;
+        Ok(MetaSnapshot {
+            definitions,
+            assignments,
+            reviews,
+        })
+    }
+
+    /// Write a snapshot back, keeping every definition id. Assignments and
+    /// reviews whose document is not in `live_hashes` are dropped, as
+    /// [`Self::reconcile`] would drop them. Upserts, so importing the same
+    /// snapshot twice changes nothing.
+    ///
+    /// # Errors
+    /// [`StoreError::Db`] on a write failure.
+    pub async fn import(
+        &self,
+        snapshot: &MetaSnapshot,
+        live_hashes: &HashSet<String>,
+    ) -> Result<(), StoreError> {
+        let _write = self.writes.lock().await;
+        for d in &snapshot.definitions {
+            self.upsert_definition(d).await?;
+        }
+        for a in snapshot
+            .assignments
+            .iter()
+            .filter(|a| live_hashes.contains(&a.content_sha256_hex))
+        {
+            let batch = RecordBatch::try_new(
+                assignments_schema(),
+                vec![
+                    Arc::new(StringArray::from(vec![a.content_sha256_hex.as_str()])),
+                    Arc::new(StringArray::from(vec![a.kind.as_str()])),
+                    Arc::new(UInt32Array::from(vec![a.definition_id])),
+                    Arc::new(StringArray::from(vec![a.source.as_str()])),
+                    Arc::new(Int64Array::from(vec![a.assigned_at_unix_ms])),
+                ],
+            )
+            .map_err(|_| StoreError::Malformed("assignments batch assembly"))?;
+            upsert(
+                &self.assignments,
+                &[col::HASH, col::KIND, col::DEFINITION_ID],
+                batch,
+                assignments_schema(),
+            )
+            .await?;
+        }
+        for r in snapshot
+            .reviews
+            .iter()
+            .filter(|r| live_hashes.contains(&r.content_sha256_hex))
+        {
+            let batch = RecordBatch::try_new(
+                reviews_schema(),
+                vec![
+                    Arc::new(StringArray::from(vec![r.content_sha256_hex.as_str()])),
+                    Arc::new(Int64Array::from(vec![r.reviewed_at_unix_ms])),
+                ],
+            )
+            .map_err(|_| StoreError::Malformed("reviews batch assembly"))?;
+            upsert(&self.reviews, &[col::HASH], batch, reviews_schema()).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Delete every row whose hash is in `dead`, in bounded `IN (...)` chunks.
 async fn delete_hashes(table: &Table, dead: &HashSet<&str>) -> Result<(), StoreError> {
     let dead: Vec<&str> = dead.iter().copied().collect();
@@ -891,6 +1002,87 @@ mod tests {
 
     fn set(hashes: &[&str]) -> HashSet<String> {
         hashes.iter().map(|h| (*h).to_string()).collect()
+    }
+
+    /// Slice C: a snapshot written into an empty store reproduces every
+    /// definition (ids, rules, retired flag), every assignment and every review
+    /// of a live document, and drops rows of documents that are not live.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn export_then_import_reproduces_the_metadata() {
+        let (_a, src) = fresh().await;
+        let tag = src
+            .create_definition(MetaKind::Tag, "Strom", 10)
+            .await
+            .expect("tag");
+        let corr = src
+            .create_definition(MetaKind::Correspondent, "Stadtwerke", 11)
+            .await
+            .expect("corr");
+        let old = src
+            .create_definition(MetaKind::Tag, "Alt", 12)
+            .await
+            .expect("old");
+        src.set_rule(MetaKind::Tag, tag.definition_id, 3, "strom", false)
+            .await
+            .expect("rule");
+        src.retire_definition(MetaKind::Tag, old.definition_id)
+            .await
+            .expect("retire");
+        src.assign("h1", MetaKind::Tag, tag.definition_id, Source::Manual, 20)
+            .await
+            .expect("assign");
+        src.assign(
+            "h1",
+            MetaKind::Correspondent,
+            corr.definition_id,
+            Source::Rule,
+            21,
+        )
+        .await
+        .expect("assign");
+        src.assign("gone", MetaKind::Tag, tag.definition_id, Source::Manual, 22)
+            .await
+            .expect("assign");
+        src.mark_reviewed("h1", 30).await.expect("review");
+        src.mark_reviewed("gone", 31).await.expect("review");
+
+        let snap = src.export().await.expect("export");
+        assert_eq!(snap.definitions.len(), 3);
+        assert_eq!(snap.assignments.len(), 3);
+        assert_eq!(snap.reviews.len(), 2);
+
+        let (_b, dst) = fresh().await;
+        dst.import(&snap, &set(&["h1"])).await.expect("import");
+        // Twice: idempotent.
+        dst.import(&snap, &set(&["h1"]))
+            .await
+            .expect("import again");
+
+        assert_eq!(dst.definitions().await.expect("defs"), snap.definitions);
+        let mut assigns = dst.all_assignments().await.expect("assigns");
+        assigns.sort_by_key(|a| a.assigned_at_unix_ms);
+        let mut want: Vec<_> = snap
+            .assignments
+            .iter()
+            .filter(|a| a.content_sha256_hex == "h1")
+            .cloned()
+            .collect();
+        want.sort_by_key(|a| a.assigned_at_unix_ms);
+        assert_eq!(assigns, want);
+        let exported = dst.export().await.expect("export");
+        assert_eq!(
+            exported.reviews,
+            vec![ReviewRow {
+                content_sha256_hex: "h1".to_string(),
+                reviewed_at_unix_ms: 30
+            }]
+        );
+        // The next id continues after the restored ones.
+        let next = dst
+            .create_definition(MetaKind::Tag, "Neu", 40)
+            .await
+            .expect("next");
+        assert!(next.definition_id > old.definition_id);
     }
 
     /// G14 support. Disable: default `match_algorithm` to ANY (1) or

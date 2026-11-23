@@ -176,6 +176,10 @@ pub async fn ingest(
                 false
             };
             drop(held);
+            if original_added {
+                // The record in S3 says the document has no original yet.
+                state.replicate_document(&hex).await;
+            }
             return Ok(IngestOutcome::Duplicate {
                 hash_hex: hex,
                 document_guid: guid,
@@ -308,6 +312,11 @@ pub async fn ingest(
     // match. The document is already archived, so a failure here is logged,
     // never turned into a failed upload.
     s8_assign(state, &hex, &text_for_s8).await;
+
+    // The S3 copy: original then record, then the metadata the rules may have
+    // assigned. A failure there never fails the upload (`docs/RECOVERY.md` §4).
+    state.replicate_document(&hex).await;
+    state.replicate_metadata().await;
 
     Ok(IngestOutcome::Stored {
         hash_hex: hex,

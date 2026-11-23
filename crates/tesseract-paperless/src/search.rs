@@ -324,10 +324,17 @@ impl SearchIndex {
         std::fs::create_dir_all(dir).map_err(SearchError::Io)?;
         let (schema, fields) = schema_and_fields();
         let mut rebuilt = false;
-        if Index::exists(&MmapDirectory::open(dir)?).map_err(tantivy::TantivyError::from)? {
-            let existing = Index::open(MmapDirectory::open(dir)?)?;
-            if existing.schema() != schema {
-                drop(existing);
+        // An index that cannot be opened (corrupt or truncated files) is
+        // treated like one with a stale schema: wiped and rebuilt. The index
+        // holds no text of its own, so the start-up reconcile refills it from
+        // the archive, and a damaged index can never keep the archive down.
+        let exists = Index::exists(&MmapDirectory::open(dir)?).unwrap_or(true);
+        if exists {
+            let usable = match Index::open(MmapDirectory::open(dir)?) {
+                Ok(existing) => existing.schema() == schema,
+                Err(_) => false,
+            };
+            if !usable {
                 for entry in std::fs::read_dir(dir).map_err(SearchError::Io)? {
                     let path = entry.map_err(SearchError::Io)?.path();
                     if path.is_dir() {
@@ -753,6 +760,24 @@ mod tests {
         idx.index_document("new1", "b.txt", "fresh wording")
             .expect("index");
         assert_eq!(idx.search("fresh", 10).expect("search").hits.len(), 1);
+    }
+
+    /// Slice C: an index whose files are damaged is wiped and rebuilt instead
+    /// of stopping the archive from starting.
+    #[test]
+    fn a_corrupt_index_is_rebuilt_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        SearchIndex::open_or_create(dir.path())
+            .expect("first open")
+            .index_document("aa11", "a.txt", "kept")
+            .expect("index");
+        std::fs::write(dir.path().join("meta.json"), b"{ not json").expect("corrupt");
+        let idx = SearchIndex::open_or_create(dir.path()).expect("a corrupt index must reopen");
+        assert!(idx.was_rebuilt());
+        assert_eq!(idx.indexed_hashes().expect("hashes").len(), 0);
+        idx.index_document("bb22", "b.txt", "after rebuild")
+            .expect("index");
+        assert_eq!(idx.search("rebuild", 10).expect("search").hits.len(), 1);
     }
 
     /// A current-schema index is reopened as is -- the silence half of the

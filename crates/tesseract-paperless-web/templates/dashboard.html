@@ -47,5 +47,7 @@
     {% endif %}
   </div>
 
+  {% if let Some(line) = replica %}<p class="note">{{ line }}</p>{% endif %}
+
   <p><a class="go" href="/">Upload a document</a></p>
 {% endblock %}

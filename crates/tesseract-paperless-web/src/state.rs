@@ -10,10 +10,23 @@ use tesseract_paperless::auto_match::AutoMatchParams;
 use tesseract_paperless::auto_model::{index_tokenizer, AutoModel, MineInputs};
 use tesseract_paperless::auto_rows::VocabParams;
 use tesseract_paperless::blobs::BlobStore;
+
+use crate::replica::Replica;
 use tesseract_paperless::kv::ContentSha256;
 use tesseract_paperless::search::SearchIndex;
 use tesseract_paperless::store::LanceStore;
 use tokio::sync::Semaphore;
+
+/// What the last replication pass found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplicaStatus {
+    /// When the last pass ended, milliseconds since the Unix epoch.
+    pub checked_at_unix_ms: Option<i64>,
+    /// Documents still without a copy in S3 after that pass.
+    pub backlog: Option<usize>,
+    /// Why the last pass failed, if it did.
+    pub error: Option<String>,
+}
 
 /// How many locks [`AppState::hash_lock`] spreads hashes over.
 pub const HASH_LOCK_STRIPES: usize = 64;
@@ -36,7 +49,11 @@ pub struct AppState {
     /// The uploaded originals, keyed by their SHA-256 (`blobs.rs`). Written
     /// before the document row (S-5), so a row never points at a missing file
     /// unless the row predates this store.
-    pub blobs: BlobStore,
+    pub blobs: Arc<BlobStore>,
+    /// The S3 copy (`replica.rs`), when `PAPERLESS_S3_*` is configured.
+    pub replica: Option<Arc<Replica>>,
+    /// What the last replication pass found, for the dashboard.
+    pub replica_status: std::sync::Mutex<ReplicaStatus>,
     /// Serializes the original and row writes of an upload with the row and
     /// original deletes of a delete, for the same hash (see [`Self::hash_lock`]).
     hash_locks: Box<[Arc<tokio::sync::Mutex<()>>]>,
@@ -87,6 +104,7 @@ impl AppState {
         search_index_dir: &Path,
         blob_dir: &Path,
         deepnsm_vocab_dir: &Path,
+        replica: Option<Replica>,
     ) -> Result<Self, String> {
         let path = |name: &str| model_dir.join(format!("eng.{name}"));
         let opt = |name: &str| path(name).exists().then(|| path(name));
@@ -110,8 +128,41 @@ impl AppState {
         let search = SearchIndex::open_or_create(search_index_dir)
             .map_err(|e| format!("open search index at {}: {e}", search_index_dir.display()))?;
 
-        let blobs = BlobStore::open(blob_dir)
-            .map_err(|e| format!("open original-file store at {}: {e}", blob_dir.display()))?;
+        let blobs = Arc::new(
+            BlobStore::open(blob_dir)
+                .map_err(|e| format!("open original-file store at {}: {e}", blob_dir.display()))?,
+        );
+
+        // An empty volume (or an interrupted restore) is filled from the S3
+        // copy before anything else reads the archive, so the reconcile below
+        // indexes the restored documents (paperless-rs `docs/RECOVERY.md` §6).
+        // A failure stops the start: an empty archive must not begin taking
+        // uploads while its history is unreachable.
+        let replica = replica.map(Arc::new);
+        if let Some(r) = &replica {
+            let restore = crate::replica::needs_restore(&store, blob_dir)
+                .await
+                .map_err(|e| format!("check whether to restore: {e}"))?;
+            if restore {
+                let report = crate::replica::restore(r, &store, &blobs)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "restore from the S3 copy failed: {e} (the archive is empty or a \
+                             restore was interrupted; it will retry on the next start)"
+                        )
+                    })?;
+                eprintln!(
+                    "tesseract-paperless-web: restored from S3: {} documents ({} already local, \
+                     {} skipped, {} without original), metadata {}",
+                    report.restored,
+                    report.already_local,
+                    report.skipped,
+                    report.without_original,
+                    if report.metadata { "imported" } else { "absent" }
+                );
+            }
+        }
 
         // The index holds references into the archive, never text of its
         // own, so it is brought back in line with the archive on every start:
@@ -191,6 +242,8 @@ impl AppState {
             store,
             search,
             blobs,
+            replica,
+            replica_status: std::sync::Mutex::new(ReplicaStatus::default()),
             hash_locks: (0..HASH_LOCK_STRIPES)
                 .map(|_| Arc::new(tokio::sync::Mutex::new(())))
                 .collect(),
@@ -214,6 +267,56 @@ impl AppState {
     #[must_use]
     pub fn hash_lock(&self, key: &ContentSha256) -> Arc<tokio::sync::Mutex<()>> {
         self.hash_locks[usize::from(key.as_bytes()[0]) % self.hash_locks.len()].clone()
+    }
+
+    /// Copy one document to S3 after its local commit. A failure is logged;
+    /// the replicator copies it later (`docs/RECOVERY.md` §4).
+    pub async fn replicate_document(&self, hash: &str) {
+        if let Some(r) = &self.replica {
+            if let Err(e) = r.upload_document(&self.store, &self.blobs, hash).await {
+                eprintln!("replica: copying {hash} to S3 failed: {e}; the replicator will retry");
+            }
+        }
+    }
+
+    /// Upload the metadata snapshot after a metadata change. A failure is
+    /// logged; the replicator uploads it again.
+    pub async fn replicate_metadata(&self) {
+        if let Some(r) = &self.replica {
+            if let Err(e) = r.upload_snapshot(&self.store).await {
+                eprintln!("replica: metadata snapshot upload failed: {e}; the replicator will retry");
+            }
+        }
+    }
+
+    /// One replication pass: copy what is missing in S3, upload the snapshot,
+    /// and record the backlog for the dashboard.
+    pub async fn replicate_now(&self) {
+        let Some(r) = &self.replica else { return };
+        let outcome = r.replicate(&self.store, &self.blobs).await;
+        let backlog = r.backlog(&self.store).await;
+        let now = crate::ingest::now_unix_ms();
+        let mut status = self
+            .replica_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.checked_at_unix_ms = Some(now);
+        match (outcome, backlog) {
+            (Ok(report), Ok(n)) => {
+                if report.uploaded + report.failed > 0 {
+                    eprintln!(
+                        "replica: {} copied to S3, {} failed, {n} still missing",
+                        report.uploaded, report.failed
+                    );
+                }
+                status.backlog = Some(n);
+                status.error = None;
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("replica: replication pass failed: {e}");
+                status.error = Some(e.to_string());
+            }
+        }
     }
 
     /// The current AUTO slot.

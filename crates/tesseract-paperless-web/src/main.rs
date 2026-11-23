@@ -10,7 +10,9 @@ mod branding;
 mod decode;
 mod fetch;
 mod ingest;
+mod replica;
 mod routes;
+mod s3;
 mod state;
 
 use std::path::PathBuf;
@@ -41,6 +43,15 @@ async fn main() {
         eprintln!("fatal: {e}");
         std::process::exit(1);
     }
+    // The S3 copy is read just as strictly: a partial configuration stops the
+    // start instead of silently running without a copy.
+    let s3_cfg = match s3::S3Config::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let model_dir =
         PathBuf::from(std::env::var("MODEL_DIR").unwrap_or_else(|_| "corpus/model".to_string()));
@@ -93,18 +104,43 @@ async fn main() {
         deepnsm_vocab_dir.display()
     );
 
+    let replica = match s3_cfg {
+        Some(cfg) => {
+            println!(
+                "tesseract-paperless-web: S3 copy: on ({} bucket {}, prefix {})",
+                cfg.endpoint, cfg.bucket, cfg.prefix
+            );
+            let prefix = cfg.prefix.clone();
+            match s3::S3Client::new(cfg) {
+                Ok(client) => Some(replica::Replica::new(Arc::new(client), &prefix)),
+                Err(e) => {
+                    eprintln!("fatal: S3 client: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => {
+            println!("tesseract-paperless-web: S3 copy: off (no PAPERLESS_S3_* configured)");
+            None
+        }
+    };
+
     let state = match AppState::load(
         &model_dir,
         &archive_uri,
         &search_index_dir,
         &blob_dir,
         &deepnsm_vocab_dir,
+        replica,
     )
     .await
     {
         Ok(s) => Arc::new(s),
         Err(e) => {
             eprintln!("fatal: could not start: {e}");
+            if e.contains("S3") {
+                std::process::exit(1);
+            }
             eprintln!(
                 "hint: set MODEL_DIR to a directory containing eng.lstm, \
                  eng.lstm-unicharset, eng.lstm-recoder (+ optional *-dawg files), \
@@ -118,6 +154,19 @@ async fn main() {
     // Mine the AUTO model off the boot path (spec R7): the app serves at once
     // and reports "no suggestions yet" until the first mine lands.
     tokio::spawn(state.clone().remine());
+
+    // Replication (`docs/RECOVERY.md` §5): once at start, then every 15
+    // minutes. It only ever adds to S3.
+    if state.replica.is_some() {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+            loop {
+                every.tick().await;
+                st.replicate_now().await;
+            }
+        });
+    }
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let addr = format!("0.0.0.0:{port}");
