@@ -3148,8 +3148,8 @@ mod tests {
         );
     }
 
-    /// The shell: every page carries the same menu, and exactly the page's own
-    /// entry is marked current.
+    /// The shell: every page carries the same menu, and in each of its two
+    /// copies (side and compact) exactly the page's own entry is marked current.
     #[tokio::test(flavor = "multi_thread")]
     async fn every_page_has_the_menu_with_its_own_entry_current() {
         let h = harness().await;
@@ -3173,13 +3173,17 @@ mod tests {
             let (status, _, body) = send(&h, get_req(&uri)).await;
             assert_eq!(status, StatusCode::OK, "{uri}");
             assert!(body.contains("<nav class=\"main\""), "{uri}: no menu");
+            // Two menus carry it: the side menu and the compact phone menu, which
+            // mark the same entry so the current section survives at phone width.
             assert_eq!(
                 body.matches(" aria-current=\"page\">").count(),
-                1,
-                "{uri}: exactly one current entry"
+                2,
+                "{uri}: one current entry per menu"
             );
-            assert!(
-                body.contains(&format!("href=\"{current} aria-current=\"page\"")),
+            assert_eq!(
+                body.matches(&format!("href=\"{current} aria-current=\"page\""))
+                    .count(),
+                2,
                 "{uri}: wrong current entry"
             );
             assert!(!body.contains("{{"), "{uri}: unrendered template syntax");
