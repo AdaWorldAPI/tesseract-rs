@@ -1155,6 +1155,20 @@ async fn require_session(
     if is_public(&path) {
         return next.run(req).await;
     }
+    // A caller that sent credentials is a service, not a browser: never redirect
+    // it. The token alone decides who it is, even when a session cookie came
+    // along: a delegated request must never borrow a session's grants.
+    if req.headers().contains_key(header::AUTHORIZATION) {
+        if login.accepts_bearer() {
+            if let Some(token) = bearer_token(req.headers()) {
+                if let Ok(caller) = login.verify_bearer(token).await {
+                    req.extensions_mut().insert(caller);
+                    return next.run(req).await;
+                }
+            }
+        }
+        return (StatusCode::UNAUTHORIZED, "invalid bearer token").into_response();
+    }
     let sid = cookie(cookie_header(req.headers()), SESSION_COOKIE).map(str::to_string);
     if let Some(sid) = sid.as_deref() {
         if login.subject(sid).is_none() {
@@ -1167,18 +1181,6 @@ async fn require_session(
             req.extensions_mut().insert(caller);
             return next.run(req).await;
         }
-    }
-    // A caller that sent credentials is a service, not a browser: never redirect it.
-    if req.headers().contains_key(header::AUTHORIZATION) {
-        if login.accepts_bearer() {
-            if let Some(token) = bearer_token(req.headers()) {
-                if let Ok(caller) = login.verify_bearer(token).await {
-                    req.extensions_mut().insert(caller);
-                    return next.run(req).await;
-                }
-            }
-        }
-        return (StatusCode::UNAUTHORIZED, "invalid bearer token").into_response();
     }
     if req.method() == Method::GET || req.method() == Method::HEAD {
         let target = req

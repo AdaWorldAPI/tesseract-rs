@@ -78,7 +78,7 @@
           {% for code in choices %}<option value="{{ code }}"{% if customer.as_deref() == Some(code.as_str()) %} selected{% endif %}>{{ code }}</option>{% endfor %}
         </select>
         {% else %}
-        <input name="customer" aria-label="Customer code" pattern="[A-Za-z0-9_-]{1,32}" placeholder="e.g. K01, empty to clear" value="{% if let Some(c) = customer %}{{ c }}{% endif %}">
+        <input name="customer" aria-label="Customer code" pattern="[A-Za-z0-9_\-]{1,32}" placeholder="e.g. K01, empty to clear" value="{% if let Some(c) = customer %}{{ c }}{% endif %}">
         {% endif %}
         <button type="submit" class="secondary">Set customer</button>
       </form>

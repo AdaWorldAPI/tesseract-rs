@@ -903,6 +903,25 @@ async fn the_gate_attaches_the_callers_grants_for_sessions_and_bearer_tokens() {
         body(r).await,
         "oidc:u2|100:paperless.user,200:report.reader"
     );
+
+    // A bearer token decides the caller even when a session cookie comes with
+    // it, and a bad token is a 401 rather than a fall-back to the session.
+    // Disable: check the session cookie before the Authorization header.
+    let both = |token: &str| {
+        HttpRequest::builder()
+            .uri("/whoami")
+            .header(header::COOKIE, format!("{SESSION_COOKIE}={cookie_value}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let r = app.clone().oneshot(both(&delegated)).await.unwrap();
+    assert!(
+        body(r).await.starts_with("oidc:u2|"),
+        "the token's caller, not the session's"
+    );
+    let r = app.clone().oneshot(both("not-a-token")).await.unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
 }
 
 /// Framed without a session, the gate offers the sign-in in a new tab rather

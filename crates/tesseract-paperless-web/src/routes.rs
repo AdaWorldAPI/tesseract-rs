@@ -189,12 +189,11 @@ async fn require_visible(state: &AppState, scope: &Scope, hash: &str) -> Result<
     if *scope == Scope::All {
         return Ok(());
     }
-    let customer = state
-        .store
-        .meta()
-        .customer_of(hash)
-        .await
-        .map_err(read_failed)?;
+    // A failed customer read answers 404 too: a 500 here, for a hash whose
+    // row exists, would tell another customer's document from an unknown one.
+    let Ok(customer) = state.store.meta().customer_of(hash).await else {
+        return Err(not_found());
+    };
     if scope.covers(customer.as_deref()) {
         Ok(())
     } else {
@@ -226,11 +225,30 @@ async fn index(
 /// dictionary beam on; deskew/rectify are display-quality knobs that don't
 /// yet have a place in the archive's stored `DocIr`).
 struct UploadedFile {
-    bytes: Vec<u8>,
-    filename: Option<String>,
-    mime: String,
+    source: UploadSource,
     /// The customer to file the document under; `None` when left empty.
     customer: Option<String>,
+}
+
+/// Where the upload's bytes come from. A URL is fetched only after the
+/// customer check, so a refused upload causes no outbound request.
+enum UploadSource {
+    File {
+        bytes: Vec<u8>,
+        filename: Option<String>,
+    },
+    Url(String),
+}
+
+impl UploadSource {
+    /// The bytes, the filename and the MIME guess.
+    async fn into_bytes(self) -> Result<(Vec<u8>, Option<String>, String), String> {
+        let octets = "application/octet-stream".to_string();
+        match self {
+            Self::File { bytes, filename } => Ok((bytes, filename, octets)),
+            Self::Url(u) => Ok((fetch_image_url(&u).await?, None, octets)),
+        }
+    }
 }
 
 async fn read_upload(mut multipart: Multipart) -> Result<UploadedFile, String> {
@@ -274,20 +292,17 @@ async fn read_upload(mut multipart: Multipart) -> Result<UploadedFile, String> {
         }
     }
 
-    let (bytes, filename, mime) = if let Some(b) = file_bytes {
-        (b, file_name, "application/octet-stream".to_string())
+    let source = if let Some(bytes) = file_bytes {
+        UploadSource::File {
+            bytes,
+            filename: file_name,
+        }
     } else if let Some(u) = url {
-        let bytes = fetch_image_url(&u).await?;
-        (bytes, None, "application/octet-stream".to_string())
+        UploadSource::Url(u)
     } else {
         return Err("please choose a file or paste an image URL".to_string());
     };
-    Ok(UploadedFile {
-        bytes,
-        filename,
-        mime,
-        customer,
-    })
+    Ok(UploadedFile { source, customer })
 }
 
 /// Whether `scope` may file a document under `customer` (`None`: no customer).
@@ -327,20 +342,26 @@ async fn upload(
         Ok(u) => u,
         Err(e) => return page_error(e),
     };
-    // Refused before recognition is spent.
+    // Refused before a URL is fetched or recognition is spent.
     if let Err(e) = may_file_under(&scope, uploaded.customer.as_deref()) {
         return page_error(e);
     }
-
-    match ingest_for_customer(
-        &state,
-        uploaded.bytes,
-        uploaded.filename,
-        &uploaded.mime,
-        uploaded.customer.as_deref(),
-    )
-    .await
+    let (bytes, filename, mime) = match uploaded.source.into_bytes().await {
+        Ok(b) => b,
+        Err(e) => return page_error(e),
+    };
+    // A file another customer already holds is refused before ingest, which
+    // could otherwise attach an original to that document.
+    let hash = format!("{:?}", ContentSha256::of(&bytes));
+    if matches!(state.store.get(&hash).await, Ok(Some(_)))
+        && require_visible(&state, &scope, &hash).await.is_err()
     {
+        return page_error(
+            "this file is already in the archive, filed under a customer you cannot see".into(),
+        );
+    }
+
+    match ingest_for_customer(&state, bytes, filename, &mime, uploaded.customer.as_deref()).await {
         Ok(outcome) => {
             log_ingest_outcome(&outcome);
             let hash = outcome.hash_hex().to_string();
