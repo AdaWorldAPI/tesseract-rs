@@ -35,7 +35,9 @@
     font-weight: 600; border: 0; border-radius: 8px; cursor: pointer;
     background: {{ self.brand().accent }}; color: {{ self.brand().on_accent() }};
   }
-  button:hover { filter: brightness(1.08); }
+  /* Hover changes no colour: the text/background pair was chosen for 4.5:1
+     contrast (Branding::on_accent), and a brightness filter would undo it. */
+  button:hover { outline: 2px solid CanvasText; outline-offset: 2px; }
   .error {
     border: 1px solid #ef4444; background: color-mix(in srgb, #ef4444 12%, Canvas);
     color: color-mix(in srgb, #ef4444 85%, CanvasText);
