@@ -989,10 +989,24 @@ async fn document_delete(State(state): State<Arc<AppState>>, Path(hash): Path<St
     //
     // The hash lock is held across the row and original deletes so a
     // concurrent upload of the same file cannot write its original in between
-    // and then lose it to this delete.
+    // and then lose it to this delete. The sequence runs in its own task that
+    // owns the lock: if the request is cancelled (the client goes away), the
+    // task still finishes and releases the lock only after the original is
+    // gone. Holding the guard in the handler would drop it on cancellation
+    // while a started unlink kept running.
+    let task = tokio::spawn(delete_document_and_original(state, hash));
+    if let Err(e) = task.await {
+        eprintln!("delete task failed: {e}");
+    }
+    Redirect::to("/documents").into_response()
+}
+
+/// The delete sequence behind [`document_delete`]: row, search entry, then
+/// original, under the document's hash lock.
+async fn delete_document_and_original(state: Arc<AppState>, hash: String) {
     let key = ContentSha256::from_hex(&hash);
     let _held = match &key {
-        Some(k) => Some(state.hash_lock(k).lock().await),
+        Some(k) => Some(state.hash_lock(k).lock_owned().await),
         None => None,
     };
     match state.store.delete(&hash).await {
@@ -1020,7 +1034,6 @@ async fn document_delete(State(state): State<Arc<AppState>>, Path(hash): Path<St
         }
         Err(e) => eprintln!("delete {hash} from archive failed: {e} (search index left untouched)"),
     }
-    Redirect::to("/documents").into_response()
 }
 
 // ---- metadata: errors ------------------------------------------------------
@@ -2211,7 +2224,8 @@ mod tests {
         let legacy = b"locked document";
         let hash = seed(&h, legacy).await;
         let key = ContentSha256::from_hex(&hash).expect("hex");
-        let held = h.state.hash_lock(&key).lock().await;
+        let lock = h.state.hash_lock(&key);
+        let held = lock.lock().await;
 
         let st = h.state.clone();
         let upload =
@@ -2247,6 +2261,45 @@ mod tests {
         // delete removed row and original together.
         assert!(h.state.store.get(&hash).await.expect("get").is_none());
         assert!(!h.state.blobs.contains(&key));
+    }
+
+    /// Slice B: a delete that started runs to the end even when its request is
+    /// cancelled, so the hash lock is never released halfway through it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_delete_still_finishes_under_the_lock() {
+        let h = harness().await;
+        let original = b"delete survives cancellation";
+        let hash = seed(&h, original).await;
+        let key = ContentSha256::from_hex(&hash).expect("hex");
+        h.state.blobs.put(&key, original).expect("put");
+
+        // Hold the lock so the delete is parked inside its sequence, then
+        // cancel the request.
+        let lock = h.state.hash_lock(&key);
+        let held = lock.lock().await;
+        let app = h.app.clone();
+        let uri = format!("/documents/{hash}/delete");
+        let req = tokio::spawn(async move { app.oneshot(post_form(&uri, "")).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        req.abort();
+        assert!(req.await.expect_err("aborted").is_cancelled());
+        assert!(h.state.store.get(&hash).await.expect("get").is_some());
+
+        drop(held);
+        // The delete completes on its own: row and original both gone.
+        let mut done = false;
+        for _ in 0..50 {
+            if h.state.store.get(&hash).await.expect("get").is_none()
+                && !h.state.blobs.contains(&key)
+            {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(done, "the cancelled delete did not finish");
+        // And it released the lock when it was done.
+        assert!(lock.try_lock().is_ok());
     }
 
     /// Slice B: altered stored bytes are refused, not served.

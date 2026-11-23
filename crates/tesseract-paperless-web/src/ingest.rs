@@ -153,7 +153,8 @@ pub async fn ingest(
         // These bytes hash to its key, so they are its original: keep them,
         // and change nothing else. No recognition either way.
         let original_added = if matched == MatchedOn::Original {
-            let _held = state.hash_lock(&hash).lock().await;
+            let lock = state.hash_lock(&hash);
+            let _held = lock.lock().await;
             let st = state.clone();
             let outcome = tokio::task::spawn_blocking(move || st.blobs.put(&hash, &bytes))
                 .await
@@ -249,7 +250,8 @@ pub async fn ingest(
     // recognition succeeded, so a file that is not a readable image never
     // reaches the store. The hash lock keeps a concurrent delete of the same
     // document from removing the original between these two writes.
-    let held = state.hash_lock(&hash).lock().await;
+    let lock = state.hash_lock(&hash);
+    let held = lock.lock().await;
     let st = state.clone();
     tokio::task::spawn_blocking(move || st.blobs.put(&hash, &bytes))
         .await

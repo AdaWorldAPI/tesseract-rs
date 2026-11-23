@@ -39,7 +39,7 @@ pub struct AppState {
     pub blobs: BlobStore,
     /// Serializes the original and row writes of an upload with the row and
     /// original deletes of a delete, for the same hash (see [`Self::hash_lock`]).
-    hash_locks: Box<[tokio::sync::Mutex<()>]>,
+    hash_locks: Box<[Arc<tokio::sync::Mutex<()>>]>,
     /// Sentence assembly + deepnsm SPO/`NarsTruth` extraction
     /// (`tesseract_ogar::{sentences,reasoning}`) — `None` when the deepnsm
     /// `word_frequency/` vocabulary is not present at `DEEPNSM_VOCAB_DIR`
@@ -192,7 +192,7 @@ impl AppState {
             search,
             blobs,
             hash_locks: (0..HASH_LOCK_STRIPES)
-                .map(|_| tokio::sync::Mutex::new(()))
+                .map(|_| Arc::new(tokio::sync::Mutex::new(())))
                 .collect(),
             reasoner,
             recognize_permits: Arc::new(Semaphore::new(permits)),
@@ -208,8 +208,12 @@ impl AppState {
     /// Striped by the first hash byte: two different documents share a lock
     /// only 1 time in [`HASH_LOCK_STRIPES`], and then only wait for each
     /// other's short write, never for recognition.
-    pub fn hash_lock(&self, key: &ContentSha256) -> &tokio::sync::Mutex<()> {
-        &self.hash_locks[usize::from(key.as_bytes()[0]) % self.hash_locks.len()]
+    ///
+    /// Shared ownership so a task can hold it after the request that started
+    /// the task is gone (see `routes::document_delete`).
+    #[must_use]
+    pub fn hash_lock(&self, key: &ContentSha256) -> Arc<tokio::sync::Mutex<()>> {
+        self.hash_locks[usize::from(key.as_bytes()[0]) % self.hash_locks.len()].clone()
     }
 
     /// The current AUTO slot.
