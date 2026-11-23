@@ -27,6 +27,7 @@ use tesseract_paperless::kv::{mint_document_root, preflight, MatchedOn, Verdict}
 use tesseract_paperless::search::SearchError;
 use tesseract_paperless::store::StoreError;
 
+use crate::customers::Scope;
 use crate::decode::decode_grey;
 use crate::state::AppState;
 
@@ -104,6 +105,9 @@ pub enum IngestError {
     /// stored yet unsearchable. Reported rather than swallowed (see
     /// [`ingest_for_customer`]'s doc comment on why this is a real, if narrow, gap).
     Search(SearchError),
+    /// The archive already holds these bytes, filed under a customer the
+    /// uploader cannot see. Nothing was changed.
+    Hidden,
 }
 
 impl std::fmt::Display for IngestError {
@@ -116,6 +120,7 @@ impl std::fmt::Display for IngestError {
             Self::Blob(e) => write!(f, "original-file store: {e}"),
             Self::Store(e) => write!(f, "archive write: {e}"),
             Self::Search(e) => write!(f, "search index write: {e}"),
+            Self::Hidden => write!(f, "already held under a customer the uploader cannot see"),
         }
     }
 }
@@ -152,6 +157,7 @@ pub async fn ingest_for_customer(
     filename: Option<String>,
     mime: &str,
     customer: Option<&str>,
+    scope: &Scope,
 ) -> Result<IngestOutcome, IngestError> {
     let (hash, verdict) = preflight(&bytes, &state.store);
     let hex = format!("{hash:?}");
@@ -170,6 +176,13 @@ pub async fn ingest_for_customer(
             .map_err(IngestError::Store)?
             .is_some()
         {
+            // Checked under the lock refiling also takes, before the original
+            // is attached: a document moved to another customer meanwhile is
+            // refused here, not after it has been changed.
+            if !may_see(state, scope, &hex).await {
+                drop(held);
+                return Err(IngestError::Hidden);
+            }
             // Deterministic from the hash alone — no store round-trip needed to
             // learn the address a Stored ingest of these exact bytes already
             // minted (`store::LanceStore::put` computes the identical value).
@@ -292,7 +305,11 @@ pub async fn ingest_for_customer(
         .map_err(IngestError::Store)?
         .is_some()
     {
+        let visible = may_see(state, scope, &hex).await;
         drop(held);
+        if !visible {
+            return Err(IngestError::Hidden);
+        }
         return Ok(IngestOutcome::Duplicate {
             hash_hex: hex,
             document_guid: mint_document_root(&hash).root.0.to_bytes(),
@@ -385,7 +402,19 @@ pub async fn ingest(
     filename: Option<String>,
     mime: &str,
 ) -> Result<IngestOutcome, IngestError> {
-    ingest_for_customer(state, bytes, filename, mime, None).await
+    ingest_for_customer(state, bytes, filename, mime, None, &Scope::All).await
+}
+
+/// Whether `scope` covers the document's current customer. A failed read
+/// answers no: an upload is refused rather than let through unchecked.
+async fn may_see(state: &AppState, scope: &Scope, hex: &str) -> bool {
+    if *scope == Scope::All {
+        return true;
+    }
+    match state.store.meta().customer_of(hex).await {
+        Ok(customer) => scope.covers(customer.as_deref()),
+        Err(_) => false,
+    }
 }
 
 /// Milliseconds since the Unix epoch; 0 if the clock is before it.

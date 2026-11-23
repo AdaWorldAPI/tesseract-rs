@@ -4708,10 +4708,10 @@ surface split.
 - Measured on `corpus/pages/page_01.pgm`: triples 1 → 3 (adds
   `(wind,moved,door)` and `(garden,cut,grass)`); corrections considered 3 → 9.
 
-## ★ paperless-web: customer separation, JSON API, frame headers, Datagroup theme (2026-11-23)
+## ★ paperless-web: customer separation, JSON API, frame headers, neutral branding (2026-11-23)
 
 The archive now separates documents by customer and can be read and embedded by
-report-rs. Recorded here because three rules are easy to break later:
+report-rs. Recorded here because four rules are easy to break later:
 
 - **The customer is an access fact, not a filing definition.** It lives in its own
   `customers` table (`archive_meta`), never as a `MetaKind`: renaming, retiring or
@@ -4727,6 +4727,15 @@ report-rs. Recorded here because three rules are easy to break later:
   start; a policy and no caller sees nothing (fail closed).
 - **Out of scope looks exactly like absent.** Every per-document route returns the
   same 404 for another customer's document as for an unknown hash.
+- **Access is checked under the document's hash lock, never before it.** Every
+  per-document write (assign, unassign, accept, review, refile, delete) goes through
+  `routes::lock_visible`, which takes the hash lock and only then checks the caller's
+  scope against the document's current customer, holding the lock across the write.
+  An upload's duplicate path makes the same check under the same lock before it
+  attaches an original (`IngestError::Hidden`). A check before the lock is stale the
+  moment a concurrent refile lands; `a_write_waiting_for_the_lock_honours_a_concurrent_move`
+  and `a_duplicate_upload_is_checked_under_the_lock_before_the_original_is_attached`
+  fail if either check moves out from under the lock.
 
 `GET /api/v1/customers/{code}/documents` answers only with a policy and returns no
 document text. `headers.rs` sets `frame-ancestors 'self'` plus

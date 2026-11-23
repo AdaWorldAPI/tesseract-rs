@@ -30,7 +30,7 @@ use tesseract_paperless::store::DocumentRow;
 use crate::auth::Caller;
 use crate::customers::Scope;
 use crate::fetch::fetch_image_url;
-use crate::ingest::{ingest_for_customer, now_unix_ms, IngestOutcome};
+use crate::ingest::{ingest_for_customer, now_unix_ms, IngestError, IngestOutcome};
 use crate::state::{AppState, AutoSlot};
 
 /// Gives every page template access to the deployment's branding
@@ -201,6 +201,24 @@ async fn require_visible(state: &AppState, scope: &Scope, hash: &str) -> Result<
     }
 }
 
+/// [`require_visible`], checked while holding the document's hash lock, which
+/// is returned to be held across the write that follows. Refiling, deletes,
+/// assignments, reviews and an upload's duplicate path all take this lock, so a
+/// move to another customer cannot land between the check and the write: a
+/// write that waited for the lock sees the document's customer as it is then.
+async fn lock_visible(
+    state: &AppState,
+    scope: &Scope,
+    hash: &str,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, Response> {
+    let Some(key) = ContentSha256::from_hex(hash) else {
+        return Err(fail(StatusCode::NOT_FOUND, "no document with this hash"));
+    };
+    let held = state.hash_lock(&key).lock_owned().await;
+    require_visible(state, scope, hash).await?;
+    Ok(held)
+}
+
 #[derive(Template)]
 #[template(path = "index.html")]
 struct IndexTemplate {
@@ -350,43 +368,27 @@ async fn upload(
         Ok(b) => b,
         Err(e) => return page_error(e),
     };
-    // A file another customer already holds is refused before ingest, which
-    // could otherwise attach an original to that document.
-    let hash = format!("{:?}", ContentSha256::of(&bytes));
-    // A failed lookup refuses the upload rather than skipping the check.
-    match state.store.get(&hash).await {
-        Ok(None) => {}
-        Ok(Some(_)) => {
-            if require_visible(&state, &scope, &hash).await.is_err() {
-                return page_error(
-                    "this file is already in the archive, filed under a customer you cannot see"
-                        .into(),
-                );
-            }
-        }
-        Err(e) => {
-            eprintln!("upload: archive lookup for {hash} failed: {e}");
-            return page_error("the archive could not be read; try again".into());
-        }
-    }
-
-    match ingest_for_customer(&state, bytes, filename, &mime, uploaded.customer.as_deref()).await {
+    // Whether the caller may see a document these bytes already belong to is
+    // decided inside ingest, under that document's hash lock and before
+    // anything is changed, so a concurrent move to another customer cannot
+    // slip in between. A re-upload never changes a document's customer.
+    match ingest_for_customer(
+        &state,
+        bytes,
+        filename,
+        &mime,
+        uploaded.customer.as_deref(),
+        &scope,
+    )
+    .await
+    {
         Ok(outcome) => {
             log_ingest_outcome(&outcome);
-            let hash = outcome.hash_hex().to_string();
-            // A duplicate keeps the customer it has: re-uploading a file never
-            // moves another customer's document into the uploader's scope.
-            if matches!(outcome, IngestOutcome::Duplicate { .. })
-                && require_visible(&state, &scope, &hash).await.is_err()
-            {
-                return page_error(
-                    "this file is already in the archive, filed under a customer \
-                     you cannot see"
-                        .into(),
-                );
-            }
-            Redirect::to(&format!("/documents/{hash}")).into_response()
+            Redirect::to(&format!("/documents/{}", outcome.hash_hex())).into_response()
         }
+        Err(IngestError::Hidden) => page_error(
+            "this file is already in the archive, filed under a customer you cannot see".into(),
+        ),
         Err(e) => page_error(format!("ingestion failed: {e}")),
     }
 }
@@ -1244,9 +1246,7 @@ async fn document_delete(
     caller: Option<Extension<Caller>>,
     Path(hash): Path<String>,
 ) -> Response {
-    if let Err(refused) = require_visible(&state, &scope_of(&state, caller.as_ref()), &hash).await {
-        return refused;
-    }
+    let scope = scope_of(&state, caller.as_ref());
     // The search-index delete only runs when the archive delete actually
     // succeeded. Doing both unconditionally (codex P1 on PR #88) meant a
     // transient LanceDB failure left the document ARCHIVED but UNSEARCHABLE
@@ -1261,22 +1261,28 @@ async fn document_delete(
     // owns the lock: if the request is cancelled (the client goes away), the
     // task still finishes and releases the lock only after the original is
     // gone. Holding the guard in the handler would drop it on cancellation
-    // while a started unlink kept running.
-    let task = tokio::spawn(delete_document_and_original(state, hash));
-    if let Err(e) = task.await {
-        eprintln!("delete task failed: {e}");
+    // while a started unlink kept running. The caller's access is checked in
+    // that task too, under the lock, so a move to another customer while the
+    // delete waits for it is honoured.
+    let task = tokio::spawn(delete_document_and_original(state, hash, scope));
+    match task.await {
+        Ok(Err(refused)) => return refused,
+        Ok(Ok(())) => {}
+        Err(e) => eprintln!("delete task failed: {e}"),
     }
     Redirect::to("/documents").into_response()
 }
 
 /// The delete sequence behind [`document_delete`]: row, search entry, then
-/// original, under the document's hash lock.
-async fn delete_document_and_original(state: Arc<AppState>, hash: String) {
+/// original, under the document's hash lock, after checking under that lock
+/// that `scope` covers the document.
+async fn delete_document_and_original(
+    state: Arc<AppState>,
+    hash: String,
+    scope: Scope,
+) -> Result<(), Response> {
+    let _held = lock_visible(&state, &scope, &hash).await?;
     let key = ContentSha256::from_hex(&hash);
-    let _held = match &key {
-        Some(k) => Some(state.hash_lock(k).lock_owned().await),
-        None => None,
-    };
     match state.store.delete(&hash).await {
         Ok(()) => {
             // Same off-runtime dispatch as every other search-index write.
@@ -1307,6 +1313,7 @@ async fn delete_document_and_original(state: Arc<AppState>, hash: String) {
         }
         Err(e) => eprintln!("delete {hash} from archive failed: {e} (search index left untouched)"),
     }
+    Ok(())
 }
 
 // ---- metadata: errors ------------------------------------------------------
@@ -1404,7 +1411,7 @@ async fn document_assign(
     Form(f): Form<AssignForm>,
 ) -> Result<Redirect, Response> {
     let kind = parse_kind(&f.kind)?;
-    require_visible(&state, &scope_of(&state, caller.as_ref()), &hash).await?;
+    let _held = lock_visible(&state, &scope_of(&state, caller.as_ref()), &hash).await?;
     state
         .store
         .meta()
@@ -1422,7 +1429,7 @@ async fn document_unassign(
     Form(f): Form<AssignForm>,
 ) -> Result<Redirect, Response> {
     let kind = parse_kind(&f.kind)?;
-    require_visible(&state, &scope_of(&state, caller.as_ref()), &hash).await?;
+    let _held = lock_visible(&state, &scope_of(&state, caller.as_ref()), &hash).await?;
     state
         .store
         .meta()
@@ -1442,7 +1449,7 @@ async fn document_accept(
     Form(f): Form<AssignForm>,
 ) -> Result<Redirect, Response> {
     let kind = parse_kind(&f.kind)?;
-    require_visible(&state, &scope_of(&state, caller.as_ref()), &hash).await?;
+    let _held = lock_visible(&state, &scope_of(&state, caller.as_ref()), &hash).await?;
     state
         .store
         .meta()
@@ -1467,7 +1474,7 @@ async fn document_review(
     Form(f): Form<ReviewForm>,
 ) -> Result<Redirect, Response> {
     let scope = scope_of(&state, caller.as_ref());
-    require_visible(&state, &scope, &hash).await?;
+    let held = lock_visible(&state, &scope, &hash).await?;
     // Validate `next` before anything is written: a refused request changes nothing.
     let to_inbox = match f.next.as_deref() {
         None | Some("") => false,
@@ -1496,6 +1503,7 @@ async fn document_review(
             ))
         }
     }
+    drop(held);
     // The review flag is written: copy it before either redirect, so a failed
     // inbox lookup below cannot skip the copy.
     state.replicate_metadata();
@@ -1533,8 +1541,8 @@ async fn document_customer(
     Form(f): Form<CustomerForm>,
 ) -> Result<Redirect, Response> {
     let scope = scope_of(&state, caller.as_ref());
-    require_visible(&state, &scope, &hash).await?;
     let customer = Some(f.customer.trim()).filter(|c| !c.is_empty());
+    let _held = lock_visible(&state, &scope, &hash).await?;
     may_file_under(&scope, customer).map_err(|e| fail(StatusCode::FORBIDDEN, e))?;
     state
         .store
@@ -3683,6 +3691,174 @@ mod tests {
             h.state.store.count().await.expect("count"),
             before,
             "nothing archived"
+        );
+    }
+
+    /// Sends `req` while this test holds the document's hash lock, so the
+    /// request has to wait for it; moves the document from K01 to K02 while it
+    /// waits, as a concurrent refile by an unrestricted caller would; then
+    /// releases the lock. Asserts the request really waited, so a write that
+    /// checked access before taking the lock cannot pass by finishing first.
+    async fn send_while_moved(h: &Harness, hash: &str, req: Request<Body>) -> (StatusCode, String) {
+        let key = ContentSha256::from_hex(hash).expect("hash");
+        let held = h.state.hash_lock(&key).lock_owned().await;
+        let app = h.app.clone();
+        let task = tokio::spawn(async move { app.oneshot(req).await.expect("oneshot") });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "the write did not wait for the document's lock"
+        );
+        h.state
+            .store
+            .meta()
+            .set_customer(hash, Some("K02"), 2)
+            .await
+            .expect("move");
+        drop(held);
+        let resp = task.await.expect("task");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// A K01 caller's write that waits for the document's lock while the
+    /// document moves to K02 is refused with 404 and changes nothing: access is
+    /// checked under the lock, not before it.
+    /// Disable: check access before taking the lock in `lock_visible`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_waiting_for_the_lock_honours_a_concurrent_move() {
+        let h = harness_with(Some(POLICY)).await;
+        let meta = h.state.store.meta();
+        let tag = meta
+            .create_definition(MetaKind::Tag, "Strom", 1)
+            .await
+            .expect("tag")
+            .definition_id;
+        let cases: [(&str, &str); 6] = [
+            ("assign", "kind=tag&definition_id=TAG"),
+            ("unassign", "kind=tag&definition_id=TAG"),
+            ("accept", "kind=tag&definition_id=TAG"),
+            ("review", "reviewed=true"),
+            ("customer", "customer=K01"),
+            ("delete", ""),
+        ];
+        for (i, (route, form)) in cases.iter().enumerate() {
+            let hash = seed(&h, format!("moved document {i}").as_bytes()).await;
+            meta.set_customer(&hash, Some("K01"), 1).await.expect("k01");
+            if *route == "unassign" {
+                meta.assign(&hash, MetaKind::Tag, tag, Source::Manual, 1)
+                    .await
+                    .expect("assign");
+            }
+            let body = form.replace("TAG", &tag.to_string());
+            let req = as_role(
+                post_form(&format!("/documents/{hash}/{route}"), &body),
+                "paperless.k01",
+            );
+            let (status, _) = send_while_moved(&h, &hash, req).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{route}: refused");
+
+            assert!(
+                h.state.store.get(&hash).await.expect("get").is_some(),
+                "{route}: the document must still exist"
+            );
+            assert_eq!(
+                meta.customer_of(&hash).await.expect("c").as_deref(),
+                Some("K02"),
+                "{route}: the move must stand"
+            );
+            assert!(
+                !meta.is_reviewed(&hash).await.expect("reviewed"),
+                "{route}: nothing marked reviewed"
+            );
+            let tags = meta
+                .assignments_for(&hash)
+                .await
+                .expect("for")
+                .into_iter()
+                .filter(|a| a.kind == MetaKind::Tag)
+                .count();
+            let expected = usize::from(*route == "unassign");
+            assert_eq!(tags, expected, "{route}: assignments unchanged");
+        }
+    }
+
+    /// The same interleaving without the move: the write waits for the lock,
+    /// then succeeds, so the guard does not refuse a caller who may write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_waiting_for_the_lock_succeeds_when_nothing_moves() {
+        let h = harness_with(Some(POLICY)).await;
+        let hash = seed(&h, b"stays in k01").await;
+        let meta = h.state.store.meta();
+        meta.set_customer(&hash, Some("K01"), 1).await.expect("k01");
+        let key = ContentSha256::from_hex(&hash).expect("hash");
+        let held = h.state.hash_lock(&key).lock_owned().await;
+        let app = h.app.clone();
+        let req = as_role(
+            post_form(&format!("/documents/{hash}/review"), "reviewed=true"),
+            "paperless.k01",
+        );
+        let task = tokio::spawn(async move { app.oneshot(req).await.expect("oneshot") });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!task.is_finished(), "the write did not wait for the lock");
+        drop(held);
+        assert_eq!(task.await.expect("task").status(), StatusCode::SEE_OTHER);
+        assert!(meta.is_reviewed(&hash).await.expect("reviewed"));
+    }
+
+    /// An upload of bytes the archive holds, for a document stored before
+    /// originals were kept: allowed when the caller sees the document (the
+    /// original is attached), refused without touching it when the document
+    /// moves to another customer while the upload waits for its lock.
+    /// Disable: drop the `may_see` check in ingest's duplicate path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_duplicate_upload_is_checked_under_the_lock_before_the_original_is_attached() {
+        let h = harness_with(Some(POLICY)).await;
+        let meta = h.state.store.meta();
+
+        let allowed = b"legacy k01 scan";
+        let hash = seed(&h, allowed).await;
+        meta.set_customer(&hash, Some("K01"), 1).await.expect("k01");
+        let (status, location, _) = send(
+            &h,
+            as_role(upload_req(allowed, Some("K01")), "paperless.k01"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SEE_OTHER,
+            "a visible duplicate is accepted"
+        );
+        assert_eq!(
+            location.as_deref(),
+            Some(format!("/documents/{hash}").as_str())
+        );
+        assert_eq!(blob_files(&h), 1, "its original is attached");
+
+        let refused = b"legacy scan that moves";
+        let hash = seed(&h, refused).await;
+        meta.set_customer(&hash, Some("K01"), 1).await.expect("k01");
+        let (_, body) = send_while_moved(
+            &h,
+            &hash,
+            as_role(upload_req(refused, Some("K01")), "paperless.k01"),
+        )
+        .await;
+        assert!(
+            body.contains("filed under a customer you cannot see"),
+            "refused: {body}"
+        );
+        assert_eq!(
+            blob_files(&h),
+            1,
+            "no original attached to the moved document"
+        );
+        assert_eq!(
+            meta.customer_of(&hash).await.expect("c").as_deref(),
+            Some("K02")
         );
     }
 
