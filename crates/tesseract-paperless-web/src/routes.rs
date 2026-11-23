@@ -214,6 +214,8 @@ async fn lock_visible(
     let Some(key) = ContentSha256::from_hex(hash) else {
         return Err(fail(StatusCode::NOT_FOUND, "no document with this hash"));
     };
+    #[cfg(test)]
+    crate::state::lock_probe::reached(hash);
     let held = state.hash_lock(&key).lock_owned().await;
     require_visible(state, scope, hash).await?;
     Ok(held)
@@ -585,53 +587,45 @@ async fn documents(
     // dispatched off the async runtime the same way OCR and the search-index
     // write already are.
     // A scoped caller's results are filtered after the search, so it searches
-    // the whole archive: cutting to LIST_LIMIT first would let other customers'
-    // documents push its own matches out. The cut to LIST_LIMIT comes after.
-    let search_limit = if scope == Scope::All {
-        LIST_LIMIT
-    } else {
-        match state.store.count().await {
-            Ok(n) => n.max(1),
-            Err(e) => {
-                return render(&DocumentsTemplate {
-                    nav: "documents",
-                    pager: None,
-                    query,
-                    count: 0,
-                    documents: Vec::new(),
-                    error: Some(format!("archive read failed: {e}")),
-                })
-            }
-        }
-    };
+    // every entry in the index: cutting to LIST_LIMIT first would let other
+    // customers' documents push its own matches out, and a limit taken from
+    // the archive's row count would let stale index entries (no archive row)
+    // use up slots. The cut to LIST_LIMIT comes after the filter.
+    let scoped = scope != Scope::All;
     let st = state.clone();
     let q_for_search = query.clone();
-    let results =
-        match tokio::task::spawn_blocking(move || st.search.search(&q_for_search, search_limit))
-            .await
-        {
-            Ok(Ok(results)) => results,
-            Ok(Err(e)) => {
-                return render(&DocumentsTemplate {
-                    nav: "documents",
-                    pager: None,
-                    query,
-                    count: 0,
-                    documents: Vec::new(),
-                    error: Some(format!("search failed: {e}")),
-                })
-            }
-            Err(e) => {
-                return render(&DocumentsTemplate {
-                    nav: "documents",
-                    pager: None,
-                    query,
-                    count: 0,
-                    documents: Vec::new(),
-                    error: Some(format!("search task failed: {e}")),
-                })
-            }
+    let results = match tokio::task::spawn_blocking(move || {
+        let limit = if scoped {
+            st.search.indexed_hashes()?.len().max(1)
+        } else {
+            LIST_LIMIT
         };
+        st.search.search(&q_for_search, limit)
+    })
+    .await
+    {
+        Ok(Ok(results)) => results,
+        Ok(Err(e)) => {
+            return render(&DocumentsTemplate {
+                nav: "documents",
+                pager: None,
+                query,
+                count: 0,
+                documents: Vec::new(),
+                error: Some(format!("search failed: {e}")),
+            })
+        }
+        Err(e) => {
+            return render(&DocumentsTemplate {
+                nav: "documents",
+                pager: None,
+                query,
+                count: 0,
+                documents: Vec::new(),
+                error: Some(format!("search task failed: {e}")),
+            })
+        }
+    };
 
     // Each hit is joined back to its archive row for display metadata the
     // search index does not carry (page_count/confidence/low_confidence).
@@ -1713,6 +1707,13 @@ async fn dashboard(
     caller: Option<Extension<Caller>>,
 ) -> Html<String> {
     let scope = scope_of(&state, caller.as_ref());
+    // The replica backlog counts every customer's documents, so only a caller
+    // who sees every customer is shown it.
+    let replica = if scope == Scope::All {
+        replica_summary(&state)
+    } else {
+        None
+    };
     let read = async {
         let unreviewed = unreviewed_rows(&state, &scope).await?;
         // The total a scoped caller sees counts only its own documents.
@@ -1749,7 +1750,7 @@ async fn dashboard(
                     ingested_at: format_unix_ms(r.ingested_at_unix_ms),
                 })
                 .collect(),
-            replica: replica_summary(&state),
+            replica: replica.clone(),
             error: None,
         }),
         Err(e) => render(&DashboardTemplate {
@@ -1757,7 +1758,7 @@ async fn dashboard(
             unreviewed: 0,
             kinds: Vec::new(),
             recent: Vec::new(),
-            replica: replica_summary(&state),
+            replica,
             error: Some(format!("archive read failed: {e}")),
         }),
     }
@@ -3697,14 +3698,22 @@ mod tests {
     /// Sends `req` while this test holds the document's hash lock, so the
     /// request has to wait for it; moves the document from K01 to K02 while it
     /// waits, as a concurrent refile by an unrestricted caller would; then
-    /// releases the lock. Asserts the request really waited, so a write that
-    /// checked access before taking the lock cannot pass by finishing first.
+    /// releases the lock. The move happens only once the request signals that it
+    /// is about to take the lock (`lock_probe`), so a write that checked access
+    /// before taking the lock always sees the old customer and fails the test.
     async fn send_while_moved(h: &Harness, hash: &str, req: Request<Body>) -> (StatusCode, String) {
         let key = ContentSha256::from_hex(hash).expect("hash");
         let held = h.state.hash_lock(&key).lock_owned().await;
+        let reached = crate::state::lock_probe::expect(hash);
         let app = h.app.clone();
         let task = tokio::spawn(async move { app.oneshot(req).await.expect("oneshot") });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Move the document only once the request is about to take the lock,
+        // never earlier: a request that has not reached the lock yet could
+        // read the moved customer even with a check made before the lock.
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached)
+            .await
+            .expect("the request never reached the document's lock")
+            .expect("probe dropped");
         assert!(
             !task.is_finished(),
             "the write did not wait for the document's lock"
@@ -3796,13 +3805,17 @@ mod tests {
         meta.set_customer(&hash, Some("K01"), 1).await.expect("k01");
         let key = ContentSha256::from_hex(&hash).expect("hash");
         let held = h.state.hash_lock(&key).lock_owned().await;
+        let reached = crate::state::lock_probe::expect(&hash);
         let app = h.app.clone();
         let req = as_role(
             post_form(&format!("/documents/{hash}/review"), "reviewed=true"),
             "paperless.k01",
         );
         let task = tokio::spawn(async move { app.oneshot(req).await.expect("oneshot") });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached)
+            .await
+            .expect("the request never reached the document's lock")
+            .expect("probe dropped");
         assert!(!task.is_finished(), "the write did not wait for the lock");
         drop(held);
         assert_eq!(task.await.expect("task").status(), StatusCode::SEE_OTHER);
@@ -3950,5 +3963,76 @@ mod tests {
         )
         .await;
         assert!(body.contains(&own), "the caller's own match must be found");
+    }
+
+    /// A stale index entry (no archive row) that outranks the caller's match
+    /// does not push it out: the scoped search limit is the index size, not
+    /// the archive's row count.
+    /// Disable: take the scoped limit from `state.store.count()`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_index_entry_does_not_hide_a_scoped_match() {
+        let h = harness_with(Some(POLICY)).await;
+        let stale = format!("{:?}", ContentSha256::of(b"deleted, still indexed"));
+        h.state
+            .search
+            .index_document(&stale, "doc.png", "Stadtwerke Stadtwerke Stadtwerke")
+            .expect("index stale");
+        let own = seed(&h, b"own document").await;
+        h.state
+            .store
+            .meta()
+            .set_customer(&own, Some("K01"), 1)
+            .await
+            .expect("k01");
+        h.state
+            .search
+            .index_document(
+                &own,
+                "doc.png",
+                "Stadtwerke with many more words that lower its rank considerably here",
+            )
+            .expect("index");
+        assert_eq!(h.state.store.count().await.expect("count"), 1);
+        let (_, _, body) = send(
+            &h,
+            as_role(get_req("/documents?q=Stadtwerke"), "paperless.k01"),
+        )
+        .await;
+        assert!(body.contains(&own), "the caller's own match must be found");
+    }
+
+    /// The S3 backlog counts every customer's documents, so the dashboard
+    /// shows it only to a caller who sees every customer.
+    /// Disable: render `replica_summary` for every caller.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_dashboard_shows_the_s3_backlog_only_to_unrestricted_callers() {
+        let archive = tempfile::tempdir().expect("archive tempdir");
+        let index = tempfile::tempdir().expect("index tempdir");
+        let blobs = tempfile::tempdir().expect("blob tempdir");
+        let bucket = Arc::new(crate::s3::memory::MemoryStore::default());
+        let mut state = AppState::load(
+            FsPath::new(MODEL_DIR),
+            &archive.path().to_string_lossy(),
+            index.path(),
+            blobs.path(),
+            FsPath::new("/nonexistent/deepnsm/word_frequency"),
+            Some(crate::replica::Replica::new(bucket, "pl")),
+        )
+        .await
+        .expect("AppState::load");
+        state.policy = Some(crate::customers::CustomerPolicy::from_json(POLICY).expect("policy"));
+        let state = Arc::new(state);
+        let h = Harness {
+            app: router(state.clone()),
+            state,
+            _dirs: (archive, index, blobs),
+        };
+        let (_, _, admin) = send(&h, as_role(get_req("/dashboard"), "paperless.admin")).await;
+        assert!(
+            admin.contains("S3 copy"),
+            "an unrestricted caller sees the backlog"
+        );
+        let (_, _, scoped) = send(&h, as_role(get_req("/dashboard"), "paperless.k01")).await;
+        assert!(!scoped.contains("S3 copy"), "a scoped caller does not");
     }
 }

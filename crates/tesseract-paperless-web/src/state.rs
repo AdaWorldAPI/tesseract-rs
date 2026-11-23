@@ -488,3 +488,40 @@ impl AppState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = slot;
     }
 }
+
+/// Tells a waiting test that a request is about to take a document's hash
+/// lock, so the test can change the document at exactly that point instead of
+/// guessing with a sleep. Keyed by hash, so tests running in parallel on
+/// different documents do not see each other's signals.
+#[cfg(test)]
+pub(crate) mod lock_probe {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use tokio::sync::oneshot;
+
+    static WAITERS: Mutex<Option<HashMap<String, oneshot::Sender<()>>>> = Mutex::new(None);
+
+    /// Arm the probe for `hash`; the receiver fires when a request reaches it.
+    pub(crate) fn expect(hash: &str) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        WAITERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(hash.to_string(), tx);
+        rx
+    }
+
+    /// Called just before a request takes `hash`'s lock.
+    pub(crate) fn reached(hash: &str) {
+        let tx = WAITERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|m| m.remove(hash));
+        if let Some(tx) = tx {
+            let _ = tx.send(());
+        }
+    }
+}

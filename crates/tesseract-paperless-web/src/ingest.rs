@@ -167,8 +167,9 @@ pub async fn ingest_for_customer(
         // the document since. Re-check under the lock: a document that is gone
         // is uploaded as new (below), never answered as "already held" with a
         // link to nothing.
-        let lock = state.hash_lock(&hash);
-        let held = lock.lock().await;
+        #[cfg(test)]
+        crate::state::lock_probe::reached(&hex);
+        let held = state.hash_lock(&hash).lock_owned().await;
         if state
             .store
             .get(&hex)
@@ -190,17 +191,23 @@ pub async fn ingest_for_customer(
             // A document stored before originals were kept has a row and no
             // blob. These bytes hash to its key, so they are its original: keep
             // them, and change nothing else. No recognition either way.
+            // The lock moves into the blocking write and is released only when
+            // it returns, even if this request is cancelled meanwhile: a refile
+            // or a delete cannot slip in while the original is being written.
             let original_added = if matched == MatchedOn::Original {
                 let st = state.clone();
-                let outcome = tokio::task::spawn_blocking(move || st.blobs.put(&hash, &bytes))
-                    .await
-                    .map_err(|e| IngestError::Task(e.to_string()))?
-                    .map_err(IngestError::Blob)?;
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let _held = held;
+                    st.blobs.put(&hash, &bytes)
+                })
+                .await
+                .map_err(|e| IngestError::Task(e.to_string()))?
+                .map_err(IngestError::Blob)?;
                 outcome == PutOutcome::Written
             } else {
+                drop(held);
                 false
             };
-            drop(held);
             if original_added {
                 // The record in S3 says the document has no original yet.
                 state.replicate_document(&hex);
