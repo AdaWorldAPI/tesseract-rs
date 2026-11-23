@@ -3304,7 +3304,7 @@ mod tests {
                     let h = t[..i].rfind("href=\"").expect("href before marker");
                     t[h..i].trim_end().to_owned()
                 };
-                assert_eq!(href_before(&side, a), href_before(&compact, b), "{uri}");
+                assert_eq!(href_before(side, a), href_before(compact, b), "{uri}");
             }
             assert!(
                 body.contains("class=\"quick-rail region-right_panel\""),
