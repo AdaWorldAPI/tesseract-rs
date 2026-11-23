@@ -524,6 +524,13 @@ pub async fn restore(
     blobs: &Arc<BlobStore>,
 ) -> Result<RestoreReport, ReplicaError> {
     let marker = blobs.root().join(RESTORE_MARKER);
+    let pinned = blobs.root().join(RESTORE_SNAPSHOT);
+    // A pin belongs to the restore its marker announces. A pin without a
+    // marker is left over from a restore that finished (marker removed, pin
+    // not yet), so a new restore drops it and reads the current snapshot.
+    if !marker.exists() {
+        remove_if_present(&pinned)?;
+    }
     std::fs::write(&marker, b"restore in progress\n").map_err(local)?;
 
     let mut report = RestoreReport::default();
@@ -612,7 +619,6 @@ pub async fn restore(
         report.restored += 1;
     }
 
-    let pinned = blobs.root().join(RESTORE_SNAPSHOT);
     let fetched = match std::fs::read(&pinned) {
         Ok(body) => Ok(body),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -645,13 +651,20 @@ pub async fn restore(
         Err(e) => return Err(e),
     }
 
-    match std::fs::remove_file(&pinned) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(local(e)),
-    }
+    // Marker first, then the pin: while the marker exists the pin stays
+    // authoritative, so an interruption between the two can never make a
+    // resumed restore read a newer snapshot.
     std::fs::remove_file(&marker).map_err(local)?;
+    remove_if_present(&pinned)?;
     Ok(report)
+}
+
+fn remove_if_present(path: &Path) -> Result<(), ReplicaError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(local(e)),
+    }
 }
 
 #[cfg(test)]
@@ -962,6 +975,28 @@ mod tests {
         assert!(snap.reviews.iter().any(|v| v.content_sha256_hex == a));
         assert!(!dst.blobs.root().join(RESTORE_SNAPSHOT).exists());
         assert!(!dst.blobs.root().join(RESTORE_MARKER).exists());
+    }
+
+    /// A pin left behind by a finished restore (marker already removed) is
+    /// not reused: a new restore drops it and imports the current snapshot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_leftover_pin_without_a_marker_is_not_reused() {
+        let bucket = Arc::new(MemoryStore::default());
+        let r = replica(&bucket);
+        let src = local().await;
+        let a = add(&src, b"stale pin", "a.png", 1, true).await;
+        src.store.meta().mark_reviewed(&a, 2).await.expect("review");
+        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        let old = bucket.get(&r.snapshot_key()).expect("snapshot");
+        src.store.meta().mark_unreviewed(&a).await.expect("unreview");
+        r.upload_snapshot(&src.store).await.expect("snapshot");
+
+        let dst = local().await;
+        std::fs::write(dst.blobs.root().join(RESTORE_SNAPSHOT), &old).expect("stale pin");
+        restore(&r, &dst.store, &dst.blobs).await.expect("restore");
+        let snap = dst.store.meta().export().await.expect("export");
+        assert!(!snap.reviews.iter().any(|v| v.content_sha256_hex == a));
+        assert!(!dst.blobs.root().join(RESTORE_SNAPSHOT).exists());
     }
 
     /// A rewrite of the record that fails after the original reached S3

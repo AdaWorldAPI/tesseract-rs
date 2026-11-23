@@ -706,17 +706,29 @@ mod tests {
         let p = format!("live-test-{}-{nanos}", std::process::id());
         let cfg = S3Config::new(&ep, &bucket, "us-east-1", &p, &key, &secret);
         let c = S3Client::new(cfg).expect("client");
+        // Deletes everything under the prefix and returns what it could not.
+        fn clean(c: &S3Client, prefix: &str) -> Vec<String> {
+            match c.list(prefix) {
+                Ok(keys) => keys
+                    .into_iter()
+                    .filter_map(|k| c.delete(&k).err().map(|e| format!("{k}: {}", e.class)))
+                    .collect(),
+                Err(e) => vec![format!("listing {prefix}: {}", e.class)],
+            }
+        }
+        // On a panic the cleanup still runs and reports what it left; on
+        // success the test calls `clean` itself and fails if anything is left.
         struct Cleanup<'a>(&'a S3Client, String);
         impl Drop for Cleanup<'_> {
             fn drop(&mut self) {
-                if let Ok(keys) = self.0.list(&self.1) {
-                    for k in keys {
-                        let _ = self.0.delete(&k);
+                if std::thread::panicking() {
+                    for left in clean(self.0, &self.1) {
+                        eprintln!("live test cleanup left {left}");
                     }
                 }
             }
         }
-        let _cleanup = Cleanup(&c, format!("{p}/"));
+        let cleanup = Cleanup(&c, format!("{p}/"));
         let original = format!("{p}/originals/a b+c");
         let body = b"live bytes \x00\xff".to_vec();
         c.put(&original, &body, "application/octet-stream").expect("put");
@@ -743,6 +755,9 @@ mod tests {
                 .class,
             "forbidden"
         );
+        let left = clean(&c, &cleanup.1);
+        assert!(left.is_empty(), "cleanup left objects: {left:?}");
+        assert!(c.list(&cleanup.1).expect("list").is_empty());
     }
 
     #[test]
