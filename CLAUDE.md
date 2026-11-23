@@ -4732,6 +4732,8 @@ report-rs. Recorded here because three rules are easy to break later:
 document text. `headers.rs` sets `frame-ancestors 'self'` plus
 `PAPERLESS_FRAME_ANCESTORS` on every response (the archive was frameable by any
 site before), and a framed request without a session gets a new-tab sign-in link
-because the identity provider refuses to be framed. `BRAND_THEME=datagroup` copies
-report-rs's `themes.css` Datagroup values; compare them by eye when report-rs
-changes its theme.
+because the identity provider refuses to be framed. No customer's identity is
+compiled in (operator, 2026-11-23: the corporate identity comes only from Railway
+variables, so one blank image hosts any customer): the layout (header bar, cards)
+is the neutral default, and a deployment sets `BRAND_NAME`, `BRAND_ACCENT`,
+`BRAND_HEADER_BG` and `BRAND_LOGO_URL`.

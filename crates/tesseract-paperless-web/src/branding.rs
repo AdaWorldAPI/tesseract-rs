@@ -11,13 +11,13 @@
 //! | `BRAND_TAGLINE` | the line under the heading on the upload page | up to 240 characters |
 //! | `BRAND_ACCENT` | links and buttons | `#rgb` or `#rrggbb` |
 //! | `BRAND_LOGO_URL` | an image beside the heading | an `https://` URL or a same-site path starting with a single `/` |
-//! | `BRAND_THEME` | the page theme | `default`, or `datagroup` (report-rs's default corporate theme) |
+//! | `BRAND_HEADER_BG` | the header bar's background | `#rgb` or `#rrggbb` |
 //!
-//! `datagroup` matches report-rs's `Theme::Datagroup` (`templates/themes.css`
-//! there): a navy header bar, a red accent, Segoe UI, white cards with a soft
-//! shadow on a light grey page. It sets the accent to `#c8102e` unless
-//! `BRAND_ACCENT` names another, and pins the light colour scheme, as
-//! report-rs does.
+//! No customer's identity is compiled in: the image is neutral, and a
+//! deployment brings its own name, colours and logo through these variables
+//! (for example a Railway service setting the colours of the portal it sits
+//! beside). Without `BRAND_HEADER_BG` the header bar uses a dark tone of the
+//! system colours, so light and dark mode both keep their contrast.
 //!
 //! An empty value counts as unset. A value that is not accepted is ignored
 //! with one line on stderr and the
@@ -41,38 +41,6 @@ const MAX_NAME: usize = 60;
 const MAX_TAGLINE: usize = 240;
 const MAX_URL: usize = 2048;
 
-/// A page theme: colours and type layered over the base styles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Theme {
-    /// The archive's own look: system colours, light and dark.
-    #[default]
-    Default,
-    /// report-rs's default corporate theme.
-    Datagroup,
-}
-
-/// The accent the `datagroup` theme uses unless `BRAND_ACCENT` is set.
-pub const DATAGROUP_ACCENT: &str = "#c8102e";
-
-/// report-rs `themes.css`, `:root[data-theme="datagroup"]`, applied to this
-/// archive's markup. Values are copied, not derived: the two must be compared
-/// by eye when report-rs changes its theme.
-const DATAGROUP_CSS: &str = r#"
-  :root { color-scheme: light; }
-  body { font-family: "Segoe UI", system-ui, -apple-system, Arial, sans-serif; font-size: 14px;
-         background: #f5f5f5; color: #1a1a1a; }
-  header.shell { background: #0d3a64; border-bottom: 0; }
-  header.shell .brand, header.shell .end, form.signout button { color: #fff; }
-  nav.main a { color: rgba(255,255,255,.75); }
-  nav.main a:hover { color: #fff; }
-  nav.main a[aria-current="page"] { color: #fff; border-bottom-color: #c8102e; }
-  .card { background: #fff; border: 1px solid #e0e6ec; border-radius: 14px;
-          box-shadow: 0 4px 16px rgba(0,0,0,.08); }
-  h1 { color: #1a1a1a; }
-  th { text-transform: uppercase; font-size: 11px; color: #4a4a4a; }
-  button:hover, :focus-visible { outline: 2px solid #c8102e; outline-offset: 2px; }
-  footer { color: #4a4a4a; }
-"#;
 
 /// The branding the pages render.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,7 +49,7 @@ pub struct Branding {
     pub tagline: String,
     pub accent: String,
     logo_url: Option<String>,
-    theme: Theme,
+    header_bg: Option<String>,
 }
 
 impl Default for Branding {
@@ -91,7 +59,7 @@ impl Default for Branding {
             tagline: DEFAULT_TAGLINE.to_owned(),
             accent: DEFAULT_ACCENT.to_owned(),
             logo_url: None,
-            theme: Theme::Default,
+            header_bg: None,
         }
     }
 }
@@ -105,16 +73,6 @@ impl Branding {
         // value, and that must not read as a rejected setting.
         let get = |k: &str| get(k).filter(|v| !v.trim().is_empty());
         let mut b = Branding::default();
-        if let Some(v) = get("BRAND_THEME") {
-            match v.trim().to_ascii_lowercase().as_str() {
-                "default" => {}
-                "datagroup" => {
-                    b.theme = Theme::Datagroup;
-                    b.accent = DATAGROUP_ACCENT.to_owned();
-                }
-                _ => warn("BRAND_THEME ignored: use default or datagroup".to_owned()),
-            }
-        }
         if let Some(v) = get("BRAND_NAME") {
             let v = v.trim();
             let n = v.chars().count();
@@ -144,6 +102,14 @@ impl Branding {
                 warn("BRAND_ACCENT ignored: use #rgb or #rrggbb".to_owned());
             }
         }
+        if let Some(v) = get("BRAND_HEADER_BG") {
+            let v = v.trim();
+            if is_hex_colour(v) {
+                b.header_bg = Some(v.to_ascii_lowercase());
+            } else {
+                warn("BRAND_HEADER_BG ignored: use #rgb or #rrggbb".to_owned());
+            }
+        }
         if let Some(v) = get("BRAND_LOGO_URL") {
             let v = v.trim();
             if is_logo_url(v) {
@@ -158,13 +124,18 @@ impl Branding {
         b
     }
 
-    /// The theme's CSS, layered after the base styles; empty for the default.
+    /// The header bar's background, if one was set.
     #[must_use]
-    pub fn theme_css(&self) -> &'static str {
-        match self.theme {
-            Theme::Default => "",
-            Theme::Datagroup => DATAGROUP_CSS,
-        }
+    pub fn header_bg(&self) -> Option<&str> {
+        self.header_bg.as_deref()
+    }
+
+    /// The text colour on the header bar: the better-contrasting of white and
+    /// black for a set `BRAND_HEADER_BG` (as [`Self::on_accent`]); `None` for
+    /// the default bar, whose text is the system `Canvas` colour.
+    #[must_use]
+    pub fn on_header(&self) -> Option<&'static str> {
+        self.header_bg.as_deref().map(on_colour)
     }
 
     /// The logo URL, if one was accepted.
@@ -180,14 +151,7 @@ impl Branding {
     /// light accent such as `#fff`.
     #[must_use]
     pub fn on_accent(&self) -> &'static str {
-        let l = relative_luminance(&self.accent).unwrap_or(0.0);
-        let with_white = 1.05 / (l + 0.05);
-        let with_black = (l + 0.05) / 0.05;
-        if with_white >= with_black {
-            "#fff"
-        } else {
-            "#000"
-        }
+        on_colour(&self.accent)
     }
 
     /// Whether a custom name is set, which adds the "powered by tesseract-rs"
@@ -195,6 +159,20 @@ impl Branding {
     #[must_use]
     pub fn is_custom(&self) -> bool {
         self.name != DEFAULT_NAME
+    }
+}
+
+/// White or black, whichever contrasts more with `colour`.
+fn on_colour(colour: &str) -> &'static str {
+    {
+        let l = relative_luminance(colour).unwrap_or(0.0);
+        let with_white = 1.05 / (l + 0.05);
+        let with_black = (l + 0.05) / 0.05;
+        if with_white >= with_black {
+            "#fff"
+        } else {
+            "#000"
+        }
     }
 }
 
@@ -399,21 +377,23 @@ mod tests {
         }
     }
 
-    /// Disable: leave `theme` at Default for `datagroup`, or let the preset
-    /// accent override an explicit `BRAND_ACCENT`.
+    /// No customer's colours are compiled in: the header bar is set only by
+    /// `BRAND_HEADER_BG`, its text contrasts with it, and a bad value is ignored.
+    /// Disable: give `header_bg` a default colour.
     #[test]
-    fn the_datagroup_theme_brings_report_rs_colours_and_yields_to_an_explicit_accent() {
-        let (b, w) = from(&[("BRAND_THEME", "Datagroup")]);
+    fn the_header_bar_colour_comes_only_from_the_variable() {
+        let (b, w) = from(&[]);
         assert!(w.is_empty());
-        assert_eq!(b.accent, DATAGROUP_ACCENT);
-        assert!(b.theme_css().contains("#0d3a64"), "navy header bar");
-        assert!(b.theme_css().contains("Segoe UI"));
-        let (b, _) = from(&[("BRAND_THEME", "datagroup"), ("BRAND_ACCENT", "#123456")]);
-        assert_eq!(b.accent, "#123456");
-        assert!(!b.theme_css().is_empty());
-        let (b, w) = from(&[("BRAND_THEME", "neon")]);
-        assert_eq!(b.theme_css(), "");
+        assert_eq!(b.header_bg(), None);
+        assert_eq!(b.on_header(), None);
+        let (b, w) = from(&[("BRAND_HEADER_BG", "#0D3A64")]);
+        assert!(w.is_empty());
+        assert_eq!(b.header_bg(), Some("#0d3a64"));
+        assert_eq!(b.on_header(), Some("#fff"));
+        let (b, _) = from(&[("BRAND_HEADER_BG", "#fafafa")]);
+        assert_eq!(b.on_header(), Some("#000"));
+        let (b, w) = from(&[("BRAND_HEADER_BG", "navy")]);
+        assert_eq!(b.header_bg(), None);
         assert_eq!(w.len(), 1);
-        assert_eq!(Branding::default().theme_css(), "");
     }
 }
