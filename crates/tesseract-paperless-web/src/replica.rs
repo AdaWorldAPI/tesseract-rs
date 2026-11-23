@@ -47,9 +47,37 @@ pub const RESTORE_SNAPSHOT: &str = ".restore-snapshot.json";
 /// metadata snapshot in S3 is not replaced: the local metadata lacks the
 /// skipped documents' assignments and reviews (start-up reconciliation
 /// removes rows whose document is missing), and replacing the snapshot would
-/// lose them from S3 as well. It lists the skipped hashes; remove it once
-/// those records are repaired or deliberately given up.
+/// lose them from S3 as well. It lists the skipped hashes. Every start retries
+/// the restore of the documents it lists ([`retry_held`]); once their records
+/// are repaired in S3, they come back with their metadata and the hold is
+/// removed. Remove it by hand only to give those documents up.
 pub const SNAPSHOT_HOLD: &str = ".snapshot-hold";
+
+/// Marker contents: which kind of restore is running.
+const MARKER_FIRST: &[u8] = b"restore in progress\n";
+const MARKER_RETRY: &[u8] = b"retry of held records in progress\n";
+
+/// Whether a degraded restore left a [`SNAPSHOT_HOLD`] in `blob_dir`.
+#[must_use]
+pub fn has_snapshot_hold(blob_dir: &Path) -> bool {
+    blob_dir.join(SNAPSHOT_HOLD).exists()
+}
+
+/// Retry the documents a degraded restore skipped (see [`SNAPSHOT_HOLD`]).
+/// It is a restore over a non-empty archive: only documents missing locally
+/// are restored, and only *their* assignments and reviews are imported from
+/// the held snapshot, so metadata changed locally since then is untouched.
+/// The hold is rewritten with whatever is still damaged, or removed.
+///
+/// # Errors
+/// As [`restore`].
+pub async fn retry_held(
+    replica: &Replica,
+    store: &LanceStore,
+    blobs: &Arc<BlobStore>,
+) -> Result<RestoreReport, ReplicaError> {
+    restore(replica, store, blobs).await
+}
 
 /// Directory in `BLOB_DIR` holding one empty file per pending S3 delete.
 pub const DELETE_INTENTS: &str = ".s3-deletes";
@@ -663,13 +691,28 @@ pub async fn restore(
 ) -> Result<RestoreReport, ReplicaError> {
     let marker = blobs.root().join(RESTORE_MARKER);
     let pinned = blobs.root().join(RESTORE_SNAPSHOT);
+    // A first restore (empty archive) imports the metadata of every local
+    // document. A restore over a live archive is the retry of a snapshot
+    // hold: it imports only the held documents' metadata, so it never
+    // overwrites metadata changed locally since the snapshot. The marker says
+    // which kind is running, so an interrupted one resumes as the same kind.
+    let fresh = match std::fs::read(&marker) {
+        Ok(body) => body.starts_with(MARKER_FIRST),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            store.count().await.map_err(local)? == 0
+        }
+        Err(e) => return Err(local(e)),
+    };
+    let held: HashSet<String> = std::fs::read_to_string(blobs.root().join(SNAPSHOT_HOLD))
+        .map(|t| t.lines().map(str::to_string).collect())
+        .unwrap_or_default();
     // A pin belongs to the restore its marker announces. A pin without a
     // marker is left over from a restore that finished (marker removed, pin
     // not yet), so a new restore drops it and reads the current snapshot.
     if !marker.exists() {
         remove_if_present(&pinned)?;
     }
-    std::fs::write(&marker, b"restore in progress\n").map_err(local)?;
+    std::fs::write(&marker, if fresh { MARKER_FIRST } else { MARKER_RETRY }).map_err(local)?;
 
     let mut report = RestoreReport::default();
     // Documents whose record was damaged and skipped. They are listed in the
@@ -779,8 +822,13 @@ pub async fn restore(
             // Only documents that are local get their assignments and reviews.
             // Importing rows for skipped documents too would leave rows that a
             // later restore, from a different snapshot, could not replace.
-            let live: HashSet<String> =
+            let local_now: HashSet<String> =
                 store.hashes().await.map_err(local)?.into_iter().collect();
+            let live: HashSet<String> = if fresh {
+                local_now
+            } else {
+                local_now.intersection(&held).cloned().collect()
+            };
             store
                 .meta()
                 .import(&snapshot, &live)
@@ -792,11 +840,14 @@ pub async fn restore(
         Err(e) => return Err(e),
     }
 
-    if !skipped_hashes.is_empty() {
+    let hold = blobs.root().join(SNAPSHOT_HOLD);
+    if skipped_hashes.is_empty() {
+        remove_if_present(&hold)?;
+    } else {
         let mut list: Vec<&String> = skipped_hashes.iter().collect();
         list.sort();
         let body: String = list.iter().map(|h| format!("{h}\n")).collect();
-        std::fs::write(blobs.root().join(SNAPSHOT_HOLD), body).map_err(local)?;
+        std::fs::write(&hold, body).map_err(local)?;
     }
     // Marker first, then the pin: while the marker exists the pin stays
     // authoritative, so an interruption between the two can never make a
@@ -1159,6 +1210,70 @@ mod tests {
         assert_eq!(report.deleted, 0);
         assert!(bucket.keys().contains(&r.record_key(&a)));
         assert!(!src.blobs.root().join(DELETE_INTENTS).join(&a).exists());
+    }
+
+    /// The documents a degraded restore skipped come back once their records
+    /// are repaired: the next start retries them, imports only their
+    /// assignments and reviews (leaving metadata changed locally since
+    /// alone), removes the hold, and the next snapshot carries everything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_documents_come_back_with_their_metadata_after_repair() {
+        let bucket = Arc::new(MemoryStore::default());
+        let r = replica(&bucket);
+        let src = local().await;
+        let a = add(&src, b"fine", "a.png", 1, true).await;
+        let b = add(&src, b"damaged then repaired", "b.png", 2, true).await;
+        let meta = src.store.meta();
+        let tag = meta
+            .create_definition(MetaKind::Tag, "Wichtig", 1)
+            .await
+            .expect("tag");
+        meta.assign(&b, MetaKind::Tag, tag.definition_id, Source::Manual, 2)
+            .await
+            .expect("assign");
+        meta.mark_reviewed(&b, 3).await.expect("review b");
+        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        let good_record = bucket.get(&r.record_key(&b)).expect("record");
+        bucket
+            .objects
+            .lock()
+            .expect("lock")
+            .insert(r.record_key(&b), b"not json".to_vec());
+
+        // Degraded restore: a only, hold written.
+        let dst = local().await;
+        restore(&r, &dst.store, &dst.blobs).await.expect("restore");
+        assert!(has_snapshot_hold(dst.blobs.root()));
+        let live: HashSet<String> = dst.store.hashes().await.expect("hashes").into_iter().collect();
+        dst.store.meta().reconcile(&live).await.expect("reconcile");
+        // A local change made while held must survive the retry.
+        dst.store.meta().mark_reviewed(&a, 9).await.expect("review a locally");
+
+        // Repair, then the retry a start performs.
+        bucket
+            .objects
+            .lock()
+            .expect("lock")
+            .insert(r.record_key(&b), good_record);
+        let report = retry_held(&r, &dst.store, &dst.blobs).await.expect("retry");
+        assert_eq!((report.restored, report.skipped), (1, 0));
+        assert!(!has_snapshot_hold(dst.blobs.root()));
+        let snap = dst.store.meta().export().await.expect("export");
+        assert!(snap.reviews.iter().any(|v| v.content_sha256_hex == b));
+        assert!(snap
+            .assignments
+            .iter()
+            .any(|x| x.content_sha256_hex == b && x.definition_id == tag.definition_id));
+        assert!(snap.reviews.iter().any(|v| v.content_sha256_hex == a && v.reviewed_at_unix_ms == 9));
+
+        // The hold is gone, so the next pass uploads a snapshot with all of it.
+        r.replicate(&dst.store, &dst.blobs, &no_lock).await.expect("replicate");
+        let up = SnapshotFile::to_snapshot(
+            &serde_json::from_slice(&bucket.get(&r.snapshot_key()).expect("snapshot")).expect("json"),
+        )
+        .expect("snapshot");
+        assert!(up.reviews.iter().any(|v| v.content_sha256_hex == b));
+        assert!(up.assignments.iter().any(|x| x.content_sha256_hex == b));
     }
 
     /// A slow S3 does not hold the document's lock: an upload or delete of the

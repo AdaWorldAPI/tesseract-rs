@@ -102,8 +102,7 @@ impl S3Config {
                 REQUIRED_VARS.join(", ")
             ));
         }
-        let endpoint = v("PAPERLESS_S3_ENDPOINT").unwrap_or_default();
-        check_endpoint(&endpoint)?;
+        let endpoint = normalize_endpoint(&v("PAPERLESS_S3_ENDPOINT").unwrap_or_default())?;
         Ok(Some(S3Config::new(
             &endpoint,
             &v("PAPERLESS_S3_BUCKET").unwrap_or_default(),
@@ -248,61 +247,34 @@ fn uri_encode(s: &str, keep_slash: bool) -> String {
     o
 }
 
-/// Check `PAPERLESS_S3_ENDPOINT`: an `https://` origin with a host and an
-/// optional port, nothing else. A path would be sent but not signed (the
-/// signer signs `/<bucket>/<key>`), so the server would refuse every request;
-/// credentials in the URL would be printed at start; a query or fragment has
-/// no meaning here.
-fn check_endpoint(endpoint: &str) -> Result<(), String> {
+/// Parse `PAPERLESS_S3_ENDPOINT` with the same URL parser the HTTP client
+/// uses and return its normalised origin, `https://host[:port]`, which is
+/// what the signer signs and the client sends. Only an origin is accepted: a
+/// path (a backslash parses as one) would be sent but not signed, credentials
+/// in the URL would be printed at start, and a query or fragment means
+/// nothing here. The default port 443 is dropped, as the parser drops it, so
+/// the signed host equals the host header the client sends.
+fn normalize_endpoint(endpoint: &str) -> Result<String, String> {
     let bad = |why: &str| Err(format!("PAPERLESS_S3_ENDPOINT {why}"));
-    let Some(rest) = endpoint.strip_prefix("https://") else {
-        return bad("must be an https:// URL");
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return bad("is not a valid URL");
     };
-    let authority = rest.strip_suffix('/').unwrap_or(rest);
-    if authority.is_empty() {
-        return bad("has no host");
+    if url.scheme() != "https" {
+        return bad("must be an https:// URL");
     }
-    if authority.contains('@') {
+    if !url.username().is_empty() || url.password().is_some() {
         return bad("must not contain credentials");
     }
-    // Only characters a host and port can contain. Anything else, such as a
-    // path, query, fragment or a backslash (which URL parsers turn into a
-    // path separator), would make the request path differ from the signed one.
-    if !authority
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
-    {
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
         return bad("must be a bare origin (https://host[:port]), without a path, query or fragment");
     }
-    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
-        let Some((addr, after)) = v6.split_once(']') else {
-            return bad("has an unclosed IPv6 address");
-        };
-        if addr.is_empty() || !addr.chars().all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.') {
-            return bad("has an invalid IPv6 address");
-        }
-        match after {
-            "" => (addr, None),
-            p if p.starts_with(':') => (addr, Some(&p[1..])),
-            _ => return bad("has text after the IPv6 address"),
-        }
-    } else if authority.contains(['[', ']']) {
-        return bad("has a bracket outside an IPv6 address");
-    } else {
-        match authority.split_once(':') {
-            Some((h, p)) => (h, Some(p)),
-            None => (authority, None),
-        }
-    };
-    if host.is_empty() {
+    let Some(host) = url.host_str() else {
         return bad("has no host");
-    }
-    if let Some(p) = port {
-        if p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) || p.parse::<u16>().is_err() {
-            return bad("has an invalid port");
-        }
-    }
-    Ok(())
+    };
+    Ok(match url.port() {
+        Some(port) => format!("https://{host}:{port}"),
+        None => format!("https://{host}"),
+    })
 }
 
 /// A signed request: URL plus headers, deterministic for a given time.
@@ -839,13 +811,16 @@ mod tests {
 
     #[test]
     fn the_endpoint_must_be_a_bare_https_origin() {
-        for ok in [
-            "https://fly.storage.tigris.dev",
-            "https://fly.storage.tigris.dev/",
-            "https://s3.example:9000",
-            "https://[::1]:9000",
+        for (given, normal) in [
+            ("https://fly.storage.tigris.dev", "https://fly.storage.tigris.dev"),
+            ("https://fly.storage.tigris.dev/", "https://fly.storage.tigris.dev"),
+            ("https://S3.Example", "https://s3.example"),
+            ("https://s3.example:9000", "https://s3.example:9000"),
+            // the default port is dropped, as the HTTP client drops it
+            ("https://s3.example:443", "https://s3.example"),
+            ("https://[::1]:9000", "https://[::1]:9000"),
         ] {
-            assert!(check_endpoint(ok).is_ok(), "{ok}");
+            assert_eq!(normalize_endpoint(given).as_deref(), Ok(normal), "{given}");
         }
         for bad in [
             "http://s3.example",
@@ -854,13 +829,15 @@ mod tests {
             "https://s3.example\\gateway",
             "https://user:pw@s3.example",
             "https://s3.example?x=1",
+            "https://s3.example#f",
             "https://s3.example:port",
             "https://s3.example:1:2",
             "https://[::1]:port",
             "https://[::1",
             "https://[::1]x",
+            "https://[:::1]",
         ] {
-            let e = check_endpoint(bad).expect_err(bad);
+            let e = normalize_endpoint(bad).expect_err(bad);
             assert!(e.starts_with("PAPERLESS_S3_ENDPOINT"), "{e}");
         }
     }

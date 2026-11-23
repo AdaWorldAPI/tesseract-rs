@@ -166,6 +166,21 @@ impl AppState {
                     report.without_original,
                     if report.metadata { "imported" } else { "absent" }
                 );
+            } else if crate::replica::has_snapshot_hold(blob_dir) {
+                // A degraded restore skipped damaged records. Retry them on
+                // every start; a failure here is logged, never fatal, since
+                // the archive itself is present and usable.
+                match crate::replica::retry_held(r, &store, &blobs).await {
+                    Ok(report) => eprintln!(
+                        "tesseract-paperless-web: retried held S3 records: {} restored, {} \
+                         still damaged",
+                        report.restored, report.skipped
+                    ),
+                    Err(e) => eprintln!(
+                        "tesseract-paperless-web: retrying held S3 records failed: {e}; will \
+                         retry on the next start"
+                    ),
+                }
             }
         }
 
