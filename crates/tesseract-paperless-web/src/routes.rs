@@ -353,12 +353,21 @@ async fn upload(
     // A file another customer already holds is refused before ingest, which
     // could otherwise attach an original to that document.
     let hash = format!("{:?}", ContentSha256::of(&bytes));
-    if matches!(state.store.get(&hash).await, Ok(Some(_)))
-        && require_visible(&state, &scope, &hash).await.is_err()
-    {
-        return page_error(
-            "this file is already in the archive, filed under a customer you cannot see".into(),
-        );
+    // A failed lookup refuses the upload rather than skipping the check.
+    match state.store.get(&hash).await {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            if require_visible(&state, &scope, &hash).await.is_err() {
+                return page_error(
+                    "this file is already in the archive, filed under a customer you cannot see"
+                        .into(),
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("upload: archive lookup for {hash} failed: {e}");
+            return page_error("the archive could not be read; try again".into());
+        }
     }
 
     match ingest_for_customer(&state, bytes, filename, &mime, uploaded.customer.as_deref()).await {

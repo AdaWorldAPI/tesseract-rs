@@ -12,7 +12,7 @@
 //! written out here rather than forced through that generic entry point. The
 //! invariant it protects — the gate decides before the producer runs, and a
 //! duplicate's bytes never reach the producer at all — holds identically:
-//! see [`ingest`]'s early return on [`Verdict::Duplicate`].
+//! see [`ingest_for_customer`]'s early return on [`Verdict::Duplicate`].
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -102,7 +102,7 @@ pub enum IngestError {
     Store(StoreError),
     /// The document was archived, but the search index write failed --
     /// stored yet unsearchable. Reported rather than swallowed (see
-    /// [`ingest`]'s doc comment on why this is a real, if narrow, gap).
+    /// [`ingest_for_customer`]'s doc comment on why this is a real, if narrow, gap).
     Search(SearchError),
 }
 
@@ -135,16 +135,8 @@ impl std::fmt::Display for IngestError {
 /// index -- an inconsistency, not data loss, because the index holds no text
 /// of its own. `Err(IngestError::Search(_))` surfaces it, and
 /// `tesseract_paperless::reconcile` repairs it on the next start.
-pub async fn ingest(
-    state: &Arc<AppState>,
-    bytes: Vec<u8>,
-    filename: Option<String>,
-    mime: &str,
-) -> Result<IngestOutcome, IngestError> {
-    ingest_for_customer(state, bytes, filename, mime, None).await
-}
-
-/// [`ingest`], filing a NEW document under `customer`.
+///
+/// # Filing under a customer
 ///
 /// The customer is written under the document's hash lock, after a re-check
 /// that no other upload committed the same bytes meanwhile, and before the
@@ -381,6 +373,17 @@ pub async fn ingest_for_customer(
         triple_count,
         spo_extraction_ran,
     })
+}
+
+/// [`ingest_for_customer`] without a customer, as tests call it.
+#[cfg(test)]
+pub async fn ingest(
+    state: &Arc<AppState>,
+    bytes: Vec<u8>,
+    filename: Option<String>,
+    mime: &str,
+) -> Result<IngestOutcome, IngestError> {
+    ingest_for_customer(state, bytes, filename, mime, None).await
 }
 
 /// Milliseconds since the Unix epoch; 0 if the clock is before it.

@@ -124,7 +124,7 @@ pub(crate) async fn customer_documents(
                 rows.push(row);
             }
         }
-        rows.sort_by(|a, b| b.ingested_at_unix_ms.cmp(&a.ingested_at_unix_ms));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.ingested_at_unix_ms));
         let total = rows.len();
         let documents = rows
             .into_iter()
