@@ -691,7 +691,11 @@ async fn bearer_tokens_of_api_clients_pass_the_gate_and_others_do_not() {
         StatusCode::OK
     );
     assert_eq!(
-        login.verify_bearer(&delegated).await.as_deref(),
+        login
+            .verify_bearer(&delegated)
+            .await
+            .map(|c| c.subject)
+            .as_deref(),
         Ok("oidc:u1")
     );
 
@@ -832,4 +836,104 @@ fn require_auth_refuses_an_open_start_and_changes_nothing_when_off() {
     assert!(check_open_mode(true, true).is_ok());
     assert!(check_open_mode(false, false).is_ok());
     assert!(check_open_mode(false, true).is_ok());
+}
+
+/// The handlers behind the gate read the caller's grants from a request
+/// extension; the customer policy is evaluated on them. Both credential paths
+/// must attach it, with every role pair of the token (not only the admitting
+/// ones), and nothing else may.
+/// Disable: drop either `extensions_mut().insert(caller)` in `require_session`.
+#[tokio::test]
+async fn the_gate_attaches_the_callers_grants_for_sessions_and_bearer_tokens() {
+    let p = Provider::new();
+    let login = Arc::new(login_with(
+        &p,
+        &[("PAPERLESS_API_CLIENTS", "report-client")],
+    ));
+    let probe = Router::new().route(
+        "/whoami",
+        get(|caller: Option<axum::Extension<Caller>>| async move {
+            match caller {
+                Some(axum::Extension(c)) => format!(
+                    "{}|{}",
+                    c.subject,
+                    c.grants
+                        .iter()
+                        .map(|(o, r)| format!("{o}:{r}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                None => "none".to_string(),
+            }
+        }),
+    );
+    let app = protect(probe, Some(login.clone()));
+    let roles = serde_json::json!({
+        "paperless.user": {"100": "a.example"},
+        "report.reader": {"200": "b.example"}
+    });
+
+    let body = |r: Response| async move {
+        String::from_utf8(
+            axum::body::to_bytes(r.into_body(), 1 << 16)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    };
+
+    let (cookie_value, _) = sign_in(&login, &p, "u1", roles.clone()).await.unwrap();
+    let req = HttpRequest::builder()
+        .uri("/whoami")
+        .header(header::COOKIE, format!("{SESSION_COOKIE}={cookie_value}"))
+        .body(Body::empty())
+        .unwrap();
+    let r = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        body(r).await,
+        "oidc:u1|100:paperless.user,200:report.reader"
+    );
+
+    let delegated = p.sign_for("report-client", None, "u2", roles);
+    let r = send_bearer(&app, "GET", "/whoami", &delegated).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        body(r).await,
+        "oidc:u2|100:paperless.user,200:report.reader"
+    );
+}
+
+/// Framed without a session, the gate offers the sign-in in a new tab rather
+/// than redirecting the frame to a provider page that refuses to be framed.
+/// A top-level request is still redirected.
+/// Disable: drop the `sec-fetch-dest` branch in `require_session`.
+#[tokio::test]
+async fn a_framed_request_without_a_session_gets_a_new_tab_sign_in_link() {
+    let p = Provider::new();
+    let app = protect(secret_app(), Some(Arc::new(login_with(&p, &[]))));
+    let framed = HttpRequest::builder()
+        .uri("/documents?x=1")
+        .header("sec-fetch-dest", "iframe")
+        .body(Body::empty())
+        .unwrap();
+    let r = app.clone().oneshot(framed).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        axum::body::to_bytes(r.into_body(), 1 << 16)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("href=\"/auth/login?return_to=%2Fdocuments%3Fx%3D1\" target=\"_blank\""));
+    assert!(!body.contains("secret"));
+    let top = HttpRequest::builder()
+        .uri("/documents")
+        .header("sec-fetch-dest", "document")
+        .body(Body::empty())
+        .unwrap();
+    let r = app.oneshot(top).await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
 }

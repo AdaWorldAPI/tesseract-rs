@@ -5,10 +5,13 @@
 //! Deploy target: Railway. Railway injects `PORT` and expects the process to
 //! bind `0.0.0.0:$PORT` — read at runtime only, never hardcoded.
 
+mod api;
 mod auth;
 mod branding;
+mod customers;
 mod decode;
 mod fetch;
+mod headers;
 mod ingest;
 mod routes;
 mod state;
@@ -40,6 +43,31 @@ async fn main() {
     if let Err(e) = auth::check_open_mode(required, auth_cfg.is_some()) {
         eprintln!("fatal: {e}");
         std::process::exit(1);
+    }
+    let policy = match customers::CustomerPolicy::from_env() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = customers::check_policy_needs_sign_in(policy.is_some(), auth_cfg.is_some()) {
+        eprintln!("fatal: {e}");
+        std::process::exit(1);
+    }
+    let security_headers = match headers::SecurityHeaders::from_env() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            std::process::exit(1);
+        }
+    };
+    match &policy {
+        Some(p) => println!("tesseract-paperless-web: {}", p.summary()),
+        None => println!(
+            "tesseract-paperless-web: no customer policy (PAPERLESS_CUSTOMER_POLICY unset): \
+             every admitted user sees every document"
+        ),
     }
 
     let model_dir =
@@ -102,7 +130,10 @@ async fn main() {
     )
     .await
     {
-        Ok(s) => Arc::new(s),
+        Ok(mut s) => {
+            s.policy = policy;
+            Arc::new(s)
+        }
         Err(e) => {
             eprintln!("fatal: could not start: {e}");
             eprintln!(
@@ -160,7 +191,10 @@ async fn main() {
             None
         }
     };
-    let app = auth::protect(routes::router(state), login);
+    println!("tesseract-paperless-web: {}", security_headers.summary());
+    let app = auth::protect(routes::router(state), login).layer(
+        axum::middleware::from_fn_with_state(security_headers, headers::add),
+    );
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("fatal: server error: {e}");
         std::process::exit(1);

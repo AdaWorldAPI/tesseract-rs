@@ -433,6 +433,19 @@ struct Session {
     expires: SystemTime,
 }
 
+/// Who is calling, for the handlers behind the gate: the subject and the
+/// `(organization id, role key)` grants of the verified token, all of them
+/// (not only the admitting ones), so the customer policy can read them.
+/// Inserted as a request extension by the gate, for a session and for a
+/// delegated bearer token alike. Never shown, never logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caller {
+    /// `oidc:<sub>`.
+    pub subject: String,
+    /// The roles claim as `(org, role_key)` pairs, sorted.
+    pub grants: Vec<(String, String)>,
+}
+
 /// Why a callback was refused. Only the class is ever shown or logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallbackError {
@@ -738,8 +751,8 @@ impl Login {
     /// A token a service presents as `Authorization: Bearer` on a user's behalf: the
     /// same checks as an ID token (signature, issuer, audience, expiry) for one of the
     /// `PAPERLESS_API_CLIENTS`, without a nonce and without a session, then the same
-    /// role rule. Returns the subject. The JWKS is refetched once on an unknown key.
-    pub async fn verify_bearer(&self, token: &str) -> Result<String, CallbackError> {
+    /// role rule. Returns the caller. The JWKS is refetched once on an unknown key.
+    pub async fn verify_bearer(&self, token: &str) -> Result<Caller, CallbackError> {
         if self.cfg.api_clients.is_empty() {
             return Err(CallbackError::Token);
         }
@@ -756,7 +769,10 @@ impl Login {
             }
             other => other,
         }?;
-        Ok(login.authenticated_user().user.subject.clone())
+        Ok(Caller {
+            subject: login.authenticated_user().user.subject.clone(),
+            grants: token_roles(token, &self.cfg.roles_claim),
+        })
     }
 
     /// Try the token against one verifier per accepted API client, all over the shared
@@ -1022,6 +1038,22 @@ impl Login {
             .map(|v| v.login.authenticated_user().user.subject.clone())
     }
 
+    /// The caller of a live session cookie: its subject, and the grants of the
+    /// ID token it carries (verified when the session was created or restored).
+    pub fn caller(&self, cookie: &str) -> Option<Caller> {
+        let sealed = self.open(cookie)?;
+        let subject = {
+            let s = self.sessions.lock().ok()?;
+            s.get(&sealed.sid)
+                .filter(|v| v.expires > SystemTime::now())
+                .map(|v| v.login.authenticated_user().user.subject.clone())?
+        };
+        Some(Caller {
+            subject,
+            grants: token_roles(&sealed.tok, &self.cfg.roles_claim),
+        })
+    }
+
     /// Sign a session out in this process.
     pub fn logout(&self, cookie: &str) {
         if let Some(s) = self.open(cookie) {
@@ -1114,7 +1146,11 @@ fn same_origin_request(origin: &str, method: &Method, headers: &HeaderMap) -> bo
 
 /// Middleware: a live session, an accepted bearer token, or a redirect to sign-in
 /// (GET/HEAD without credentials) / 401.
-async fn require_session(State(login): State<Arc<Login>>, req: Request, next: Next) -> Response {
+async fn require_session(
+    State(login): State<Arc<Login>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     let path = req.uri().path().to_string();
     if is_public(&path) {
         return next.run(req).await;
@@ -1124,10 +1160,11 @@ async fn require_session(State(login): State<Arc<Login>>, req: Request, next: Ne
         if login.subject(sid).is_none() {
             login.restore(sid).await;
         }
-        if login.subject(sid).is_some() {
+        if let Some(caller) = login.caller(sid) {
             if !login.same_origin(req.method(), req.headers()) {
                 return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
             }
+            req.extensions_mut().insert(caller);
             return next.run(req).await;
         }
     }
@@ -1135,7 +1172,8 @@ async fn require_session(State(login): State<Arc<Login>>, req: Request, next: Ne
     if req.headers().contains_key(header::AUTHORIZATION) {
         if login.accepts_bearer() {
             if let Some(token) = bearer_token(req.headers()) {
-                if login.verify_bearer(token).await.is_ok() {
+                if let Ok(caller) = login.verify_bearer(token).await {
+                    req.extensions_mut().insert(caller);
                     return next.run(req).await;
                 }
             }
@@ -1148,7 +1186,18 @@ async fn require_session(State(login): State<Arc<Login>>, req: Request, next: Ne
             .path_and_query()
             .map(|p| p.as_str().to_string())
             .unwrap_or_else(|| DEFAULT_RETURN_TO.to_string());
-        Redirect::to(&format!("/auth/login?return_to={}", urlencode(&target))).into_response()
+        let login_url = format!("/auth/login?return_to={}", urlencode(&target));
+        // Inside a frame (report-rs embedding the archive) the identity
+        // provider's login page refuses to be framed, so a redirect would end
+        // in a blank frame. Offer the sign-in in its own tab instead.
+        if req
+            .headers()
+            .get("sec-fetch-dest")
+            .is_some_and(|v| v.as_bytes() == b"iframe")
+        {
+            return framed_sign_in(&login_url);
+        }
+        Redirect::to(&login_url).into_response()
     } else {
         (StatusCode::UNAUTHORIZED, "sign in required").into_response()
     }
@@ -1235,6 +1284,25 @@ async fn auth_signed_out() -> Response {
         "Signed out",
         "You are signed out of the archive.",
     )
+}
+
+/// The page a framed request without a session gets: a link that opens the
+/// sign-in in a new tab. `login_url` is built from [`urlencode`], so it holds
+/// no character that needs escaping in an attribute.
+fn framed_sign_in(login_url: &str) -> Response {
+    let html = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <title>Sign in</title></head><body style=\"font-family:system-ui,sans-serif;\
+         margin:1.5rem\"><p>Sign in to the document archive to see this view.</p>\
+         <p><a href=\"{login_url}\" target=\"_blank\" rel=\"noopener\">Sign in \
+         (opens a new tab)</a>, then reload this page.</p></body></html>"
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
 }
 
 /// A refusal page naming the class only; never an identity, a role or a token.

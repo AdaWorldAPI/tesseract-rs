@@ -58,6 +58,10 @@ pub struct AppState {
     /// whole on every re-mine; a reader clones the slot and never holds the
     /// lock across an `.await`.
     pub auto: std::sync::RwLock<AutoSlot>,
+    /// Who may see which customers' documents (`customers.rs`). `None`: no
+    /// policy is configured and every admitted caller sees every document.
+    /// Set by `main` after [`Self::load`], from the environment.
+    pub policy: Option<crate::customers::CustomerPolicy>,
 }
 
 /// Where the AUTO model stands.
@@ -197,6 +201,7 @@ impl AppState {
             reasoner,
             recognize_permits: Arc::new(Semaphore::new(permits)),
             auto: std::sync::RwLock::new(AutoSlot::Pending),
+            policy: None,
         })
     }
 

@@ -8,6 +8,16 @@
 //! | [`TAXONOMY_TABLE`] | `(kind, definition_id)` | kind, definition_id, name, match_algorithm, match_pattern, case_insensitive, retired, created_at_unix_ms |
 //! | [`ASSIGNMENTS_TABLE`] | `(document, kind, definition_id)` | content_sha256_hex, kind, definition_id, source, assigned_at_unix_ms |
 //! | [`REVIEWS_TABLE`] | reviewed document | content_sha256_hex, reviewed_at_unix_ms |
+//! | [`CUSTOMERS_TABLE`] | document with a customer | content_sha256_hex, customer_code, assigned_at_unix_ms |
+//!
+//! # The customer is an access fact, not a filing definition
+//!
+//! A document's customer decides who may see it (the web crate's customer
+//! policy), so it is not a [`MetaKind`]: a definition can be renamed, retired
+//! and suggested by AUTO, and none of that may move a document between
+//! customers. The code is the report-rs customer code (`K01`), validated by
+//! [`valid_customer_code`], at most one per document. Only an explicit action
+//! writes it: nothing here infers a customer from a document's content.
 //!
 //! # Why they are NOT columns of `documents`
 //!
@@ -80,6 +90,23 @@ pub const TAXONOMY_TABLE: &str = "taxonomy";
 pub const ASSIGNMENTS_TABLE: &str = "assignments";
 /// Reviews table name.
 pub const REVIEWS_TABLE: &str = "reviews";
+/// Customers table name: one row per document that has a customer.
+pub const CUSTOMERS_TABLE: &str = "customers";
+
+/// Longest customer code accepted.
+pub const MAX_CUSTOMER_CODE: usize = 32;
+
+/// `true` for a customer code: 1 to [`MAX_CUSTOMER_CODE`] ASCII letters,
+/// digits, `-` or `_`. Anything else is refused rather than normalised, so a
+/// code is the same string in the policy, the table and report-rs.
+#[must_use]
+pub fn valid_customer_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= MAX_CUSTOMER_CODE
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
 
 /// paperless-ngx's `MATCH_AUTO` number. The ONLY algorithm number store code
 /// knows; converting a stored number to a `MatchRule` is glue under
@@ -100,6 +127,7 @@ mod col {
     pub const SOURCE: &str = "source";
     pub const ASSIGNED_AT: &str = "assigned_at_unix_ms";
     pub const REVIEWED_AT: &str = "reviewed_at_unix_ms";
+    pub const CUSTOMER: &str = "customer_code";
 }
 
 /// What a definition files documents under.
@@ -220,6 +248,8 @@ pub struct MetaReconcileReport {
     pub assignments_removed: usize,
     /// Review rows removed.
     pub reviews_removed: usize,
+    /// Customer rows removed.
+    pub customers_removed: usize,
 }
 
 /// Why a metadata operation failed.
@@ -241,6 +271,8 @@ pub enum MetaError {
         /// The id looked up.
         definition_id: u32,
     },
+    /// A customer code [`valid_customer_code`] refuses.
+    InvalidCustomer,
 }
 
 impl core::fmt::Display for MetaError {
@@ -257,6 +289,10 @@ impl core::fmt::Display for MetaError {
                 f,
                 "no usable {} definition with id {definition_id}",
                 kind.as_str()
+            ),
+            Self::InvalidCustomer => write!(
+                f,
+                "a customer code is 1 to {MAX_CUSTOMER_CODE} letters, digits, '-' or '_'"
             ),
         }
     }
@@ -302,6 +338,14 @@ fn assignments_schema() -> SchemaRef {
         Field::new(col::KIND, DataType::Utf8, false),
         Field::new(col::DEFINITION_ID, DataType::UInt32, false),
         Field::new(col::SOURCE, DataType::Utf8, false),
+        Field::new(col::ASSIGNED_AT, DataType::Int64, false),
+    ]))
+}
+
+fn customers_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(col::HASH, DataType::Utf8, false),
+        Field::new(col::CUSTOMER, DataType::Utf8, false),
         Field::new(col::ASSIGNED_AT, DataType::Int64, false),
     ]))
 }
@@ -436,6 +480,18 @@ fn assignments_from_batches(batches: &[RecordBatch]) -> Result<Vec<AssignmentRow
     Ok(out)
 }
 
+fn customers_from_batches(batches: &[RecordBatch]) -> Result<Vec<(String, String)>, StoreError> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let hash = typed::<StringArray>(batch, col::HASH)?;
+        let code = typed::<StringArray>(batch, col::CUSTOMER)?;
+        out.extend(
+            (0..batch.num_rows()).map(|i| (hash.value(i).to_string(), code.value(i).to_string())),
+        );
+    }
+    Ok(out)
+}
+
 fn hashes_from_batches(batches: &[RecordBatch]) -> Result<Vec<String>, StoreError> {
     let mut out = Vec::new();
     for batch in batches {
@@ -450,6 +506,7 @@ pub struct MetaStore {
     taxonomy: Table,
     assignments: Table,
     reviews: Table,
+    customers: Table,
     /// Serializes every write (see the module doc's Concurrency section).
     writes: tokio::sync::Mutex<()>,
 }
@@ -464,10 +521,12 @@ impl MetaStore {
         let taxonomy = open_or_create(db, TAXONOMY_TABLE, taxonomy_schema()).await?;
         let assignments = open_or_create(db, ASSIGNMENTS_TABLE, assignments_schema()).await?;
         let reviews = open_or_create(db, REVIEWS_TABLE, reviews_schema()).await?;
+        let customers = open_or_create(db, CUSTOMERS_TABLE, customers_schema()).await?;
         Ok(Self {
             taxonomy,
             assignments,
             reviews,
+            customers,
             writes: tokio::sync::Mutex::new(()),
         })
     }
@@ -801,6 +860,66 @@ impl MetaStore {
         hashes_from_batches(&batches)
     }
 
+    /// Set (`Some`) or clear (`None`) a document's customer. Setting replaces
+    /// any previous customer (`merge_insert` on the hash).
+    ///
+    /// # Errors
+    /// [`MetaError::InvalidCustomer`] for a code [`valid_customer_code`]
+    /// refuses (nothing is written); [`MetaError::Store`] on a store failure.
+    pub async fn set_customer(
+        &self,
+        hash: &str,
+        code: Option<&str>,
+        now_ms: i64,
+    ) -> Result<(), MetaError> {
+        if let Some(c) = code {
+            if !valid_customer_code(c) {
+                return Err(MetaError::InvalidCustomer);
+            }
+        }
+        let _write = self.writes.lock().await;
+        let Some(code) = code else {
+            let predicate = format!("{} = '{}'", col::HASH, sql_quote(hash));
+            self.customers.delete(&predicate).await?;
+            return Ok(());
+        };
+        let batch = RecordBatch::try_new(
+            customers_schema(),
+            vec![
+                Arc::new(StringArray::from(vec![hash])),
+                Arc::new(StringArray::from(vec![code])),
+                Arc::new(Int64Array::from(vec![now_ms])),
+            ],
+        )
+        .map_err(|_| StoreError::Malformed("customers batch assembly"))?;
+        upsert(&self.customers, &[col::HASH], batch, customers_schema()).await?;
+        Ok(())
+    }
+
+    /// A document's customer, if it has one.
+    ///
+    /// # Errors
+    /// As [`Self::definitions`].
+    pub async fn customer_of(&self, hash: &str) -> Result<Option<String>, StoreError> {
+        let predicate = format!("{} = '{}'", col::HASH, sql_quote(hash));
+        let batches = collect(&self.customers, Some(predicate)).await?;
+        Ok(customers_from_batches(&batches)?
+            .into_iter()
+            .next()
+            .map(|(_, code)| code))
+    }
+
+    /// Every document's customer, by hash. Documents without one are absent.
+    ///
+    /// # Errors
+    /// As [`Self::definitions`].
+    pub async fn customers(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        let batches = collect(&self.customers, None).await?;
+        Ok(customers_from_batches(&batches)?.into_iter().collect())
+    }
+
     /// Delete a document's assignments AND its review row. Called by
     /// `LanceStore::delete` AFTER the document row is gone (spec R2a), so the
     /// worst case is an orphan, never a document with its metadata missing.
@@ -812,6 +931,7 @@ impl MetaStore {
         let predicate = format!("{} = '{}'", col::HASH, sql_quote(hash));
         self.assignments.delete(&predicate).await?;
         self.reviews.delete(&predicate).await?;
+        self.customers.delete(&predicate).await?;
         Ok(())
     }
 
@@ -848,11 +968,21 @@ impl MetaStore {
             .filter(|h| dead_reviewed.contains(h.as_str()))
             .count();
 
+        let customer_rows = self.customers().await?;
+        let dead_customers: HashSet<&str> = customer_rows
+            .keys()
+            .map(String::as_str)
+            .filter(|h| !live_hashes.contains(*h))
+            .collect();
+        let customers_removed = dead_customers.len();
+
         delete_hashes(&self.assignments, &dead_assigned).await?;
         delete_hashes(&self.reviews, &dead_reviewed).await?;
+        delete_hashes(&self.customers, &dead_customers).await?;
         Ok(MetaReconcileReport {
             assignments_removed,
             reviews_removed,
+            customers_removed,
         })
     }
 }
@@ -1227,7 +1357,8 @@ mod tests {
             nothing,
             MetaReconcileReport {
                 assignments_removed: 0,
-                reviews_removed: 0
+                reviews_removed: 0,
+                customers_removed: 0
             }
         );
         assert_eq!(s.all_assignments().await.expect("all").len(), 4);
@@ -1237,7 +1368,8 @@ mod tests {
             report,
             MetaReconcileReport {
                 assignments_removed: 2,
-                reviews_removed: 2
+                reviews_removed: 2,
+                customers_removed: 0
             }
         );
         assert!(
@@ -1376,5 +1508,57 @@ mod tests {
         assert!(MetaKind::Correspondent.is_single_valued());
         assert!(MetaKind::DocumentType.is_single_valued());
         assert!(!MetaKind::Tag.is_single_valued());
+    }
+
+    /// Disable: drop the `valid_customer_code` check in `set_customer`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn customer_codes_are_validated_before_anything_is_written() {
+        let (_d, s) = fresh().await;
+        for bad in ["", "K 01", "K01'", "../K01", &"K".repeat(MAX_CUSTOMER_CODE + 1)] {
+            assert!(
+                matches!(
+                    s.set_customer("h", Some(bad), 1).await,
+                    Err(MetaError::InvalidCustomer)
+                ),
+                "{bad:?} must be refused"
+            );
+        }
+        assert!(s.customers().await.expect("read").is_empty());
+        for good in ["K01", "R10", "a-b_c", &"K".repeat(MAX_CUSTOMER_CODE)] {
+            assert!(valid_customer_code(good), "{good:?} must be accepted");
+        }
+    }
+
+    /// Disable: make `set_customer(None)` a no-op, or insert instead of
+    /// `merge_insert` on the hash.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_document_has_at_most_one_customer() {
+        let (_d, s) = fresh().await;
+        s.set_customer("h", Some("K01"), 1).await.expect("set");
+        s.set_customer("h", Some("K02"), 2).await.expect("replace");
+        s.set_customer("other", Some("K01"), 3).await.expect("set");
+        assert_eq!(s.customer_of("h").await.expect("of").as_deref(), Some("K02"));
+        let all = s.customers().await.expect("all");
+        assert_eq!(all.len(), 2, "replacing a customer must not add a row");
+        s.set_customer("h", None, 4).await.expect("clear");
+        assert_eq!(s.customer_of("h").await.expect("of"), None);
+        assert_eq!(s.customer_of("other").await.expect("of").as_deref(), Some("K01"));
+    }
+
+    /// A deleted document must not leave its customer behind: a re-upload of
+    /// the same file would otherwise inherit it, and with it who may see it.
+    /// Disable: drop the customers delete from `forget_document` / `reconcile`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forget_and_reconcile_remove_customer_rows() {
+        let (_d, s) = fresh().await;
+        for h in ["live", "forgotten", "orphan"] {
+            s.set_customer(h, Some("K01"), 1).await.expect("set");
+        }
+        s.forget_document("forgotten").await.expect("forget");
+        assert_eq!(s.customer_of("forgotten").await.expect("of"), None);
+        let report = s.reconcile(&set(&["live"])).await.expect("reconcile");
+        assert_eq!(report.customers_removed, 1);
+        assert_eq!(s.customer_of("orphan").await.expect("of"), None);
+        assert_eq!(s.customer_of("live").await.expect("of").as_deref(), Some("K01"));
     }
 }

@@ -11,6 +11,13 @@
 //! | `BRAND_TAGLINE` | the line under the heading on the upload page | up to 240 characters |
 //! | `BRAND_ACCENT` | links and buttons | `#rgb` or `#rrggbb` |
 //! | `BRAND_LOGO_URL` | an image beside the heading | an `https://` URL or a same-site path starting with a single `/` |
+//! | `BRAND_THEME` | the page theme | `default`, or `datagroup` (report-rs's default corporate theme) |
+//!
+//! `datagroup` matches report-rs's `Theme::Datagroup` (`templates/themes.css`
+//! there): a navy header bar, a red accent, Segoe UI, white cards with a soft
+//! shadow on a light grey page. It sets the accent to `#c8102e` unless
+//! `BRAND_ACCENT` names another, and pins the light colour scheme, as
+//! report-rs does.
 //!
 //! An empty value counts as unset. A value that is not accepted is ignored
 //! with one line on stderr and the
@@ -34,6 +41,39 @@ const MAX_NAME: usize = 60;
 const MAX_TAGLINE: usize = 240;
 const MAX_URL: usize = 2048;
 
+/// A page theme: colours and type layered over the base styles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Theme {
+    /// The archive's own look: system colours, light and dark.
+    #[default]
+    Default,
+    /// report-rs's default corporate theme.
+    Datagroup,
+}
+
+/// The accent the `datagroup` theme uses unless `BRAND_ACCENT` is set.
+pub const DATAGROUP_ACCENT: &str = "#c8102e";
+
+/// report-rs `themes.css`, `:root[data-theme="datagroup"]`, applied to this
+/// archive's markup. Values are copied, not derived: the two must be compared
+/// by eye when report-rs changes its theme.
+const DATAGROUP_CSS: &str = r#"
+  :root { color-scheme: light; }
+  body { font-family: "Segoe UI", system-ui, -apple-system, Arial, sans-serif; font-size: 14px;
+         background: #f5f5f5; color: #1a1a1a; }
+  header.shell { background: #0d3a64; border-bottom: 0; }
+  header.shell .brand, header.shell .end, form.signout button { color: #fff; }
+  nav.main a { color: rgba(255,255,255,.75); }
+  nav.main a:hover { color: #fff; }
+  nav.main a[aria-current="page"] { color: #fff; border-bottom-color: #c8102e; }
+  .card { background: #fff; border: 1px solid #e0e6ec; border-radius: 14px;
+          box-shadow: 0 4px 16px rgba(0,0,0,.08); }
+  h1 { color: #1a1a1a; }
+  th { text-transform: uppercase; font-size: 11px; color: #4a4a4a; }
+  button:hover, :focus-visible { outline: 2px solid #c8102e; outline-offset: 2px; }
+  footer { color: #4a4a4a; }
+"#;
+
 /// The branding the pages render.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Branding {
@@ -41,6 +81,7 @@ pub struct Branding {
     pub tagline: String,
     pub accent: String,
     logo_url: Option<String>,
+    theme: Theme,
 }
 
 impl Default for Branding {
@@ -50,6 +91,7 @@ impl Default for Branding {
             tagline: DEFAULT_TAGLINE.to_owned(),
             accent: DEFAULT_ACCENT.to_owned(),
             logo_url: None,
+            theme: Theme::Default,
         }
     }
 }
@@ -63,6 +105,16 @@ impl Branding {
         // value, and that must not read as a rejected setting.
         let get = |k: &str| get(k).filter(|v| !v.trim().is_empty());
         let mut b = Branding::default();
+        if let Some(v) = get("BRAND_THEME") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "default" => {}
+                "datagroup" => {
+                    b.theme = Theme::Datagroup;
+                    b.accent = DATAGROUP_ACCENT.to_owned();
+                }
+                _ => warn("BRAND_THEME ignored: use default or datagroup".to_owned()),
+            }
+        }
         if let Some(v) = get("BRAND_NAME") {
             let v = v.trim();
             let n = v.chars().count();
@@ -104,6 +156,15 @@ impl Branding {
             }
         }
         b
+    }
+
+    /// The theme's CSS, layered after the base styles; empty for the default.
+    #[must_use]
+    pub fn theme_css(&self) -> &'static str {
+        match self.theme {
+            Theme::Default => "",
+            Theme::Datagroup => DATAGROUP_CSS,
+        }
     }
 
     /// The logo URL, if one was accepted.
@@ -336,5 +397,23 @@ mod tests {
         for bad in ["abc", "#abcd", "#ggg", "#12345", "blue"] {
             assert!(!is_hex_colour(bad), "{bad}");
         }
+    }
+
+    /// Disable: leave `theme` at Default for `datagroup`, or let the preset
+    /// accent override an explicit `BRAND_ACCENT`.
+    #[test]
+    fn the_datagroup_theme_brings_report_rs_colours_and_yields_to_an_explicit_accent() {
+        let (b, w) = from(&[("BRAND_THEME", "Datagroup")]);
+        assert!(w.is_empty());
+        assert_eq!(b.accent, DATAGROUP_ACCENT);
+        assert!(b.theme_css().contains("#0d3a64"), "navy header bar");
+        assert!(b.theme_css().contains("Segoe UI"));
+        let (b, _) = from(&[("BRAND_THEME", "datagroup"), ("BRAND_ACCENT", "#123456")]);
+        assert_eq!(b.accent, "#123456");
+        assert!(!b.theme_css().is_empty());
+        let (b, w) = from(&[("BRAND_THEME", "neon")]);
+        assert_eq!(b.theme_css(), "");
+        assert_eq!(w.len(), 1);
+        assert_eq!(Branding::default().theme_css(), "");
     }
 }

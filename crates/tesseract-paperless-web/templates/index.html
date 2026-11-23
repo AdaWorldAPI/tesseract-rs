@@ -6,7 +6,7 @@
 
   .tag { color: color-mix(in srgb, CanvasText 60%, Canvas); font-size: .95rem; margin: 0 0 1.5rem; }
   label { display: block; font-weight: 600; margin-bottom: .35rem; }
-  input[type=file], input[type=url] {
+  input[type=file], input[type=url], #customer {
     width: 100%; padding: .55rem; border-radius: 8px;
     border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas);
     background: Canvas; color: CanvasText; font-size: 1rem;
@@ -37,6 +37,19 @@
     <label for="url">Fetch an image URL</label>
     <input id="url" type="url" name="url" placeholder="https://example.com/scan.png">
     <p class="note">Private, loopback, and link-local addresses are refused (SSRF guard); 10&nbsp;MB / 10&nbsp;s cap.</p>
+
+    <label for="customer">Customer</label>
+    {% if let Some(choices) = customer_choices %}
+    {% if choices.is_empty() %}
+    <p class="note">No customer has been assigned to your account, so you cannot file documents yet.</p>
+    {% else %}
+    <select id="customer" name="customer" required>
+      {% for code in choices %}<option value="{{ code }}">{{ code }}</option>{% endfor %}
+    </select>
+    {% endif %}
+    {% else %}
+    <input id="customer" name="customer" pattern="[A-Za-z0-9_-]{1,32}" placeholder="optional, e.g. K01">
+    {% endif %}
 
     <div class="btns">
       <button class="go" type="submit">Ingest document</button>

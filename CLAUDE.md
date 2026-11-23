@@ -4707,3 +4707,31 @@ surface split.
   confidence. Disable run: renumbering after the filter turns it red.
 - Measured on `corpus/pages/page_01.pgm`: triples 1 → 3 (adds
   `(wind,moved,door)` and `(garden,cut,grass)`); corrections considered 3 → 9.
+
+## ★ paperless-web: customer separation, JSON API, frame headers, Datagroup theme (2026-11-23)
+
+The archive now separates documents by customer and can be read and embedded by
+report-rs. Recorded here because three rules are easy to break later:
+
+- **The customer is an access fact, not a filing definition.** It lives in its own
+  `customers` table (`archive_meta`), never as a `MetaKind`: renaming, retiring or
+  an AUTO suggestion must never move a document between customers. It is written
+  only by an explicit action, and only for a NEW document on upload: a duplicate
+  upload keeps its customer, or re-uploading a file would move another customer's
+  document into the uploader's scope.
+- **The archive decides scope from the caller's own grants.** `customers.rs`
+  maps `(org, role_key)` pairs from the roles claim to customers. The gate attaches
+  a `Caller` with ALL token grants (not only the admitting ones) for a session and
+  for a delegated bearer token alike; report-rs adds no authority. No policy means
+  the old behaviour (everyone sees everything); a policy without sign-in refuses to
+  start; a policy and no caller sees nothing (fail closed).
+- **Out of scope looks exactly like absent.** Every per-document route returns the
+  same 404 for another customer's document as for an unknown hash.
+
+`GET /api/v1/customers/{code}/documents` answers only with a policy and returns no
+document text. `headers.rs` sets `frame-ancestors 'self'` plus
+`PAPERLESS_FRAME_ANCESTORS` on every response (the archive was frameable by any
+site before), and a framed request without a session gets a new-tab sign-in link
+because the identity provider refuses to be framed. `BRAND_THEME=datagroup` copies
+report-rs's `themes.css` Datagroup values; compare them by eye when report-rs
+changes its theme.
