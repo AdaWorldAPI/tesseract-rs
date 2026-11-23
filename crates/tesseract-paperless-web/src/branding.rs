@@ -587,7 +587,12 @@ fn is_logo_url(v: &str) -> bool {
     // An absolute address is parsed the way a browser would: it must be https,
     // carry a real host (`https://:443/x` has none), and have no userinfo that
     // could make the visible host a different one (`https://good@evil/`).
-    let https_host = v.starts_with("https://")
+    // The host must also be written out: the parser reads `https:///x` as host
+    // `x`, but three slashes there are a typo, not an address.
+    let written_host = v
+        .strip_prefix("https://")
+        .is_some_and(|rest| !rest.starts_with(['/', '?', '#']));
+    let https_host = written_host
         && url::Url::parse(v).is_ok_and(|u| {
             u.scheme() == "https"
                 && u.host_str().is_some_and(|h| !h.is_empty())
@@ -675,6 +680,8 @@ mod tests {
             "https:///logo.svg",
             "https://user@evil.example/l.svg",
             "https://?x",
+            "https://:443/logo.svg",
+            "https://[invalid]/logo.svg",
         ] {
             assert!(!is_logo_url(bad), "{bad:?}");
         }
