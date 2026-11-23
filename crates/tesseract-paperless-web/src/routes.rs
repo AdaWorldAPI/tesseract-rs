@@ -2142,6 +2142,57 @@ mod tests {
         assert!(body == bytes);
     }
 
+    /// Slice B: an original survives a restart. A new `AppState` over the same
+    /// directories (what a redeploy with the volume does) serves the same
+    /// bytes, and their SHA-256 is the document's key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_original_survives_a_restart() {
+        let archive = tempfile::tempdir().expect("archive tempdir");
+        let index = tempfile::tempdir().expect("index tempdir");
+        let blobs = tempfile::tempdir().expect("blob tempdir");
+        let load = || async {
+            Arc::new(
+                AppState::load(
+                    FsPath::new(MODEL_DIR),
+                    &archive.path().to_string_lossy(),
+                    index.path(),
+                    blobs.path(),
+                    FsPath::new("/nonexistent/deepnsm/word_frequency"),
+                )
+                .await
+                .expect("AppState::load"),
+            )
+        };
+        let bytes = page_bytes();
+        let first = load().await;
+        let hash = ingest(
+            &first,
+            bytes.clone(),
+            Some("p.pgm".to_string()),
+            "image/png",
+        )
+        .await
+        .expect("ingest")
+        .hash_hex()
+        .to_string();
+        drop(first);
+
+        let state = load().await;
+        let h = Harness {
+            app: router(state.clone()),
+            state,
+            _dirs: (
+                tempfile::tempdir().expect("unused"),
+                tempfile::tempdir().expect("unused"),
+                tempfile::tempdir().expect("unused"),
+            ),
+        };
+        let (status, _, body) = send_raw(&h, get_req(&format!("/documents/{hash}/original"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(format!("{:?}", ContentSha256::of(&body)), hash);
+        assert!(body == bytes);
+    }
+
     /// Slice B: altered stored bytes are refused, not served.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_tampered_original_is_refused() {
