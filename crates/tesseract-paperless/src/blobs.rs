@@ -148,7 +148,18 @@ impl BlobStore {
             });
         }
         match self.get(key) {
-            Ok(Some(_)) => return Ok(PutOutcome::AlreadyPresent),
+            Ok(Some(_)) => {
+                // A readable blob is not necessarily a durable one: an earlier
+                // put may have renamed it into place and then failed to sync
+                // the directory. Sync before reporting it as kept.
+                let dir = self.path_of(key);
+                let dir = dir
+                    .parent()
+                    .ok_or_else(|| io::Error::other("blob path has no parent"))?;
+                sync_dir(dir)?;
+                sync_dir(&self.root)?;
+                return Ok(PutOutcome::AlreadyPresent);
+            }
             Ok(None) | Err(BlobError::Tampered { .. }) => {}
             Err(e) => return Err(e),
         }
@@ -177,7 +188,7 @@ impl BlobStore {
             drop(f);
             fs::rename(&temp, &target)?;
             // The rename is only durable once the directory entry is.
-            File::open(dir)?.sync_all()
+            sync_dir(dir)
         })();
         if let Err(e) = written {
             // Best effort: a leftover temporary file is garbage, not a blob,
@@ -241,12 +252,63 @@ fn create_dir_durable(dir: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => return Ok(()),
         Err(e) => return Err(e),
     }
-    File::open(parent.unwrap_or_else(|| Path::new(".")))?.sync_all()
+    sync_dir(parent.unwrap_or_else(|| Path::new(".")))
+}
+
+/// Make a directory's entries durable.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        tests::DIR_SYNCS.with(|n| n.set(n.get() + 1));
+        if tests::FAIL_DIR_SYNC.with(|f| f.replace(false)) {
+            return Err(io::Error::other("injected directory sync failure"));
+        }
+    }
+    File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Directory syncs performed on this thread.
+        pub(super) static DIR_SYNCS: Cell<usize> = const { Cell::new(0) };
+        /// Fail the next directory sync on this thread.
+        pub(super) static FAIL_DIR_SYNC: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[test]
+    fn a_retry_after_a_failed_directory_sync_syncs_before_succeeding() {
+        let (_d, s) = store();
+        let bytes = b"renamed but not synced".to_vec();
+        let key = ContentSha256::of(&bytes);
+        // First put: create the fan-out directory, then fail the sync that
+        // follows the rename.
+        let hex = format!("{key:?}");
+        create_dir_durable(&s.root().join(&hex[..2])).expect("fan-out dir");
+        FAIL_DIR_SYNC.with(|f| f.set(true));
+        assert!(matches!(s.put(&key, &bytes), Err(BlobError::Io(_))));
+        assert!(
+            s.contains(&key),
+            "the rename happened before the failed sync"
+        );
+
+        let before = DIR_SYNCS.with(Cell::get);
+        assert_eq!(
+            s.put(&key, &bytes).expect("retry"),
+            PutOutcome::AlreadyPresent
+        );
+        assert!(
+            DIR_SYNCS.with(Cell::get) >= before + 2,
+            "the retry reported the blob kept without syncing its directory"
+        );
+
+        // A sync failure on the reuse path is reported, not hidden.
+        FAIL_DIR_SYNC.with(|f| f.set(true));
+        assert!(matches!(s.put(&key, &bytes), Err(BlobError::Io(_))));
+    }
 
     fn store() -> (tempfile::TempDir, BlobStore) {
         let dir = tempfile::tempdir().expect("tempdir");
