@@ -575,9 +575,10 @@ pub async fn restore(
     std::fs::write(&marker, b"restore in progress\n").map_err(local)?;
 
     let mut report = RestoreReport::default();
-    // Documents whose record was damaged keep their assignments and reviews:
-    // the next snapshot upload would otherwise replace the good metadata in
-    // S3 with one that lost them.
+    // Documents whose record was damaged and skipped. They are listed in the
+    // snapshot hold (below); their metadata is not imported locally. It stays
+    // in the S3 snapshot, which the hold keeps from being replaced, so a later
+    // restore after the record is repaired brings it back.
     let mut skipped_hashes: HashSet<String> = HashSet::new();
     let local_hashes: HashSet<String> = store.hashes().await.map_err(local)?.into_iter().collect();
     // An original present in S3 is restored even when its record still says
@@ -678,9 +679,11 @@ pub async fn restore(
             let file: SnapshotFile = serde_json::from_slice(&body)
                 .map_err(|e| ReplicaError::Invalid(format!("metadata snapshot: {e}")))?;
             let snapshot = file.to_snapshot()?;
-            let mut live: HashSet<String> =
+            // Only documents that are local get their assignments and reviews.
+            // Importing rows for skipped documents too would leave rows that a
+            // later restore, from a different snapshot, could not replace.
+            let live: HashSet<String> =
                 store.hashes().await.map_err(local)?.into_iter().collect();
-            live.extend(skipped_hashes.iter().cloned());
             store
                 .meta()
                 .import(&snapshot, &live)
@@ -954,6 +957,42 @@ mod tests {
         bucket.objects.lock().expect("lock").remove(&r.record_key(&b));
         restore(&r, &clean.store, &clean.blobs).await.expect("restore");
         assert!(!clean.blobs.root().join(SNAPSHOT_HOLD).exists());
+    }
+
+    /// A restore in which every record is damaged leaves the archive empty
+    /// and imports no assignment or review rows for the skipped documents, so
+    /// a later restore from a newer snapshot cannot merge with stale rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restore_that_skips_every_record_imports_no_rows_for_them() {
+        let bucket = Arc::new(MemoryStore::default());
+        let r = replica(&bucket);
+        let src = local().await;
+        let a = add(&src, b"only doc", "a.png", 1, true).await;
+        let meta = src.store.meta();
+        let tag = meta
+            .create_definition(MetaKind::Tag, "Alt", 1)
+            .await
+            .expect("tag");
+        meta.assign(&a, MetaKind::Tag, tag.definition_id, Source::Manual, 2)
+            .await
+            .expect("assign");
+        meta.mark_reviewed(&a, 3).await.expect("review");
+        r.replicate(&src.store, &src.blobs, &no_lock).await.expect("replicate");
+        bucket
+            .objects
+            .lock()
+            .expect("lock")
+            .insert(r.record_key(&a), b"not json".to_vec());
+
+        let dst = local().await;
+        let report = restore(&r, &dst.store, &dst.blobs).await.expect("restore");
+        assert_eq!((report.restored, report.skipped), (0, 1));
+        let snap = dst.store.meta().export().await.expect("export");
+        assert!(snap.assignments.is_empty(), "{:?}", snap.assignments);
+        assert!(snap.reviews.is_empty(), "{:?}", snap.reviews);
+        // The definitions come back with their ids; the hold keeps S3 intact.
+        assert!(snap.definitions.iter().any(|d| d.definition_id == tag.definition_id));
+        assert!(dst.blobs.root().join(SNAPSHOT_HOLD).exists());
     }
 
     /// A slow S3 does not hold the document's lock: an upload or delete of the
