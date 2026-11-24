@@ -19,6 +19,7 @@
 //! | `name` | page titles and the main heading (1 to 60 characters) |
 //! | `tagline` | the line under the heading on the upload page (up to 240 characters) |
 //! | `logo_url` | an image beside the heading: an `https://` URL or a same-site path starting with a single `/` |
+//! | `image_url` | a decorative brand image on the upload page; the same rules as `logo_url` |
 //! | `font_family` | the page font |
 //! | `bg` | the page background |
 //! | `fg` | the body text |
@@ -129,6 +130,7 @@ pub struct Branding {
     pub name: String,
     pub tagline: String,
     logo_url: Option<String>,
+    image_url: Option<String>,
     pub font_family: String,
     pub bg: String,
     pub fg: String,
@@ -153,6 +155,7 @@ impl Default for Branding {
             name: DEFAULT_NAME.to_owned(),
             tagline: DEFAULT_TAGLINE.to_owned(),
             logo_url: None,
+            image_url: None,
             font_family: "system-ui, -apple-system, \"Segoe UI\", Roboto, sans-serif".to_owned(),
             bg: "#ffffff".to_owned(),
             fg: "#1f2937".to_owned(),
@@ -220,6 +223,7 @@ struct BrandTable {
     name: Option<String>,
     tagline: Option<String>,
     logo_url: Option<String>,
+    image_url: Option<String>,
     font_family: Option<String>,
     bg: Option<String>,
     fg: Option<String>,
@@ -323,6 +327,16 @@ impl Branding {
                 });
             }
             b.logo_url = Some(v.to_owned());
+        }
+        if let Some(v) = nonblank(t.image_url.take()) {
+            let v = v.trim();
+            if !is_logo_url(v) {
+                return Err(BrandError::Value {
+                    key: "image_url",
+                    value: v.to_owned(),
+                });
+            }
+            b.image_url = Some(v.to_owned());
         }
 
         macro_rules! tokens {
@@ -441,6 +455,12 @@ impl Branding {
     #[must_use]
     pub fn logo_url(&self) -> Option<&str> {
         self.logo_url.as_deref()
+    }
+
+    /// The decorative brand image URL, if one was accepted.
+    #[must_use]
+    pub fn image_url(&self) -> Option<&str> {
+        self.image_url.as_deref()
     }
 
     /// Whether a custom name is set, which adds the "powered by tesseract-rs"
@@ -1007,7 +1027,20 @@ mod tests {
         assert_eq!(b.name, "Archiv");
         assert_eq!(b.tagline, "Alles an einem Ort.");
         assert_eq!(b.logo_url(), Some("https://example.org/l.svg"));
+        assert_eq!(b.image_url(), None, "image_url is its own key");
         assert!(b.is_custom());
+    }
+
+    /// `image_url` is accepted on its own key and kept apart from the logo.
+    #[test]
+    fn toml_sets_the_brand_image() {
+        let b = toml_brand(
+            "[brand]\nimage_url = \" https://cdn.example.org/deco.png \"\nlogo_url = \"/static/l.svg\"\n",
+        )
+        .expect("valid");
+        assert_eq!(b.image_url(), Some("https://cdn.example.org/deco.png"));
+        assert_eq!(b.logo_url(), Some("/static/l.svg"));
+        assert_eq!(Branding::default().image_url(), None);
     }
 
     /// `BRAND_FILE` is read through the injected reader, from exactly the path
@@ -1129,6 +1162,18 @@ mod tests {
             ("logo_url = \"//evil.example/x.png\"".to_owned(), "logo_url"),
             ("logo_url = \"javascript:alert(1)\"".to_owned(), "logo_url"),
             ("logo_url = \"/a b.png\"".to_owned(), "logo_url"),
+            (
+                "image_url = \"http://example.org/i.png\"".to_owned(),
+                "image_url",
+            ),
+            (
+                "image_url = \"//evil.example/i.png\"".to_owned(),
+                "image_url",
+            ),
+            (
+                "image_url = \"javascript:alert(1)\"".to_owned(),
+                "image_url",
+            ),
         ];
         for (line, key) in cases {
             match toml_brand(&format!("[brand]\n{line}\n")) {
