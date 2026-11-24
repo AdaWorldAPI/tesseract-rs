@@ -2,7 +2,12 @@
 {% block title %}{{ self.brand().name }} — document archive{% endblock %}
 {% block style %}
   h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
-  form.card { max-width: 42rem; }
+  .intake { display: flex; flex-wrap: wrap; gap: 1.25rem; align-items: flex-start; margin-bottom: 1.25rem; }
+  form.card { flex: 1 1 24rem; max-width: 42rem; margin-bottom: 0; }
+  img.brand-image {
+    flex: 0 1 20rem; min-width: 0; max-width: 100%; max-height: 24rem; height: auto;
+    object-fit: contain; align-self: center; border-radius: var(--brand-radius);
+  }
   .tag { color: var(--brand-muted); font-size: .95rem; margin: 0 0 1.5rem; }
   label { display: block; font-weight: 600; margin-bottom: .35rem; }
   input[type=file], input[type=url], #customer {
@@ -27,6 +32,7 @@
   <div class="error" role="alert">{{ msg }}</div>
   {% endif %}
 
+  <div class="intake">
   <form class="card" action="/upload" method="post" enctype="multipart/form-data">
     <label for="file">Upload a document image</label>
     <input id="file" type="file" name="file" accept="image/png,image/jpeg,image/webp,image/tiff,image/gif,image/bmp,image/x-portable-graymap,image/*">
@@ -54,6 +60,8 @@
       <button class="go" type="submit">Ingest document</button>
     </div>
   </form>
+  {% if let Some(img) = self.brand().image_url() %}<img class="brand-image" src="{{ img }}" alt="">{% endif %}
+  </div>
 
   <p class="note">A document already in the archive (byte-identical content) is recognized as a duplicate and skipped &mdash; no repeat OCR spend, and you land straight on the existing record.</p>
 {% endblock %}
