@@ -53,23 +53,23 @@
 //! a refused value stops the start ([`BrandError`]) instead of quietly serving
 //! the neutral look.
 //!
-//! Example: the corporate design the `datagroup` theme of report-rs uses,
-//! set through `BRAND_TOML` (documentation only, nothing here is compiled in):
+//! Example: a fictional corporate design set through `BRAND_TOML`
+//! (documentation only, nothing here is compiled in):
 //!
 //! ```toml
 //! [brand]
-//! name = "DATAGROUP Dokumente"
-//! accent = "#c8102e"
-//! muted = "#4a4a4a"
-//! fg = "#1a1a1a"
-//! h1 = "#1a1a1a"
-//! bg = "#f5f5f5"
-//! border = "#e0e6ec"
-//! subtle_bg = "#eef1f4"
-//! side_bg = "#0d3a64"
-//! radius = "14px"
-//! radius_sm = "10px"
-//! elevation = "0 4px 16px rgba(0,0,0,.08)"
+//! name = "Example Corp Documents"
+//! accent = "#7c3aed"
+//! muted = "#52525b"
+//! fg = "#18181b"
+//! h1 = "#18181b"
+//! bg = "#fafafa"
+//! border = "#e4e4e7"
+//! subtle_bg = "#f4f4f5"
+//! side_bg = "#1e293b"
+//! radius = "12px"
+//! radius_sm = "8px"
+//! elevation = "0 2px 8px rgba(0,0,0,.06)"
 //! ```
 //!
 //! # Per-setting variables
@@ -930,9 +930,9 @@ mod tests {
         assert!(w.is_empty());
         assert_eq!(b.side_bg, DEFAULT_SIDE_BG);
         assert_eq!(b.side_fg, "#fff");
-        let (b, w) = from(&[("BRAND_HEADER_BG", "#0D3A64")]);
+        let (b, w) = from(&[("BRAND_HEADER_BG", "#1E293B")]);
         assert!(w.is_empty());
-        assert_eq!(b.side_bg, "#0d3a64");
+        assert_eq!(b.side_bg, "#1e293b");
         assert_eq!(b.side_fg, "#fff");
         let (b, _) = from(&[("BRAND_HEADER_BG", "#fafafa")]);
         assert_eq!(b.side_bg, "#fafafa");
@@ -1098,10 +1098,10 @@ mod tests {
     #[test]
     fn stylesheet_safe_values_are_accepted() {
         for (key, good) in [
-            ("accent", "#c8102e"),
+            ("accent", "#7c3aed"),
             ("side_hover", "rgba(255,255,255,.08)"),
-            ("elevation", "0 4px 16px rgba(0,0,0,.08)"),
-            ("radius", "14px"),
+            ("elevation", "0 2px 8px rgba(0,0,0,.06)"),
+            ("radius", "12px"),
             ("elevation", "none"),
             ("font_family", "Inter, \"Helvetica Neue\", sans-serif"),
         ] {
@@ -1181,28 +1181,28 @@ mod tests {
     /// The corporate-design example in the module documentation parses and
     /// yields its stated values.
     #[test]
-    fn the_documented_datagroup_example_parses() {
+    fn the_documented_example_parses() {
         let doc = r##"
 [brand]
-name = "DATAGROUP Dokumente"
-accent = "#c8102e"
-muted = "#4a4a4a"
-fg = "#1a1a1a"
-h1 = "#1a1a1a"
-bg = "#f5f5f5"
-border = "#e0e6ec"
-subtle_bg = "#eef1f4"
-side_bg = "#0d3a64"
-radius = "14px"
-radius_sm = "10px"
-elevation = "0 4px 16px rgba(0,0,0,.08)"
+name = "Example Corp Documents"
+accent = "#7c3aed"
+muted = "#52525b"
+fg = "#18181b"
+h1 = "#18181b"
+bg = "#fafafa"
+border = "#e4e4e7"
+subtle_bg = "#f4f4f5"
+side_bg = "#1e293b"
+radius = "12px"
+radius_sm = "8px"
+elevation = "0 2px 8px rgba(0,0,0,.06)"
 "##;
         let b = toml_brand(doc).expect("the documented example is valid");
-        assert_eq!(b.name, "DATAGROUP Dokumente");
-        assert_eq!(b.accent, "#c8102e");
-        assert_eq!(b.side_bg, "#0d3a64");
+        assert_eq!(b.name, "Example Corp Documents");
+        assert_eq!(b.accent, "#7c3aed");
+        assert_eq!(b.side_bg, "#1e293b");
         assert_eq!(b.side_fg, "#fff");
-        assert_eq!(b.elevation, "0 4px 16px rgba(0,0,0,.08)");
+        assert_eq!(b.elevation, "0 2px 8px rgba(0,0,0,.06)");
         assert!(b.is_custom());
     }
 
