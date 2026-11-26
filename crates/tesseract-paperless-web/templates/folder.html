@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ label }} &middot; {{ source }}</title>
+<script src="/static/desktop.js" defer></script>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: #1b2430; background: #fff; }
+  header { position: sticky; top: 0; display: flex; align-items: baseline; gap: 10px; padding: 10px 16px; background: #f6f8fb; border-bottom: 1px solid #e2e7ee; }
+  h1 { font-size: 15px; margin: 0; }
+  .muted { color: #5b6778; font-size: 12.5px; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li a { display: flex; flex-direction: column; padding: 9px 16px; border-bottom: 1px solid #eef1f5; color: inherit; text-decoration: none; }
+  li a:hover { background: #f2f6fd; }
+  li a:focus-visible { outline: 2px solid #2f6fd6; outline-offset: -2px; }
+  li b { font-weight: 600; color: #22427a; word-break: break-word; }
+  .empty, .more { padding: 14px 16px; }
+</style>
+</head>
+<body>
+<header><h1>{{ label }}</h1><span class="muted">{{ source }} &middot; {{ total }} {% if total == 1 %}document{% else %}documents{% endif %}</span></header>
+{% if entries.is_empty() %}
+<p class="empty muted">This folder is empty.</p>
+{% else %}
+<ul>
+{% for e in entries %}
+  <li><a data-win="{{ e.id }}" data-title="{{ e.label }}" href="{{ e.href }}"><b>{{ e.label }}</b><span class="muted">{{ e.detail }}</span></a></li>
+{% endfor %}
+</ul>
+{% if total > entries.len() %}<p class="more muted">Showing {{ entries.len() }} of {{ total }}. Use the document search for the rest.</p>{% endif %}
+{% endif %}
+</body>
+</html>
