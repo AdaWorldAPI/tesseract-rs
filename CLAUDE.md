@@ -4746,3 +4746,41 @@ compiled in (operator, 2026-11-23: the corporate identity comes only from Railwa
 variables, so one blank image hosts any customer): the layout (header bar, cards)
 is the neutral default, and a deployment sets `BRAND_NAME`, `BRAND_ACCENT`,
 `BRAND_HEADER_BG` and `BRAND_LOGO_URL`.
+
+## ★ paperless-web: the portal's glass background, and a desktop of folder windows (2026-11-26)
+
+Every archive page now carries the shared material "Physikalisches Glas"
+(`data-material="physical-glass"` on `<html>`, Rosé unless the viewer picks
+another wallpaper), and `/desktop` shows the archive as glass folder tiles that
+open as windows. Four rules:
+
+- **The material is served, never copied.** `glass.rs` answers
+  `/static/physical-glass.css`, `/static/physical-glass.js` and
+  `/static/physical-glass/wallpapers/:file` from `a2ui_theme::asset` (a2ui-rs,
+  floating on its default branch like `a2ui-layout`). A wallpaper request must
+  end in `.webp`; the theme's asset table also holds a `README.md`, which a
+  bare lookup would serve.
+- **Wallpaper only, no refraction maps.** Pages load the script with
+  `data-surfaces=":not(*)"`, so nothing calls `/optics/surface/map` and the
+  archive does not serve it. Serving it means `a2ui-paint`, which brings OGAR
+  in from git next to the OGAR path dependencies this crate already has. That
+  would be a separate decision. `base.html` maps the material's
+  `--fg/--bg/--card-bg/--border` onto the brand tokens, because an undefined
+  `--card-bg` would make every card transparent.
+- **The shell never names a backend.** `desktop.rs` asks every
+  `FolderSource` in `registry()` for its folders and for one folder's
+  listing. The archive is the first source: "All documents" plus one folder per
+  active correspondent, document type and tag. An S3 (Tigris) or SharePoint
+  (Graph) source is one more `impl FolderSource` plus one line in `registry()`.
+  The routes, templates and `static/desktop.js` stay unchanged. Source ids and
+  folder keys must match `[a-z0-9_-]{1,64}`, checked before any source is
+  asked.
+- **A source lists with the caller's scope.** The archive source filters
+  through `routes::filter_visible`, the same filter the document list uses.
+  An unknown source, a malformed key, a retired definition and a folder the
+  caller may not see all return the same 404.
+
+The window script follows report-rs's `static/desktop.js`. In addition, a folder
+page that sits inside a desktop window hands its `a[data-win]` links to
+`window.parent.desktopOpen`, so a document opens as another window. Without
+script, every tile and entry is a plain link.

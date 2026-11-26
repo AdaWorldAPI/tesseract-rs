@@ -134,6 +134,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/definitions/rule", post(definition_rule))
         .route("/definitions/retire", post(definition_retire))
         .route("/auto/mine", post(auto_mine))
+        .route(crate::desktop::DESKTOP_ROUTE, get(crate::desktop::desktop))
+        .route("/desktop/folders/:source/:key", get(crate::desktop::folder))
+        .route("/static/desktop.js", get(crate::desktop::script))
+        .route(crate::glass::CSS_ROUTE, get(crate::glass::css))
+        .route(crate::glass::JS_ROUTE, get(crate::glass::js))
+        .route(crate::glass::WALLPAPER_ROUTE, get(crate::glass::wallpaper))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD))
         .layer(RequestBodyLimitLayer::new(MAX_UPLOAD))
         .with_state(state)
@@ -155,7 +161,7 @@ fn render<T: Template>(t: &T) -> Html<String> {
 /// sees everything (the archive's earlier behaviour). With one, a caller the
 /// gate attached no grants to sees nothing: the start rule makes that
 /// unreachable (a policy needs sign-in), and failing closed keeps it so.
-fn scope_of(state: &AppState, caller: Option<&Extension<Caller>>) -> Scope {
+pub(crate) fn scope_of(state: &AppState, caller: Option<&Extension<Caller>>) -> Scope {
     match (&state.policy, caller) {
         (None, _) => Scope::All,
         (Some(p), Some(Extension(c))) => p.scope_for(&c.grants),
@@ -165,7 +171,7 @@ fn scope_of(state: &AppState, caller: Option<&Extension<Caller>>) -> Scope {
 
 /// Keep the rows `scope` may see. One read of the customers table, not one
 /// per row.
-async fn filter_visible(
+pub(crate) async fn filter_visible(
     state: &AppState,
     scope: &Scope,
     rows: Vec<DocumentRow>,
@@ -2073,7 +2079,7 @@ async fn auto_mine(State(state): State<Arc<AppState>>) -> Redirect {
 
 /// Milliseconds since the Unix epoch -> a plain `YYYY-MM-DD HH:MM:SS UTC`
 /// string, hand-rolled rather than pulling `chrono`/`time` for one call site.
-fn format_unix_ms(ms: i64) -> String {
+pub(crate) fn format_unix_ms(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let days = secs.div_euclid(86_400);
     let secs_of_day = secs.rem_euclid(86_400);
@@ -4297,5 +4303,272 @@ mod tests {
         );
         let (_, _, scoped) = send(&h, as_role(get_req("/dashboard"), "paperless.k01")).await;
         assert!(!scoped.contains("S3 copy"), "a scoped caller does not");
+    }
+
+    // ---- glass background + desktop view -----------------------------------
+
+    use crate::desktop::{ArchiveSource, FolderCtx, FolderSource as _};
+
+    /// Two documents, a tag on the first, a correspondent with no documents, and
+    /// a retired tag that still holds the second document.
+    async fn filed(h: &Harness) -> (String, String, u32, u32, u32) {
+        let first = seed(h, b"first filed").await;
+        let second = seed(h, b"second filed").await;
+        let meta = h.state.store.meta();
+        let tag = meta
+            .create_definition(MetaKind::Tag, "Strom", 1)
+            .await
+            .expect("tag")
+            .definition_id;
+        let corr = meta
+            .create_definition(MetaKind::Correspondent, "Stadtwerke", 1)
+            .await
+            .expect("correspondent")
+            .definition_id;
+        let old = meta
+            .create_definition(MetaKind::Tag, "Altbestand", 1)
+            .await
+            .expect("old tag")
+            .definition_id;
+        meta.assign(&first, MetaKind::Tag, tag, Source::Manual, 1)
+            .await
+            .expect("assign");
+        meta.assign(&second, MetaKind::Tag, old, Source::Manual, 1)
+            .await
+            .expect("assign old");
+        meta.retire_definition(MetaKind::Tag, old)
+            .await
+            .expect("retire");
+        (first, second, tag, corr, old)
+    }
+
+    /// Every archive page carries the shared material with the wallpaper only
+    /// (no surface asks for refraction maps), the background picker and the
+    /// way to the desktop; Rosé is the default because no page sets
+    /// `data-pg-bg`. Disable: drop `data-material` from `base.html`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_archive_page_shows_the_glass_background() {
+        let h = harness().await;
+        let hash = seed(&h, b"glass page").await;
+        for uri in [
+            "/".to_string(),
+            "/dashboard".to_string(),
+            "/inbox".to_string(),
+            "/documents".to_string(),
+            format!("/documents/{hash}"),
+            "/definitions?kind=tag".to_string(),
+        ] {
+            let (status, _, body) = send(&h, get_req(&uri)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            for needle in [
+                "<html lang=\"en\" data-material=\"physical-glass\">",
+                "href=\"/static/physical-glass.css\"",
+                "src=\"/static/physical-glass.js\" data-surfaces=\":not(*)\"",
+                "<select data-pg-bg-choice",
+                "href=\"/desktop\"",
+            ] {
+                assert!(body.contains(needle), "{uri}: missing {needle}");
+            }
+            assert!(
+                !body.contains("data-pg-bg=\""),
+                "{uri}: Rosé is the default"
+            );
+        }
+    }
+
+    /// The material is served from `a2ui-theme`'s asset table: the sheet names
+    /// the Rosé wallpaper, the wallpaper is a real WebP. Only `.webp` names
+    /// reach the table. Disable: drop the `.ends_with(".webp")` guard in
+    /// `glass::wallpaper`; the theme's `README.md` is then served.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_glass_material_is_served_and_only_wallpapers_reach_the_table() {
+        let h = harness().await;
+        let (status, headers, css) = send_raw(&h, get_req("/static/physical-glass.css")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CONTENT_TYPE], "text/css; charset=utf-8");
+        let css = String::from_utf8(css).expect("utf-8");
+        assert!(css.contains("physical-glass/wallpapers/rose.webp"));
+        let (status, headers, js) = send_raw(&h, get_req("/static/physical-glass.js")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[header::CONTENT_TYPE],
+            "text/javascript; charset=utf-8"
+        );
+        assert!(String::from_utf8(js).expect("utf-8").contains("data-pg-bg"));
+        let (status, headers, webp) =
+            send_raw(&h, get_req("/static/physical-glass/wallpapers/rose.webp")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CONTENT_TYPE], "image/webp");
+        assert!(webp.len() > 1024 && &webp[..4] == b"RIFF" && &webp[8..12] == b"WEBP");
+        for bad in ["README.md", "rose.png", "missing.webp", "..%2Frose.webp"] {
+            let (status, _, _) = send_raw(
+                &h,
+                get_req(&format!("/static/physical-glass/wallpapers/{bad}")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{bad}");
+        }
+    }
+
+    /// The archive source offers "All documents" first, then one folder per
+    /// ACTIVE definition with its document count; the retired tag is not
+    /// offered even though a document still carries it.
+    /// Disable: drop `!d.retired` from `ArchiveSource::folders`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_archive_offers_all_documents_and_one_folder_per_active_definition() {
+        let h = harness().await;
+        let (_, _, tag, corr, old) = filed(&h).await;
+        let scope = Scope::All;
+        let ctx = FolderCtx {
+            state: &h.state,
+            scope: &scope,
+        };
+        let folders = ArchiveSource.folders(ctx).await.expect("folders");
+        let got: Vec<(&str, &str, usize)> = folders
+            .iter()
+            .map(|f| (f.key.as_str(), f.label.as_str(), f.count))
+            .collect();
+        let tag_key = format!("tag-{tag}");
+        let corr_key = format!("correspondent-{corr}");
+        assert_eq!(
+            got,
+            vec![
+                ("all", "All documents", 2),
+                (corr_key.as_str(), "Stadtwerke", 0),
+                (tag_key.as_str(), "Strom", 1),
+            ]
+        );
+
+        let (status, _, page) = send(&h, get_req("/desktop")).await;
+        assert_eq!(status, StatusCode::OK);
+        for needle in [
+            "data-material=\"physical-glass\"".to_string(),
+            "data-surfaces=\":not(*)\"".to_string(),
+            "src=\"/static/desktop.js\"".to_string(),
+            "<select data-pg-bg-choice".to_string(),
+            "href=\"/desktop/folders/archive/all\"".to_string(),
+            format!("data-win=\"archive-{tag_key}\" data-title=\"Strom\" href=\"/desktop/folders/archive/{tag_key}\""),
+            format!("href=\"/desktop/folders/archive/{corr_key}\""),
+        ] {
+            assert!(page.contains(&needle), "desktop: missing {needle}");
+        }
+        assert!(
+            !page.contains(&format!("tag-{old}\"")),
+            "retired tag offered"
+        );
+        assert!(!page.contains("Altbestand"));
+    }
+
+    /// A folder window lists exactly its documents, each opening its detail
+    /// page as a window; "All documents" lists every one.
+    /// Disable: skip the `these.contains` filter in `ArchiveSource::listing`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_folder_window_lists_exactly_its_documents() {
+        let h = harness().await;
+        let (first, second, tag, corr, _) = filed(&h).await;
+        let (status, _, tagged) =
+            send(&h, get_req(&format!("/desktop/folders/archive/tag-{tag}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(tagged.contains(&format!(
+            "data-win=\"doc-{first}\" data-title=\"doc.png\" href=\"/documents/{first}\""
+        )));
+        assert!(!tagged.contains(&second), "an untagged document listed");
+        assert!(tagged.contains("1 document<"));
+
+        let (_, _, all) = send(&h, get_req("/desktop/folders/archive/all")).await;
+        assert!(all.contains(&first) && all.contains(&second));
+        assert!(all.contains("src=\"/static/desktop.js\""));
+
+        let (status, _, empty) = send(
+            &h,
+            get_req(&format!("/desktop/folders/archive/correspondent-{corr}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(empty.contains("This folder is empty."));
+    }
+
+    /// An unknown source, a malformed key, a key no active definition has and
+    /// a retired definition's key are all the same 404.
+    /// Disable: drop `!d.retired` from `ArchiveSource::listing`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_or_retired_folder_is_not_found() {
+        let h = harness().await;
+        let (_, _, tag, _, old) = filed(&h).await;
+        for uri in [
+            "/desktop/folders/s3/all".to_string(),
+            "/desktop/folders/archive/ALL".to_string(),
+            "/desktop/folders/archive/tag-999".to_string(),
+            format!("/desktop/folders/archive/tag-0{tag}"),
+            "/desktop/folders/archive/label-0".to_string(),
+            format!("/desktop/folders/archive/tag-{old}"),
+        ] {
+            let (status, _, _) = send(&h, get_req(&uri)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    /// A scoped caller's desktop counts and lists its own customer's documents
+    /// only, in "All documents" and in a tag folder alike.
+    /// Disable: return `rows` unfiltered from `ArchiveSource::visible`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scoped_caller_sees_only_its_documents_on_the_desktop() {
+        let h = harness_with(Some(POLICY)).await;
+        let (k01, k02, none) = three_customers(&h).await;
+        let meta = h.state.store.meta();
+        let tag = meta
+            .create_definition(MetaKind::Tag, "Strom", 1)
+            .await
+            .expect("tag")
+            .definition_id;
+        for hash in [&k01, &k02, &none] {
+            meta.assign(hash, MetaKind::Tag, tag, Source::Manual, 1)
+                .await
+                .expect("assign");
+        }
+        let scope = Scope::Customers(["K01".to_string()].into_iter().collect());
+        let ctx = FolderCtx {
+            state: &h.state,
+            scope: &scope,
+        };
+        let counts: Vec<usize> = ArchiveSource
+            .folders(ctx)
+            .await
+            .expect("folders")
+            .iter()
+            .map(|f| f.count)
+            .collect();
+        assert_eq!(counts, vec![1, 1]);
+        for uri in [
+            "/desktop/folders/archive/all".to_string(),
+            format!("/desktop/folders/archive/tag-{tag}"),
+        ] {
+            let (status, _, body) = send(&h, as_role(get_req(&uri), "paperless.k01")).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(body.contains(&k01), "{uri}: own document listed");
+            assert!(!body.contains(&k02), "{uri}: another customer's document");
+            assert!(!body.contains(&none), "{uri}: an unfiled document");
+            let (_, _, admin) = send(&h, as_role(get_req(&uri), "paperless.admin")).await;
+            assert!(
+                admin.contains(&k02) && admin.contains(&none),
+                "{uri}: admin"
+            );
+        }
+    }
+
+    /// The window script is served and carries the hook a folder window uses
+    /// to open a document as another window.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_window_script_is_served() {
+        let h = harness().await;
+        let (status, headers, js) = send_raw(&h, get_req("/static/desktop.js")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[header::CONTENT_TYPE],
+            "text/javascript; charset=utf-8"
+        );
+        let js = String::from_utf8(js).expect("utf-8");
+        assert!(js.contains("window.desktopOpen = open"));
+        assert!(js.contains("a[data-win]"));
     }
 }

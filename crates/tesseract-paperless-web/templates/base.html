@@ -1,15 +1,20 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-material="physical-glass">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}{% endblock %}</title>
+<link rel="stylesheet" href="/static/physical-glass.css">
+<script src="/static/physical-glass.js" data-surfaces=":not(*)" defer></script>
 <style>
 {{ self.zones_css()|safe }}
   :root { color-scheme: light; }
   nav.topnav-links { display: none; }
   @media (max-width: 640px) { .a2-body, .a2-body.mode-main-wide { grid-template-columns: minmax(0, 1fr); } aside.sidemenu-region, aside.quick-rail { display: none; } nav.topnav-links { display: flex; flex-wrap: wrap; } }
 {{ self.brand().css_vars()|safe }}
+  /* The shared glass material reads --fg/--bg/--card-bg/--border; here they are
+     the brand's, so its frosted cards keep the brand's card colour. */
+  :root { --fg: var(--brand-fg); --bg: var(--brand-bg); --card-bg: var(--brand-card-bg); --border: var(--brand-border); }
   * { box-sizing: border-box; }
   body {
     font-family: var(--brand-font-family);
@@ -26,6 +31,9 @@
   nav.topnav-links { gap: .25rem .9rem; flex-basis: 100%; }
   nav.topnav-links a { color: var(--brand-side-fg); text-decoration: none; font-weight: 600; padding: .15rem 0; }
   form.signout { display: inline; margin: 0; }
+  header.shell .tools { display: inline-flex; align-items: center; gap: .75rem; }
+  header.shell .tools a { color: inherit; }
+  header.shell select { font: inherit; font-size: .8rem; border-radius: var(--brand-radius-sm); border: 1px solid var(--brand-border); padding: .1rem .3rem; }
   form.signout button { font: inherit; padding: 0; border: 0; background: none; color: inherit; text-decoration: underline; cursor: pointer; }
   aside.sidemenu-region { align-self: stretch; background: var(--brand-side-bg); color: var(--brand-side-fg); padding: .75rem 0; }
   nav.main ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
@@ -74,7 +82,7 @@
 <header class="shell region-top_bar">
   <div class="bar">
     <a class="brand" href="/dashboard">{% if let Some(logo) = self.brand().logo_url() %}<img src="{{ logo }}" alt="">{% endif %}{{ self.brand().name }}</a>
-    {% if self.sign_in() %}<span class="end"><form class="signout" method="post" action="/auth/logout"><button type="submit">Sign out</button></form></span>{% endif %}
+    <span class="end tools"><a href="/desktop">Desktop</a><select data-pg-bg-choice aria-label="Background"></select>{% if self.sign_in() %}<form class="signout" method="post" action="/auth/logout"><button type="submit">Sign out</button></form>{% endif %}</span>
     <nav class="topnav-links" aria-label="Main (compact)">
       <a href="/dashboard"{% if self.nav() == "dashboard" %} aria-current="page"{% endif %}>Dashboard</a>
       <a href="/inbox"{% if self.nav() == "inbox" %} aria-current="page"{% endif %}>Inbox</a>
@@ -83,6 +91,7 @@
       <a href="/definitions?kind=tag"{% if self.nav() == "tag" %} aria-current="page"{% endif %}>Tags</a>
       <a href="/definitions?kind=document_type"{% if self.nav() == "document_type" %} aria-current="page"{% endif %}>Document types</a>
       <a href="/"{% if self.nav() == "upload" %} aria-current="page"{% endif %}>Upload</a>
+      <a href="/desktop">Desktop</a>
     </nav>
   </div>
 </header>
@@ -97,6 +106,7 @@
         <li><a href="/definitions?kind=tag"{% if self.nav() == "tag" %} aria-current="page"{% endif %}>Tags</a></li>
         <li><a href="/definitions?kind=document_type"{% if self.nav() == "document_type" %} aria-current="page"{% endif %}>Document types</a></li>
         <li><a href="/"{% if self.nav() == "upload" %} aria-current="page"{% endif %}>Upload</a></li>
+        <li><a href="/desktop">Desktop</a></li>
       </ul>
     </nav>
   </aside>

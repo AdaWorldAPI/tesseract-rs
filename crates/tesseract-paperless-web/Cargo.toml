@@ -30,6 +30,10 @@ url = "2"
 # Shared zone geometry from a2ui-layout: the same page grid the other
 # AdaWorldAPI apps use. Floats on the default branch like the other siblings.
 a2ui-layout = { git = "https://github.com/AdaWorldAPI/a2ui-rs", package = "a2ui-layout" }
+# The shared material "Physikalisches Glas" (stylesheet, script, wallpapers) the
+# portal shows; served from its asset table, never copied. Zero dependencies.
+# Same source as a2ui-layout, so both float on the a2ui-rs default branch.
+a2ui-theme = { git = "https://github.com/AdaWorldAPI/a2ui-rs", package = "a2ui-theme" }
 # BRAND_TOML / BRAND_FILE: the deployment's brand as a TOML document.
 toml = "0.8"
 
