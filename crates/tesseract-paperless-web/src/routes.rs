@@ -4446,6 +4446,8 @@ mod tests {
             "data-surfaces=\":not(*)\"".to_string(),
             "src=\"/static/desktop.js\"".to_string(),
             "<select data-pg-bg-choice".to_string(),
+            // The tiles scroll in their own layer; the windows on #desk do not.
+            "<main id=\"desk\"><div id=\"icons\">".to_string(),
             "href=\"/desktop/folders/archive/all\"".to_string(),
             format!("data-win=\"archive-{tag_key}\" data-title=\"Strom\" href=\"/desktop/folders/archive/{tag_key}\""),
             format!("href=\"/desktop/folders/archive/{corr_key}\""),
