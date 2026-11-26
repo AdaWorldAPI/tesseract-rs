@@ -38,9 +38,14 @@
     var n = Object.keys(wins).length % 8;
     var el = document.createElement('section'); el.className = 'win';
     el.setAttribute('data-win-id', id);
-    el.style.left = (40 + 28 * n) + 'px'; el.style.top = (24 + 24 * n) + 'px';
-    el.style.width = Math.max(360, Math.min(960, desk.clientWidth - 80)) + 'px';
-    el.style.height = Math.max(240, Math.min(620, desk.clientHeight - 48)) + 'px';
+    // Never wider or taller than the desk, so the controls stay on screen; at most
+    // 960 x 620 on a wide desk. The offset cascades only while the window still fits.
+    var dw = desk.clientWidth, dh = desk.clientHeight;
+    var ww = Math.min(960, Math.max(Math.min(360, dw), dw - 80));
+    var wh = Math.min(620, Math.max(Math.min(240, dh), dh - 48));
+    el.style.width = ww + 'px'; el.style.height = wh + 'px';
+    el.style.left = Math.max(0, Math.min(40 + 28 * n, dw - ww)) + 'px';
+    el.style.top = Math.max(0, Math.min(24 + 24 * n, dh - wh)) + 'px';
     el.setAttribute('role', 'dialog'); el.setAttribute('aria-label', title);
     var bar = document.createElement('div'); bar.className = 'bar';
     var t = document.createElement('b'); t.textContent = title; bar.appendChild(t);
@@ -63,13 +68,26 @@
     mn.onclick = function () { el.classList.add('min'); btn.classList.remove('on'); };
     cl.onclick = function () { close(id); };
     el.addEventListener('pointerdown', function () { focus(w); });
+    // A click inside the page never reaches this section (an iframe is its own
+    // document); the pages are same-origin, so listen in each loaded page too.
+    fr.addEventListener('load', function () {
+      try { fr.contentDocument.addEventListener('pointerdown', function () { if (wins[id] === w) focus(w); }); } catch (e) {}
+    });
     bar.addEventListener('pointerdown', function (e) {
       if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
       var sx = e.clientX, sy = e.clientY, ox = el.offsetLeft, oy = el.offsetTop;
       fr.style.pointerEvents = 'none'; bar.setPointerCapture(e.pointerId);
       function mv(ev) { el.style.left = Math.max(0, ox + ev.clientX - sx) + 'px'; el.style.top = Math.max(0, oy + ev.clientY - sy) + 'px'; }
-      function up() { fr.style.pointerEvents = ''; bar.removeEventListener('pointermove', mv); bar.removeEventListener('pointerup', up); }
-      bar.addEventListener('pointermove', mv); bar.addEventListener('pointerup', up);
+      // Ends the drag on release, and also when the browser cancels it or takes the
+      // capture away; otherwise the page would stay unclickable. Safe to run twice.
+      var ends = ['pointerup', 'pointercancel', 'lostpointercapture'];
+      function up() {
+        fr.style.pointerEvents = '';
+        bar.removeEventListener('pointermove', mv);
+        ends.forEach(function (t) { bar.removeEventListener(t, up); });
+      }
+      bar.addEventListener('pointermove', mv);
+      ends.forEach(function (t) { bar.addEventListener(t, up); });
     });
     focus(w);
   }

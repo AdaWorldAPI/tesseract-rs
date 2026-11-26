@@ -106,7 +106,12 @@ Then, from `crates/`:
 
 ```sh
 ruff_charon import $STORE $T/tesseract_paperless_web.llbc tesseract_paperless_web
-cg_query $STORE . sweep | callees SYM | callers SYM | refs SYM | symbols SUBSTR
+cg_query $STORE . sweep
+cg_query $STORE . symbols ::call_once
+cg_query $STORE . callees tesseract_paperless_web::routes::router
+cg_query $STORE . refs tesseract_paperless_web::routes::router
+cg_query $STORE . callees tesseract_paperless_web::desktop::folder
+cg_query $STORE . callers tesseract_paperless_web::desktop::valid_key
 ```
 
 | Measurement | Value |
@@ -165,12 +170,18 @@ cg_query $STORE . sweep | callees SYM | callers SYM | refs SYM | symbols SUBSTR
 - **Not proven, read from source instead:** the click path from a URL to what the handler
   does, for all 27 routes.
 
-Klickwege parity via Codegraph needs one of these:
-- **(a)** coroutine support in the Charon fork, or a lowering of `async fn` bodies in ruff_charon;
-- **(b)** handlers written as thin async shells over named sync functions (the archive and
-  desktop logic would then be visible);
-- **(c)** a route table as data (`const ROUTES: &[(&str, Method, Handler)]`), so the URL ↔
-  handler edge is a fact the compiler sees.
+Klickwege parity via Codegraph has two separate gaps, and it needs a fix for **both**:
+
+1. **What a handler does.** One of these makes handler bodies visible:
+   - **(a)** coroutine support in the Charon fork, or a lowering of `async fn` bodies in
+     ruff_charon;
+   - **(b)** handlers written as thin async shells over named sync functions (the archive and
+     desktop logic would then be visible).
+2. **Which URL reaches which handler.** For example **(c)**: a route table as data
+   (`const ROUTES: &[(&str, Method, Handler)]`), so the URL ↔ handler edge is a fact the
+   compiler sees.
+
+(a) or (b) alone leaves the URL edge invisible; (c) alone leaves the bodies invisible.
 
 Before (a), Codegraph should report an async body as `UNKNOWN coroutine-body-untranslated`, not
 as an empty set. These are proposals; none is implemented in this PR.
