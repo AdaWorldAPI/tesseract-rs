@@ -190,6 +190,23 @@ impl ArchiveSource {
             .map_err(|e| e.to_string())
     }
 
+    /// The hashes the caller may see, read from the hash column alone (no
+    /// document bodies): what the tile counts need. Same rule as
+    /// `routes::filter_visible`: everything for `Scope::All`, otherwise only
+    /// documents whose customer the scope covers.
+    async fn visible_hashes(ctx: FolderCtx<'_>) -> Result<Vec<String>, String> {
+        let store = &ctx.state.store;
+        let hashes = store.hashes().await.map_err(|e| e.to_string())?;
+        if *ctx.scope == Scope::All {
+            return Ok(hashes);
+        }
+        let customers = store.meta().customers().await.map_err(|e| e.to_string())?;
+        Ok(hashes
+            .into_iter()
+            .filter(|h| ctx.scope.covers(customers.get(h).map(String::as_str)))
+            .collect())
+    }
+
     /// Visible document hashes per active definition.
     async fn members(
         ctx: FolderCtx<'_>,
@@ -252,9 +269,8 @@ impl FolderSource for ArchiveSource {
 
     fn folders<'a>(&'a self, ctx: FolderCtx<'a>) -> BoxFuture<'a, Result<Vec<Folder>, String>> {
         Box::pin(async move {
-            let rows = Self::visible(ctx).await?;
-            let visible: HashSet<&str> =
-                rows.iter().map(|r| r.content_sha256_hex.as_str()).collect();
+            let hashes = Self::visible_hashes(ctx).await?;
+            let visible: HashSet<&str> = hashes.iter().map(String::as_str).collect();
             let members = Self::members(ctx, &visible).await?;
             let defs = ctx
                 .state
@@ -267,7 +283,7 @@ impl FolderSource for ArchiveSource {
                 key: "all".to_string(),
                 label: "All documents".to_string(),
                 icon: FolderIcon::All,
-                count: rows.len(),
+                count: visible.len(),
             }];
             for kind in KINDS {
                 let mut of_kind: Vec<_> = defs

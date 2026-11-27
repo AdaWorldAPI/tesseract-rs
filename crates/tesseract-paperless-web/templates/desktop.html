@@ -11,12 +11,13 @@
   :root { color-scheme: light; --fg: #1b2430; --bg: #e8ecf2; --card-bg: #fff; --border: #d6dce5; }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
-  body { display: grid; grid-template-rows: 44px 1fr 40px; font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: var(--bg); }
-  .top { display: flex; align-items: center; gap: 14px; padding: 0 14px; background: rgb(31 42 58 / .86); color: #e9eef6; backdrop-filter: blur(10px); }
-  .top b { font-weight: 600; } .top .sp { flex: 1; }
-  .top a, .top button { color: inherit; font: inherit; font-size: 13px; text-decoration: none; padding: 4px 10px; border: 0; border-radius: 6px; background: rgb(255 255 255 / .12); cursor: pointer; }
+  /* minmax(0, 1fr): the page is never wider than the viewport, whatever the top bar holds. */
+  body { display: grid; grid-template-rows: 44px minmax(0, 1fr) 40px; grid-template-columns: minmax(0, 1fr); font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: var(--bg); }
+  .top { display: flex; align-items: center; gap: 10px; padding: 0 12px; min-width: 0; overflow: hidden; background: rgb(31 42 58 / .86); color: #e9eef6; backdrop-filter: blur(10px); }
+  .top b { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .top .sp { flex: 1; }
+  .top a, .top button { flex: none; white-space: nowrap; color: inherit; font: inherit; font-size: 13px; text-decoration: none; padding: 4px 10px; border: 0; border-radius: 6px; background: rgb(255 255 255 / .12); cursor: pointer; }
   .top a:hover, .top button:hover { background: rgb(255 255 255 / .22); }
-  .top select { font: inherit; font-size: 12px; border-radius: 6px; border: 0; padding: 3px 6px; }
+  .top select { min-width: 0; max-width: 9rem; font: inherit; font-size: 12px; border-radius: 6px; border: 0; padding: 3px 6px; }
   .top form { margin: 0; }
   /* The windows sit on #desk and never scroll; the tiles scroll in their own
      layer underneath, so every folder stays reachable however many there are. */
@@ -34,7 +35,7 @@
   .tile:focus-visible { outline: none; } .tile:focus-visible .sq { outline: 2px solid #2f6fd6; outline-offset: 3px; }
   .tile .txt { font-size: 13.5px; line-height: 1.25; word-break: break-word; }
   .errors { margin: 0 0 20px; padding: 10px 14px; border-radius: 10px; background: rgb(255 255 255 / .85); color: #8a1c1c; max-width: 1100px; }
-  .win { position: absolute; display: flex; flex-direction: column; background: #fff; border: 1px solid #b9c2cf; border-radius: 10px; box-shadow: 0 14px 44px rgb(20 30 45 / .3); overflow: hidden; min-width: 360px; min-height: 220px; resize: both; }
+  .win { position: absolute; display: flex; flex-direction: column; background: #fff; border: 1px solid #b9c2cf; border-radius: 10px; box-shadow: 0 14px 44px rgb(20 30 45 / .3); overflow: hidden; min-width: min(360px, 100%); min-height: min(220px, 100%); max-width: 100%; max-height: 100%; resize: both; }
   .win .bar { display: flex; align-items: center; gap: 6px; height: 34px; padding: 0 6px 0 12px; background: #eef2f7; border-bottom: 1px solid #d6dce5; cursor: move; user-select: none; }
   .win .bar b { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .win .bar button, .win .bar a { display: grid; place-items: center; border: 0; background: transparent; width: 28px; height: 26px; border-radius: 6px; cursor: pointer; font-size: 14px; color: inherit; text-decoration: none; }

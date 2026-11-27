@@ -29,7 +29,7 @@ Codegraph pipeline (lance-graph PR #2000) could prove about our side.
 
 The **Codegraph** column gives what the compiler facts show for our handler:
 - `H` means the handler is CONFIRMED in the store, as axum's `FnOnce::call_once` for it.
-- `body?` means its callees are not observed (see § Codegraph).
+- `body?` means its callees are not observed: the body is not read (see § Codegraph).
 
 ## Navigation (sidebar and routes)
 
@@ -106,7 +106,13 @@ Then, from `crates/`:
 
 ```sh
 ruff_charon import $STORE $T/tesseract_paperless_web.llbc tesseract_paperless_web
-cg_query $STORE . sweep | callees SYM | callers SYM | refs SYM | symbols SUBSTR
+cg_query $STORE . sweep
+cg_query $STORE . symbols ::call_once
+cg_query $STORE . callees tesseract_paperless_web::routes::router
+cg_query $STORE . refs tesseract_paperless_web::routes::router
+cg_query $STORE . refs tesseract_paperless_web::desktop::folder
+cg_query $STORE . callees tesseract_paperless_web::desktop::folder
+cg_query $STORE . callers tesseract_paperless_web::desktop::valid_key
 ```
 
 | Measurement | Value |
@@ -115,62 +121,71 @@ cg_query $STORE . sweep | callees SYM | callers SYM | refs SYM | symbols SUBSTR
 | Whole crate, every foreign crate `--opaque` | killed again: 13.5 GB peak after 28 s |
 | Started from `routes::router`, `desktop`, `glass` | 14 s, 0.88 GB peak, 30 MB LLBC |
 | `ruff_charon import` | harvested 1,615, represented 1,584, residual 31, dangling 0 |
-| `cg_query sweep` | 384 positions, 236 answered, 532 empty, 3 ms |
+| `cg_query sweep` | 384 positions, 236 answered, 532 empty, 3 ms (with lance-graph #2215: 497 answered, 271 empty) |
 | Charon warnings | 255, all `Coroutine types are not supported yet` / `Coroutines are not supported` |
 
 ### What it shows
 
-- **Every route's handler is in the store.**
+- **Every route's handler is in the store, and so is the router's edge to it.**
   - Each of the 27 handlers has a CONFIRMED caller row:
-    `{impl FnOnce<…> for <handler>}::call_once`. That is axum's `Handler` impl, the same 27
-    names `router()` registers.
+    `{impl FnOnce<…> for <handler>}::call_once`. That is axum's `Handler` impl.
+  - `router()` has a `REFERENCES` row to each of the 27 handlers (27 of 27), with the
+    call-site offset. `refs <handler>` shows it, for example `refs desktop::folder` →
+    `REFERENCES tesseract_paperless_web::routes::router`. An earlier version of this document
+    said "no route facts"; it had queried `refs router`, which asks the opposite direction.
   - `callees routes::router` lists the axum builder calls (`Router::route`, `get`, `post`,
     `layer`, `with_state`, `DefaultBodyLimit::max`, `RequestBodyLimitLayer::new`) over 60 call
     sites.
 - **Synchronous helpers are fully covered.** For example:
   - `desktop::entry_of → routes::format_unix_ms` (CONFIRMED);
   - `desktop::valid_key → str::bytes, RangeInclusive::contains, …`.
+- **The harvest names every body it did not read.** `ruff_charon` writes one
+  `BODY_NOT_STRUCTURED` residual per function whose body Charon did not translate: 31 of 31
+  here (the 27 handlers and 4 async helpers).
 
-### What it cannot show, and how it fails
+### What it cannot show yet: intake gaps, not a reason to replace Codegraph
 
-1. **No click path goes past the handler.**
+1. **Handler bodies are not read.**
    - Every axum handler is an `async fn`. Its body is a coroutine, and Charon `c69e231` does
      not translate coroutines (the 255 warnings).
-   - So `callees` of every handler returns **0 sites**. For example, `callees desktop::folder`
-     is empty, although the source calls `scope_of`, `registry`, `valid_key` and
-     `FolderSource::listing`.
-   - The empty set comes with **no UNKNOWN line**. This is the "false unaffected" defect PR
-     #2000 recorded for public symbols, now for async bodies, and it is worse here: the bodies
-     are in the observed files.
-2. **False "no callers".**
-   - `callers desktop::valid_key` reports 0 sites. Its real callers are the async handlers
-     `desktop` and `folder`.
-   - The line that does appear (`UNKNOWN external-callers-unobserved`) comes from the symbol
-     being `pub`, not from the coroutine gap. A private function called only from a handler
-     would get no UNKNOWN line at all.
-3. **No route-path facts.**
-   - The URL strings (`"/desktop/folders/:source/:key"`) are constants passed to
-     `Router::route`. `refs routes::router` returns `confirmed=0 possible=0`.
-   - The store holds *that* a handler exists, never *which URL* reaches it. A Klickweg (URL →
-     handler → effect) therefore cannot be read from Codegraph today. The URL ↔ handler column
-     above comes from reading `router()`.
-4. **Whole-crate extraction does not fit in memory** on this crate (lancedb, arrow, datafusion
+   - Before lance-graph #2215 the answer was an empty set with no UNKNOWN line:
+     `callees desktop::folder` returned 0 sites, and `callers desktop::valid_key` returned no
+     caller, although its callers are the handlers `desktop` and `folder`.
+   - With #2215 (draft) the residual names become per-function UNKNOWN. Measured on the same
+     store:
+     - `callees desktop::folder` → `UNKNOWN body-not-read … functions=280`.
+     - `callers desktop::valid_key` lists the 31 unread bodies as UNKNOWN, `desktop` and
+       `folder` among them.
+     - `sweep`: 532 → 271 empty answers.
+   - This makes the gap honest. It does not close it: the calls inside a handler are still
+     not facts.
+2. **The URL is not a fact.** The `REFERENCES router → handler` edge exists, but the string
+   passed to `.route("…")` at that call site is not stored. The URL ↔ handler column above
+   comes from reading `router()`.
+3. **Whole-crate extraction does not fit in memory** on this crate (lancedb, arrow, datafusion
    in the dependency tree), even with every foreign crate opaque. Only a narrow
    `--start-from` run completes.
 
 ### Verdict
 
-- **Proven by Codegraph:** the handler inventory (27 of 27 routes) and the synchronous helper
-  call graph.
-- **Not proven, read from source instead:** the click path from a URL to what the handler
-  does, for all 27 routes.
+- **Proven by Codegraph:** the handler inventory (27 of 27), the router → handler edges
+  (27 of 27, with offsets), the synchronous helper call graph, and the list of unread bodies.
+- **Not yet proven:** the URL of each edge, and what each handler calls.
 
-Klickwege parity via Codegraph needs one of these:
-- **(a)** coroutine support in the Charon fork, or a lowering of `async fn` bodies in ruff_charon;
-- **(b)** handlers written as thin async shells over named sync functions (the archive and
-  desktop logic would then be visible);
-- **(c)** a route table as data (`const ROUTES: &[(&str, Method, Handler)]`), so the URL ↔
-  handler edge is a fact the compiler sees.
+Both gaps belong in Codegraph's intake, in lance-graph, and neither needs this crate to change
+shape:
 
-Before (a), Codegraph should report an async body as `UNKNOWN coroutine-body-untranslated`, not
-as an empty set. These are proposals; none is implemented in this PR.
+1. **Route literals:** store the string argument of the `.route(…)` call next to the
+   `REFERENCES` edge that already has its offset. Route declarations are the source; no
+   hand-written route table.
+2. **Async bodies:** investigate a targeted intake of `async fn` bodies (in Charon or in
+   ruff_charon) before asking for handlers to be rewritten.
+
+The goal is one graph, `View → Action → Route → Handler → Effect → Next View`, with each edge
+graded as source-observed, inferred, runtime-confirmed or unknown. For our app the view and
+action side comes from the a2ui-rs screen contracts and the Askama templates. For paperless-ngx
+it comes from its Angular routes, guards, template `(click)` actions and component
+relationships. Playwright then confirms a few selected real task paths at runtime; it is
+not a replacement for the graph.
+
+None of this is implemented here. The UNKNOWN half is in lance-graph #2215.
