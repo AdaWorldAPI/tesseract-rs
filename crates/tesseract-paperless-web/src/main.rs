@@ -14,6 +14,7 @@ mod desktop;
 mod fetch;
 mod glass;
 mod headers;
+mod i18n;
 mod ingest;
 mod replica;
 mod routes;

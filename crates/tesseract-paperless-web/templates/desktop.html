@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en" data-material="physical-glass">
+<html lang="{{ self.lang() }}" data-material="physical-glass">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Desktop &middot; {{ brand_name }}</title>
+<title>{{ self.t("Desktop") }} &middot; {{ brand_name }}</title>
 <link rel="stylesheet" href="/static/physical-glass.css">
 <script src="/static/physical-glass.js" data-surfaces=":not(*)" defer></script>
 <script src="/static/desktop.js" defer></script>
@@ -52,13 +52,13 @@
 <body data-desktop>
 <header class="top">
   <b>{{ brand_name }}</b><span class="sp"></span>
-  <select data-pg-bg-choice aria-label="Background"></select>
-  <a data-desktop-exit href="/dashboard">Classic view</a>
-  {% if sign_in %}<form method="post" action="/auth/logout"><button type="submit">Sign out</button></form>{% endif %}
+  <select data-pg-bg-choice aria-label="{{ self.t("Background") }}"></select>
+  <a data-desktop-exit href="/dashboard">{{ self.t("Classic view") }}</a>
+  {% if sign_in %}<form method="post" action="/auth/logout"><button type="submit">{{ self.t("Sign out") }}</button></form>{% endif %}
 </header>
 <main id="desk"><div id="icons">
 {% if !errors.is_empty() %}<div class="errors" role="alert">{% for e in errors %}<div>{{ e }}</div>{% endfor %}</div>{% endif %}
-<ul class="grid" aria-label="Folders">
+<ul class="grid" aria-label="{{ self.t("Folders") }}">
 {% for t in tiles %}
   <li><a class="tile" data-win="{{ t.id }}" data-title="{{ t.label }}" href="{{ t.href }}" title="{{ t.hint }}"><span class="sq"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">{{ t.icon|safe }}</svg><span class="n" aria-label="{{ t.count }} documents">{{ t.count }}</span></span><span class="txt" data-pg-on-bg>{{ t.label }}</span></a></li>
 {% endfor %}

@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Dashboard — {{ self.brand().name }}{% endblock %}
+{% block title %}{{ self.t("Dashboard") }} — {{ self.brand().name }}{% endblock %}
 {% block style %}
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: .75rem; margin-bottom: 1.25rem; }
   .stat {
@@ -19,35 +19,35 @@
   }
 {% endblock %}
 {% block content %}
-  <h1>Dashboard</h1>
+  <h1>{{ self.t("Dashboard") }}</h1>
 
   {% if let Some(msg) = error %}
   <div class="error" role="alert">{{ msg }}</div>
   {% endif %}
 
   <div class="stats">
-    <a class="stat" href="/documents"><span class="n">{{ total }}</span><span class="l">document{% if total != 1 %}s{% endif %}</span></a>
-    <a class="stat" href="/inbox"><span class="n">{{ unreviewed }}</span><span class="l">to review</span></a>
+    <a class="stat" href="/documents"><span class="n">{{ total }}</span><span class="l">{% if total == 1 %}{{ self.t("document") }}{% else %}{{ self.t("documents") }}{% endif %}</span></a>
+    <a class="stat" href="/inbox"><span class="n">{{ unreviewed }}</span><span class="l">{{ self.t("to review") }}</span></a>
     {% for k in kinds %}
-    <a class="stat" href="/definitions?kind={{ k.kind }}"><span class="n">{{ k.definitions }}</span><span class="l">{{ k.label|lower }}</span></a>
+    <a class="stat" href="/definitions?kind={{ k.kind }}"><span class="n">{{ k.definitions }}</span><span class="l">{{ self.t(k.label) }}</span></a>
     {% endfor %}
   </div>
 
   <div class="card">
-    <h2>Inbox</h2>
+    <h2>{{ self.t("Inbox") }}</h2>
     {% if recent.is_empty() %}
-    <p class="none">Nothing to review.</p>
+    <p class="none">{{ self.t("Nothing to review.") }}</p>
     {% else %}
     <ul class="recent">
       {% for d in recent %}
       <li><a href="/documents/{{ d.hash_hex }}?from=inbox">{{ d.filename }}</a> <span class="note">{{ d.ingested_at }}</span></li>
       {% endfor %}
     </ul>
-    {% if unreviewed > recent.len() %}<p class="note"><a href="/inbox">All {{ unreviewed }} in the inbox</a></p>{% endif %}
+    {% if unreviewed > recent.len() %}<p class="note"><a href="/inbox">{{ self.t("All in the inbox") }} ({{ unreviewed }})</a></p>{% endif %}
     {% endif %}
   </div>
 
   {% if let Some(line) = replica %}<p class="note">{{ line }}</p>{% endif %}
 
-  <p><a class="go" href="/">Upload a document</a></p>
+  <p><a class="go" href="/">{{ self.t("Upload a document") }}</a></p>
 {% endblock %}

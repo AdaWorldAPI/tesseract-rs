@@ -50,7 +50,7 @@
   button.danger:hover { filter: brightness(1.08); }
 {% endblock %}
 {% block content %}
-  <p class="back">{% if from_inbox %}<a href="/inbox">&larr; Inbox</a>{% else %}<a href="/documents">&larr; All documents</a>{% endif %}</p>
+  <p class="back">{% if from_inbox %}<a href="/inbox">&larr; {{ self.t("Inbox") }}</a>{% else %}<a href="/documents">&larr; {{ self.t("All documents") }}</a>{% endif %}</p>
 
   {% if let Some(msg) = error %}
   <div class="error" role="alert">{{ msg }}</div>
@@ -59,59 +59,59 @@
   <div class="meta">
     <span>{{ mime }}</span>
     <span>{{ source }}</span>
-    <span>{{ page_count }} page{% if page_count != 1 %}s{% endif %}</span>
-    <span>confidence {{ confidence }}{% if low_confidence %} <span class="low-conf">(low)</span>{% endif %}</span>
-    <span>ingested {{ ingested_at }}</span>
+    <span>{{ page_count }} {% if page_count == 1 %}{{ self.t("page") }}{% else %}{{ self.t("pages") }}{% endif %}</span>
+    <span>{{ self.t("confidence") }} {{ confidence }}{% if low_confidence %} <span class="low-conf">({{ self.t("low") }})</span>{% endif %}</span>
+    <span>{{ self.t("ingested") }} {{ ingested_at }}</span>
     <span class="hash">{{ hash_hex }}</span>
   </div>
-  <p class="original">{% if has_original %}<a href="/documents/{{ hash_hex }}/original" download>Download original</a>{% else %}<span class="note">The original is not available: this document was stored before originals were kept. Upload the same file again to attach it.</span>{% endif %}</p>
+  <p class="original">{% if has_original %}<a href="/documents/{{ hash_hex }}/original" download>{{ self.t("Download original") }}</a>{% else %}<span class="note">{{ self.t("The original is not available: this document was stored before originals were kept. Upload the same file again to attach it.") }}</span>{% endif %}</p>
 
   <div class="card">
-    <h2>Metadata</h2>
+    <h2>{{ self.t("Metadata") }}</h2>
     <div class="customer">
-      <strong>Customer:</strong>
-      {% if let Some(c) = customer %}<span class="customer-code">{{ c }}</span>{% else %}<span class="note">not filed under a customer</span>{% endif %}
+      <strong>{{ self.t("Customer") }}:</strong>
+      {% if let Some(c) = customer %}<span class="customer-code">{{ c }}</span>{% else %}<span class="note">{{ self.t("not filed under a customer") }}</span>{% endif %}
       <form class="inline" action="/documents/{{ hash_hex }}/customer" method="post">
         {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
         {% if let Some(choices) = customer_choices %}
-        <select name="customer" aria-label="Customer" required>
+        <select name="customer" aria-label="{{ self.t("Customer") }}" required>
           {% for code in choices %}<option value="{{ code }}"{% if customer.as_deref() == Some(code.as_str()) %} selected{% endif %}>{{ code }}</option>{% endfor %}
         </select>
         {% else %}
-        <input name="customer" aria-label="Customer code" pattern="[A-Za-z0-9_\-]{1,32}" placeholder="e.g. K01, empty to clear" value="{% if let Some(c) = customer %}{{ c }}{% endif %}">
+        <input name="customer" aria-label="{{ self.t("Customer code") }}" pattern="[A-Za-z0-9_\-]{1,32}" placeholder="{{ self.t("e.g. K01, empty to clear") }}" value="{% if let Some(c) = customer %}{{ c }}{% endif %}">
         {% endif %}
-        <button type="submit" class="secondary">Set customer</button>
+        <button type="submit" class="secondary">{{ self.t("Set customer") }}</button>
       </form>
     </div>
     <div class="review">
       {% if reviewed %}
-      <strong>Reviewed</strong>
+      <strong>{{ self.t("Reviewed") }}</strong>
       <form class="inline" action="/documents/{{ hash_hex }}/review" method="post">
         {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
         <input type="hidden" name="reviewed" value="false">
-        <button type="submit" class="secondary">Mark unreviewed</button>
+        <button type="submit" class="secondary">{{ self.t("Mark unreviewed") }}</button>
       </form>
       {% else %}
-      <strong>Not reviewed</strong>
+      <strong>{{ self.t("Not reviewed") }}</strong>
       <form class="inline" action="/documents/{{ hash_hex }}/review" method="post">
         {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
         <input type="hidden" name="reviewed" value="true">
-        <button type="submit" class="secondary">Mark reviewed</button>
+        <button type="submit" class="secondary">{{ self.t("Mark reviewed") }}</button>
       </form>
       {% if from_inbox %}
       <form class="inline" action="/documents/{{ hash_hex }}/review" method="post">
         {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
         <input type="hidden" name="reviewed" value="true">
         <input type="hidden" name="next" value="inbox">
-        <button type="submit" class="act">Mark reviewed, next</button>
+        <button type="submit" class="act">{{ self.t("Mark reviewed, next") }}</button>
       </form>
       {% endif %}
       {% endif %}
     </div>
     {% for g in groups %}
-    <h3>{{ g.label }}</h3>
+    <h3>{{ self.t(g.label) }}</h3>
     {% if g.assigned.is_empty() %}
-    <p class="none">None assigned.</p>
+    <p class="none">{{ self.t("None assigned.") }}</p>
     {% else %}
     <ul class="assigned">
       {% for a in g.assigned %}
@@ -122,31 +122,31 @@
         {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
           <input type="hidden" name="kind" value="{{ g.kind }}">
           <input type="hidden" name="definition_id" value="{{ a.definition_id }}">
-          <button type="submit" class="secondary">Unassign</button>
+          <button type="submit" class="secondary">{{ self.t("Unassign") }}</button>
         </form>
       </li>
       {% endfor %}
     </ul>
     {% endif %}
     {% if g.options.is_empty() %}
-    <p class="none">No definitions yet &mdash; <a href="/definitions?kind={{ g.kind }}">create one</a>.</p>
+    <p class="none">{{ self.t("No definitions yet") }} &mdash; <a href="/definitions?kind={{ g.kind }}">{{ self.t("create one") }}</a>.</p>
     {% else %}
     <form class="inline" action="/documents/{{ hash_hex }}/assign" method="post">
         {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
       <input type="hidden" name="kind" value="{{ g.kind }}">
-      <select name="definition_id" aria-label="{{ g.label }}">
+      <select name="definition_id" aria-label="{{ self.t(g.label) }}">
         {% for o in g.options %}
         <option value="{{ o.definition_id }}">{{ o.name }}</option>
         {% endfor %}
       </select>
-      <button type="submit" class="act">Assign</button>
+      <button type="submit" class="act">{{ self.t("Assign") }}</button>
     </form>
     {% endif %}
     {% endfor %}
   </div>
 
   <div class="card">
-    <h2>Suggestions</h2>
+    <h2>{{ self.t("Suggestions") }}</h2>
     {% if let Some(note) = suggestions_note %}
     <p class="none">{{ note }}</p>
     {% endif %}
@@ -154,25 +154,25 @@
     <ul class="suggestions">
       {% for s in suggestions %}
       <li>
-        <strong>{{ s.label }}: {{ s.name }}</strong>
-        <span>{{ s.percent }}% expected &middot; evidence {{ s.evidence }}</span>
+        <strong>{{ self.t(s.label) }}: {{ s.name }}</strong>
+        <span>{{ s.percent }}% {{ self.t("expected") }} &middot; {{ self.t("evidence") }} {{ s.evidence }}</span>
         <form class="inline" action="/documents/{{ hash_hex }}/accept" method="post">
         {% if from_inbox %}<input type="hidden" name="from" value="inbox">{% endif %}
           <input type="hidden" name="kind" value="{{ s.kind }}">
           <input type="hidden" name="definition_id" value="{{ s.definition_id }}">
-          <button type="submit" class="act">Accept</button>
+          <button type="submit" class="act">{{ self.t("Accept") }}</button>
         </form>
-        <span class="cues">because: {{ s.cues }}</span>
+        <span class="cues">{{ self.t("because") }}: {{ s.cues }}</span>
       </li>
       {% endfor %}
     </ul>
     {% endif %}
-    <p class="note">Ignoring a suggestion stores nothing.</p>
+    <p class="note">{{ self.t("Ignoring a suggestion stores nothing.") }}</p>
   </div>
 
   {% if !fields.is_empty() %}
   <div class="card">
-    <h2>Harvested fields</h2>
+    <h2>{{ self.t("Harvested fields") }}</h2>
     <table class="fields">
       {% for (key, value) in fields %}
       <tr><td>{{ key }}</td><td>{{ value }}</td></tr>
@@ -182,16 +182,16 @@
   {% endif %}
 
   <div class="card">
-    <h2>Recognized text</h2>
+    <h2>{{ self.t("Recognized text") }}</h2>
     <pre class="text">{{ text }}</pre>
   </div>
 
   {% if !regions.is_empty() %}
   <div class="card">
-    <h2>Regions</h2>
+    <h2>{{ self.t("Regions") }}</h2>
     <table class="regions">
       {% for r in regions %}
-      <tr><td><span class="region-kind">{{ r.kind }}</span></td><td>{{ r.text }}</td></tr>
+      <tr><td><span class="region-kind">{{ self.t(r.kind) }}</span></td><td>{{ r.text }}</td></tr>
       {% endfor %}
     </table>
   </div>
@@ -199,9 +199,9 @@
 
   {% if !triples.is_empty() %}
   <div class="card">
-    <h2>Extracted facts</h2>
+    <h2>{{ self.t("Extracted facts") }}</h2>
     <table class="triples">
-      <thead><tr><th>Subject</th><th>Predicate</th><th>Object</th><th>Sentence</th></tr></thead>
+      <thead><tr><th>{{ self.t("Subject") }}</th><th>{{ self.t("Predicate") }}</th><th>{{ self.t("Object") }}</th><th>{{ self.t("Sentence") }}</th></tr></thead>
       <tbody>
       {% for t in triples %}
       <tr><td>{{ t.subject }}</td><td>{{ t.predicate }}</td><td>{{ t.object }}</td><td class="sentence">{{ t.sentence }}</td></tr>
@@ -211,8 +211,8 @@
   </div>
   {% endif %}
 
-  <form class="delete" action="/documents/{{ hash_hex }}/delete" method="post" onsubmit="return confirm('Delete this document from the archive?');">
-    <button type="submit" class="danger">Delete document</button>
+  <form class="delete" action="/documents/{{ hash_hex }}/delete" method="post" onsubmit="return confirm('{{ self.t("Delete this document from the archive?") }}');">
+    <button type="submit" class="danger">{{ self.t("Delete document") }}</button>
   </form>
   {% endif %}
 {% endblock %}

@@ -264,7 +264,7 @@ impl FolderSource for ArchiveSource {
     }
 
     fn label(&self) -> &'static str {
-        "Archive"
+        crate::i18n::t("Archive")
     }
 
     fn folders<'a>(&'a self, ctx: FolderCtx<'a>) -> BoxFuture<'a, Result<Vec<Folder>, String>> {
@@ -281,7 +281,7 @@ impl FolderSource for ArchiveSource {
                 .map_err(|e| e.to_string())?;
             let mut folders = vec![Folder {
                 key: "all".to_string(),
-                label: "All documents".to_string(),
+                label: crate::i18n::t("All documents").to_string(),
                 icon: FolderIcon::All,
                 count: visible.len(),
             }];
@@ -378,6 +378,22 @@ struct FolderTemplate {
     entries: Vec<Entry>,
     total: usize,
 }
+
+macro_rules! localized {
+    ($($t:ty),+) => {$(
+        impl $t {
+            /// The interface text in the request's language ([`crate::i18n`]).
+            fn t(&self, en: &'static str) -> &'static str {
+                crate::i18n::t(en)
+            }
+            /// The request's interface language, for `<html lang>`.
+            fn lang(&self) -> &'static str {
+                crate::i18n::current().code()
+            }
+        }
+    )+};
+}
+localized!(DesktopTemplate, FolderTemplate);
 
 fn page<T: Template>(status: StatusCode, t: &T) -> Response {
     match t.render() {

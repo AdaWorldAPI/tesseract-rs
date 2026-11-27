@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}{{ self.brand().name }} — document archive{% endblock %}
+{% block title %}{{ self.brand().name }} — {{ self.t("document archive") }}{% endblock %}
 {% block style %}
   h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
   .intake { display: flex; flex-wrap: wrap; gap: 1.25rem; align-items: flex-start; margin-bottom: 1.25rem; }
@@ -10,7 +10,7 @@
   }
   .tag { color: var(--brand-muted); font-size: .95rem; margin: 0 0 1.5rem; }
   label { display: block; font-weight: 600; margin-bottom: .35rem; }
-  input[type=file], input[type=url], #customer {
+  input[type=file], input[type=url], #customer, #ocr_lang {
     width: 100%; padding: .55rem; border-radius: var(--brand-radius-sm);
     border: 1px solid var(--brand-border);
     background: var(--brand-card-bg); color: var(--brand-fg); font-size: 1rem;
@@ -34,34 +34,40 @@
 
   <div class="intake">
   <form class="card" action="/upload" method="post" enctype="multipart/form-data">
-    <label for="file">Upload a document image</label>
+    <label for="file">{{ self.t("Upload a document image") }}</label>
     <input id="file" type="file" name="file" accept="image/png,image/jpeg,image/webp,image/tiff,image/gif,image/bmp,image/x-portable-graymap,image/*">
 
-    <div class="or">&mdash; OR &mdash;</div>
+    <div class="or">&mdash; {{ self.t("OR") }} &mdash;</div>
 
-    <label for="url">Fetch an image URL</label>
+    <label for="url">{{ self.t("Fetch an image URL") }}</label>
     <input id="url" type="url" name="url" placeholder="https://example.com/scan.png">
-    <p class="note">Private, loopback, and link-local addresses are refused (SSRF guard); 10&nbsp;MB / 10&nbsp;s cap.</p>
+    <p class="note">{{ self.t("Private, loopback, and link-local addresses are refused (SSRF guard); 10 MB / 10 s cap.") }}</p>
 
-    <label for="customer">Customer</label>
+    <label for="ocr_lang">{{ self.t("Document language") }}</label>
+    <select id="ocr_lang" name="ocr_lang">
+      <option value="deu" selected>{{ self.t("German") }}</option>
+      <option value="eng">{{ self.t("English") }}</option>
+    </select>
+
+    <label for="customer">{{ self.t("Customer") }}</label>
     {% if let Some(choices) = customer_choices %}
     {% if choices.is_empty() %}
-    <p class="note">No customer has been assigned to your account, so you cannot file documents yet.</p>
+    <p class="note">{{ self.t("No customer has been assigned to your account, so you cannot file documents yet.") }}</p>
     {% else %}
     <select id="customer" name="customer" required>
       {% for code in choices %}<option value="{{ code }}">{{ code }}</option>{% endfor %}
     </select>
     {% endif %}
     {% else %}
-    <input id="customer" name="customer" pattern="[A-Za-z0-9_\-]{1,32}" placeholder="optional, e.g. K01">
+    <input id="customer" name="customer" pattern="[A-Za-z0-9_\-]{1,32}" placeholder="{{ self.t("optional, e.g. K01") }}">
     {% endif %}
 
     <div class="btns">
-      <button class="go" type="submit">Ingest document</button>
+      <button class="go" type="submit">{{ self.t("Ingest document") }}</button>
     </div>
   </form>
   {% if let Some(img) = self.brand().image_url() %}<img class="brand-image" src="{{ img }}" alt="">{% endif %}
   </div>
 
-  <p class="note">A document already in the archive (byte-identical content) is recognized as a duplicate and skipped &mdash; no repeat OCR spend, and you land straight on the existing record.</p>
+  <p class="note">{{ self.t("A document already in the archive (byte-identical content) is recognized as a duplicate and skipped — no repeat OCR spend, and you land straight on the existing record.") }}</p>
 {% endblock %}

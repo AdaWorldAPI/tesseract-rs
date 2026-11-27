@@ -36,11 +36,12 @@ pub const HASH_LOCK_STRIPES: usize = 64;
 
 /// The archive's tissue, loaded once at startup and shared.
 pub struct AppState {
-    /// The pure-Rust recognizer, dict-optional. `eng` only — this crate is
-    /// the archive demo, not the full language-selection surface
-    /// `tesseract-ocr-web` already owns; add a `lang` field the same way
-    /// that crate did if a second model becomes worth carrying here.
+    /// The pure-Rust recognizer for English (`eng`), dict-optional.
     pub executor: OcrExecutor,
+    /// The German recognizer (`deu`), the default document language. `None`
+    /// when the `deu.lstm*` files are not in the model directory; German
+    /// uploads then fall back to `eng` ([`Self::executor_for`]).
+    pub executor_deu: Option<OcrExecutor>,
     /// The document archive.
     pub store: LanceStore,
     /// The full-text search index (BM25 + snippets) over the archive's
@@ -99,7 +100,50 @@ pub enum AutoSlot {
     Refused(String),
 }
 
+/// The language a document is recognized in. German is the default: the
+/// archive's documents are German; English stays selectable per upload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OcrLang {
+    /// German (`deu.lstm`).
+    #[default]
+    Deu,
+    /// English (`eng.lstm`).
+    Eng,
+}
+
+impl OcrLang {
+    /// The form and API value: `deu` or `eng`. Anything else is `None`, so a
+    /// caller can refuse it instead of guessing.
+    #[must_use]
+    pub fn parse(v: &str) -> Option<Self> {
+        match v.trim() {
+            "deu" => Some(Self::Deu),
+            "eng" => Some(Self::Eng),
+            _ => None,
+        }
+    }
+
+    /// The model name, `deu` or `eng`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deu => "deu",
+            Self::Eng => "eng",
+        }
+    }
+}
+
 impl AppState {
+    /// The recognizer for `lang`, and the language it actually recognizes in:
+    /// German falls back to English when the German model is not installed.
+    #[must_use]
+    pub fn executor_for(&self, lang: OcrLang) -> (&OcrExecutor, OcrLang) {
+        match (lang, &self.executor_deu) {
+            (OcrLang::Deu, Some(e)) => (e, OcrLang::Deu),
+            _ => (&self.executor, OcrLang::Eng),
+        }
+    }
+
     /// Load the model from `model_dir`, connect the archive at
     /// `lancedb_uri`, open (or create) the search index at
     /// `search_index_dir` and the original-file store at `blob_dir`.
@@ -115,17 +159,31 @@ impl AppState {
         deepnsm_vocab_dir: &Path,
         replica: Option<Replica>,
     ) -> Result<Self, String> {
-        let path = |name: &str| model_dir.join(format!("eng.{name}"));
-        let opt = |name: &str| path(name).exists().then(|| path(name));
-        let executor = OcrExecutor::from_data_paths(
-            &path("lstm"),
-            &path("lstm-unicharset"),
-            &path("lstm-recoder"),
-            opt("lstm-word-dawg").as_deref(),
-            opt("lstm-punc-dawg").as_deref(),
-            opt("lstm-number-dawg").as_deref(),
-        )
-        .map_err(|e| format!("load eng model from {}: {e:?}", model_dir.display()))?;
+        let load_model = |lang: &str| {
+            let path = |name: &str| model_dir.join(format!("{lang}.{name}"));
+            let opt = |name: &str| path(name).exists().then(|| path(name));
+            OcrExecutor::from_data_paths(
+                &path("lstm"),
+                &path("lstm-unicharset"),
+                &path("lstm-recoder"),
+                opt("lstm-word-dawg").as_deref(),
+                opt("lstm-punc-dawg").as_deref(),
+                opt("lstm-number-dawg").as_deref(),
+            )
+            .map_err(|e| format!("load {lang} model from {}: {e:?}", model_dir.display()))
+        };
+        let executor = load_model("eng")?;
+        // German is the default document language. Its absence is no startup
+        // failure: German uploads are then recognized with `eng`, and the log says so.
+        let executor_deu = if model_dir.join("deu.lstm").exists() {
+            Some(load_model("deu")?)
+        } else {
+            eprintln!(
+                "warning: no deu.lstm in {}; German uploads are recognized with eng",
+                model_dir.display()
+            );
+            None
+        };
 
         let store = LanceStore::connect(lancedb_uri)
             .await
@@ -267,6 +325,7 @@ impl AppState {
 
         Ok(Self {
             executor,
+            executor_deu,
             store,
             search,
             blobs,
