@@ -110,6 +110,7 @@ cg_query $STORE . sweep
 cg_query $STORE . symbols ::call_once
 cg_query $STORE . callees tesseract_paperless_web::routes::router
 cg_query $STORE . refs tesseract_paperless_web::routes::router
+cg_query $STORE . refs tesseract_paperless_web::desktop::folder
 cg_query $STORE . callees tesseract_paperless_web::desktop::folder
 cg_query $STORE . callers tesseract_paperless_web::desktop::valid_key
 ```
