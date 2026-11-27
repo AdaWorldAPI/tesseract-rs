@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}{% if nav == "inbox" %}Inbox{% else %}Documents{% endif %} — {{ self.brand().name }}{% endblock %}
+{% block title %}{% if nav == "inbox" %}{{ self.t("Inbox") }}{% else %}{{ self.t("Documents") }}{% endif %} — {{ self.brand().name }}{% endblock %}
 {% block style %}
   .count { color: var(--brand-muted); font-size: .9rem; }
   form.search { display: flex; gap: .5rem; margin-bottom: 1.25rem; }
@@ -29,10 +29,10 @@
 {% endblock %}
 {% block content %}
   {% if nav == "inbox" %}
-  <h1>Inbox</h1>
-  <p class="note">Documents not yet marked reviewed, newest first. Open one, file it, and mark it reviewed to take it off this list.</p>
+  <h1>{{ self.t("Inbox") }}</h1>
+  <p class="note">{{ self.t("Documents not yet marked reviewed, newest first. Open one, file it, and mark it reviewed to take it off this list.") }}</p>
   {% else %}
-  <h1>Documents</h1>
+  <h1>{{ self.t("Documents") }}</h1>
   {% endif %}
 
   {% if let Some(msg) = error %}
@@ -41,19 +41,19 @@
 
   {% if nav != "inbox" %}
   <form class="search" action="/documents" method="get" role="search">
-    <label class="note" for="q" hidden>Search</label>
-    <input id="q" type="text" name="q" value="{{ query }}" placeholder="Search recognized text&hellip;">
-    <button type="submit">Search</button>
+    <label class="note" for="q" hidden>{{ self.t("Search") }}</label>
+    <input id="q" type="text" name="q" value="{{ query }}" placeholder="{{ self.t("Search recognized text…") }}">
+    <button type="submit">{{ self.t("Search") }}</button>
   </form>
   {% endif %}
 
-  <p class="count">{{ count }} document{% if count != 1 %}s{% endif %}{% if !query.is_empty() %} matching &ldquo;{{ query }}&rdquo;{% endif %}{% if nav == "inbox" %} to review{% endif %}</p>
+  <p class="count">{{ count }} {% if count == 1 %}{{ self.t("document") }}{% else %}{{ self.t("documents") }}{% endif %}{% if !query.is_empty() %} {{ self.t("matching") }} &ldquo;{{ query }}&rdquo;{% endif %}{% if nav == "inbox" %} {{ self.t("to review") }}{% endif %}</p>
 
   {% if documents.is_empty() %}
   {% if nav == "inbox" %}
-  <p class="empty">Nothing to review.</p>
+  <p class="empty">{{ self.t("Nothing to review.") }}</p>
   {% else %}
-  <p class="empty">No documents yet. <a href="/">Ingest one</a>.</p>
+  <p class="empty">{{ self.t("No documents yet.") }} <a href="/">{{ self.t("Ingest one") }}</a>.</p>
   {% endif %}
   {% else %}
   <ul class="docs">
@@ -66,9 +66,9 @@
       <p class="preview">{{ d.preview }}</p>
       {% endif %}
       <p class="meta">
-        {{ d.page_count }} page{% if d.page_count != 1 %}s{% endif %}
-        &middot; confidence {{ d.confidence }}
-        {% if d.low_confidence %}<span class="low-conf">&middot; low confidence</span>{% endif %}
+        {{ d.page_count }} {% if d.page_count == 1 %}{{ self.t("page") }}{% else %}{{ self.t("pages") }}{% endif %}
+        &middot; {{ self.t("confidence") }} {{ d.confidence }}
+        {% if d.low_confidence %}<span class="low-conf">&middot; {{ self.t("low confidence") }}</span>{% endif %}
       </p>
     </li>
     {% endfor %}
@@ -76,10 +76,10 @@
   {% endif %}
   {% if let Some(p) = pager %}
   {% if p.prev.is_some() || p.next.is_some() %}
-  <nav class="pager" aria-label="Inbox pages">
-    {% if let Some(n) = p.prev %}<a href="/inbox?page={{ n }}" rel="prev">&larr; Newer</a>{% endif %}
-    <span class="note">Page {{ p.page }}</span>
-    {% if let Some(n) = p.next %}<a href="/inbox?page={{ n }}" rel="next">Older &rarr;</a>{% endif %}
+  <nav class="pager" aria-label="{{ self.t("Inbox pages") }}">
+    {% if let Some(n) = p.prev %}<a href="/inbox?page={{ n }}" rel="prev">&larr; {{ self.t("Newer") }}</a>{% endif %}
+    <span class="note">{{ self.t("Page") }} {{ p.page }}</span>
+    {% if let Some(n) = p.next %}<a href="/inbox?page={{ n }}" rel="next">{{ self.t("Older") }} &rarr;</a>{% endif %}
   </nav>
   {% endif %}
   {% endif %}

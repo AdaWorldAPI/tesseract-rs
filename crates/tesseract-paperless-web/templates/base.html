@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-material="physical-glass">
+<html lang="{{ self.lang() }}" data-material="physical-glass">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -82,42 +82,42 @@
 <header class="shell region-top_bar">
   <div class="bar">
     <a class="brand" href="/dashboard">{% if let Some(logo) = self.brand().logo_url() %}<img src="{{ logo }}" alt="">{% endif %}{{ self.brand().name }}</a>
-    <span class="end tools"><a href="/desktop">Desktop</a><select data-pg-bg-choice aria-label="Background"></select>{% if self.sign_in() %}<form class="signout" method="post" action="/auth/logout"><button type="submit">Sign out</button></form>{% endif %}</span>
-    <nav class="topnav-links" aria-label="Main (compact)">
-      <a href="/dashboard"{% if self.nav() == "dashboard" %} aria-current="page"{% endif %}>Dashboard</a>
-      <a href="/inbox"{% if self.nav() == "inbox" %} aria-current="page"{% endif %}>Inbox</a>
-      <a href="/documents"{% if self.nav() == "documents" %} aria-current="page"{% endif %}>Documents</a>
-      <a href="/definitions?kind=correspondent"{% if self.nav() == "correspondent" %} aria-current="page"{% endif %}>Correspondents</a>
-      <a href="/definitions?kind=tag"{% if self.nav() == "tag" %} aria-current="page"{% endif %}>Tags</a>
-      <a href="/definitions?kind=document_type"{% if self.nav() == "document_type" %} aria-current="page"{% endif %}>Document types</a>
-      <a href="/"{% if self.nav() == "upload" %} aria-current="page"{% endif %}>Upload</a>
-      <a href="/desktop">Desktop</a>
+    <span class="end tools"><a href="/desktop">{{ self.t("Desktop") }}</a><span class="langs" aria-label="{{ self.t("Language") }}"><a href="/lang?set=de" hreflang="de"{% if self.lang() == "de" %} aria-current="true"{% endif %}>DE</a> <a href="/lang?set=en" hreflang="en"{% if self.lang() == "en" %} aria-current="true"{% endif %}>EN</a></span><select data-pg-bg-choice aria-label="{{ self.t("Background") }}"></select>{% if self.sign_in() %}<form class="signout" method="post" action="/auth/logout"><button type="submit">{{ self.t("Sign out") }}</button></form>{% endif %}</span>
+    <nav class="topnav-links" aria-label="{{ self.t("Main (compact)") }}">
+      <a href="/dashboard"{% if self.nav() == "dashboard" %} aria-current="page"{% endif %}>{{ self.t("Dashboard") }}</a>
+      <a href="/inbox"{% if self.nav() == "inbox" %} aria-current="page"{% endif %}>{{ self.t("Inbox") }}</a>
+      <a href="/documents"{% if self.nav() == "documents" %} aria-current="page"{% endif %}>{{ self.t("Documents") }}</a>
+      <a href="/definitions?kind=correspondent"{% if self.nav() == "correspondent" %} aria-current="page"{% endif %}>{{ self.t("Correspondents") }}</a>
+      <a href="/definitions?kind=tag"{% if self.nav() == "tag" %} aria-current="page"{% endif %}>{{ self.t("Tags") }}</a>
+      <a href="/definitions?kind=document_type"{% if self.nav() == "document_type" %} aria-current="page"{% endif %}>{{ self.t("Document types") }}</a>
+      <a href="/"{% if self.nav() == "upload" %} aria-current="page"{% endif %}>{{ self.t("Upload") }}</a>
+      <a href="/desktop">{{ self.t("Desktop") }}</a>
     </nav>
   </div>
 </header>
 <div class="a2-body {{ self.layout_class() }}">
   <aside class="sidemenu-region region-left_nav">
-    <nav class="main" aria-label="Main">
+    <nav class="main" aria-label="{{ self.t("Main") }}">
       <ul>
-        <li><a href="/dashboard"{% if self.nav() == "dashboard" %} aria-current="page"{% endif %}>Dashboard</a></li>
-        <li><a href="/inbox"{% if self.nav() == "inbox" %} aria-current="page"{% endif %}>Inbox</a></li>
-        <li><a href="/documents"{% if self.nav() == "documents" %} aria-current="page"{% endif %}>Documents</a></li>
-        <li><a href="/definitions?kind=correspondent"{% if self.nav() == "correspondent" %} aria-current="page"{% endif %}>Correspondents</a></li>
-        <li><a href="/definitions?kind=tag"{% if self.nav() == "tag" %} aria-current="page"{% endif %}>Tags</a></li>
-        <li><a href="/definitions?kind=document_type"{% if self.nav() == "document_type" %} aria-current="page"{% endif %}>Document types</a></li>
-        <li><a href="/"{% if self.nav() == "upload" %} aria-current="page"{% endif %}>Upload</a></li>
-        <li><a href="/desktop">Desktop</a></li>
+        <li><a href="/dashboard"{% if self.nav() == "dashboard" %} aria-current="page"{% endif %}>{{ self.t("Dashboard") }}</a></li>
+        <li><a href="/inbox"{% if self.nav() == "inbox" %} aria-current="page"{% endif %}>{{ self.t("Inbox") }}</a></li>
+        <li><a href="/documents"{% if self.nav() == "documents" %} aria-current="page"{% endif %}>{{ self.t("Documents") }}</a></li>
+        <li><a href="/definitions?kind=correspondent"{% if self.nav() == "correspondent" %} aria-current="page"{% endif %}>{{ self.t("Correspondents") }}</a></li>
+        <li><a href="/definitions?kind=tag"{% if self.nav() == "tag" %} aria-current="page"{% endif %}>{{ self.t("Tags") }}</a></li>
+        <li><a href="/definitions?kind=document_type"{% if self.nav() == "document_type" %} aria-current="page"{% endif %}>{{ self.t("Document types") }}</a></li>
+        <li><a href="/"{% if self.nav() == "upload" %} aria-current="page"{% endif %}>{{ self.t("Upload") }}</a></li>
+        <li><a href="/desktop">{{ self.t("Desktop") }}</a></li>
       </ul>
     </nav>
   </aside>
   <main class="region-center">
 {% block content %}{% endblock %}
   </main>
-  <aside class="quick-rail region-right_panel" aria-label="Quick actions">
-    <a href="/" aria-label="Upload" title="Upload">+</a>
+  <aside class="quick-rail region-right_panel" aria-label="{{ self.t("Quick actions") }}">
+    <a href="/" aria-label="{{ self.t("Upload") }}" title="{{ self.t("Upload") }}">+</a>
   </aside>
 </div>
-<footer>Pure-Rust OCR (no libtesseract/leptonica at runtime) &middot; <code>lancedb</code>-backed archive.{% if self.brand().is_custom() %} &middot; powered by tesseract-rs{% endif %}</footer>
+<footer>{{ self.t("Pure-Rust OCR (no libtesseract/leptonica at runtime)") }} &middot; <code>lancedb</code> {{ self.t("archive") }}.{% if self.brand().is_custom() %} &middot; {{ self.t("powered by tesseract-rs") }}{% endif %}</footer>
 </div>
 </body>
 </html>

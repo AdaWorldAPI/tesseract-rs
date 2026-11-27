@@ -4784,3 +4784,29 @@ The window script follows report-rs's `static/desktop.js`. In addition, a folder
 page that sits inside a desktop window hands its `a[data-win]` links to
 `window.parent.desktopOpen`, so a document opens as another window. Without
 script, every tile and entry is a plain link.
+
+## ★ paperless-web: German by default, with a language switch (2026-11-27)
+
+The archive reads and speaks German first. Two separate choices, both presentation
+or input settings, neither touching what a caller may see:
+
+- **Document language (OCR).** Both `deu` and `eng` are loaded from `MODEL_DIR`
+  (`AppState::{executor, executor_deu}`); an upload is recognized in German unless the
+  form (or `ocr_lang=eng`) says English. Without `deu.lstm` the app still starts and
+  German uploads fall back to `eng`, logged at startup. An unknown value is refused
+  before anything is fetched or recognized.
+- **Interface language.** `i18n.rs`: German by default, English via the `lang` cookie,
+  set by the DE/EN switch in the top bar (`GET /lang?set=en`, back to the referring page
+  on this site only). Templates call `self.t("English text")`; the test
+  `every_template_text_has_a_german_entry` fails on any template text without a German
+  entry, and `DYNAMIC` lists the labels the code passes in.
+
+**Codebooks, checked (not guessed):**
+
+| layer | German | state |
+|---|---|---|
+| OCR model + DAWGs | `corpus/model/deu.lstm*` (charset has ä ö ü ß Ä) | wired, default |
+| search stemming | Tantivy `text_de` (German Snowball + stopwords) | already wired |
+| facts extraction (deepnsm SPO) | none: deepnsm loads the English COCA list, its parser reads English word order | runs for `eng` documents only; German documents are archived without facts, not with misread English facts |
+| German lexicon | lance-graph release `v0.1.0-codebooks-2026-07-26` → `de-bundle.tar.gz` (95,856 forms: word, lemma, PoS, rank; plus Satzklammer, valency, TEKAMOLO) | exists, no reader in deepnsm; its manifest says CC BY-SA 4.0 but `lexicon.tsv`'s own header says "CC BY-SA / CC BY-NC-SA" — the licence must be settled before it ships in a commercial image |
+| correction lexicon (`tesseract_ogar::correction`) | English only | not used by the archive |

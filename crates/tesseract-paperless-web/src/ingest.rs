@@ -29,7 +29,7 @@ use tesseract_paperless::store::StoreError;
 
 use crate::customers::Scope;
 use crate::decode::decode_grey;
-use crate::state::AppState;
+use crate::state::{AppState, OcrLang};
 
 /// What ingesting one upload produced — the S-2 gate's two outcomes, each
 /// carrying what a caller needs to redirect to the document's detail page.
@@ -158,7 +158,11 @@ pub async fn ingest_for_customer(
     mime: &str,
     customer: Option<&str>,
     scope: &Scope,
+    lang: OcrLang,
 ) -> Result<IngestOutcome, IngestError> {
+    // The recognizer for the document's language; German falls back to
+    // English when the German model is not installed.
+    let lang = state.executor_for(lang).1;
     let (hash, verdict) = preflight(&bytes, &state.store);
     let hex = format!("{hash:?}");
 
@@ -234,7 +238,8 @@ pub async fn ingest_for_customer(
     let (bytes, doc_json, spo_json, triple_count) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let (grey, w, h) = decode_grey(&bytes).map_err(IngestError::Decode)?;
-        let doc_json = match st.executor.execute(OcrRequest::RecognizeDocument {
+        let executor = st.executor_for(lang).0;
+        let doc_json = match executor.execute(OcrRequest::RecognizeDocument {
             grey: &grey,
             width: w,
             height: h,
@@ -255,9 +260,14 @@ pub async fn ingest_for_customer(
         // Mirrors `tesseract-ogar/examples/ocr_demo.rs`'s own step 6.
         // `None` reasoner (no deepnsm vocabulary loaded) means this whole
         // block is skipped, not a failed ingest.
-        let (spo_json, triple_count) = match &st.reasoner {
+        // The deepnsm vocabulary is the English COCA list and its parser reads
+        // English word order, so facts are extracted from English documents
+        // only. A German document is archived without them, not with English
+        // misreadings of German sentences.
+        let reasoner = st.reasoner.as_ref().filter(|_| lang == OcrLang::Eng);
+        let (spo_json, triple_count) = match reasoner {
             Some(reasoner) => {
-                let words = match st.executor.execute(OcrRequest::RecognizePageWords {
+                let words = match executor.execute(OcrRequest::RecognizePageWords {
                     grey: &grey,
                     width: w,
                     height: h,
@@ -269,7 +279,7 @@ pub async fn ingest_for_customer(
                 };
                 let page = tesseract_ogar::DocPage::from_line_words(
                     &words,
-                    st.executor.charset(),
+                    executor.charset(),
                     w as u32,
                     h as u32,
                 );
@@ -290,7 +300,7 @@ pub async fn ingest_for_customer(
     let ir: DocIr = ogar_from_docv1::from_doc_v1(&doc_json, *hash.as_bytes(), mime)
         .map_err(IngestError::Convert)?;
     let page_count = ir.pages.len();
-    let spo_extraction_ran = state.reasoner.is_some();
+    let spo_extraction_ran = state.reasoner.is_some() && lang == OcrLang::Eng;
 
     let ingested_at_unix_ms = now_unix_ms();
 
@@ -409,7 +419,16 @@ pub async fn ingest(
     filename: Option<String>,
     mime: &str,
 ) -> Result<IngestOutcome, IngestError> {
-    ingest_for_customer(state, bytes, filename, mime, None, &Scope::All).await
+    ingest_for_customer(
+        state,
+        bytes,
+        filename,
+        mime,
+        None,
+        &Scope::All,
+        OcrLang::Eng,
+    )
+    .await
 }
 
 /// Whether `scope` covers the document's current customer. A failed read

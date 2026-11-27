@@ -55,6 +55,14 @@ macro_rules! branded {
             fn layout_class(&self) -> &'static str {
                 a2ui_layout::LayoutMode::MainWide.class()
             }
+            /// The interface text in the request's language ([`crate::i18n`]).
+            fn t(&self, en: &'static str) -> &'static str {
+                crate::i18n::t(en)
+            }
+            /// The request's interface language, for `<html lang>`.
+            fn lang(&self) -> &'static str {
+                crate::i18n::current().code()
+            }
         }
     )+};
 }
@@ -114,6 +122,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/dashboard", get(dashboard))
         .route("/inbox", get(inbox))
         .route("/healthz", get(healthz))
+        .route("/lang", get(crate::i18n::switch))
         .route("/upload", post(upload))
         .route("/documents", get(documents))
         .route("/documents/:hash", get(document_detail))
@@ -142,6 +151,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(crate::glass::WALLPAPER_ROUTE, get(crate::glass::wallpaper))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD))
         .layer(RequestBodyLimitLayer::new(MAX_UPLOAD))
+        .layer(axum::middleware::from_fn(crate::i18n::negotiate))
         .with_state(state)
 }
 
@@ -264,6 +274,8 @@ struct UploadedFile {
     source: UploadSource,
     /// The customer to file the document under; `None` when left empty.
     customer: Option<String>,
+    /// The document's language for recognition: German unless the form says `eng`.
+    lang: crate::state::OcrLang,
 }
 
 /// Where the upload's bytes come from. A URL is fetched only after the
@@ -292,6 +304,7 @@ async fn read_upload(mut multipart: Multipart) -> Result<UploadedFile, String> {
     let mut file_name: Option<String> = None;
     let mut url: Option<String> = None;
     let mut customer: Option<String> = None;
+    let mut lang = crate::state::OcrLang::default();
 
     loop {
         match multipart.next_field().await {
@@ -320,6 +333,13 @@ async fn read_upload(mut multipart: Multipart) -> Result<UploadedFile, String> {
                             }
                         }
                     }
+                    "ocr_lang" => {
+                        if let Ok(t) = field.text().await {
+                            lang = crate::state::OcrLang::parse(&t).ok_or_else(|| {
+                                format!("{:?} is not a document language (deu or eng)", t.trim())
+                            })?;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -338,7 +358,11 @@ async fn read_upload(mut multipart: Multipart) -> Result<UploadedFile, String> {
     } else {
         return Err("please choose a file or paste an image URL".to_string());
     };
-    Ok(UploadedFile { source, customer })
+    Ok(UploadedFile {
+        source,
+        customer,
+        lang,
+    })
 }
 
 /// Whether `scope` may file a document under `customer` (`None`: no customer).
@@ -386,6 +410,7 @@ async fn upload(
         Ok(b) => b,
         Err(e) => return page_error(e),
     };
+    println!("ingest: document language {}", uploaded.lang.as_str());
     // Whether the caller may see a document these bytes already belong to is
     // decided inside ingest, under that document's hash lock and before
     // anything is changed, so a concurrent move to another customer cannot
@@ -397,6 +422,7 @@ async fn upload(
         &mime,
         uploaded.customer.as_deref(),
         &scope,
+        uploaded.lang,
     )
     .await
     {
@@ -435,7 +461,7 @@ fn log_ingest_outcome(outcome: &IngestOutcome) {
                 if *spo_extraction_ran {
                     format!("{triple_count} SPO triple(s) extracted")
                 } else {
-                    "SPO extraction skipped (no deepnsm vocabulary loaded)".to_string()
+                    "SPO extraction skipped (English documents only, and only with the deepnsm vocabulary)".to_string()
                 }
             );
         }
@@ -2122,7 +2148,7 @@ mod tests {
         }
         .render()
         .expect("render");
-        assert!(html.contains("<title>tesseract-paperless — document archive</title>"));
+        assert!(html.contains("<title>tesseract-paperless — Dokumentenarchiv</title>"));
         assert!(html.contains("<h1>tesseract-paperless</h1>"));
         assert!(html.contains("deduplicated by content hash"));
         // The default accent reaches the page as a token, and the upload
@@ -2475,7 +2501,7 @@ mod tests {
         assert_eq!(status, StatusCode::SEE_OTHER);
 
         let (_, _, page) = send(&h, get_req(&format!("/documents/{hash}"))).await;
-        assert!(page.contains("The original is not available"));
+        assert!(page.contains("Das Original fehlt"));
         assert!(!page.contains(&format!("/documents/{hash}/original")));
         let (status, _, _) = send_raw(&h, get_req(&format!("/documents/{hash}/original"))).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -2523,7 +2549,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, legacy);
         let (_, _, page) = send(&h, get_req(&format!("/documents/{hash}"))).await;
-        assert!(page.contains("Download original"));
+        assert!(page.contains("Original herunterladen"));
     }
 
     /// Slice B, S-5: when the original cannot be written, no row is written
@@ -2864,6 +2890,140 @@ mod tests {
         assert_eq!(percent_encode_filename("März 1.png"), "M%C3%A4rz%201.png");
     }
 
+    /// German is the default document language, and it is the German model: its
+    /// charset has the umlauts and ß, which the English one lacks. CAN FIRE: load
+    /// `eng` for both languages, or default to `Eng`.
+    #[tokio::test]
+    async fn german_documents_use_the_german_model() {
+        let h = harness().await;
+        assert_eq!(crate::state::OcrLang::default(), crate::state::OcrLang::Deu);
+        let (deu, lang) = h.state.executor_for(crate::state::OcrLang::Deu);
+        assert_eq!(lang, crate::state::OcrLang::Deu);
+        for c in ["ä", "ö", "ü", "ß", "Ä"] {
+            assert!(deu.charset().unichar_to_id(c).is_some(), "deu lacks {c}");
+        }
+        let (eng, lang) = h.state.executor_for(crate::state::OcrLang::Eng);
+        assert_eq!(lang, crate::state::OcrLang::Eng);
+        assert!(eng.charset().unichar_to_id("ß").is_none());
+        assert_eq!(
+            crate::state::OcrLang::parse("eng"),
+            Some(crate::state::OcrLang::Eng)
+        );
+        assert_eq!(crate::state::OcrLang::parse("fra"), None);
+    }
+
+    /// Without the German files the app still starts, and German uploads are
+    /// recognized with English (and say so in the language they return).
+    #[tokio::test]
+    async fn without_the_german_model_german_falls_back_to_english() {
+        let models = tempfile::tempdir().expect("model tempdir");
+        for f in ["eng.lstm", "eng.lstm-unicharset", "eng.lstm-recoder"] {
+            std::fs::copy(FsPath::new(MODEL_DIR).join(f), models.path().join(f)).expect("copy");
+        }
+        let archive = tempfile::tempdir().expect("archive tempdir");
+        let index = tempfile::tempdir().expect("index tempdir");
+        let blobs = tempfile::tempdir().expect("blob tempdir");
+        let state = AppState::load(
+            models.path(),
+            &archive.path().to_string_lossy(),
+            index.path(),
+            blobs.path(),
+            FsPath::new("/nonexistent/deepnsm/word_frequency"),
+            None,
+        )
+        .await
+        .expect("loads with eng alone");
+        assert!(state.executor_deu.is_none());
+        assert_eq!(
+            state.executor_for(crate::state::OcrLang::Deu).1,
+            crate::state::OcrLang::Eng
+        );
+    }
+
+    /// The interface is German by default and English when the `lang` cookie says
+    /// so; the upload form offers the document language with German selected.
+    #[tokio::test]
+    async fn the_interface_is_german_unless_english_is_chosen() {
+        let h = harness().await;
+        let get = |cookie: Option<&'static str>| {
+            let mut r = Request::builder().uri("/");
+            if let Some(c) = cookie {
+                r = r.header(header::COOKIE, c);
+            }
+            r.body(Body::empty()).expect("request")
+        };
+        let (status, _, de) = send(&h, get(None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(de.contains("<html lang=\"de\""));
+        assert!(de.contains(">Dokument erfassen</button>"));
+        assert!(de.contains(">Dokumente</a>"));
+        assert!(de.contains("<option value=\"deu\" selected>Deutsch</option>"));
+        assert!(!de.contains("Ingest document"));
+        let (_, _, en) = send(&h, get(Some("lang=en"))).await;
+        assert!(en.contains("<html lang=\"en\""));
+        assert!(en.contains(">Ingest document</button>"));
+        assert!(en.contains("<option value=\"deu\" selected>German</option>"));
+        assert!(!en.contains("Dokument erfassen"));
+    }
+
+    /// The switch sets the cookie and goes back to the page it was clicked on.
+    #[tokio::test]
+    async fn the_language_switch_remembers_and_returns() {
+        let h = harness().await;
+        let req = Request::builder()
+            .uri("/lang?set=en")
+            .header(header::HOST, "ocr.example")
+            .header(header::REFERER, "https://ocr.example/documents?q=Strom")
+            .body(Body::empty())
+            .expect("request");
+        let resp = h.app.clone().oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.headers()[header::LOCATION], "/documents?q=Strom");
+        assert!(resp.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .starts_with("lang=en;"));
+        // A referer from another site is not followed.
+        let req = Request::builder()
+            .uri("/lang?set=de")
+            .header(header::HOST, "ocr.example")
+            .header(header::REFERER, "https://evil.example/x")
+            .body(Body::empty())
+            .expect("request");
+        let resp = h.app.clone().oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.headers()[header::LOCATION], "/dashboard");
+    }
+
+    /// An unknown document language is refused before anything is recognized.
+    #[tokio::test]
+    async fn an_unknown_document_language_is_refused() {
+        let h = harness().await;
+        let b = "XLANGX";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{b}\r\nContent-Disposition: form-data; name=\"ocr_lang\"\r\n\r\nfra\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(
+            format!("--{b}\r\nContent-Disposition: form-data; name=\"url\"\r\n\r\nhttps://example.com/x.png\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(format!("--{b}--\r\n").as_bytes());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={b}"),
+            )
+            .body(Body::from(body))
+            .expect("request");
+        let (status, location, page) = send(&h, req).await;
+        assert_eq!(status, StatusCode::OK, "the form again, with the error");
+        assert!(location.is_none());
+        assert!(page.contains("not a document language"), "{page}");
+        assert_eq!(h.state.store.count().await.expect("count"), 0);
+    }
+
     /// Status, `Location` header (if any) and body text.
     async fn send(h: &Harness, req: Request<Body>) -> (StatusCode, Option<String>, String) {
         let resp = h.app.clone().oneshot(req).await.expect("oneshot");
@@ -2900,7 +3060,7 @@ mod tests {
 
         let (status, _, body) = send(&h, get_req(&format!("/documents/{hash}"))).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("Not reviewed"), "the metadata card rendered");
+        assert!(body.contains("Nicht geprüft"), "the metadata card rendered");
         assert!(body.contains("Energie"), "the definition is offered");
 
         let meta = h.state.store.meta();
@@ -3321,7 +3481,7 @@ mod tests {
                 "{uri}"
             );
             assert!(
-                body.contains("aria-label=\"Upload\""),
+                body.contains("aria-label=\"Hochladen\""),
                 "{uri}: quick-menu upload link"
             );
             if let Some(i) = side.find("aria-current=\"page\"") {
@@ -3456,7 +3616,7 @@ mod tests {
         let b = seed(&h, b"inbox-b").await;
         let (_, _, body) = send(&h, get_req("/inbox")).await;
         assert!(body.contains(&a) && body.contains(&b), "both to review");
-        assert!(body.contains("2 documents"), "{body}");
+        assert!(body.contains("2 Dokumente"), "{body}");
 
         h.state
             .store
@@ -3467,7 +3627,7 @@ mod tests {
         let (_, _, body) = send(&h, get_req("/inbox")).await;
         assert!(!body.contains(&a), "a reviewed document leaves the inbox");
         assert!(body.contains(&b));
-        assert!(body.contains("1 document "), "{body}");
+        assert!(body.contains("1 Dokument "), "{body}");
         // The document list still shows both.
         let (_, _, body) = send(&h, get_req("/documents")).await;
         assert!(body.contains(&a) && body.contains(&b));
@@ -3531,8 +3691,8 @@ mod tests {
         // The button exists only when the page was opened from the inbox.
         let (_, _, from_inbox) = send(&h, get_req(&format!("/documents/{a}?from=inbox"))).await;
         let (_, _, plain) = send(&h, get_req(&format!("/documents/{a}"))).await;
-        assert!(from_inbox.contains("Mark reviewed, next"));
-        assert!(!plain.contains("Mark reviewed, next"));
+        assert!(from_inbox.contains("Als geprüft markieren, weiter"));
+        assert!(!plain.contains("Als geprüft markieren, weiter"));
     }
 
     /// The dashboard counts documents, documents to review and live definitions
@@ -3564,15 +3724,15 @@ mod tests {
         let (status, _, body) = send(&h, get_req("/dashboard")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
-            body.contains("<span class=\"n\">2</span><span class=\"l\">documents</span>"),
+            body.contains("<span class=\"n\">2</span><span class=\"l\">Dokumente</span>"),
             "{body}"
         );
         assert!(
-            body.contains("<span class=\"n\">1</span><span class=\"l\">to review</span>"),
+            body.contains("<span class=\"n\">1</span><span class=\"l\">zu prüfen</span>"),
             "{body}"
         );
         assert!(
-            body.contains("<span class=\"n\">1</span><span class=\"l\">tags</span>"),
+            body.contains("<span class=\"n\">1</span><span class=\"l\">Schlagwörter</span>"),
             "a retired tag is not counted: {body}"
         );
         assert!(
@@ -3606,7 +3766,7 @@ mod tests {
             tags.contains("Energie") && !tags.contains("Stadtwerke"),
             "{tags}"
         );
-        assert!(tags.contains("1 document<"), "{tags}");
+        assert!(tags.contains("1 Dokument<"), "{tags}");
         let (_, _, all) = send(&h, get_req("/definitions")).await;
         assert!(all.contains("Energie") && all.contains("Stadtwerke"));
         let (status, _, _) = send(&h, get_req("/definitions?kind=storage_path")).await;
@@ -4361,7 +4521,7 @@ mod tests {
             let (status, _, body) = send(&h, get_req(&uri)).await;
             assert_eq!(status, StatusCode::OK, "{uri}");
             for needle in [
-                "<html lang=\"en\" data-material=\"physical-glass\">",
+                "<html lang=\"de\" data-material=\"physical-glass\">",
                 "href=\"/static/physical-glass.css\"",
                 "src=\"/static/physical-glass.js\" data-surfaces=\":not(*)\"",
                 "<select data-pg-bg-choice",
@@ -4433,7 +4593,7 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("all", "All documents", 2),
+                ("all", "Alle Dokumente", 2),
                 (corr_key.as_str(), "Stadtwerke", 0),
                 (tag_key.as_str(), "Strom", 1),
             ]
@@ -4475,7 +4635,7 @@ mod tests {
             "data-win=\"doc-{first}\" data-title=\"doc.png\" href=\"/documents/{first}\""
         )));
         assert!(!tagged.contains(&second), "an untagged document listed");
-        assert!(tagged.contains("1 document<"));
+        assert!(tagged.contains("1 Dokument<"));
 
         let (_, _, all) = send(&h, get_req("/desktop/folders/archive/all")).await;
         assert!(all.contains(&first) && all.contains(&second));
@@ -4487,7 +4647,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(empty.contains("This folder is empty."));
+        assert!(empty.contains("Dieser Ordner ist leer."));
     }
 
     /// An unknown source, a malformed key, a key no active definition has and

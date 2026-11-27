@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}{{ heading }} — {{ self.brand().name }}{% endblock %}
+{% block title %}{{ self.t(heading) }} — {{ self.brand().name }}{% endblock %}
 {% block style %}
   .def { border-top: 1px solid var(--brand-border); padding: .75rem 0; }
   .def.retired { opacity: .6; }
@@ -27,35 +27,35 @@
   button.danger { background: #ef4444; color: #fff; }
 {% endblock %}
 {% block content %}
-  <h1>{{ heading }}</h1>
-  {% if view.is_empty() %}<p class="muted">Correspondents, document types and tags in one place. Each also has its own page in the menu.</p>{% else %}<p class="muted"><a href="/definitions">All definitions</a></p>{% endif %}
+  <h1>{{ self.t(heading) }}</h1>
+  {% if view.is_empty() %}<p class="muted">{{ self.t("Correspondents, document types and tags in one place. Each also has its own page in the menu.") }}</p>{% else %}<p class="muted"><a href="/definitions">{{ self.t("All definitions") }}</a></p>{% endif %}
 
   <div class="card">
-    <h2>AUTO model</h2>
+    <h2>{{ self.t("AUTO model") }}</h2>
     <p class="muted">{{ auto_status }}</p>
     <form class="inline" action="/auto/mine" method="post">
-      <button type="submit">Re-mine now</button>
+      <button type="submit">{{ self.t("Re-mine now") }}</button>
     </form>
-    <p class="muted">A new definition is AUTO: it is suggested from reviewed documents, never assigned without a person accepting it.</p>
+    <p class="muted">{{ self.t("A new definition is AUTO: it is suggested from reviewed documents, never assigned without a person accepting it.") }}</p>
   </div>
 
   {% for s in sections %}
   <div class="card">
-    <h2>{{ s.label }}</h2>
+    <h2>{{ self.t(s.label) }}</h2>
     {% if s.rows.is_empty() %}
-    <p class="none">None yet.</p>
+    <p class="none">{{ self.t("None yet.") }}</p>
     {% endif %}
     {% for d in s.rows %}
     <div class="def{% if d.retired %} retired{% endif %}">
       <div>
         <strong>{{ d.name }}</strong>
-        <span class="badge">{{ d.documents }} document{% if d.documents != 1 %}s{% endif %}</span>
-        <span class="badge">{{ d.algorithm_name }}</span>
-        {% if d.retired %}<span class="badge warn">retired</span>{% endif %}
+        <span class="badge">{{ d.documents }} {% if d.documents == 1 %}{{ self.t("document") }}{% else %}{{ self.t("documents") }}{% endif %}</span>
+        <span class="badge">{{ self.t(d.algorithm_name) }}</span>
+        {% if d.retired %}<span class="badge warn">{{ self.t("retired") }}</span>{% endif %}
       </div>
       <div class="muted">
-        pattern <code>{{ d.pattern }}</code> &middot;
-        case-insensitive: {% if d.case_insensitive %}yes{% else %}no{% endif %}
+        {{ self.t("pattern") }} <code>{{ d.pattern }}</code> &middot;
+        {{ self.t("case-insensitive") }}: {% if d.case_insensitive %}{{ self.t("yes") }}{% else %}{{ self.t("no") }}{% endif %}
       </div>
       {% if !d.retired %}
       <div class="forms">
@@ -63,27 +63,27 @@
           <input type="hidden" name="kind" value="{{ s.kind }}">
           <input type="hidden" name="view" value="{{ view }}">
           <input type="hidden" name="definition_id" value="{{ d.definition_id }}">
-          <input type="text" name="name" value="{{ d.name }}" aria-label="Name" required>
-          <button type="submit" class="secondary">Rename</button>
+          <input type="text" name="name" value="{{ d.name }}" aria-label="{{ self.t("Name") }}" required>
+          <button type="submit" class="secondary">{{ self.t("Rename") }}</button>
         </form>
         <form class="inline" action="/definitions/rule" method="post">
           <input type="hidden" name="kind" value="{{ s.kind }}">
           <input type="hidden" name="view" value="{{ view }}">
           <input type="hidden" name="definition_id" value="{{ d.definition_id }}">
-          <select name="match_algorithm" aria-label="Matching algorithm">
+          <select name="match_algorithm" aria-label="{{ self.t("Matching algorithm") }}">
             {% for o in d.alg_options %}
-            <option value="{{ o.value }}"{% if o.selected %} selected{% endif %}>{{ o.name }}</option>
+            <option value="{{ o.value }}"{% if o.selected %} selected{% endif %}>{{ self.t(o.name) }}</option>
             {% endfor %}
           </select>
-          <input type="text" name="match_pattern" value="{{ d.pattern }}" placeholder="pattern" aria-label="Pattern">
-          <label><input type="checkbox" name="case_insensitive" value="on"{% if d.case_insensitive %} checked{% endif %}> ignore case</label>
-          <button type="submit" class="secondary">Save rule</button>
+          <input type="text" name="match_pattern" value="{{ d.pattern }}" placeholder="{{ self.t("pattern") }}" aria-label="{{ self.t("Pattern") }}">
+          <label><input type="checkbox" name="case_insensitive" value="on"{% if d.case_insensitive %} checked{% endif %}> {{ self.t("ignore case") }}</label>
+          <button type="submit" class="secondary">{{ self.t("Save rule") }}</button>
         </form>
-        <form class="inline" action="/definitions/retire" method="post" onsubmit="return confirm('Retire this definition? Its id is never reused.');">
+        <form class="inline" action="/definitions/retire" method="post" onsubmit="return confirm('{{ self.t("Retire this definition? Its id is never reused.") }}');">
           <input type="hidden" name="kind" value="{{ s.kind }}">
           <input type="hidden" name="view" value="{{ view }}">
           <input type="hidden" name="definition_id" value="{{ d.definition_id }}">
-          <button type="submit" class="danger">Retire</button>
+          <button type="submit" class="danger">{{ self.t("Retire") }}</button>
         </form>
       </div>
       {% endif %}
@@ -92,8 +92,8 @@
     <form class="inline" action="/definitions/create" method="post" style="margin-top:.75rem">
       <input type="hidden" name="kind" value="{{ s.kind }}">
       <input type="hidden" name="view" value="{{ view }}">
-      <input type="text" name="name" placeholder="New name" aria-label="New {{ s.label|lower }} name" required>
-      <button type="submit">Create</button>
+      <input type="text" name="name" placeholder="{{ self.t("New name") }}" aria-label="{{ self.t("New name") }} ({{ self.t(s.label) }})" required>
+      <button type="submit">{{ self.t("Create") }}</button>
     </form>
   </div>
   {% endfor %}

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{ self.lang() }}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -21,16 +21,16 @@
 </style>
 </head>
 <body>
-<header><h1>{{ label }}</h1><span class="muted">{{ source }} &middot; {{ total }} {% if total == 1 %}document{% else %}documents{% endif %}</span></header>
+<header><h1>{{ label }}</h1><span class="muted">{{ source }} &middot; {{ total }} {% if total == 1 %}{{ self.t("document") }}{% else %}{{ self.t("documents") }}{% endif %}</span></header>
 {% if entries.is_empty() %}
-<p class="empty muted">This folder is empty.</p>
+<p class="empty muted">{{ self.t("This folder is empty.") }}</p>
 {% else %}
 <ul>
 {% for e in entries %}
   <li><a data-win="{{ e.id }}" data-title="{{ e.label }}" href="{{ e.href }}"><b>{{ e.label }}</b><span class="muted">{{ e.detail }}</span></a></li>
 {% endfor %}
 </ul>
-{% if total > entries.len() %}<p class="more muted">Showing {{ entries.len() }} of {{ total }}. Use the document search for the rest.</p>{% endif %}
+{% if total > entries.len() %}<p class="more muted">{{ self.t("Showing") }} {{ entries.len() }} {{ self.t("of") }} {{ total }}. {{ self.t("Use the document search for the rest.") }}</p>{% endif %}
 {% endif %}
 </body>
 </html>
